@@ -2,8 +2,11 @@
   "name": "geodesic-map",
   "version": "1.0.0",
   "type": "module",
-  "description": "Geodesic Map Visualizer",
+  "description": "Geodesic flight path visualizer and great-circle calculation engine",
   "scripts": {
-    "test": "node maps/tests/test_directory.js"
+    "test": "node maps/tests/test_directory.js && node maps/tests/test_geodesic.js && node maps/tests/test_globe.js",
+    "test:directory": "node maps/tests/test_directory.js",
+    "test:geodesic": "node maps/tests/test_geodesic.js",
+    "test:globe": "node maps/tests/test_globe.js"
   }
 }
