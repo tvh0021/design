@@ -158,12 +158,13 @@ export class FlightHUD {
     this.onDestSelect = options.onDestSelect || (() => {});
     this.onSwap = options.onSwap || (() => {});
     this.onRecenter = options.onRecenter || (() => {});
+    this.onCollapseChange = options.onCollapseChange || (() => {});
 
     // State
     this.originCity = normalizeCityRecord(options.initialOrigin);
     this.destCity = normalizeCityRecord(options.initialDest);
     this.geodesicResult = null;
-    this.isDrawerCollapsed = false;
+    this.isCollapsed = false;
 
     // Combobox controllers
     this.originCombobox = null;
@@ -196,11 +197,45 @@ export class FlightHUD {
     // Mobile Sheet Handle
     const handleBar = doc.createElement('div');
     handleBar.className = 'hud-drawer-handle';
-    handleBar.setAttribute('aria-hidden', 'true');
+    handleBar.setAttribute('role', 'button');
+    handleBar.setAttribute('tabindex', '0');
+    handleBar.setAttribute('aria-label', 'Toggle flight controls panel');
+    handleBar.setAttribute('aria-expanded', 'true');
     const handleIndicator = doc.createElement('span');
     handleIndicator.className = 'hud-drawer-pill';
     handleBar.appendChild(handleIndicator);
     hud.appendChild(handleBar);
+
+    handleBar.addEventListener('click', () => {
+      this.toggleCollapse();
+    });
+    handleBar.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+        this.toggleCollapse();
+      }
+    });
+
+    let touchStartY = 0;
+    let touchStartTime = 0;
+    handleBar.addEventListener('touchstart', (e) => {
+      if (e.touches && e.touches[0]) {
+        touchStartY = e.touches[0].clientY;
+        touchStartTime = Date.now();
+      }
+    }, { passive: true });
+
+    handleBar.addEventListener('touchend', (e) => {
+      if (e.changedTouches && e.changedTouches[0]) {
+        const deltaY = e.changedTouches[0].clientY - touchStartY;
+        const deltaTime = Date.now() - touchStartTime;
+        if (deltaY > 30 && deltaTime < 600) {
+          this.collapse();
+        } else if (deltaY < -30 && deltaTime < 600) {
+          this.expand();
+        }
+      }
+    }, { passive: true });
 
     // Header Bar
     const header = doc.createElement('header');
@@ -228,7 +263,10 @@ export class FlightHUD {
     headerLeft.appendChild(titleGroup);
     header.appendChild(headerLeft);
 
-    // Header Recenter Action
+    // Header Actions Group
+    const headerActions = doc.createElement('div');
+    headerActions.className = 'hud-header-actions';
+
     const recenterBtn = doc.createElement('button');
     recenterBtn.className = 'hud-btn hud-btn-recenter';
     recenterBtn.type = 'button';
@@ -247,7 +285,28 @@ export class FlightHUD {
     recenterBtn.addEventListener('click', () => {
       this.onRecenter();
     });
-    header.appendChild(recenterBtn);
+    headerActions.appendChild(recenterBtn);
+
+    const toggleBtn = doc.createElement('button');
+    toggleBtn.className = 'hud-btn hud-btn-toggle';
+    toggleBtn.type = 'button';
+    toggleBtn.setAttribute('title', 'Minimize flight panel to view full globe');
+    toggleBtn.setAttribute('aria-label', 'Minimize flight panel to view full globe');
+    toggleBtn.innerHTML = `
+      <svg class="hud-icon toggle-icon-collapse" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"></polyline>
+      </svg>
+      <svg class="hud-icon toggle-icon-expand" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
+        <polyline points="18 15 12 9 6 15"></polyline>
+      </svg>
+      <span class="btn-text">Hide</span>
+    `;
+    toggleBtn.addEventListener('click', () => {
+      this.toggleCollapse();
+    });
+    headerActions.appendChild(toggleBtn);
+
+    header.appendChild(headerActions);
     hud.appendChild(header);
 
     // Route Selection Section
@@ -360,9 +419,31 @@ export class FlightHUD {
 
     this.container.appendChild(hud);
 
+    // Floating Trigger Pill for when HUD is minimized
+    const floatingTrigger = doc.createElement('button');
+    floatingTrigger.className = 'hud-floating-trigger hidden';
+    floatingTrigger.type = 'button';
+    floatingTrigger.setAttribute('title', 'Open flight controls');
+    floatingTrigger.setAttribute('aria-label', 'Open flight route controls');
+    floatingTrigger.innerHTML = `
+      <span class="trigger-icon" aria-hidden="true">✈️</span>
+      <span class="trigger-summary" data-telemetry="floating-summary">Flight Controls</span>
+      <svg class="trigger-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="18 15 12 9 6 15"></polyline>
+      </svg>
+    `;
+    floatingTrigger.addEventListener('click', () => {
+      this.expand();
+    });
+    this.container.appendChild(floatingTrigger);
+
     // Store references
     this.hudElement = hud;
+    this.handleBar = handleBar;
     this.recenterBtn = recenterBtn;
+    this.toggleBtn = toggleBtn;
+    this.floatingTrigger = floatingTrigger;
+    this.floatingSummaryEl = floatingTrigger.querySelector('[data-telemetry="floating-summary"]');
     this.swapBtn = swapBtn;
     this.antipodalBadge = antipodalBadge;
     this.telemetryCard = telemetryCard;
@@ -759,6 +840,7 @@ export class FlightHUD {
       if (this.midpointCoordEl) this.midpointCoordEl.textContent = '—';
       if (this.destCoordEl) this.destCoordEl.textContent = '—';
       if (this.antipodalBadge) this.antipodalBadge.style.display = 'none';
+      if (this.floatingSummaryEl) this.floatingSummaryEl.textContent = 'Flight Controls';
       return;
     }
 
@@ -774,6 +856,13 @@ export class FlightHUD {
 
     // 1. Total Distance Formatting
     const dist = formatDistance(distanceKm, distanceMiles);
+    if (this.floatingSummaryEl) {
+      if (this.originCity && this.destCity && dist) {
+        this.floatingSummaryEl.textContent = `${this.originCity.name} → ${this.destCity.name} · ${dist.km}`;
+      } else {
+        this.floatingSummaryEl.textContent = 'Flight Controls';
+      }
+    }
     if (this.distanceKmEl) this.distanceKmEl.textContent = dist.km;
     if (this.distanceMilesEl) this.distanceMilesEl.textContent = dist.miles;
 
@@ -882,6 +971,66 @@ export class FlightHUD {
   getDest() {
     return this.destCity;
   }
+  /**
+   * Collapses/minimizes the HUD panel, revealing the full globe.
+   */
+  collapse() {
+    this.isCollapsed = true;
+    this.hudElement.classList.add('is-minimized');
+    if (this.handleBar) this.handleBar.setAttribute('aria-expanded', 'false');
+    if (this.floatingTrigger) this.floatingTrigger.classList.remove('hidden');
+    if (this.toggleBtn) {
+      const textEl = this.toggleBtn.querySelector('.btn-text');
+      if (textEl) textEl.textContent = 'Show';
+      const cIcon = this.toggleBtn.querySelector('.toggle-icon-collapse');
+      if (cIcon) cIcon.style.display = 'none';
+      const eIcon = this.toggleBtn.querySelector('.toggle-icon-expand');
+      if (eIcon) eIcon.style.display = '';
+    }
+    if (typeof this.onCollapseChange === 'function') {
+      this.onCollapseChange(true);
+    }
+  }
+
+  /**
+   * Expands the HUD panel to display complete flight controls and telemetry.
+   */
+  expand() {
+    this.isCollapsed = false;
+    this.hudElement.classList.remove('is-minimized');
+    if (this.handleBar) this.handleBar.setAttribute('aria-expanded', 'true');
+    if (this.floatingTrigger) this.floatingTrigger.classList.add('hidden');
+    if (this.toggleBtn) {
+      const textEl = this.toggleBtn.querySelector('.btn-text');
+      if (textEl) textEl.textContent = 'Hide';
+      const cIcon = this.toggleBtn.querySelector('.toggle-icon-collapse');
+      if (cIcon) cIcon.style.display = '';
+      const eIcon = this.toggleBtn.querySelector('.toggle-icon-expand');
+      if (eIcon) eIcon.style.display = 'none';
+    }
+    if (typeof this.onCollapseChange === 'function') {
+      this.onCollapseChange(false);
+    }
+  }
+
+  /**
+   * Toggles between expanded and minimized panel states.
+   */
+  toggleCollapse() {
+    if (this.isCollapsed) {
+      this.expand();
+    } else {
+      this.collapse();
+    }
+  }
+
+  /**
+   * Returns current collapse status.
+   */
+  getIsCollapsed() {
+    return this.isCollapsed;
+  }
+
 
   /**
    * Returns a map of key DOM elements for automated test assertions.
@@ -897,6 +1046,10 @@ export class FlightHUD {
       destClearBtn: this.destCombobox?.clearBtn,
       swapBtn: this.swapBtn,
       recenterBtn: this.recenterBtn,
+      toggleBtn: this.toggleBtn,
+      handleBar: this.handleBar,
+      floatingTrigger: this.floatingTrigger,
+      floatingSummary: this.floatingSummaryEl,
       antipodalBadge: this.antipodalBadge,
       telemetryCard: this.telemetryCard,
       distanceKm: this.distanceKmEl,
@@ -919,6 +1072,9 @@ export class FlightHUD {
     if (this.destCombobox) this.destCombobox.destroy();
     if (this.hudElement && this.hudElement.parentElement) {
       this.hudElement.parentElement.removeChild(this.hudElement);
+    }
+    if (this.floatingTrigger && this.floatingTrigger.parentElement) {
+      this.floatingTrigger.parentElement.removeChild(this.floatingTrigger);
     }
   }
 }

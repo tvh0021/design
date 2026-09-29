@@ -48,6 +48,11 @@ function getLocalIpAddresses() {
 
 function handleRequest(req, res) {
   let reqPath = decodeURIComponent(req.url.split('?')[0]);
+  if (reqPath.startsWith('/maps/')) {
+    reqPath = reqPath.slice(5);
+  } else if (reqPath === '/maps') {
+    reqPath = '/';
+  }
   if (reqPath === '/' || reqPath === '') {
     reqPath = '/index.html';
   }

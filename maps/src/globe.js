@@ -437,6 +437,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let currentDest = null;
   let currentRouteGeoJson = null;
   let currentMidpoint = null;
+  let verticalCenterRatio = typeof options.verticalCenterRatio === "number" ? options.verticalCenterRatio : 0.5;
 
   // Configure high-DPI scaling
   function updateCanvasDimensions() {
@@ -449,7 +450,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.scale(dpr, dpr);
 
-    projection.translate([width / 2, height / 2]);
+    projection.translate([width / 2, height * verticalCenterRatio]);
 
     if (webglTerrain) {
       webglTerrain.resize(width, height, dpr);
@@ -821,6 +822,36 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
   }
 
+  // Adjust vertical projection center (e.g. upper region on mobile drawer)
+  function setVerticalCenterRatio(ratio, animate = true) {
+    const targetRatio = Math.max(0.1, Math.min(0.9, ratio));
+    if (!animate || typeof requestAnimationFrame === "undefined") {
+      verticalCenterRatio = targetRatio;
+      updateCanvasDimensions();
+      render();
+      return;
+    }
+
+    const startY = projection.translate()[1];
+    const targetY = height * targetRatio;
+    const startTime = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const duration = 280;
+
+    function anim(now) {
+      const elapsed = now - startTime;
+      const t = Math.min(1, elapsed / duration);
+      const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+      const currentY = startY + (targetY - startY) * ease;
+      verticalCenterRatio = currentY / height;
+      projection.translate([width / 2, currentY]);
+      render();
+      if (t < 1) {
+        requestAnimationFrame(anim);
+      }
+    }
+    requestAnimationFrame(anim);
+  }
+
   // Resize canvas and update projection viewport
   function resize(newWidth, newHeight) {
     if (typeof newWidth === 'number' && typeof newHeight === 'number') {
@@ -1051,6 +1082,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     recenter,
     rotateTo,
     resize,
+    setVerticalCenterRatio,
+    getVerticalCenterRatio: () => verticalCenterRatio,
     destroy,
     render,
     getRotation: () => projection.rotate().slice(),

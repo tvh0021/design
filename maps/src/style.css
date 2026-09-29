@@ -231,12 +231,18 @@ canvas.globe-canvas:active {
   letter-spacing: 0.02em;
 }
 
-/* Recenter Button */
-.hud-btn-recenter {
+/* Header Actions & HUD Buttons */
+.hud-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hud-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
+  padding: 5px 9px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -247,18 +253,76 @@ canvas.globe-canvas:active {
   transition: all var(--transition-fast);
 }
 
-.hud-btn-recenter:hover {
-  background: rgba(6, 182, 212, 0.1);
-  border-color: var(--color-border-focus);
+.hud-btn:hover,
+.hud-btn:focus-visible {
+  background: rgba(6, 182, 212, 0.12);
+  border-color: var(--color-cyan);
   color: var(--color-cyan);
 }
 
-.hud-btn-recenter:active {
+.hud-btn:active {
   transform: scale(0.97);
 }
 
-.hud-btn-recenter .hud-icon {
+.hud-btn .hud-icon {
   stroke: currentColor;
+  flex-shrink: 0;
+}
+
+/* Floating Trigger Pill for Minimized HUD */
+.hud-floating-trigger {
+  position: fixed;
+  background: rgba(10, 16, 32, 0.9);
+  backdrop-filter: var(--blur-glass);
+  -webkit-backdrop-filter: var(--blur-glass);
+  border: 1px solid rgba(6, 182, 212, 0.45);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 0 16px rgba(6, 182, 212, 0.25);
+  border-radius: 9999px;
+  padding: 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+  z-index: 120;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease, border-color var(--transition-fast);
+  white-space: nowrap;
+}
+
+.hud-floating-trigger:hover,
+.hud-floating-trigger:focus-visible {
+  border-color: var(--color-cyan);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7), 0 0 24px rgba(6, 182, 212, 0.4);
+}
+
+.hud-floating-trigger:active {
+  transform: scale(0.98);
+}
+
+.hud-floating-trigger.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.trigger-icon {
+  font-size: 0.9375rem;
+  line-height: 1;
+}
+
+.trigger-summary {
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.trigger-chevron {
+  color: var(--color-cyan);
+  flex-shrink: 0;
 }
 
 /* ==========================================================================
@@ -703,22 +767,73 @@ canvas.globe-canvas:active {
     right: 0;
     width: 100%;
     max-width: 100%;
-    max-height: 60vh;
+    max-height: 52vh;
     border-radius: 20px 20px 0 0;
     border-left: none;
     border-right: none;
     border-bottom: none;
-    padding: 12px 16px 20px 16px;
+    padding: 10px 16px calc(16px + env(safe-area-inset-bottom, 0px)) 16px;
     gap: 12px;
     box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
+    transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
+  }
+
+  .geodesic-hud.is-minimized {
+    transform: translateY(calc(100% + 24px));
+    opacity: 0;
+    pointer-events: none;
   }
 
   .hud-drawer-handle {
     display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 4px 0 10px 0;
+    cursor: pointer;
+    touch-action: pan-y;
+  }
+
+  .hud-drawer-pill {
+    width: 44px;
+    height: 5px;
+    border-radius: 3px;
+    background-color: var(--color-text-subtle);
+    opacity: 0.65;
+    transition: background-color var(--transition-fast), width var(--transition-fast);
+  }
+
+  .hud-drawer-handle:hover .hud-drawer-pill,
+  .hud-drawer-handle:focus-visible .hud-drawer-pill {
+    background-color: var(--color-cyan);
+    opacity: 1;
+    width: 52px;
+  }
+
+  .hud-floating-trigger {
+    bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%) translateY(0);
+  }
+
+  .hud-floating-trigger:hover,
+  .hud-floating-trigger:focus-visible {
+    transform: translateX(-50%) translateY(-2px);
+  }
+
+  .hud-floating-trigger.hidden {
+    transform: translateX(-50%) translateY(24px);
   }
 
   .hud-header {
     padding-bottom: 10px;
+  }
+
+  .hud-title {
+    font-size: 0.75rem;
+  }
+
+  .hud-subtitle {
+    font-size: 0.625rem;
   }
 
   .telemetry-grid {
@@ -731,6 +846,30 @@ canvas.globe-canvas:active {
 
   .combobox-input {
     height: 36px;
+  }
+}
+
+@media (min-width: 640px) {
+  .geodesic-hud.is-minimized {
+    transform: translateY(-20px);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .hud-floating-trigger {
+    bottom: auto;
+    top: 24px;
+    left: 24px;
+    transform: translateX(0) translateY(0);
+  }
+
+  .hud-floating-trigger:hover,
+  .hud-floating-trigger:focus-visible {
+    transform: translateX(0) translateY(-2px);
+  }
+
+  .hud-floating-trigger.hidden {
+    transform: translateX(0) translateY(-20px);
   }
 }
 

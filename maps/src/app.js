@@ -54,11 +54,15 @@ export async function initApp(options = {}) {
     }
 
     // 3. Initialize GlobeRenderer
+    const isMobilePortrait = typeof window !== 'undefined' && window.innerWidth < 640 && window.innerHeight > window.innerWidth;
+    const initialVerticalRatio = isMobilePortrait ? 0.28 : 0.50;
+
     const canvas = options.canvas || (doc ? doc.createElement('canvas') : undefined);
     const globe = createGlobeRenderer(globeContainer, worldTopology, {
       d3: options.d3,
       topojson: options.topojson,
       canvas,
+      verticalCenterRatio: initialVerticalRatio,
       ...(options.globeOptions || {})
     });
 
@@ -112,6 +116,14 @@ export async function initApp(options = {}) {
       initialOrigin,
       initialDest,
       document: doc,
+      onCollapseChange: (isCollapsed) => {
+        const isMobile = typeof window !== 'undefined' && window.innerWidth < 640 && window.innerHeight > window.innerWidth;
+        if (isMobile) {
+          globe.setVerticalCenterRatio(isCollapsed ? 0.50 : 0.28, true);
+        } else {
+          globe.setVerticalCenterRatio(0.50, true);
+        }
+      },
       onOriginSelect: (city) => {
         if (isSwapping) return;
         updateRoute(city, currentDest, true);
@@ -132,11 +144,27 @@ export async function initApp(options = {}) {
       }
     });
 
+    // Tap on globe canvas outside HUD collapses the sheet on mobile to reveal full globe
+    const onGlobeTap = () => {
+      const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+      if (isMobile && !hud.getIsCollapsed()) {
+        hud.collapse();
+      }
+    };
+    if (globeContainer && typeof globeContainer.addEventListener === 'function') {
+      globeContainer.addEventListener('click', onGlobeTap);
+    }
+
     // 6. Set initial iconic route (Paris -> Tokyo) and smooth camera focus
     updateRoute(initialOrigin, initialDest, true);
 
     // 7. Window resize handler
     const onResize = () => {
+      const isMobile = typeof window !== 'undefined' && window.innerWidth < 640 && window.innerHeight > window.innerWidth;
+      const targetRatio = (isMobile && !hud.getIsCollapsed()) ? 0.28 : 0.50;
+      if (globe && typeof globe.setVerticalCenterRatio === 'function') {
+        globe.setVerticalCenterRatio(targetRatio, false);
+      }
       if (globe && typeof globe.resize === 'function') {
         globe.resize();
       }
@@ -167,6 +195,9 @@ export async function initApp(options = {}) {
       destroy: () => {
         if (typeof window !== 'undefined') {
           window.removeEventListener('resize', onResize);
+        }
+        if (globeContainer && typeof globeContainer.removeEventListener === 'function') {
+          globeContainer.removeEventListener('click', onGlobeTap);
         }
         if (globe) globe.destroy();
         if (hud) hud.destroy();

@@ -665,6 +665,75 @@ test('Programmatic setters update values and clean up on destroy', () => {
   assert.equal(container.children.length, 0, 'Container should be empty after destroy()');
 });
 
+
+// 12. Collapsible Drawer & Minimize State
+test('FlightHUD supports collapse, expand, toggleCollapse, and onCollapseChange', () => {
+  const { doc, container } = createTestEnvironment();
+  let collapseState = null;
+
+  const hud = createFlightHUD(container, {
+    document: doc,
+    onCollapseChange: (isCollapsed) => {
+      collapseState = isCollapsed;
+    }
+  });
+
+  const { hud: hudEl, floatingTrigger, toggleBtn } = hud.getElements();
+
+  assert.equal(hud.getIsCollapsed(), false, 'HUD should initially be expanded');
+  assert.equal(hudEl.classList.contains('is-minimized'), false);
+  assert.ok(floatingTrigger.classList.contains('hidden'));
+
+  // Collapse
+  hud.collapse();
+  assert.equal(hud.getIsCollapsed(), true);
+  assert.ok(hudEl.classList.contains('is-minimized'));
+  assert.equal(floatingTrigger.classList.contains('hidden'), false);
+  assert.equal(collapseState, true);
+
+  // Expand
+  hud.expand();
+  assert.equal(hud.getIsCollapsed(), false);
+  assert.equal(hudEl.classList.contains('is-minimized'), false);
+  assert.ok(floatingTrigger.classList.contains('hidden'));
+  assert.equal(collapseState, false);
+
+  // Toggle Collapse
+  hud.toggleCollapse();
+  assert.equal(hud.getIsCollapsed(), true);
+  hud.toggleCollapse();
+  assert.equal(hud.getIsCollapsed(), false);
+
+  hud.destroy();
+});
+
+// 13. Mobile Drawer Controls & Floating Pill Interaction
+test('Drawer handle, toggle button, and floating trigger fire collapse/expand', () => {
+  const { doc, container } = createTestEnvironment();
+  const hud = createFlightHUD(container, { document: doc });
+  const { hud: hudEl, handleBar, toggleBtn, floatingTrigger } = hud.getElements();
+
+  // Click on Toggle Button in header
+  toggleBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getIsCollapsed(), true, 'Clicking toggle button should collapse HUD');
+  assert.ok(hudEl.classList.contains('is-minimized'));
+
+  // Click on Floating Trigger Pill
+  floatingTrigger.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getIsCollapsed(), false, 'Clicking floating trigger should expand HUD');
+  assert.equal(hudEl.classList.contains('is-minimized'), false);
+
+  // Click on Handle Bar
+  handleBar.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getIsCollapsed(), true, 'Clicking handle bar should collapse HUD');
+
+  // Enter key on Handle Bar
+  handleBar.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  assert.equal(hud.getIsCollapsed(), false, 'Enter key on handle bar should expand HUD');
+
+  hud.destroy();
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);

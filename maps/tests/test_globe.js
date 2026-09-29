@@ -604,6 +604,41 @@ test("maps/data/etopo.jpg exists and is a valid JPEG binary", () => {
   assert.equal(buf[2], 0xFF);
 });
 
+
+// 15. Test Vertical Center Ratio & Projection Translate
+test("verticalCenterRatio adjusts projection translation for mobile viewports", () => {
+  const { canvas } = createMockCanvas();
+  const container = createMockContainer(canvas);
+  const mockD3 = createMockD3();
+  const mockTopojson = createMockTopojson();
+
+  const controller = createGlobeRenderer(container, null, {
+    canvas,
+    d3: mockD3,
+    topojson: mockTopojson,
+    width: 400,
+    height: 800,
+    verticalCenterRatio: 0.28,
+    terrain: false
+  });
+
+  assert.equal(typeof controller.setVerticalCenterRatio, "function");
+  assert.equal(typeof controller.getVerticalCenterRatio, "function");
+  assert.equal(controller.getVerticalCenterRatio(), 0.28);
+
+  const [cx, cy] = controller.getProjection().translate();
+  assert.equal(cx, 200);
+  assert.equal(cy, 800 * 0.28);
+
+  // Update ratio without animation
+  controller.setVerticalCenterRatio(0.50, false);
+  assert.equal(controller.getVerticalCenterRatio(), 0.50);
+  const [, newCy] = controller.getProjection().translate();
+  assert.equal(newCy, 400);
+
+  controller.destroy();
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);
