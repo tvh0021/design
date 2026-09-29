@@ -5,13 +5,13 @@ Implement the `GlobeRenderer` module (`maps/src/globe.js`) and download/bundle T
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Acceptance Criteria
-- [ ] TopoJSON world atlas asset exists at `maps/data/world-110m.json` (~120 KB).
-- [ ] `createGlobeRenderer(container, topology)` renders Earth landmasses, oceans, and graticule lines in an orthographic projection.
-- [ ] Route display renders origin marker, destination marker, and curved geodesic line on the globe surface with back-hemisphere clipping.
-- [ ] User can click-and-drag to rotate the globe in 3D with mouse or touch.
-- [ ] User can zoom in and out smoothly.
-- [ ] Calling `setRoute(geodesicResult, origin, dest, true)` triggers a smooth camera rotation to center the orthographic view on `geodesicResult.sphericalMidpoint`.
-- [ ] `recenter()` resets camera view directly to the route midpoint.
+- [x] TopoJSON world atlas asset exists at `maps/data/world-110m.json` (~120 KB).
+- [x] `createGlobeRenderer(container, topology)` renders Earth landmasses, oceans, and graticule lines in an orthographic projection.
+- [x] Route display renders origin marker, destination marker, and curved geodesic line on the globe surface with back-hemisphere clipping.
+- [x] User can click-and-drag to rotate the globe in 3D with mouse or touch.
+- [x] User can zoom in and out smoothly.
+- [x] Calling `setRoute(geodesicResult, origin, dest, true)` triggers a smooth camera rotation to center the orthographic view on `geodesicResult.sphericalMidpoint`.
+- [x] `recenter()` resets camera view directly to the route midpoint.
