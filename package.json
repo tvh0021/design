@@ -1,0 +1,9 @@
+{
+  "name": "geodesic-map",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Geodesic Map Visualizer",
+  "scripts": {
+    "test": "node maps/tests/test_directory.js"
+  }
+}
