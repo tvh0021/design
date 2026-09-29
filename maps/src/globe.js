@@ -1,9 +1,10 @@
 /**
  * Geodesic Map - Interactive Orthographic Globe Renderer
  *
- * Renders an orthographic Earth globe onto an HTML5 Canvas using D3.js (d3-geo, topojson-client).
+ * Renders an orthographic Earth globe onto an HTML5 Canvas using D3.js (d3-geo, topojson-client)
+ * and GPU-accelerated WebGL physical ETOPO relief terrain with crisp sovereign country borders.
  * Supports mouse drag rotation, pinch / wheel zoom, smooth slerp transitions,
- * glowing great-circle geodesic paths, landmasses, graticules, and city waypoint pins.
+ * glowing great-circle geodesic paths, sovereign borders, graticules, and city waypoint pins.
  */
 
 /**
@@ -85,16 +86,221 @@ function isCoordVisible(coord, projection) {
 }
 
 /**
+ * Initializes the GPU WebGL ETOPO physical terrain sphere renderer.
+ * Returns controller object or null if WebGL is unavailable.
+ */
+function initWebGLTerrain(containerElement, beforeCanvas, initialWidth, initialHeight, initialDpr, textureUrl, onTextureLoaded) {
+  if (typeof document === 'undefined' || !containerElement) return null;
+
+  try {
+    const glCanvas = document.createElement('canvas');
+    glCanvas.className = 'globe-terrain-canvas';
+    glCanvas.style.position = 'absolute';
+    glCanvas.style.inset = '0';
+    glCanvas.style.width = '100%';
+    glCanvas.style.height = '100%';
+    glCanvas.style.pointerEvents = 'none';
+    glCanvas.width = Math.round(initialWidth * initialDpr);
+    glCanvas.height = Math.round(initialHeight * initialDpr);
+    glCanvas.style.width = `${initialWidth}px`;
+    glCanvas.style.height = `${initialHeight}px`;
+
+    if (beforeCanvas && beforeCanvas.parentElement === containerElement) {
+      containerElement.insertBefore(glCanvas, beforeCanvas);
+    } else {
+      containerElement.appendChild(glCanvas);
+    }
+
+    const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true, preserveDrawingBuffer: true }) ||
+               glCanvas.getContext('experimental-webgl', { alpha: true, antialias: true, preserveDrawingBuffer: true });
+
+    if (!gl) {
+      if (glCanvas.parentElement) glCanvas.parentElement.removeChild(glCanvas);
+      return null;
+    }
+
+    const vsSource = `
+      attribute vec2 a_pos;
+      void main() {
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+      }
+    `;
+
+    const fsSource = `
+      precision highp float;
+      uniform sampler2D u_texture;
+      uniform vec2 u_resolution;
+      uniform vec2 u_center;
+      uniform float u_radius;
+      uniform vec3 u_rotation; // [yaw, pitch, roll] in radians
+      const float PI = 3.14159265358979323846;
+
+      void main() {
+        vec2 p = vec2(gl_FragCoord.x - u_center.x, gl_FragCoord.y - (u_resolution.y - u_center.y)) / u_radius;
+        float r2 = dot(p, p);
+        if (r2 > 1.0) {
+          discard;
+        }
+        float z = sqrt(max(0.0, 1.0 - r2));
+        vec3 viewVec = vec3(p.x, p.y, z);
+
+        float lam = u_rotation.x;
+        float phi = u_rotation.y;
+        float gam = u_rotation.z;
+
+        // Roll (-gamma)
+        float c_g = cos(-gam), s_g = sin(-gam);
+        vec3 v1 = vec3(c_g * viewVec.x - s_g * viewVec.y, s_g * viewVec.x + c_g * viewVec.y, viewVec.z);
+
+        // Pitch (+phi)
+        float c_p = cos(phi), s_p = sin(phi);
+        vec3 v2 = vec3(v1.x, c_p * v1.y - s_p * v1.z, s_p * v1.y + c_p * v1.z);
+
+        // Yaw (-lambda)
+        float c_l = cos(-lam), s_l = sin(-lam);
+        vec3 geo = vec3(c_l * v2.x + s_l * v2.z, v2.y, -s_l * v2.x + c_l * v2.z);
+
+        float lon = atan(geo.x, geo.z);
+        float lat = asin(clamp(geo.y, -1.0, 1.0));
+
+        float texU = (lon + PI) / (2.0 * PI);
+        float texV = 0.5 - lat / PI;
+
+        vec4 texColor = texture2D(u_texture, vec2(texU, texV));
+        // Spherical limb falloff for 3D realism
+        float limb = pow(z, 0.22);
+        vec3 rgb = texColor.rgb * (0.35 + 0.65 * limb);
+        gl_FragColor = vec4(rgb, 0.95);
+      }
+    `;
+
+    function compileShader(type, src) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        gl.deleteShader(s);
+        return null;
+      }
+      return s;
+    }
+
+    const vs = compileShader(gl.VERTEX_SHADER, vsSource);
+    const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
+    if (!vs || !fs) return null;
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+
+    const quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+      -1,  1,
+       1, -1,
+       1,  1
+    ]), gl.STATIC_DRAW);
+
+    const aPos = gl.getAttribLocation(program, 'a_pos');
+    const uRes = gl.getUniformLocation(program, 'u_resolution');
+    const uCenter = gl.getUniformLocation(program, 'u_center');
+    const uRadius = gl.getUniformLocation(program, 'u_radius');
+    const uRot = gl.getUniformLocation(program, 'u_rotation');
+    const uTex = gl.getUniformLocation(program, 'u_texture');
+
+    const texture = gl.createTexture();
+    let isReady = false;
+
+    if (textureUrl) {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = textureUrl;
+      img.onerror = (e) => { console.error("Texture failed to load:", e); };
+      img.onload = () => {
+        try {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        isReady = true;
+        if (typeof onTextureLoaded === 'function') onTextureLoaded();
+        } catch(err) { console.error("WebGL texture error:", err); }
+      };
+    }
+
+    return {
+      glCanvas,
+      gl,
+      resize(w, h, dpr) {
+        glCanvas.width = Math.round(w * dpr);
+        glCanvas.height = Math.round(h * dpr);
+        glCanvas.style.width = `${w}px`;
+        glCanvas.style.height = `${h}px`;
+      },
+      render(w, h, dpr, cx, cy, r, rot) {
+        if (!isReady) return;
+        gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        gl.useProgram(program);
+        gl.enableVertexAttribArray(aPos);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+        const toRad = Math.PI / 180;
+        gl.uniform2f(uRes, glCanvas.width, glCanvas.height);
+        gl.uniform2f(uCenter, cx * dpr, cy * dpr);
+        gl.uniform1f(uRadius, r * dpr);
+        gl.uniform3f(uRot, rot[0] * toRad, rot[1] * toRad, rot[2] * toRad);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.uniform1i(uTex, 0);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      },
+      isLoaded() {
+        return isReady;
+      },
+      destroy() {
+        try {
+          if (quadBuf) gl.deleteBuffer(quadBuf);
+          if (texture) gl.deleteTexture(texture);
+          if (program) gl.deleteProgram(program);
+          if (vs) gl.deleteShader(vs);
+          if (fs) gl.deleteShader(fs);
+          if (glCanvas.parentElement) {
+            glCanvas.parentElement.removeChild(glCanvas);
+          }
+        } catch (e) {}
+      }
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Creates an interactive orthographic globe renderer mounted in `containerElement`.
  *
  * @param {HTMLElement} containerElement - DOM container to attach canvas to
  * @param {object} worldTopology - TopoJSON topology (e.g. world-110m.json) or GeoJSON feature
  * @param {object} options - Configuration options:
  *   - d3: D3 object containing geoOrthographic, geoPath, etc. (falls back to window.d3)
- *   - topojson: TopoJSON client containing feature() (falls back to window.topojson)
+ *   - topojson: TopoJSON client containing feature() and mesh() (falls back to window.topojson)
  *   - width: initial width in px
  *   - height: initial height in px
  *   - initialRotation: [yaw, pitch, roll], default [0, -20, 0]
+ *   - terrain: boolean, whether to render physical ETOPO terrain (default: true)
+ *   - terrainTextureUrl: URL to ETOPO equirectangular texture (default: 'data/etopo.jpg')
  *   - onRotate: callback (rotation) => {}
  *   - onZoom: callback (scale) => {}
  *   - colors: override palette
@@ -111,12 +317,13 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let width = options.width || (containerElement && containerElement.clientWidth) || 800;
   let height = options.height || (containerElement && containerElement.clientHeight) || 600;
 
-  // Palette styling per Anthropic / SPEC guidelines
+  // Palette styling per Anthropic / SPEC guidelines with physical terrain & sovereign borders
   const palette = {
     ocean: '#0d1424',
     land: '#1e293b',
-    landStroke: '#334155',
-    graticule: 'rgba(255, 255, 255, 0.08)',
+    landStroke: 'rgba(255, 255, 255, 0.7)',
+    countryBorder: 'rgba(255, 255, 255, 0.42)',
+    graticule: 'rgba(255, 255, 255, 0.22)',
     haloOuter: 'rgba(6, 182, 212, 0.16)',
     haloMid: 'rgba(6, 182, 212, 0.05)',
     haloBorder: 'rgba(6, 182, 212, 0.35)',
@@ -132,7 +339,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ...(options.colors || {})
   };
 
-  // Create canvas element
+  // Create 2D vector canvas element
   const canvas = options.canvas || (typeof document !== 'undefined' ? document.createElement('canvas') : null);
   if (!canvas) {
     throw new Error('createGlobeRenderer: Unable to create or locate canvas element.');
@@ -163,23 +370,33 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   let animFrameId = null;
 
-  // Convert TopoJSON to GeoJSON land feature once on initialization
+  // Convert TopoJSON to GeoJSON features
   let landFeature = null;
+  let countryBordersFeature = null;
+
   if (worldTopology) {
     if (worldTopology.type === 'Topology' && worldTopology.objects) {
       if (!topojson || typeof topojson.feature !== 'function') {
         throw new Error('createGlobeRenderer: topojson-client is required to extract geometry from Topology.');
       }
-      const topoObj = worldTopology.objects.land || worldTopology.objects.countries;
-      if (topoObj) {
-        landFeature = topojson.feature(worldTopology, topoObj);
+      const topoLand = worldTopology.objects.land || worldTopology.objects.countries;
+      if (topoLand) {
+        landFeature = topojson.feature(worldTopology, topoLand);
+      }
+      // Extract sovereign country borders matching m.drawcountries()
+      if (worldTopology.objects.countries && typeof topojson.mesh === 'function') {
+        try {
+          countryBordersFeature = topojson.mesh(worldTopology, worldTopology.objects.countries, (a, b) => a !== b);
+        } catch (e) {
+          countryBordersFeature = null;
+        }
       }
     } else if (worldTopology.type === 'FeatureCollection' || worldTopology.type === 'Feature') {
       landFeature = worldTopology;
     }
   }
 
-  // Pre-generate graticule
+  // Pre-generate graticule (parallels and meridians matching m.drawmeridians/parallels)
   let graticuleFeature = null;
   if (typeof d3.geoGraticule10 === 'function') {
     graticuleFeature = d3.geoGraticule10();
@@ -202,6 +419,18 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   const path = d3.geoPath(projection, ctx);
 
+  // Initialize WebGL ETOPO terrain layer if enabled
+  const terrainEnabled = options.terrain !== false;
+  const terrainUrl = options.terrainTextureUrl || 'data/etopo.jpg';
+  let webglTerrain = null;
+
+  if (terrainEnabled) {
+    const initDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+    webglTerrain = initWebGLTerrain(containerElement, canvas, width, height, initDpr, terrainUrl, () => {
+      render();
+    });
+  }
+
   // Application state
   let currentGeodesic = null;
   let currentOrigin = null;
@@ -221,16 +450,28 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.scale(dpr, dpr);
 
     projection.translate([width / 2, height / 2]);
+
+    if (webglTerrain) {
+      webglTerrain.resize(width, height, dpr);
+    }
   }
 
   updateCanvasDimensions();
 
   // Rendering routines
   function render() {
-    ctx.clearRect(0, 0, width, height);
-
+    const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
     const [cx, cy] = projection.translate();
     const r = projection.scale();
+    const rot = projection.rotate();
+
+    // Render WebGL physical terrain sphere if active
+    const hasTerrain = webglTerrain && webglTerrain.isLoaded();
+    if (hasTerrain) {
+      webglTerrain.render(width, height, dpr, cx, cy, r, rot);
+    }
+
+    ctx.clearRect(0, 0, width, height);
 
     // 1. Atmosphere halo ring outside sphere
     if (r > 0) {
@@ -250,38 +491,55 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.save();
     ctx.beginPath();
     path({ type: 'Sphere' });
-    ctx.fillStyle = palette.ocean;
-    ctx.fill();
-    ctx.lineWidth = 1.5;
+    if (!hasTerrain) {
+      // Fallback solid ocean fill if WebGL terrain is not active
+      ctx.fillStyle = palette.ocean;
+      ctx.fill();
+    }
+    ctx.lineWidth = 1.4;
     ctx.strokeStyle = palette.haloBorder;
     ctx.stroke();
     ctx.restore();
 
-    // 3. Graticule lines (meridians and parallels)
+    // 3. Graticule lines (meridians and parallels matching m.drawmeridians/drawparallels)
     if (graticuleFeature) {
       ctx.save();
       ctx.beginPath();
       path(graticuleFeature);
       ctx.strokeStyle = palette.graticule;
+      ctx.lineWidth = 0.65;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 4. Landmass polygons & coastlines
+    if (landFeature) {
+      ctx.save();
+      ctx.beginPath();
+      path(landFeature);
+      if (!hasTerrain) {
+        // Fallback solid land fill if WebGL terrain is not active
+        ctx.fillStyle = palette.land;
+        ctx.fill();
+      }
+      ctx.strokeStyle = palette.landStroke;
+      ctx.lineWidth = 0.85;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 5. Sovereign Country Borders matching m.drawcountries()
+    if (countryBordersFeature) {
+      ctx.save();
+      ctx.beginPath();
+      path(countryBordersFeature);
+      ctx.strokeStyle = palette.countryBorder;
       ctx.lineWidth = 0.75;
       ctx.stroke();
       ctx.restore();
     }
 
-    // 4. Landmass polygons
-    if (landFeature) {
-      ctx.save();
-      ctx.beginPath();
-      path(landFeature);
-      ctx.fillStyle = palette.land;
-      ctx.fill();
-      ctx.strokeStyle = palette.landStroke;
-      ctx.lineWidth = 0.8;
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // 5. Geodesic flight path line (with illuminated cyan glow)
+    // 6. Geodesic flight path line (with illuminated cyan glow)
     if (currentRouteGeoJson) {
       ctx.save();
       // Outer soft glow
@@ -309,7 +567,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.restore();
     }
 
-    // 6. Spherical midpoint marker (subtle crosshair / ring)
+    // 7. Spherical midpoint marker (subtle crosshair / ring)
     if (currentMidpoint) {
       const midCoord = [currentMidpoint.lng, currentMidpoint.lat];
       if (isCoordVisible(midCoord, projection)) {
@@ -320,7 +578,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       }
     }
 
-    // 7. City pins and labels (origin and destination)
+    // 8. City pins and labels (origin and destination)
     if (currentOrigin) {
       const coord = getCityCoords(currentOrigin);
       if (coord && isCoordVisible(coord, projection)) {
@@ -707,7 +965,6 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       isPinching = false;
       touchStartDist = 0;
     } else if (e.touches.length === 1) {
-      // Transition from pinch to single-touch drag
       isPinching = false;
       isDragging = true;
       touchStartX = e.touches[0].clientX;
@@ -779,6 +1036,11 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       resizeObserver = null;
     }
 
+    if (webglTerrain) {
+      webglTerrain.destroy();
+      webglTerrain = null;
+    }
+
     if (canvas.parentElement) {
       canvas.parentElement.removeChild(canvas);
     }
@@ -793,6 +1055,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     render,
     getRotation: () => projection.rotate().slice(),
     getScale: () => projection.scale(),
+    getProjection: () => projection,
     getCanvas: () => canvas
   };
 }

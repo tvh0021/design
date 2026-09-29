@@ -191,7 +191,7 @@ export async function initApp(options = {}) {
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const launch = () => {
     if (document.getElementById('globe-container')) {
-      initApp().catch((err) => {
+      initApp().then((app) => { window.__APP__ = app; }).catch((err) => {
         console.error('App launch failed:', err);
       });
     }

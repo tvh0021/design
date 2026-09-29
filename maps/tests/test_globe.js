@@ -11,7 +11,7 @@
  * 7. Loads and validates the TopoJSON dataset maps/data/world-110m.json.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
@@ -554,6 +554,54 @@ test('initializes successfully with real world-110m.json dataset', () => {
 
   assert.ok(extractCalled, 'topojson.feature should be called to extract land geometry');
   controller.destroy();
+});
+
+// 13. Test TopoJSON Sovereign Country Borders extraction via topojson.mesh
+test("extracts sovereign country borders when objects.countries is present", () => {
+  const { canvas, ctx, drawnElements } = createMockCanvas();
+  const container = createMockContainer(canvas);
+  const mockD3 = createMockD3();
+  const mockTopojson = createMockTopojson();
+
+  let meshExtracted = false;
+  mockTopojson.mesh = (topology, object, filter) => {
+    meshExtracted = true;
+    assert.equal(typeof filter, "function", "Filter callback should separate adjacent countries");
+    return { type: "MultiLineString", coordinates: [] };
+  };
+
+  const fakeTopology = {
+    type: "Topology",
+    objects: {
+      land: {},
+      countries: {}
+    }
+  };
+
+  const controller = createGlobeRenderer(container, fakeTopology, {
+    canvas,
+    d3: mockD3,
+    topojson: mockTopojson,
+    terrain: false
+  });
+
+  assert.ok(meshExtracted, "topojson.mesh must be invoked to extract country boundaries");
+  assert.equal(typeof controller.render, "function");
+  controller.render();
+  controller.destroy();
+});
+
+// 14. Test ETOPO Terrain Data Asset Integrity
+test("maps/data/etopo.jpg exists and is a valid JPEG binary", () => {
+  const etopoPath = resolve(__dirname, "../data/etopo.jpg");
+  assert.ok(existsSync(etopoPath), "etopo.jpg must exist in maps/data/");
+  const stat = statSync(etopoPath);
+  assert.ok(stat.size > 100000, "etopo.jpg should be a detailed texture (>100KB)");
+  const buf = readFileSync(etopoPath);
+  // JPEG magic header: FF D8 FF
+  assert.equal(buf[0], 0xFF);
+  assert.equal(buf[1], 0xD8);
+  assert.equal(buf[2], 0xFF);
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
