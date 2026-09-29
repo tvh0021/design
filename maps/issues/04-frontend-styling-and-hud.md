@@ -5,12 +5,12 @@ Implement the user interface and styling (`maps/src/style.css` and `maps/src/hud
 
 **Blocked by:** 01: Top 10k City Data Pipeline and Search Directory, 02: Spherical Geodesic and Flight Telemetry Engine
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Acceptance Criteria
-- [ ] CSS uses disciplined custom properties (palette: `#070a13`, `#0d1424`, `#1e293b`, `#06b6d4`, `#f59e0b`).
-- [ ] Autocomplete dropdown allows keyboard navigation (arrow keys, enter, esc) and instant filtering.
-- [ ] 1-click swap button switches origin and destination with smooth visual feedback.
-- [ ] Telemetry card renders distance in km and miles, midpoint lat/lon, flight duration, and westerly wind penalty.
-- [ ] Antipodal indicator badge displays warning message when `geodesicResult.isAntipodal` is true.
-- [ ] UI is fully responsive across desktop and mobile screens.
+- [x] CSS uses disciplined custom properties (palette: `#070a13`, `#0d1424`, `#1e293b`, `#06b6d4`, `#f59e0b`).
+- [x] Autocomplete dropdown allows keyboard navigation (arrow keys, enter, esc) and instant filtering.
+- [x] 1-click swap button switches origin and destination with smooth visual feedback.
+- [x] Telemetry card renders distance in km and miles, midpoint lat/lon, flight duration, and westerly wind penalty.
+- [x] Antipodal indicator badge displays warning message when `geodesicResult.isAntipodal` is true.
+- [x] UI is fully responsive across desktop and mobile screens.
