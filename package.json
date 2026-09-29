@@ -4,10 +4,11 @@
   "type": "module",
   "description": "Geodesic flight path visualizer and great-circle calculation engine",
   "scripts": {
-    "test": "node maps/tests/test_directory.js && node maps/tests/test_geodesic.js && node maps/tests/test_globe.js && node maps/tests/test_hud.js",
+    "test": "node maps/tests/test_directory.js && node maps/tests/test_geodesic.js && node maps/tests/test_globe.js && node maps/tests/test_hud.js && node maps/tests/test_integration.js",
     "test:directory": "node maps/tests/test_directory.js",
     "test:geodesic": "node maps/tests/test_geodesic.js",
     "test:globe": "node maps/tests/test_globe.js",
-    "test:hud": "node maps/tests/test_hud.js"
+    "test:hud": "node maps/tests/test_hud.js",
+    "test:integration": "node maps/tests/test_integration.js"
   }
 }

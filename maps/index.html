@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="description" content="Interactive orthographic 3D geodesic flight visualizer and spherical telemetry engine.">
+  <meta name="theme-color" content="#070a13">
+  <title>Geodesic Flight Visualizer</title>
+  <link rel="stylesheet" href="src/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+</head>
+<body>
+  <div id="app" class="app-container">
+    <div id="globe-container" class="globe-viewport"></div>
+    <div id="hud-container"></div>
+    <div id="loading-splash" class="loading-splash" role="status" aria-live="polite">
+      <div class="loading-content">
+        <div class="loading-spinner"></div>
+        <div class="loading-title">INITIALIZING GEODESIC ENGINE</div>
+        <div class="loading-subtitle">Loading global cities and topological boundaries...</div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
