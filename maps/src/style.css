@@ -200,9 +200,11 @@ canvas.globe-canvas:active {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .hud-status-pulse {
+  flex-shrink: 0;
   width: 8px;
   height: 8px;
   border-radius: 50%;
@@ -236,6 +238,66 @@ canvas.globe-canvas:active {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
+}
+
+/* Projection Toggle Switch Segmented Control */
+.hud-proj-toggle {
+  position: fixed;
+  top: max(24px, env(safe-area-inset-top, 0px));
+  right: max(24px, env(safe-area-inset-right, 0px));
+  z-index: 130;
+  display: inline-flex;
+  align-items: center;
+  background: var(--color-surface);
+  backdrop-filter: var(--blur-glass);
+  -webkit-backdrop-filter: var(--blur-glass);
+  box-shadow: var(--shadow-hud);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.hud-proj-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  min-height: 36px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  font-size: 0.6875rem;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.hud-proj-btn:hover {
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.hud-proj-btn:focus-visible {
+  outline: 2px solid var(--color-cyan);
+  outline-offset: 2px;
+}
+
+.hud-proj-btn.is-active {
+  background: rgba(6, 182, 212, 0.18);
+  border-color: rgba(6, 182, 212, 0.5);
+  color: var(--color-cyan);
+  font-weight: 600;
+  box-shadow: 0 0 8px rgba(6, 182, 212, 0.25);
+}
+
+.hud-proj-btn .hud-icon {
+  stroke: currentColor;
+  flex-shrink: 0;
 }
 
 .hud-btn {
@@ -623,7 +685,7 @@ canvas.globe-canvas:active {
 
 .telemetry-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
 }
 
@@ -673,6 +735,8 @@ canvas.globe-canvas:active {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .wind-label {
@@ -759,6 +823,15 @@ canvas.globe-canvas:active {
    Responsive Layout (Mobile Sheet < 640px)
    ========================================================================== */
 @media (max-width: 639px) {
+  .hud-proj-toggle {
+    top: max(12px, env(safe-area-inset-top, 0px));
+    right: max(12px, env(safe-area-inset-right, 0px));
+  }
+
+  .hud-proj-btn {
+    min-height: 44px;
+  }
+
   .geodesic-hud {
     position: fixed;
     top: auto;

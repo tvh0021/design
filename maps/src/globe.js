@@ -1,9 +1,11 @@
 /**
- * Geodesic Map - Interactive Orthographic Globe Renderer
+ * Geodesic Map - Interactive Orthographic & Robinson Globe Renderer
  *
- * Renders an orthographic Earth globe onto an HTML5 Canvas using D3.js (d3-geo, topojson-client)
- * and GPU-accelerated WebGL physical ETOPO relief terrain with crisp sovereign country borders.
- * Supports mouse drag rotation, pinch / wheel zoom, smooth slerp transitions,
+ * Renders an orthographic Earth globe or 2D Robinson flat map onto an HTML5 Canvas
+ * using D3.js (d3-geo, topojson-client) and GPU-accelerated WebGL physical ETOPO relief
+ * terrain with crisp sovereign country borders.
+ * Supports toggle between 3D Orthographic and 2D Robinson (centered on route midpoint),
+ * mouse drag rotation/panning, pinch / wheel zoom, smooth slerp transitions,
  * glowing great-circle geodesic paths, sovereign borders, graticules, and city waypoint pins.
  */
 
@@ -49,10 +51,10 @@ function getCityName(city) {
  */
 function normalizeMidpoint(mid) {
   if (!mid) return null;
-  if (typeof mid.lat === 'number' && typeof mid.lng === 'number') {
-    return { lat: mid.lat, lng: mid.lng };
+  if (typeof mid.lng === 'number' && typeof mid.lat === 'number') {
+    return mid;
   }
-  if (typeof mid.lat === 'number' && typeof mid.lon === 'number') {
+  if (typeof mid.lon === 'number' && typeof mid.lat === 'number') {
     return { lat: mid.lat, lng: mid.lon };
   }
   if (Array.isArray(mid) && mid.length >= 2) {
@@ -62,13 +64,20 @@ function normalizeMidpoint(mid) {
 }
 
 /**
- * Checks if a geographical coordinate [lng, lat] is located on the visible
- * front hemisphere of the orthographic projection (angular distance <= 90 deg).
+ * Determines whether a given [lng, lat] coordinate is visible.
+ * In orthographic mode, checks if it lies on the visible front hemisphere (angular distance <= 90°).
+ * In Robinson mode, checks if it lies within latitude [-90, 90] and projected viewport bounds.
  */
-function isCoordVisible(coord, projection) {
-  if (!coord || !projection) return false;
-  const rot = projection.rotate();
-  // Projection center coordinates in degrees
+function isCoordVisible(coord, proj, type = 'orthographic', vpWidth = 800, vpHeight = 600) {
+  if (!coord || !proj) return false;
+  if (type === 'robinson') {
+    if (Math.abs(coord[1]) > 90) return false;
+    const pt = proj(coord);
+    if (!pt || !isFinite(pt[0]) || !isFinite(pt[1])) return false;
+    return pt[0] >= -80 && pt[0] <= vpWidth + 80 && pt[1] >= -80 && pt[1] <= vpHeight + 80;
+  }
+
+  const rot = proj.rotate();
   const centerLng = rot[0] === 0 ? 0 : -rot[0];
   const centerLat = rot[1] === 0 ? 0 : -rot[1];
 
@@ -78,315 +87,400 @@ function isCoordVisible(coord, projection) {
   const phi = coord[1] * toRad;
   const lam = coord[0] * toRad;
 
-  // cos(angular_distance) = sin(phi0)*sin(phi) + cos(phi0)*cos(phi)*cos(lam - lam0)
-  const cosDist = Math.sin(phi0) * Math.sin(phi) +
-                  Math.cos(phi0) * Math.cos(phi) * Math.cos(lam - lam0);
+  const cosDist =
+    Math.sin(phi0) * Math.sin(phi) +
+    Math.cos(phi0) * Math.cos(phi) * Math.cos(lam - lam0);
 
-  return cosDist > 0.005;
+  return cosDist >= -1e-9;
 }
 
 /**
- * Initializes the GPU WebGL ETOPO physical terrain sphere renderer.
- * Returns controller object or null if WebGL is unavailable.
+ * Interpolates two 3D points on a unit sphere using SLERP.
  */
-function initWebGLTerrain(containerElement, beforeCanvas, initialWidth, initialHeight, initialDpr, textureUrl, onTextureLoaded) {
-  if (typeof document === 'undefined' || !containerElement) return null;
+function slerp3D(v0, v1, t) {
+  let dot = v0[0] * v1[0] + v0[1] * v1[1] + v0[2] * v1[2];
+  dot = Math.max(-1, Math.min(1, dot));
 
-  try {
-    const glCanvas = document.createElement('canvas');
-    glCanvas.className = 'globe-terrain-canvas';
-    glCanvas.style.position = 'absolute';
-    glCanvas.style.inset = '0';
-    glCanvas.style.width = '100%';
-    glCanvas.style.height = '100%';
-    glCanvas.style.pointerEvents = 'none';
-    glCanvas.width = Math.round(initialWidth * initialDpr);
-    glCanvas.height = Math.round(initialHeight * initialDpr);
-    glCanvas.style.width = `${initialWidth}px`;
-    glCanvas.style.height = `${initialHeight}px`;
+  if (dot > 0.9995) {
+    const res = [
+      v0[0] + t * (v1[0] - v0[0]),
+      v0[1] + t * (v1[1] - v0[1]),
+      v0[2] + t * (v1[2] - v0[2])
+    ];
+    const n = Math.hypot(res[0], res[1], res[2]) || 1;
+    return [res[0] / n, res[1] / n, res[2] / n];
+  }
 
-    if (beforeCanvas && beforeCanvas.parentElement === containerElement) {
-      containerElement.insertBefore(glCanvas, beforeCanvas);
-    } else {
-      containerElement.appendChild(glCanvas);
-    }
+  const theta0 = Math.acos(dot);
+  const theta = theta0 * t;
+  const sinTheta = Math.sin(theta);
+  const sinTheta0 = Math.sin(theta0);
 
-    const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true, preserveDrawingBuffer: true }) ||
-               glCanvas.getContext('experimental-webgl', { alpha: true, antialias: true, preserveDrawingBuffer: true });
+  const s0 = Math.cos(theta) - (dot * sinTheta) / sinTheta0;
+  const s1 = sinTheta / sinTheta0;
 
-    if (!gl) {
-      if (glCanvas.parentElement) glCanvas.parentElement.removeChild(glCanvas);
-      return null;
-    }
+  return [
+    s0 * v0[0] + s1 * v1[0],
+    s0 * v0[1] + s1 * v1[1],
+    s0 * v0[2] + s1 * v1[2]
+  ];
+}
 
-    const vsSource = `
-      attribute vec2 a_pos;
-      void main() {
-        gl_Position = vec4(a_pos, 0.0, 1.0);
-      }
-    `;
+/**
+ * Converts geographic [lng, lat] in degrees to 3D Cartesian coordinates on unit sphere.
+ */
+function geoToCartesian(lng, lat) {
+  const toRad = Math.PI / 180;
+  const phi = lat * toRad;
+  const lam = lng * toRad;
+  return [
+    Math.cos(phi) * Math.cos(lam),
+    Math.cos(phi) * Math.sin(lam),
+    Math.sin(phi)
+  ];
+}
 
-    const fsSource = `
-      precision highp float;
-      uniform sampler2D u_texture;
-      uniform vec2 u_resolution;
-      uniform vec2 u_center;
-      uniform float u_radius;
-      uniform vec3 u_rotation; // [yaw, pitch, roll] in radians
-      const float PI = 3.14159265358979323846;
+/**
+ * Converts 3D Cartesian coordinates to [lng, lat] in degrees.
+ */
+function cartesianToGeo(v) {
+  const toDeg = 180 / Math.PI;
+  const lat = Math.asin(Math.max(-1, Math.min(1, v[2]))) * toDeg;
+  const lng = Math.atan2(v[1], v[0]) * toDeg;
+  return [lng, lat];
+}
 
-      void main() {
-        vec2 p = vec2(gl_FragCoord.x - u_center.x, gl_FragCoord.y - (u_resolution.y - u_center.y)) / u_radius;
-        float r2 = dot(p, p);
-        if (r2 > 1.0) {
-          discard;
-        }
-        float z = sqrt(max(0.0, 1.0 - r2));
-        vec3 viewVec = vec3(p.x, p.y, z);
+/**
+ * WebGL Physical Terrain Layer
+ * Raymarches NOAA ETOPO1 relief on a true sphere beneath vector borders.
+ */
+function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUrl, onLoaded) {
+  if (typeof document === 'undefined') return null;
 
-        float lam = u_rotation.x;
-        float phi = u_rotation.y;
-        float gam = u_rotation.z;
+  const glCanvas = document.createElement('canvas');
+  glCanvas.className = 'globe-webgl-terrain';
+  glCanvas.style.position = 'absolute';
+  glCanvas.style.top = '0';
+  glCanvas.style.left = '0';
+  glCanvas.style.width = `${width}px`;
+  glCanvas.style.height = `${height}px`;
+  glCanvas.style.pointerEvents = 'none';
+  glCanvas.style.zIndex = '0';
 
-        // Roll (-gamma)
-        float c_g = cos(-gam), s_g = sin(-gam);
-        vec3 v1 = vec3(c_g * viewVec.x - s_g * viewVec.y, s_g * viewVec.x + c_g * viewVec.y, viewVec.z);
+  if (parentCanvas && parentCanvas.parentElement) {
+    parentCanvas.parentElement.insertBefore(glCanvas, parentCanvas);
+  } else if (container) {
+    container.appendChild(glCanvas);
+  }
 
-        // Pitch (+phi)
-        float c_p = cos(phi), s_p = sin(phi);
-        vec3 v2 = vec3(v1.x, c_p * v1.y - s_p * v1.z, s_p * v1.y + c_p * v1.z);
-
-        // Yaw (-lambda)
-        float c_l = cos(-lam), s_l = sin(-lam);
-        vec3 geo = vec3(c_l * v2.x + s_l * v2.z, v2.y, -s_l * v2.x + c_l * v2.z);
-
-        float lon = atan(geo.x, geo.z);
-        float lat = asin(clamp(geo.y, -1.0, 1.0));
-
-        float texU = (lon + PI) / (2.0 * PI);
-        float texV = 0.5 - lat / PI;
-
-        vec4 texColor = texture2D(u_texture, vec2(texU, texV));
-        // Spherical limb falloff for 3D realism
-        float limb = pow(z, 0.22);
-        vec3 rgb = texColor.rgb * (0.35 + 0.65 * limb);
-        gl_FragColor = vec4(rgb, 0.95);
-      }
-    `;
-
-    function compileShader(type, src) {
-      const s = gl.createShader(type);
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-        gl.deleteShader(s);
-        return null;
-      }
-      return s;
-    }
-
-    const vs = compileShader(gl.VERTEX_SHADER, vsSource);
-    const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
-    if (!vs || !fs) return null;
-
-    const program = gl.createProgram();
-    gl.attachShader(program, vs);
-    gl.attachShader(program, fs);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
-
-    const quadBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-      -1, -1,
-       1, -1,
-      -1,  1,
-      -1,  1,
-       1, -1,
-       1,  1
-    ]), gl.STATIC_DRAW);
-
-    const aPos = gl.getAttribLocation(program, 'a_pos');
-    const uRes = gl.getUniformLocation(program, 'u_resolution');
-    const uCenter = gl.getUniformLocation(program, 'u_center');
-    const uRadius = gl.getUniformLocation(program, 'u_radius');
-    const uRot = gl.getUniformLocation(program, 'u_rotation');
-    const uTex = gl.getUniformLocation(program, 'u_texture');
-
-    const texture = gl.createTexture();
-    let isReady = false;
-
-    if (textureUrl) {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.src = textureUrl;
-      img.onerror = (e) => { console.error("Texture failed to load:", e); };
-      img.onload = () => {
-        try {
-        gl.bindTexture(gl.TEXTURE_2D, texture);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        isReady = true;
-        if (typeof onTextureLoaded === 'function') onTextureLoaded();
-        } catch(err) { console.error("WebGL texture error:", err); }
-      };
-    }
-
-    return {
-      glCanvas,
-      gl,
-      resize(w, h, dpr) {
-        glCanvas.width = Math.round(w * dpr);
-        glCanvas.height = Math.round(h * dpr);
-        glCanvas.style.width = `${w}px`;
-        glCanvas.style.height = `${h}px`;
-      },
-      render(w, h, dpr, cx, cy, r, rot) {
-        if (!isReady) return;
-        gl.viewport(0, 0, glCanvas.width, glCanvas.height);
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-
-        gl.useProgram(program);
-        gl.enableVertexAttribArray(aPos);
-        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-        const toRad = Math.PI / 180;
-        gl.uniform2f(uRes, glCanvas.width, glCanvas.height);
-        gl.uniform2f(uCenter, cx * dpr, cy * dpr);
-        gl.uniform1f(uRadius, r * dpr);
-        gl.uniform3f(uRot, rot[0] * toRad, rot[1] * toRad, rot[2] * toRad);
-
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, texture);
-        gl.uniform1i(uTex, 0);
-
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-      },
-      isLoaded() {
-        return isReady;
-      },
-      destroy() {
-        try {
-          if (quadBuf) gl.deleteBuffer(quadBuf);
-          if (texture) gl.deleteTexture(texture);
-          if (program) gl.deleteProgram(program);
-          if (vs) gl.deleteShader(vs);
-          if (fs) gl.deleteShader(fs);
-          if (glCanvas.parentElement) {
-            glCanvas.parentElement.removeChild(glCanvas);
-          }
-        } catch (e) {}
-      }
-    };
-  } catch (e) {
+  const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true, premultipliedAlpha: false });
+  if (!gl) {
+    if (glCanvas.parentElement) glCanvas.parentElement.removeChild(glCanvas);
     return null;
   }
+
+  const vsSource = `
+    attribute vec2 a_position;
+    varying vec2 v_uv;
+    void main() {
+      v_uv = a_position * 0.5 + 0.5;
+      gl_Position = vec4(a_position, 0.0, 1.0);
+    }
+  `;
+
+  const fsSource = `
+    precision mediump float;
+    varying vec2 v_uv;
+
+    uniform sampler2D u_texture;
+    uniform vec2 u_resolution;
+    uniform vec2 u_center;
+    uniform float u_radius;
+    uniform mat3 u_rotMatrix;
+    uniform float u_loaded;
+
+    #define PI 3.141592653589793
+
+    void main() {
+      if (u_loaded < 0.5) {
+        discard;
+      }
+      vec2 screenCoord = vec2(v_uv.x * u_resolution.x, (1.0 - v_uv.y) * u_resolution.y);
+      vec2 p = (screenCoord - u_center) / u_radius;
+      float r2 = dot(p, p);
+      if (r2 > 1.0) {
+        discard;
+      }
+
+      float z = sqrt(1.0 - r2);
+      vec3 sphereNorm = vec3(p.x, -p.y, z);
+      // The unflipped texture has north at v=0, so its inverse rotation
+      // uses screen-down Y. Lighting still uses the screen-up normal.
+      vec3 rotatedNorm = u_rotMatrix * vec3(p.x, p.y, z);
+
+      float phi = asin(clamp(rotatedNorm.y, -1.0, 1.0));
+      float lambda = atan(rotatedNorm.x, rotatedNorm.z);
+
+      float texU = fract((lambda / (2.0 * PI)) + 0.5);
+      float texV = clamp((phi / PI) + 0.5, 0.001, 0.999);
+
+      vec4 texColor = texture2D(u_texture, vec2(texU, texV));
+
+      vec3 lightDir = normalize(vec3(0.3, 0.5, 0.8));
+      float diff = clamp(dot(sphereNorm, lightDir), 0.0, 1.0) * 0.45 + 0.55;
+
+      float edge = smoothstep(0.99, 0.94, r2);
+      float rim = pow(1.0 - z, 3.0) * 0.28;
+      vec3 rimColor = vec3(0.02, 0.71, 0.83);
+
+      vec3 color = texColor.rgb * diff + rimColor * rim;
+      gl_FragColor = vec4(color, edge * 0.88);
+    }
+  `;
+
+  function createShader(type, src) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      gl.deleteShader(shader);
+      return null;
+    }
+    return shader;
+  }
+
+  const vs = createShader(gl.VERTEX_SHADER, vsSource);
+  const fs = createShader(gl.FRAGMENT_SHADER, fsSource);
+  if (!vs || !fs) return null;
+
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+
+  gl.useProgram(program);
+
+  const quad = new Float32Array([
+    -1, -1,
+     1, -1,
+    -1,  1,
+    -1,  1,
+     1, -1,
+     1,  1
+  ]);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  const posLoc = gl.getAttribLocation(program, 'a_position');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const uRes = gl.getUniformLocation(program, 'u_resolution');
+  const uCenter = gl.getUniformLocation(program, 'u_center');
+  const uRadius = gl.getUniformLocation(program, 'u_radius');
+  const uRotMat = gl.getUniformLocation(program, 'u_rotMatrix');
+  const uLoaded = gl.getUniformLocation(program, 'u_loaded');
+
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([13, 20, 36, 255]));
+
+  let isLoaded = false;
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    isLoaded = true;
+    if (typeof onLoaded === 'function') onLoaded();
+  };
+  img.onerror = () => {
+    isLoaded = false;
+  };
+  img.src = textureUrl;
+
+  function resize(newW, newH, newDpr) {
+    glCanvas.width = Math.round(newW * newDpr);
+    glCanvas.height = Math.round(newH * newDpr);
+    glCanvas.style.width = `${newW}px`;
+    glCanvas.style.height = `${newH}px`;
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+  }
+
+  resize(width, height, dpr);
+
+  function getEulerRotationMatrix(yawDeg, pitchDeg, rollDeg) {
+    const toRad = Math.PI / 180;
+    const y = yawDeg * toRad;
+    const p = pitchDeg * toRad;
+    const r = rollDeg * toRad;
+
+    const cy = Math.cos(y), sy = Math.sin(y);
+    const cp = Math.cos(p), sp = Math.sin(p);
+    const cr = Math.cos(r), sr = Math.sin(r);
+
+    const m00 = cy * cr + sy * sp * sr;
+    const m01 = -cy * sr + sy * sp * cr;
+    const m02 = sy * cp;
+
+    const m10 = cp * sr;
+    const m11 = cp * cr;
+    const m12 = -sp;
+
+    const m20 = -sy * cr + cy * sp * sr;
+    const m21 = sy * sr + cy * sp * cr;
+    const m22 = cy * cp;
+
+    return new Float32Array([
+      m00, m10, m20,
+      m01, m11, m21,
+      m02, m12, m22
+    ]);
+  }
+
+  function render(w, h, currentDpr, cx, cy, r, rot) {
+    if (!isLoaded) return;
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(program);
+    gl.uniform2f(uRes, w * currentDpr, h * currentDpr);
+    gl.uniform2f(uCenter, cx * currentDpr, cy * currentDpr);
+    gl.uniform1f(uRadius, r * currentDpr);
+    gl.uniform1f(uLoaded, isLoaded ? 1.0 : 0.0);
+
+    const rotMat = getEulerRotationMatrix(-rot[0], -rot[1], rot[2] || 0);
+    gl.uniformMatrix3fv(uRotMat, false, rotMat);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  function destroy() {
+    if (glCanvas.parentElement) {
+      glCanvas.parentElement.removeChild(glCanvas);
+    }
+  }
+
+  return {
+    glCanvas,
+    resize,
+    render,
+    destroy,
+    isLoaded: () => isLoaded
+  };
 }
 
 /**
- * Creates an interactive orthographic globe renderer mounted in `containerElement`.
+ * Creates and initializes an interactive Orthographic / Robinson Earth globe renderer.
  *
- * @param {HTMLElement} containerElement - DOM container to attach canvas to
- * @param {object} worldTopology - TopoJSON topology (e.g. world-110m.json) or GeoJSON feature
- * @param {object} options - Configuration options:
- *   - d3: D3 object containing geoOrthographic, geoPath, etc. (falls back to window.d3)
- *   - topojson: TopoJSON client containing feature() and mesh() (falls back to window.topojson)
- *   - width: initial width in px
- *   - height: initial height in px
- *   - initialRotation: [yaw, pitch, roll], default [0, -20, 0]
- *   - terrain: boolean, whether to render physical ETOPO terrain (default: true)
- *   - terrainTextureUrl: URL to ETOPO equirectangular texture (default: 'data/etopo.jpg')
- *   - onRotate: callback (rotation) => {}
- *   - onZoom: callback (scale) => {}
- *   - colors: override palette
- * @returns {object} Controller with setRoute, recenter, rotateTo, resize, destroy
+ * @param {HTMLElement} containerElement
+ * @param {object} worldTopology TopoJSON world topology
+ * @param {object} [options]
+ * @returns {object} Controller API
  */
 export function createGlobeRenderer(containerElement, worldTopology, options = {}) {
   const { d3, topojson } = resolveDependencies(options);
 
   if (!d3 || typeof d3.geoOrthographic !== 'function') {
-    throw new Error('createGlobeRenderer: D3 (d3-geo) is required. Ensure d3 is available globally or passed via options.d3.');
+    throw new Error(
+      'D3 (d3-geo) is required to create a map renderer. Provide it in options.d3 or load d3 globally.'
+    );
   }
 
-  // Determine initial canvas dimensions
-  let width = options.width || (containerElement && containerElement.clientWidth) || 800;
-  let height = options.height || (containerElement && containerElement.clientHeight) || 600;
-
-  // Palette styling per Anthropic / SPEC guidelines with physical terrain & sovereign borders
+  // Theme Palette
   const palette = {
+    spaceBg: '#070a13',
     ocean: '#0d1424',
     land: '#1e293b',
-    landStroke: 'rgba(255, 255, 255, 0.7)',
-    countryBorder: 'rgba(255, 255, 255, 0.42)',
-    graticule: 'rgba(255, 255, 255, 0.22)',
-    haloOuter: 'rgba(6, 182, 212, 0.16)',
-    haloMid: 'rgba(6, 182, 212, 0.05)',
-    haloBorder: 'rgba(6, 182, 212, 0.35)',
+    landStroke: 'rgba(255, 255, 255, 0.12)',
+    countryBorder: 'rgba(255, 255, 255, 0.28)',
+    graticule: 'rgba(255, 255, 255, 0.06)',
+    haloOuter: 'rgba(6, 182, 212, 0.22)',
+    haloMid: 'rgba(6, 182, 212, 0.08)',
+    haloBorder: 'rgba(6, 182, 212, 0.45)',
     geodesic: '#06b6d4',
     geodesicGlow: 'rgba(6, 182, 212, 0.35)',
-    geodesicInnerGlow: 'rgba(6, 182, 212, 0.7)',
+    geodesicInnerGlow: 'rgba(6, 182, 212, 0.70)',
     origin: '#f59e0b',
-    originAura: 'rgba(245, 158, 11, 0.25)',
+    originAura: 'rgba(245, 158, 11, 0.35)',
     dest: '#10b981',
-    destAura: 'rgba(16, 185, 129, 0.25)',
-    midpoint: '#06b6d4',
-    midpointAura: 'rgba(6, 182, 212, 0.85)',
-    ...(options.colors || {})
+    destAura: 'rgba(16, 185, 129, 0.35)',
+    midpoint: '#38bdf8',
+    midpointAura: 'rgba(56, 189, 248, 0.35)',
+    pinTextBg: 'rgba(7, 10, 19, 0.88)',
+    pinTextBorder: 'rgba(255, 255, 255, 0.22)',
+    pinText: '#f8fafc',
+    ...(options.palette || {})
   };
 
-  // Create 2D vector canvas element
-  const canvas = options.canvas || (typeof document !== 'undefined' ? document.createElement('canvas') : null);
-  if (!canvas) {
-    throw new Error('createGlobeRenderer: Unable to create or locate canvas element.');
-  }
-  canvas.className = options.canvasClass || 'globe-canvas';
-  canvas.style.display = 'block';
-  canvas.style.cursor = 'grab';
-  canvas.style.userSelect = 'none';
-  canvas.style.webkitUserSelect = 'none';
-  canvas.style.touchAction = 'none';
+  // Dimensions
+  let width = options.width || (containerElement ? containerElement.clientWidth : 800) || 800;
+  let height = options.height || (containerElement ? containerElement.clientHeight : 600) || 600;
 
-  if (containerElement && canvas.parentElement !== containerElement) {
-    containerElement.appendChild(canvas);
+  // Mount primary HTML5 Canvas
+  const doc = options.document || (typeof document !== 'undefined' ? document : null);
+  let canvas = options.canvas || null;
+
+  if (!canvas && doc) {
+    canvas = doc.createElement('canvas');
   }
 
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    throw new Error('createGlobeRenderer: Unable to acquire 2D canvas context.');
+  if (canvas) {
+    if (typeof canvas.className === 'string') {
+      canvas.className = 'geodesic-globe-canvas';
+    }
+    if (canvas.style) {
+      canvas.style.display = 'block';
+      canvas.style.cursor = 'grab';
+      canvas.style.position = 'relative';
+      canvas.style.zIndex = '1';
+    }
+
+    if (containerElement && canvas.parentElement !== containerElement && typeof containerElement.appendChild === 'function') {
+      containerElement.appendChild(canvas);
+    }
+  } else {
+    canvas = {
+      width,
+      height,
+      style: {},
+      getContext: () => null,
+      addEventListener: () => {},
+      removeEventListener: () => {}
+    };
   }
 
-  // Animation frame and timer references
-  const reqAnim = typeof requestAnimationFrame === 'function'
-    ? requestAnimationFrame
-    : (cb) => setTimeout(() => cb(Date.now()), 16);
-  const cancelAnim = typeof cancelAnimationFrame === 'function'
-    ? cancelAnimationFrame
-    : (id) => clearTimeout(id);
+  const ctx = canvas.getContext ? canvas.getContext('2d') : null;
 
-  let animFrameId = null;
-
-  // Convert TopoJSON to GeoJSON features
+  // Extract Landmass & Sovereign Country Borders from TopoJSON
   let landFeature = null;
   let countryBordersFeature = null;
 
-  if (worldTopology) {
-    if (worldTopology.type === 'Topology' && worldTopology.objects) {
-      if (!topojson || typeof topojson.feature !== 'function') {
-        throw new Error('createGlobeRenderer: topojson-client is required to extract geometry from Topology.');
+  if (worldTopology && topojson && typeof topojson.feature === 'function') {
+    if (worldTopology.objects) {
+      if (worldTopology.objects.land) {
+        landFeature = topojson.feature(worldTopology, worldTopology.objects.land);
       }
-      const topoLand = worldTopology.objects.land || worldTopology.objects.countries;
-      if (topoLand) {
-        landFeature = topojson.feature(worldTopology, topoLand);
-      }
-      // Extract sovereign country borders matching m.drawcountries()
-      if (worldTopology.objects.countries && typeof topojson.mesh === 'function') {
+      if (worldTopology.objects.countries) {
+        if (!landFeature) {
+          landFeature = topojson.feature(worldTopology, worldTopology.objects.countries);
+        }
         try {
-          countryBordersFeature = topojson.mesh(worldTopology, worldTopology.objects.countries, (a, b) => a !== b);
+          if (typeof topojson.mesh === 'function') {
+            countryBordersFeature = topojson.mesh(
+              worldTopology,
+              worldTopology.objects.countries,
+              (a, b) => a !== b
+            );
+          }
         } catch (e) {
           countryBordersFeature = null;
         }
@@ -396,7 +490,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
   }
 
-  // Pre-generate graticule (parallels and meridians matching m.drawmeridians/parallels)
+  // Pre-generate graticule (parallels and meridians)
   let graticuleFeature = null;
   if (typeof d3.geoGraticule10 === 'function') {
     graticuleFeature = d3.geoGraticule10();
@@ -405,19 +499,59 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   }
 
   // Projection setup
+  let projectionType = options.projectionType || 'orthographic'; // 'orthographic' | 'robinson'
+  let verticalCenterRatio = typeof options.verticalCenterRatio === 'number' ? options.verticalCenterRatio : 0.5;
+
   let minScale = Math.min(width, height) * 0.2;
   let maxScale = Math.min(width, height) * 3.5;
   let currentScale = options.scale || Math.min(width, height) * 0.42;
   const initialRot = options.initialRotation || [0, -20, 0];
 
-  const projection = d3.geoOrthographic()
+  const orthoProj = d3.geoOrthographic()
     .clipAngle(90)
     .precision(0.3)
     .scale(currentScale)
-    .translate([width / 2, height / 2])
+    .translate([width / 2, height * verticalCenterRatio])
     .rotate(initialRot.slice());
 
-  const path = d3.geoPath(projection, ctx);
+  let robinsonViewportInsets = { left: 0, right: 0, top: 0, bottom: 0 };
+  let robinsonRouteDistance = 0;
+  // D3's Robinson unit sphere spans 2π horizontally and 3.18683 vertically.
+  function worldRobinsonScale() {
+    const availableWidth = Math.max(1, width - robinsonViewportInsets.left - robinsonViewportInsets.right - 48);
+    const availableHeight = Math.max(1, height - robinsonViewportInsets.top - robinsonViewportInsets.bottom - 48);
+    return Math.max(1, Math.min(availableWidth / (2 * Math.PI), availableHeight / 3.1868315878));
+  }
+  function defaultRobinsonScale() {
+    const availableWidth = Math.max(1, width - robinsonViewportInsets.left - robinsonViewportInsets.right - 48);
+    const availableHeight = Math.max(1, height - robinsonViewportInsets.top - robinsonViewportInsets.bottom - 48);
+    if (robinsonRouteDistance > 0 && robinsonRouteDistance < 1500) {
+      // A world overview makes nearby city pins overlap. Open short routes at
+      // a regional scale, within the same zoom range as the wheel/pinch controls.
+      return Math.min(Math.min(width, height) * 4,
+        Math.min(availableWidth, availableHeight) * 6371.0088 / robinsonRouteDistance * 0.55);
+    }
+    return worldRobinsonScale();
+  }
+  let robinsonScale = options.robinsonScale || defaultRobinsonScale();
+  let minRobinsonScale = worldRobinsonScale() * 0.4;
+  let maxRobinsonScale = Math.min(width, height) * 4.0;
+  let robinsonCenterLng = 0;
+  let robinsonCenterLat = 0;
+
+  let robinsonProj = null;
+  if (typeof d3.geoRobinson === 'function') {
+    robinsonProj = d3.geoRobinson()
+      .precision(0.3)
+      .scale(robinsonScale)
+      .translate([width / 2, height * verticalCenterRatio])
+      .rotate([-robinsonCenterLng, 0, 0])
+      .center([0, robinsonCenterLat]);
+  }
+
+  function getActiveProjection() {
+    return projectionType === 'robinson' && robinsonProj ? robinsonProj : orthoProj;
+  }
 
   // Initialize WebGL ETOPO terrain layer if enabled
   const terrainEnabled = options.terrain !== false;
@@ -437,7 +571,43 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let currentDest = null;
   let currentRouteGeoJson = null;
   let currentMidpoint = null;
-  let verticalCenterRatio = typeof options.verticalCenterRatio === "number" ? options.verticalCenterRatio : 0.5;
+
+  function robinsonTranslation() {
+    const { left, right, top, bottom } = robinsonViewportInsets;
+    return [(width + left - right) / 2, (height + top - bottom) / 2];
+  }
+
+  function setRobinsonViewportInsets(insets = {}) {
+    const zoomRatio = robinsonScale / defaultRobinsonScale();
+    robinsonViewportInsets = {
+      left: Math.max(0, insets.left || 0), right: Math.max(0, insets.right || 0),
+      top: Math.max(0, insets.top || 0), bottom: Math.max(0, insets.bottom || 0)
+    };
+    robinsonScale = defaultRobinsonScale() * zoomRatio;
+    minRobinsonScale = worldRobinsonScale() * 0.4;
+    if (robinsonProj) robinsonProj.scale(robinsonScale).translate(robinsonTranslation());
+    if (projectionType === 'robinson') render();
+  }
+
+  // A polar fallback path includes both endpoints and the North Pole. Center
+  // its smallest enclosing hemisphere, rather than hiding a southern endpoint.
+  function orthographicRouteCenter() {
+    if (!currentGeodesic?.isAntipodal || !currentOrigin || !currentDest) return currentMidpoint;
+    const origin = getCityCoords(currentOrigin), dest = getCityCoords(currentDest);
+    if (!origin || !dest) return currentMidpoint;
+    const a = geoToCartesian(...origin), b = geoToCartesian(...dest), pole = [0, 0, 1];
+    const u = a.map((v, i) => v - b[i]);
+    const v = a.map((value, i) => value - pole[i]);
+    let normal = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    const length = Math.hypot(...normal);
+    if (length < 1e-10) return currentMidpoint;
+    normal = normal.map(value => value / length);
+    const dot = normal.reduce((sum, value, i) => sum + value * a[i], 0);
+    if (Math.abs(dot) < 1e-10) return currentMidpoint;
+    if (dot < 0) normal = normal.map(value => -value);
+    const [lng, lat] = cartesianToGeo(normal);
+    return { lng, lat };
+  }
 
   // Configure high-DPI scaling
   function updateCanvasDimensions() {
@@ -447,10 +617,15 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(dpr, dpr);
+    if (ctx && typeof ctx.setTransform === 'function') {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+    }
 
-    projection.translate([width / 2, height * verticalCenterRatio]);
+    orthoProj.translate([width / 2, height * verticalCenterRatio]);
+    if (robinsonProj) {
+      robinsonProj.translate(robinsonTranslation());
+    }
 
     if (webglTerrain) {
       webglTerrain.resize(width, height, dpr);
@@ -461,54 +636,71 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   // Rendering routines
   function render() {
+    if (!ctx) return;
     const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
-    const [cx, cy] = projection.translate();
-    const r = projection.scale();
-    const rot = projection.rotate();
+    const activeProj = getActiveProjection();
+    const path = d3.geoPath(activeProj, ctx);
 
-    // Render WebGL physical terrain sphere if active
-    const hasTerrain = webglTerrain && webglTerrain.isLoaded();
+    const isRobinson = projectionType === 'robinson';
+    const [cx, cy] = activeProj.translate();
+    const r = activeProj.scale();
+    const rot = activeProj.rotate();
+
+    // Render WebGL physical terrain sphere only in orthographic mode
+    const hasTerrain = !isRobinson && webglTerrain && webglTerrain.isLoaded();
     if (hasTerrain) {
       webglTerrain.render(width, height, dpr, cx, cy, r, rot);
     }
 
     ctx.clearRect(0, 0, width, height);
 
-    // 1. Atmosphere halo ring outside sphere
-    if (r > 0) {
+    if (isRobinson) {
+      // 1. Draw the curved world outline, leaving space outside the map.
       ctx.save();
-      const haloGrad = ctx.createRadialGradient(cx, cy, r * 0.96, cx, cy, r * 1.09);
-      haloGrad.addColorStop(0, palette.haloOuter);
-      haloGrad.addColorStop(0.5, palette.haloMid);
-      haloGrad.addColorStop(1, 'rgba(6, 182, 212, 0)');
       ctx.beginPath();
-      ctx.arc(cx, cy, r * 1.09, 0, Math.PI * 2);
-      ctx.fillStyle = haloGrad;
+      path({ type: 'Sphere' });
+      ctx.fillStyle = palette.ocean;
       ctx.fill();
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = palette.haloBorder;
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      // 1. Atmosphere halo ring outside sphere
+      if (r > 0) {
+        ctx.save();
+        const haloGrad = ctx.createRadialGradient(cx, cy, r * 0.96, cx, cy, r * 1.09);
+        haloGrad.addColorStop(0, palette.haloOuter);
+        haloGrad.addColorStop(0.5, palette.haloMid);
+        haloGrad.addColorStop(1, 'rgba(6, 182, 212, 0)');
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * 1.09, 0, Math.PI * 2);
+        ctx.fillStyle = haloGrad;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // 2. Outer sphere / ocean background
+      ctx.save();
+      ctx.beginPath();
+      path({ type: 'Sphere' });
+      if (!hasTerrain) {
+        ctx.fillStyle = palette.ocean;
+        ctx.fill();
+      }
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = palette.haloBorder;
+      ctx.stroke();
       ctx.restore();
     }
 
-    // 2. Outer sphere / ocean background
-    ctx.save();
-    ctx.beginPath();
-    path({ type: 'Sphere' });
-    if (!hasTerrain) {
-      // Fallback solid ocean fill if WebGL terrain is not active
-      ctx.fillStyle = palette.ocean;
-      ctx.fill();
-    }
-    ctx.lineWidth = 1.4;
-    ctx.strokeStyle = palette.haloBorder;
-    ctx.stroke();
-    ctx.restore();
-
-    // 3. Graticule lines (meridians and parallels matching m.drawmeridians/drawparallels)
+    // 3. Graticule lines
     if (graticuleFeature) {
       ctx.save();
       ctx.beginPath();
       path(graticuleFeature);
       ctx.strokeStyle = palette.graticule;
-      ctx.lineWidth = 0.65;
+      ctx.lineWidth = isRobinson ? 0.5 : 0.65;
       ctx.stroke();
       ctx.restore();
     }
@@ -519,7 +711,6 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.beginPath();
       path(landFeature);
       if (!hasTerrain) {
-        // Fallback solid land fill if WebGL terrain is not active
         ctx.fillStyle = palette.land;
         ctx.fill();
       }
@@ -529,7 +720,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.restore();
     }
 
-    // 5. Sovereign Country Borders matching m.drawcountries()
+    // 5. Sovereign Country Borders
     if (countryBordersFeature) {
       ctx.save();
       ctx.beginPath();
@@ -568,11 +759,11 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.restore();
     }
 
-    // 7. Spherical midpoint marker (subtle crosshair / ring)
+    // 7. Spherical midpoint marker
     if (currentMidpoint) {
       const midCoord = [currentMidpoint.lng, currentMidpoint.lat];
-      if (isCoordVisible(midCoord, projection)) {
-        const pt = projection(midCoord);
+      if (isCoordVisible(midCoord, activeProj, projectionType, width, height)) {
+        const pt = activeProj(midCoord);
         if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
           drawMidpointMarker(pt[0], pt[1]);
         }
@@ -582,8 +773,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     // 8. City pins and labels (origin and destination)
     if (currentOrigin) {
       const coord = getCityCoords(currentOrigin);
-      if (coord && isCoordVisible(coord, projection)) {
-        const pt = projection(coord);
+      if (coord && isCoordVisible(coord, activeProj, projectionType, width, height)) {
+        const pt = activeProj(coord);
         if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
           const name = getCityName(currentOrigin);
           drawCityPin(pt[0], pt[1], name, palette.origin, palette.originAura, 'left');
@@ -593,8 +784,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
     if (currentDest) {
       const coord = getCityCoords(currentDest);
-      if (coord && isCoordVisible(coord, projection)) {
-        const pt = projection(coord);
+      if (coord && isCoordVisible(coord, activeProj, projectionType, width, height)) {
+        const pt = activeProj(coord);
         if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
           const name = getCityName(currentDest);
           drawCityPin(pt[0], pt[1], name, palette.dest, palette.destAura, 'right');
@@ -606,14 +797,12 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   // Draw spherical midpoint marker
   function drawMidpointMarker(x, y) {
     ctx.save();
-    // Midpoint ring
     ctx.beginPath();
     ctx.arc(x, y, 6, 0, Math.PI * 2);
     ctx.strokeStyle = palette.midpointAura;
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Crosshair ticks
     ctx.beginPath();
     ctx.strokeStyle = palette.geodesic;
     ctx.lineWidth = 1;
@@ -627,7 +816,6 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.lineTo(x, y + 9);
     ctx.stroke();
 
-    // Center dot
     ctx.beginPath();
     ctx.arc(x, y, 1.5, 0, Math.PI * 2);
     ctx.fillStyle = palette.midpoint;
@@ -638,47 +826,36 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   // Draw waypoint city pin with badge label
   function drawCityPin(x, y, name, color, haloColor, align = 'right') {
     ctx.save();
-    // Glowing aura
     ctx.beginPath();
     ctx.arc(x, y, 8, 0, Math.PI * 2);
     ctx.fillStyle = haloColor;
     ctx.fill();
 
-    // Outer circle
     ctx.beginPath();
     ctx.arc(x, y, 4.5, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
-    ctx.lineWidth = 1.2;
     ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
     ctx.stroke();
 
-    // Core dot
-    ctx.beginPath();
-    ctx.arc(x, y, 1.5, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffffff';
-    ctx.fill();
-
-    // Typography badge label
     if (name) {
-      ctx.font = "600 11px 'Space Grotesk', 'Inter', -apple-system, sans-serif";
-      ctx.textBaseline = 'middle';
-      const textWidth = ctx.measureText(name).width;
-      const padX = 6;
-      const badgeH = 18;
-      const badgeW = textWidth + padX * 2;
+      ctx.font = '600 11px system-ui, -apple-system, sans-serif';
+      const textMetrics = ctx.measureText(name);
+      const textW = textMetrics.width;
+      const textH = 14;
+      const padX = 7;
+      const padY = 4;
+      const badgeW = textW + padX * 2;
+      const badgeH = textH + padY * 2;
 
-      let badgeX = align === 'left' ? x - 8 - badgeW : x + 8;
-      // Clamp within canvas bounds
-      if (badgeX < 4) badgeX = x + 8;
-      if (badgeX + badgeW > width - 4) badgeX = x - 8 - badgeW;
-
+      let badgeX;
+      if (align === 'left') {
+        badgeX = x - badgeW - 10;
+      } else {
+        badgeX = x + 10;
+      }
       const badgeY = y - badgeH / 2;
-
-      // Dark card pill
-      ctx.fillStyle = 'rgba(13, 20, 36, 0.9)';
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1;
 
       ctx.beginPath();
       if (typeof ctx.roundRect === 'function') {
@@ -686,112 +863,186 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       } else {
         ctx.rect(badgeX, badgeY, badgeW, badgeH);
       }
+      ctx.fillStyle = palette.pinTextBg;
       ctx.fill();
+      ctx.strokeStyle = palette.pinTextBorder;
+      ctx.lineWidth = 0.8;
       ctx.stroke();
 
-      ctx.fillStyle = '#f8fafc';
-      ctx.fillText(name, badgeX + padX, y);
+      ctx.fillStyle = palette.pinText;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.fillText(name, badgeX + padX, badgeY + badgeH / 2);
     }
     ctx.restore();
   }
 
-  // Smooth spherical transition
-  function animateRotationTo(targetYaw, targetPitch, duration = 850) {
+  // Animation controller
+  let animFrameId = null;
+  const requestAnim = typeof requestAnimationFrame !== 'undefined'
+    ? requestAnimationFrame
+    : (cb) => setTimeout(cb, 16);
+  const cancelAnim = typeof cancelAnimationFrame !== 'undefined'
+    ? cancelAnimationFrame
+    : (id) => clearTimeout(id);
+
+  function rotateTo(targetLng, targetLat, animate = true) {
     if (animFrameId) {
       cancelAnim(animFrameId);
       animFrameId = null;
     }
 
-    const startRot = projection.rotate();
-    const startYaw = startRot[0] === 0 ? 0 : startRot[0];
-    const startPitch = startRot[1] === 0 ? 0 : startRot[1];
+    const targetYaw = targetLng === 0 ? 0 : -targetLng;
+    const targetPitch = targetLat === 0 ? 0 : -targetLat;
 
-    // Wrap delta yaw to take the shortest angular path along the minor arc
-    let deltaYaw = (targetYaw - startYaw) % 360;
-    if (deltaYaw > 180) deltaYaw -= 360;
-    if (deltaYaw < -180) deltaYaw += 360;
-
-    const deltaPitch = targetPitch - startPitch;
-
-    if (Math.abs(deltaYaw) < 0.01 && Math.abs(deltaPitch) < 0.01) {
-      projection.rotate([targetYaw, targetPitch, 0]);
+    if (!animate) {
+      orthoProj.rotate([targetYaw, targetPitch, 0]);
       render();
+      if (typeof options.onRotate === 'function') {
+        options.onRotate(orthoProj.rotate());
+      }
       return;
     }
 
-    const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const startRot = orthoProj.rotate().slice();
+    const startYaw = startRot[0];
+    const startPitch = startRot[1];
 
-    function step(now) {
+    let dYaw = ((targetYaw - startYaw + 540) % 360) - 180;
+    const dPitch = targetPitch - startPitch;
+
+    const startCenterLng = startYaw === 0 ? 0 : -startYaw;
+    const startCenterLat = startPitch === 0 ? 0 : -startPitch;
+    const vStart = geoToCartesian(startCenterLng, startCenterLat);
+    const vEnd = geoToCartesian(targetLng, targetLat);
+
+    const startTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const duration = options.animationDuration || 850;
+
+    function frame(now) {
       const elapsed = now - startTime;
-      const t = Math.min(1, Math.max(0, elapsed / duration));
-      // Cubic ease-in-out
-      const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+      const progress = Math.min(1, elapsed / duration);
+      const ease = progress < 0.5
+        ? 2 * progress * progress
+        : -1 + (4 - 2 * progress) * progress;
 
-      let curYaw = startYaw + deltaYaw * ease;
-      let curPitch = startPitch + deltaPitch * ease;
-      if (Math.abs(curYaw) < 1e-9) curYaw = 0;
-      if (Math.abs(curPitch) < 1e-9) curPitch = 0;
+      const vCurrent = slerp3D(vStart, vEnd, ease);
+      const [currentLng, currentLat] = cartesianToGeo(vCurrent);
 
-      projection.rotate([curYaw, curPitch, 0]);
+      const curYaw = currentLng === 0 ? 0 : -currentLng;
+      const curPitch = currentLat === 0 ? 0 : -currentLat;
+
+      orthoProj.rotate([curYaw, curPitch, 0]);
       render();
 
       if (typeof options.onRotate === 'function') {
-        options.onRotate(projection.rotate());
+        options.onRotate(orthoProj.rotate());
       }
 
-      if (t < 1) {
-        animFrameId = reqAnim(step);
+      if (progress < 1) {
+        animFrameId = requestAnim(frame);
       } else {
+        orthoProj.rotate([targetYaw, targetPitch, 0]);
         animFrameId = null;
-        projection.rotate([targetYaw, targetPitch, 0]);
+        render();
+        if (typeof options.onRotate === 'function') {
+          options.onRotate(orthoProj.rotate());
+        }
+      }
+    }
+
+    animFrameId = requestAnim(frame);
+  }
+
+  // Keep the north-up world outline in view and align its central meridian
+  // with the route. Polar fallback midpoints use the endpoints' longitude.
+  function centerRobinsonOnRoute() {
+    if (!robinsonProj || !currentMidpoint) return;
+    robinsonRouteDistance = currentGeodesic?.distanceKm || 0;
+    let { lng, lat } = currentMidpoint;
+    if (Math.abs(lat) > 80) {
+      const origin = getCityCoords(currentOrigin);
+      const dest = getCityCoords(currentDest);
+      if (origin && dest) {
+        const deltaLng = ((dest[0] - origin[0] + 540) % 360) - 180;
+        lng = origin[0] + deltaLng / 2;
+      }
+    }
+    robinsonCenterLng = ((lng + 540) % 360) - 180;
+    robinsonCenterLat = robinsonRouteDistance > 0 && robinsonRouteDistance < 1500 ? currentMidpoint.lat : 0;
+    robinsonScale = defaultRobinsonScale();
+    robinsonProj.scale(robinsonScale)
+      .rotate([-robinsonCenterLng, 0, 0]).center([0, robinsonCenterLat]);
+  }
+
+  // Recenter projection
+  function recenter(animate = true) {
+    if (!currentMidpoint) {
+      if (projectionType === 'robinson') {
+        if (robinsonProj) {
+          robinsonCenterLng = 0;
+          robinsonCenterLat = 0;
+          robinsonRouteDistance = 0;
+          robinsonScale = defaultRobinsonScale();
+          robinsonProj.scale(robinsonScale).rotate([0, 0, 0]).center([0, 0]);
+          render();
+        }
+      } else {
+        rotateTo(0, 0, animate);
+      }
+      return;
+    }
+
+    if (projectionType === 'robinson') {
+      if (robinsonProj) {
+        robinsonScale = defaultRobinsonScale();
+        centerRobinsonOnRoute();
         render();
       }
-    }
-
-    animFrameId = reqAnim(step);
-  }
-
-  // Rotate to specific longitude / latitude coordinate
-  function rotateTo(lng, lat, animate = true) {
-    const targetYaw = lng === 0 ? 0 : -lng;
-    const targetPitch = lat === 0 ? 0 : -lat;
-
-    if (animate) {
-      animateRotationTo(targetYaw, targetPitch);
     } else {
-      if (animFrameId) {
-        cancelAnim(animFrameId);
-        animFrameId = null;
-      }
-      projection.rotate([targetYaw, targetPitch, 0]);
-      render();
-      if (typeof options.onRotate === 'function') {
-        options.onRotate(projection.rotate());
-      }
+      const center = orthographicRouteCenter();
+      rotateTo(center.lng, center.lat, animate);
     }
   }
 
-  // Recenter orthographic view on route midpoint
-  function recenter() {
-    if (currentMidpoint) {
-      rotateTo(currentMidpoint.lng, currentMidpoint.lat, true);
+  // Switch projection type between 'orthographic' and 'robinson'
+  function setProjectionType(type) {
+    if (type !== 'orthographic' && type !== 'robinson') return;
+    if (type === projectionType) return;
+    projectionType = type;
+
+    if (projectionType === 'robinson') {
+      if (webglTerrain && webglTerrain.glCanvas) {
+        webglTerrain.glCanvas.style.display = 'none';
+      }
+      if (robinsonProj && currentMidpoint) {
+        centerRobinsonOnRoute();
+      }
     } else {
-      const initLng = initialRot[0] === 0 ? 0 : -initialRot[0];
-      const initLat = initialRot[1] === 0 ? 0 : -initialRot[1];
-      rotateTo(initLng, initLat, true);
+      if (webglTerrain && webglTerrain.glCanvas && terrainEnabled) {
+        webglTerrain.glCanvas.style.display = 'block';
+      }
+      if (currentMidpoint) {
+        const center = orthographicRouteCenter();
+        rotateTo(center.lng, center.lat, false);
+      }
+    }
+
+    render();
+    if (typeof options.onProjectionChange === 'function') {
+      options.onProjectionChange(projectionType);
     }
   }
 
-  // Update displayed route
+  // Set active geodesic flight route
   function setRoute(geodesicResult, originCity, destCity, animate = true) {
-    currentGeodesic = geodesicResult;
-    currentOrigin = originCity;
-    currentDest = destCity;
+    currentGeodesic = geodesicResult || null;
+    currentOrigin = originCity || null;
+    currentDest = destCity || null;
 
     if (geodesicResult) {
       currentMidpoint = normalizeMidpoint(geodesicResult.sphericalMidpoint);
-
-      if (geodesicResult.pathCoordinates && geodesicResult.pathCoordinates.length >= 2) {
+      if (geodesicResult.pathCoordinates && geodesicResult.pathCoordinates.length > 0) {
         currentRouteGeoJson = {
           type: 'LineString',
           coordinates: geodesicResult.pathCoordinates
@@ -813,28 +1064,37 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       currentRouteGeoJson = null;
     }
 
-    if (currentMidpoint && animate) {
-      rotateTo(currentMidpoint.lng, currentMidpoint.lat, true);
-    } else if (currentMidpoint && !animate) {
-      rotateTo(currentMidpoint.lng, currentMidpoint.lat, false);
-    } else {
+    if (projectionType === 'robinson') {
+      if (currentMidpoint && robinsonProj) {
+        centerRobinsonOnRoute();
+      }
       render();
+    } else {
+      if (currentMidpoint && animate) {
+        const center = orthographicRouteCenter();
+        rotateTo(center.lng, center.lat, true);
+      } else if (currentMidpoint && !animate) {
+        const center = orthographicRouteCenter();
+        rotateTo(center.lng, center.lat, false);
+      } else {
+        render();
+      }
     }
   }
 
   // Adjust vertical projection center (e.g. upper region on mobile drawer)
   function setVerticalCenterRatio(ratio, animate = true) {
     const targetRatio = Math.max(0.1, Math.min(0.9, ratio));
-    if (!animate || typeof requestAnimationFrame === "undefined") {
+    if (!animate || typeof requestAnimationFrame === 'undefined') {
       verticalCenterRatio = targetRatio;
       updateCanvasDimensions();
       render();
       return;
     }
 
-    const startY = projection.translate()[1];
+    const startY = getActiveProjection().translate()[1];
     const targetY = height * targetRatio;
-    const startTime = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const startTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     const duration = 280;
 
     function anim(now) {
@@ -843,7 +1103,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
       const currentY = startY + (targetY - startY) * ease;
       verticalCenterRatio = currentY / height;
-      projection.translate([width / 2, currentY]);
+      orthoProj.translate([width / 2, currentY]);
+      if (robinsonProj) {
+        robinsonProj.translate(robinsonTranslation());
+      }
       render();
       if (t < 1) {
         requestAnimationFrame(anim);
@@ -854,6 +1117,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   // Resize canvas and update projection viewport
   function resize(newWidth, newHeight) {
+    const robinsonZoomRatio = robinsonScale / defaultRobinsonScale();
     if (typeof newWidth === 'number' && typeof newHeight === 'number') {
       width = newWidth;
       height = newHeight;
@@ -863,16 +1127,22 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
     minScale = Math.min(width, height) * 0.2;
     maxScale = Math.min(width, height) * 3.5;
+    robinsonScale = defaultRobinsonScale() * robinsonZoomRatio;
+    minRobinsonScale = worldRobinsonScale() * 0.4;
+    maxRobinsonScale = Math.min(width, height) * 4.0;
+    if (robinsonProj) robinsonProj.scale(robinsonScale);
 
     updateCanvasDimensions();
     render();
   }
 
-  // Interactivity: Drag to rotate
+  // Interactivity: Drag to rotate (Orthographic) or pan (Robinson)
   let isDragging = false;
   let dragStartX = 0;
   let dragStartY = 0;
   let dragStartRot = [0, 0, 0];
+  let dragStartRobinsonLng = 0;
+  let dragStartRobinsonLat = 0;
 
   function onMouseDown(e) {
     if (e.button !== 0) return;
@@ -883,7 +1153,9 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     isDragging = true;
     dragStartX = e.clientX;
     dragStartY = e.clientY;
-    dragStartRot = projection.rotate().slice();
+    dragStartRot = orthoProj.rotate().slice();
+    dragStartRobinsonLng = robinsonCenterLng;
+    dragStartRobinsonLat = robinsonCenterLat;
     canvas.style.cursor = 'grabbing';
 
     if (typeof window !== 'undefined') {
@@ -897,19 +1169,28 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     const dx = e.clientX - dragStartX;
     const dy = e.clientY - dragStartY;
 
-    const k = 75 / projection.scale();
-    let newYaw = dragStartRot[0] + dx * k;
-    let newPitch = dragStartRot[1] - dy * k;
-    newPitch = Math.max(-89, Math.min(89, newPitch));
+    if (projectionType === 'robinson' && robinsonProj) {
+      const kLng = 180 / (Math.PI * robinsonScale);
+      const kLat = 90 / (1.5934157939 * robinsonScale);
+      robinsonCenterLng = ((dragStartRobinsonLng - dx * kLng + 540) % 360) - 180;
+      robinsonCenterLat = Math.max(-80, Math.min(80, dragStartRobinsonLat + dy * kLat));
+      robinsonProj.rotate([-robinsonCenterLng, 0, 0]).center([0, robinsonCenterLat]);
+      render();
+    } else {
+      const k = 75 / orthoProj.scale();
+      let newYaw = dragStartRot[0] + dx * k;
+      let newPitch = dragStartRot[1] - dy * k;
+      newPitch = Math.max(-89, Math.min(89, newPitch));
 
-    if (Math.abs(newYaw) < 1e-9) newYaw = 0;
-    if (Math.abs(newPitch) < 1e-9) newPitch = 0;
+      if (Math.abs(newYaw) < 1e-9) newYaw = 0;
+      if (Math.abs(newPitch) < 1e-9) newPitch = 0;
 
-    projection.rotate([newYaw, newPitch, 0]);
-    render();
+      orthoProj.rotate([newYaw, newPitch, 0]);
+      render();
 
-    if (typeof options.onRotate === 'function') {
-      options.onRotate(projection.rotate());
+      if (typeof options.onRotate === 'function') {
+        options.onRotate(orthoProj.rotate());
+      }
     }
   }
 
@@ -927,7 +1208,6 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let isPinching = false;
   let touchStartX = 0;
   let touchStartY = 0;
-  let touchStartRot = [0, 0, 0];
   let touchStartDist = 0;
   let touchStartScale = 0;
 
@@ -942,14 +1222,16 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       isPinching = false;
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
-      touchStartRot = projection.rotate().slice();
+      dragStartRot = orthoProj.rotate().slice();
+      dragStartRobinsonLng = robinsonCenterLng;
+      dragStartRobinsonLat = robinsonCenterLat;
     } else if (e.touches.length === 2) {
       isDragging = false;
       isPinching = true;
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       touchStartDist = Math.hypot(dx, dy);
-      touchStartScale = projection.scale();
+      touchStartScale = projectionType === 'robinson' ? robinsonScale : orthoProj.scale();
     }
   }
 
@@ -960,32 +1242,46 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       const dx = e.touches[0].clientX - touchStartX;
       const dy = e.touches[0].clientY - touchStartY;
 
-      const k = 75 / projection.scale();
-      let newYaw = touchStartRot[0] + dx * k;
-      let newPitch = touchStartRot[1] - dy * k;
-      newPitch = Math.max(-89, Math.min(89, newPitch));
+      if (projectionType === 'robinson' && robinsonProj) {
+        const kLng = 180 / (Math.PI * robinsonScale);
+        const kLat = 90 / (1.5934157939 * robinsonScale);
+        robinsonCenterLng = ((dragStartRobinsonLng - dx * kLng + 540) % 360) - 180;
+        robinsonCenterLat = Math.max(-80, Math.min(80, dragStartRobinsonLat + dy * kLat));
+        robinsonProj.rotate([-robinsonCenterLng, 0, 0]).center([0, robinsonCenterLat]);
+        render();
+      } else {
+        const k = 75 / orthoProj.scale();
+        let newYaw = dragStartRot[0] + dx * k;
+        let newPitch = dragStartRot[1] - dy * k;
+        newPitch = Math.max(-89, Math.min(89, newPitch));
 
-      if (Math.abs(newYaw) < 1e-9) newYaw = 0;
-      if (Math.abs(newPitch) < 1e-9) newPitch = 0;
+        if (Math.abs(newYaw) < 1e-9) newYaw = 0;
+        if (Math.abs(newPitch) < 1e-9) newPitch = 0;
 
-      projection.rotate([newYaw, newPitch, 0]);
-      render();
+        orthoProj.rotate([newYaw, newPitch, 0]);
+        render();
 
-      if (typeof options.onRotate === 'function') {
-        options.onRotate(projection.rotate());
+        if (typeof options.onRotate === 'function') {
+          options.onRotate(orthoProj.rotate());
+        }
       }
     } else if (e.touches.length === 2 && isPinching && touchStartDist > 0) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const dist = Math.hypot(dx, dy);
       const factor = dist / touchStartDist;
-      const newScale = Math.max(minScale, Math.min(maxScale, touchStartScale * factor));
 
-      projection.scale(newScale);
-      render();
-
-      if (typeof options.onZoom === 'function') {
-        options.onZoom(newScale);
+      if (projectionType === 'robinson' && robinsonProj) {
+        robinsonScale = Math.max(minRobinsonScale, Math.min(maxRobinsonScale, touchStartScale * factor));
+        robinsonProj.scale(robinsonScale);
+        render();
+      } else {
+        const newScale = Math.max(minScale, Math.min(maxScale, touchStartScale * factor));
+        orthoProj.scale(newScale);
+        render();
+        if (typeof options.onZoom === 'function') {
+          options.onZoom(newScale);
+        }
       }
     }
   }
@@ -1000,7 +1296,9 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       isDragging = true;
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
-      touchStartRot = projection.rotate().slice();
+      dragStartRot = orthoProj.rotate().slice();
+      dragStartRobinsonLng = robinsonCenterLng;
+      dragStartRobinsonLat = robinsonCenterLat;
     }
   }
 
@@ -1008,13 +1306,18 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   function onWheel(e) {
     if (e.cancelable) e.preventDefault();
     const factor = e.deltaY < 0 ? 1.12 : 0.89;
-    const nextScale = Math.max(minScale, Math.min(maxScale, projection.scale() * factor));
 
-    projection.scale(nextScale);
-    render();
-
-    if (typeof options.onZoom === 'function') {
-      options.onZoom(nextScale);
+    if (projectionType === 'robinson' && robinsonProj) {
+      robinsonScale = Math.max(minRobinsonScale, Math.min(maxRobinsonScale, robinsonScale * factor));
+      robinsonProj.scale(robinsonScale);
+      render();
+    } else {
+      const nextScale = Math.max(minScale, Math.min(maxScale, orthoProj.scale() * factor));
+      orthoProj.scale(nextScale);
+      render();
+      if (typeof options.onZoom === 'function') {
+        options.onZoom(nextScale);
+      }
     }
   }
 
@@ -1082,13 +1385,16 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     recenter,
     rotateTo,
     resize,
+    setProjectionType,
+    getProjectionType: () => projectionType,
+    setRobinsonViewportInsets,
     setVerticalCenterRatio,
     getVerticalCenterRatio: () => verticalCenterRatio,
     destroy,
     render,
-    getRotation: () => projection.rotate().slice(),
-    getScale: () => projection.scale(),
-    getProjection: () => projection,
+    getRotation: () => getActiveProjection().rotate().slice(),
+    getScale: () => getActiveProjection().scale(),
+    getProjection: () => getActiveProjection(),
     getCanvas: () => canvas
   };
 }

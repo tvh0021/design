@@ -1,22 +1,26 @@
 /**
- * Geodesic Flight Visualizer - HUD & Navigation UI Component
+ * Geodesic Map - Modern Interactive Flight HUD & Controls
  *
- * Provides:
- * - Searchable Combobox Autocomplete for Origin & Destination cities
- * - 1-Click Swap Route button with rotation transition
- * - Recenter Globe camera button
- * - Flight Telemetry HUD Card (Distance, Duration, Wind Penalty, Coordinates)
- * - Educational Antipodal Warning Badge for ~180° spherical path ambiguity
- * - Full Keyboard Navigation (ArrowUp, ArrowDown, Enter, Escape)
- * - Responsive floating HUD / mobile sheet layout
+ * Glassmorphic HUD overlay featuring:
+ * - Origin & Destination searchable autocomplete comboboxes (top 10k cities index)
+ * - 1-Click Swap Cities button
+ * - Recenter Globe / Map button
+ * - Projection Toggle (3D Orthographic Globe vs 2D Robinson flat map)
+ * - Real-time flight telemetry cards:
+ *   * Geodesic Distance (km & nautical/statute miles)
+ *   * Estimated Nonstop Flight Time (calibrated jet stream headwinds/tailwinds)
+ *   * Wind effect indicator (tailwind assist / headwind delay / neutral crosswind)
+ *   * Origin, Spherical Midpoint, and Destination coordinates
+ * - Antipodal educational warning callout badge
+ * - Minimizable mobile bottom drawer / desktop floating trigger
  */
 
 /**
- * Formats a latitude/longitude pair into a human-readable string.
- * Example: (48.8566, 2.3522) -> "48.86° N, 2.35° E"
+ * Converts decimal degrees latitude/longitude to formatted string with cardinal symbols.
+ * Example: 48.8566, 2.3522 -> "48.86° N, 2.35° E"
  *
- * @param {number} lat - Latitude in degrees [-90, 90]
- * @param {number} lng - Longitude in degrees [-180, 180]
+ * @param {number} lat
+ * @param {number} lng
  * @returns {string}
  */
 export function formatCoordinate(lat, lng) {
@@ -25,32 +29,31 @@ export function formatCoordinate(lat, lng) {
   }
   const latDir = lat >= 0 ? 'N' : 'S';
   const lngDir = lng >= 0 ? 'E' : 'W';
-  const latStr = `${Math.abs(lat).toFixed(2)}° ${latDir}`;
-  const lngStr = `${Math.abs(lng).toFixed(2)}° ${lngDir}`;
-  return `${latStr}, ${lngStr}`;
+  return `${Math.abs(lat).toFixed(2)}° ${latDir}, ${Math.abs(lng).toFixed(2)}° ${lngDir}`;
 }
 
 /**
- * Formats distances in kilometers and statute miles with comma thousands separators.
+ * Formats distance in km and miles with thousands separators.
  *
- * @param {number} distanceKm
- * @param {number} distanceMiles
+ * @param {number} km
+ * @param {number} [miles]
  * @returns {{ km: string, miles: string }}
  */
-export function formatDistance(distanceKm, distanceMiles) {
-  if (typeof distanceKm !== 'number' || isNaN(distanceKm) || distanceKm <= 0) {
-    return { km: '0 km', miles: '0 mi' };
+export function formatDistance(km, miles) {
+  if (typeof km !== 'number' || isNaN(km) || km < 0) {
+    return { km: '— km', miles: '— mi' };
   }
-  const kmFormatted = `${Math.round(distanceKm).toLocaleString('en-US')} km`;
-  const milesVal = typeof distanceMiles === 'number' && !isNaN(distanceMiles)
-    ? distanceMiles
-    : distanceKm * 0.621371;
-  const milesFormatted = `${Math.round(milesVal).toLocaleString('en-US')} mi`;
-  return { km: kmFormatted, miles: milesFormatted };
+  const mi = typeof miles === 'number' && !isNaN(miles) ? miles : km * 0.621371;
+  const kmFormatted = Math.round(km).toLocaleString('en-US');
+  const miFormatted = Math.round(mi).toLocaleString('en-US');
+  return {
+    km: `${kmFormatted} km`,
+    miles: `${miFormatted} mi`
+  };
 }
 
 /**
- * Formats decimal hours into a concise "Xh Ym" duration string.
+ * Formats duration in decimal hours to "Xh Ym" string.
  *
  * @param {number} hours
  * @returns {string}
@@ -59,7 +62,7 @@ export function formatDuration(hours) {
   if (typeof hours !== 'number' || isNaN(hours) || hours <= 0) {
     return '0h 00m';
   }
-  let totalMinutes = Math.round(hours * 60);
+  const totalMinutes = Math.round(hours * 60);
   const h = Math.floor(totalMinutes / 60);
   const m = totalMinutes % 60;
   return `${h}h ${m < 10 ? '0' : ''}${m}m`;
@@ -73,15 +76,11 @@ export function formatDuration(hours) {
  * @returns {{ text: string, type: 'headwind' | 'tailwind' | 'neutral', penaltyPercent: number, penaltyMinutes: number }}
  */
 export function formatWindPenalty(prevailingWindAdjustmentHours, nominalFlightTimeHours) {
-  if (typeof prevailingWindAdjustmentHours !== 'number' || isNaN(prevailingWindAdjustmentHours) || prevailingWindAdjustmentHours <= 0) {
-    if (nominalFlightTimeHours > 0) {
-      return {
-        text: 'Favorable tailwind / Neutral flow (optimal eastward corridor)',
-        type: 'tailwind',
-        penaltyPercent: 0,
-        penaltyMinutes: 0
-      };
-    }
+  if (
+    typeof prevailingWindAdjustmentHours !== 'number' ||
+    isNaN(prevailingWindAdjustmentHours) ||
+    (prevailingWindAdjustmentHours === 0 && (nominalFlightTimeHours === 0 || !nominalFlightTimeHours))
+  ) {
     return {
       text: 'No active flight route',
       type: 'neutral',
@@ -90,17 +89,36 @@ export function formatWindPenalty(prevailingWindAdjustmentHours, nominalFlightTi
     };
   }
 
-  const penaltyMinutes = Math.round(prevailingWindAdjustmentHours * 60);
-  const penaltyPercent = nominalFlightTimeHours > 0
-    ? Math.round((prevailingWindAdjustmentHours / nominalFlightTimeHours) * 1000) / 10
-    : 0;
+  if (Math.abs(prevailingWindAdjustmentHours) < 0.05) {
+    return {
+      text: 'Favorable tailwind / Neutral flow (optimal eastward or crosswind corridor)',
+      type: 'tailwind',
+      penaltyPercent: 0,
+      penaltyMinutes: 0
+    };
+  }
 
-  return {
-    text: `+${penaltyPercent}% (+${penaltyMinutes}m) headwind delay (westerly jet stream)`,
-    type: 'headwind',
-    penaltyPercent,
-    penaltyMinutes
-  };
+  const penaltyMinutes = Math.round(Math.abs(prevailingWindAdjustmentHours) * 60);
+  const penaltyPercent =
+    nominalFlightTimeHours > 0
+      ? Math.round((Math.abs(prevailingWindAdjustmentHours) / nominalFlightTimeHours) * 1000) / 10
+      : 0;
+
+  if (prevailingWindAdjustmentHours < 0) {
+    return {
+      text: `-${penaltyPercent}% (-${penaltyMinutes}m) tailwind assist (westerly jet stream)`,
+      type: 'tailwind',
+      penaltyPercent: -penaltyPercent,
+      penaltyMinutes: -penaltyMinutes
+    };
+  } else {
+    return {
+      text: `+${penaltyPercent}% (+${penaltyMinutes}m) headwind delay (westerly jet stream)`,
+      type: 'headwind',
+      penaltyPercent,
+      penaltyMinutes
+    };
+  }
 }
 
 /**
@@ -159,12 +177,19 @@ export class FlightHUD {
     this.onSwap = options.onSwap || (() => {});
     this.onRecenter = options.onRecenter || (() => {});
     this.onCollapseChange = options.onCollapseChange || (() => {});
+    this.onProjectionChange = options.onProjectionChange || (() => {});
 
     // State
     this.originCity = normalizeCityRecord(options.initialOrigin);
     this.destCity = normalizeCityRecord(options.initialDest);
+    this.projectionType = options.initialProjection || 'orthographic';
     this.geodesicResult = null;
     this.isCollapsed = false;
+
+    // Elements
+    this.projToggle = null;
+    this.orthoBtn = null;
+    this.robinsonBtn = null;
 
     // Combobox controllers
     this.originCombobox = null;
@@ -198,14 +223,10 @@ export class FlightHUD {
     const handleBar = doc.createElement('div');
     handleBar.className = 'hud-drawer-handle';
     handleBar.setAttribute('role', 'button');
-    handleBar.setAttribute('tabindex', '0');
-    handleBar.setAttribute('aria-label', 'Toggle flight controls panel');
     handleBar.setAttribute('aria-expanded', 'true');
-    const handleIndicator = doc.createElement('span');
-    handleIndicator.className = 'hud-drawer-pill';
-    handleBar.appendChild(handleIndicator);
-    hud.appendChild(handleBar);
-
+    handleBar.setAttribute('tabindex', '0');
+    handleBar.setAttribute('aria-label', 'Toggle flight telemetry drawer');
+    handleBar.innerHTML = '<span class="hud-drawer-pill"></span>';
     handleBar.addEventListener('click', () => {
       this.toggleCollapse();
     });
@@ -215,29 +236,30 @@ export class FlightHUD {
         this.toggleCollapse();
       }
     });
+    hud.appendChild(handleBar);
 
-    let touchStartY = 0;
-    let touchStartTime = 0;
-    handleBar.addEventListener('touchstart', (e) => {
-      if (e.touches && e.touches[0]) {
-        touchStartY = e.touches[0].clientY;
-        touchStartTime = Date.now();
-      }
-    }, { passive: true });
+    // Floating trigger button when collapsed
+    const floatingTrigger = doc.createElement('button');
+    floatingTrigger.className = 'hud-floating-trigger hidden';
+    floatingTrigger.type = 'button';
+    floatingTrigger.setAttribute('title', 'Expand flight controls');
+    floatingTrigger.setAttribute('aria-label', 'Expand flight controls');
+    floatingTrigger.innerHTML = `
+      <svg class="hud-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="2" y1="12" x2="22" y2="12"></line>
+        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+      </svg>
+      <span class="trigger-summary">Flight Controls</span>
+    `;
+    floatingTrigger.addEventListener('click', () => {
+      this.expand();
+    });
+    this.container.appendChild(floatingTrigger);
+    this.floatingTrigger = floatingTrigger;
+    this.floatingSummaryEl = floatingTrigger.querySelector('.trigger-summary');
 
-    handleBar.addEventListener('touchend', (e) => {
-      if (e.changedTouches && e.changedTouches[0]) {
-        const deltaY = e.changedTouches[0].clientY - touchStartY;
-        const deltaTime = Date.now() - touchStartTime;
-        if (deltaY > 30 && deltaTime < 600) {
-          this.collapse();
-        } else if (deltaY < -30 && deltaTime < 600) {
-          this.expand();
-        }
-      }
-    }, { passive: true });
-
-    // Header Bar
+    // HUD Header
     const header = doc.createElement('header');
     header.className = 'hud-header';
 
@@ -249,6 +271,8 @@ export class FlightHUD {
     titleBadge.setAttribute('aria-hidden', 'true');
 
     const titleGroup = doc.createElement('div');
+    titleGroup.className = 'hud-title-group';
+
     const title = doc.createElement('h1');
     title.className = 'hud-title';
     title.textContent = 'GEODESIC FLIGHT';
@@ -267,11 +291,62 @@ export class FlightHUD {
     const headerActions = doc.createElement('div');
     headerActions.className = 'hud-header-actions';
 
+    // Projection Toggle (Globe / Robinson)
+    const projToggle = doc.createElement('div');
+    projToggle.className = 'hud-proj-toggle';
+    projToggle.setAttribute('role', 'group');
+    projToggle.setAttribute('aria-label', 'Map Projection Toggle');
+
+    const orthoBtn = doc.createElement('button');
+    orthoBtn.className = `hud-proj-btn hud-proj-ortho ${this.projectionType === 'orthographic' ? 'is-active' : ''}`;
+    orthoBtn.type = 'button';
+    orthoBtn.setAttribute('title', 'Switch to 3D Orthographic Globe projection');
+    orthoBtn.setAttribute('aria-label', '3D Orthographic Globe projection');
+    orthoBtn.setAttribute('aria-pressed', String(this.projectionType === 'orthographic'));
+    orthoBtn.innerHTML = `
+      <svg class="hud-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="2" y1="12" x2="22" y2="12"></line>
+        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+      </svg>
+      <span class="btn-text">Globe</span>
+    `;
+
+    const robinsonBtn = doc.createElement('button');
+    robinsonBtn.className = `hud-proj-btn hud-proj-robinson ${this.projectionType === 'robinson' ? 'is-active' : ''}`;
+    robinsonBtn.type = 'button';
+    robinsonBtn.setAttribute('title', 'Switch to 2D Robinson flat map projection centered on route');
+    robinsonBtn.setAttribute('aria-label', '2D Robinson flat map projection');
+    robinsonBtn.setAttribute('aria-pressed', String(this.projectionType === 'robinson'));
+    robinsonBtn.innerHTML = `
+      <svg class="hud-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon>
+        <line x1="8" y1="2" x2="8" y2="18"></line>
+        <line x1="16" y1="6" x2="16" y2="22"></line>
+      </svg>
+      <span class="btn-text">Robinson</span>
+    `;
+
+    orthoBtn.addEventListener('click', () => {
+      this.setProjection('orthographic');
+    });
+    robinsonBtn.addEventListener('click', () => {
+      this.setProjection('robinson');
+    });
+
+    projToggle.appendChild(orthoBtn);
+    projToggle.appendChild(robinsonBtn);
+    this.container.appendChild(projToggle);
+
+    this.projToggle = projToggle;
+    this.orthoBtn = orthoBtn;
+    this.robinsonBtn = robinsonBtn;
+
     const recenterBtn = doc.createElement('button');
     recenterBtn.className = 'hud-btn hud-btn-recenter';
     recenterBtn.type = 'button';
-    recenterBtn.setAttribute('title', 'Recenter globe to route midpoint');
-    recenterBtn.setAttribute('aria-label', 'Recenter globe projection to route midpoint');
+    recenterBtn.setAttribute('title', 'Recenter map to route midpoint');
+    recenterBtn.setAttribute('aria-label', 'Recenter projection to route midpoint');
     recenterBtn.innerHTML = `
       <svg class="hud-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="9"></circle>
@@ -290,8 +365,8 @@ export class FlightHUD {
     const toggleBtn = doc.createElement('button');
     toggleBtn.className = 'hud-btn hud-btn-toggle';
     toggleBtn.type = 'button';
-    toggleBtn.setAttribute('title', 'Minimize flight panel to view full globe');
-    toggleBtn.setAttribute('aria-label', 'Minimize flight panel to view full globe');
+    toggleBtn.setAttribute('title', 'Minimize flight panel to view full map');
+    toggleBtn.setAttribute('aria-label', 'Minimize flight panel to view full map');
     toggleBtn.innerHTML = `
       <svg class="hud-icon toggle-icon-collapse" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="6 9 12 15 18 9"></polyline>
@@ -316,11 +391,30 @@ export class FlightHUD {
 
     // Origin Combobox Container
     const originContainer = doc.createElement('div');
-    originContainer.className = 'combobox-container combobox-origin';
+    originContainer.className = 'combobox-container combobox-origin combobox-group';
 
-    // Destination Combobox Container
-    const destContainer = doc.createElement('div');
-    destContainer.className = 'combobox-container combobox-dest';
+    const originLabel = doc.createElement('label');
+    originLabel.className = 'combobox-label combobox-label-row';
+    originLabel.textContent = 'ORIGIN';
+    originLabel.htmlFor = 'hud-origin-input';
+
+    const originBadge = doc.createElement('span');
+    originBadge.className = 'combobox-dot indicator-amber';
+    if (typeof originLabel.prepend === 'function') { originLabel.prepend(originBadge); } else { originLabel.appendChild(originBadge); }
+
+    this.originCombobox = this._createCombobox({
+      id: 'hud-origin-input',
+      placeholder: 'Search origin (e.g. Paris, Tokyo, New York)...',
+      ariaLabel: 'Search origin city',
+      onSelect: (city) => {
+        this.originCity = city;
+        this.onOriginSelect(city);
+      }
+    });
+
+    originContainer.appendChild(originLabel);
+    originContainer.appendChild(this.originCombobox.inputWrapper);
+    routeSection.appendChild(originContainer);
 
     // 1-Click Swap Button
     const swapContainer = doc.createElement('div');
@@ -330,7 +424,7 @@ export class FlightHUD {
     swapBtn.className = 'hud-btn-swap';
     swapBtn.type = 'button';
     swapBtn.setAttribute('title', 'Swap Origin and Destination');
-    swapBtn.setAttribute('aria-label', 'Swap origin and destination cities');
+    swapBtn.setAttribute('aria-label', 'Swap Origin and Destination cities');
     swapBtn.innerHTML = `
       <svg class="swap-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M7 16V4M7 4L3 8M7 4L11 8"></path>
@@ -341,34 +435,56 @@ export class FlightHUD {
       this.swapCities();
     });
     swapContainer.appendChild(swapBtn);
-
-    // Append route inputs
-    routeSection.appendChild(originContainer);
     routeSection.appendChild(swapContainer);
+
+    // Destination Combobox Container
+    const destContainer = doc.createElement('div');
+    destContainer.className = 'combobox-container combobox-dest combobox-group';
+
+    const destLabel = doc.createElement('label');
+    destLabel.className = 'combobox-label combobox-label-row';
+    destLabel.textContent = 'DESTINATION';
+    destLabel.htmlFor = 'hud-dest-input';
+
+    const destBadge = doc.createElement('span');
+    destBadge.className = 'combobox-dot indicator-emerald';
+    if (typeof destLabel.prepend === 'function') { destLabel.prepend(destBadge); } else { destLabel.appendChild(destBadge); }
+
+    this.destCombobox = this._createCombobox({
+      id: 'hud-dest-input',
+      placeholder: 'Search destination (e.g. San Francisco, London)...',
+      ariaLabel: 'Search destination city',
+      onSelect: (city) => {
+        this.destCity = city;
+        this.onDestSelect(city);
+      }
+    });
+
+    destContainer.appendChild(destLabel);
+    destContainer.appendChild(this.destCombobox.inputWrapper);
     routeSection.appendChild(destContainer);
+
     hud.appendChild(routeSection);
 
-    // Antipodal Educational Warning Badge
+    // Antipodal Educational Callout Warning Badge
     const antipodalBadge = doc.createElement('div');
     antipodalBadge.className = 'hud-antipodal-badge';
-    antipodalBadge.setAttribute('role', 'alert');
-    antipodalBadge.setAttribute('aria-live', 'polite');
+    antipodalBadge.setAttribute('role', 'status');
     antipodalBadge.style.display = 'none';
     antipodalBadge.innerHTML = `
       <div class="antipodal-badge-inner">
-        <span class="antipodal-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-            <line x1="12" y1="9" x2="12" y2="13"></line>
-            <line x1="12" y1="17" x2="12.01" y2="17"></line>
-          </svg>
-        </span>
+        <svg class="antipodal-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="12" y1="8" x2="12" y2="12"></line>
+          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+        </svg>
         <span class="antipodal-message">${ANTIPODAL_CALLOUT_TEXT}</span>
       </div>
     `;
     hud.appendChild(antipodalBadge);
+    this.antipodalBadge = antipodalBadge;
 
-    // Telemetry Card Section
+    // Flight Telemetry Card
     const telemetryCard = doc.createElement('section');
     telemetryCard.className = 'hud-telemetry-card';
     telemetryCard.setAttribute('aria-label', 'Flight Telemetry');
@@ -384,7 +500,7 @@ export class FlightHUD {
 
         <!-- Duration Metric -->
         <div class="telemetry-metric-block metric-duration">
-          <div class="metric-label">FLIGHT DURATION <span class="metric-sublabel">@ 900 km/h</span></div>
+          <div class="metric-label">FLIGHT DURATION <span class="metric-sublabel">@ 870 km/h</span></div>
           <div class="metric-value-primary" data-telemetry="duration-effective">—</div>
           <div class="metric-value-secondary" data-telemetry="duration-nominal">—</div>
         </div>
@@ -417,38 +533,7 @@ export class FlightHUD {
     `;
     hud.appendChild(telemetryCard);
 
-    this.container.appendChild(hud);
-
-    // Floating Trigger Pill for when HUD is minimized
-    const floatingTrigger = doc.createElement('button');
-    floatingTrigger.className = 'hud-floating-trigger hidden';
-    floatingTrigger.type = 'button';
-    floatingTrigger.setAttribute('title', 'Open flight controls');
-    floatingTrigger.setAttribute('aria-label', 'Open flight route controls');
-    floatingTrigger.innerHTML = `
-      <span class="trigger-icon" aria-hidden="true">✈️</span>
-      <span class="trigger-summary" data-telemetry="floating-summary">Flight Controls</span>
-      <svg class="trigger-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="18 15 12 9 6 15"></polyline>
-      </svg>
-    `;
-    floatingTrigger.addEventListener('click', () => {
-      this.expand();
-    });
-    this.container.appendChild(floatingTrigger);
-
-    // Store references
-    this.hudElement = hud;
-    this.handleBar = handleBar;
-    this.recenterBtn = recenterBtn;
-    this.toggleBtn = toggleBtn;
-    this.floatingTrigger = floatingTrigger;
-    this.floatingSummaryEl = floatingTrigger.querySelector('[data-telemetry="floating-summary"]');
-    this.swapBtn = swapBtn;
-    this.antipodalBadge = antipodalBadge;
-    this.telemetryCard = telemetryCard;
-
-    // Cache Telemetry query targets
+    // Save metric elements for dynamic updates
     this.distanceKmEl = telemetryCard.querySelector('[data-telemetry="distance-km"]');
     this.distanceMilesEl = telemetryCard.querySelector('[data-telemetry="distance-mi"]');
     this.durationEffectiveEl = telemetryCard.querySelector('[data-telemetry="duration-effective"]');
@@ -459,194 +544,134 @@ export class FlightHUD {
     this.midpointCoordEl = telemetryCard.querySelector('[data-telemetry="midpoint-coord"]');
     this.destCoordEl = telemetryCard.querySelector('[data-telemetry="dest-coord"]');
 
-    // Mount Comboboxes
-    this.originCombobox = this._createCombobox({
-      container: originContainer,
-      label: 'ORIGIN',
-      indicatorClass: 'indicator-amber',
-      placeholder: 'Search origin city (e.g. Paris)...',
-      inputId: 'hud-origin-input',
-      onSelect: (city) => {
-        this.originCity = city;
-        this.onOriginSelect(city);
-      }
-    });
-
-    this.destCombobox = this._createCombobox({
-      container: destContainer,
-      label: 'DESTINATION',
-      indicatorClass: 'indicator-emerald',
-      placeholder: 'Search destination (e.g. Tokyo)...',
-      inputId: 'hud-dest-input',
-      onSelect: (city) => {
-        this.destCity = city;
-        this.onDestSelect(city);
-      }
-    });
+    this.container.appendChild(hud);
+    this.hudElement = hud;
+    this.recenterBtn = recenterBtn;
+    this.toggleBtn = toggleBtn;
+    this.swapBtn = swapBtn;
+    this.handleBar = handleBar;
+    this.telemetryCard = telemetryCard;
   }
 
   /**
-   * Instantiates a fully accessible combobox with live search and keyboard navigation.
+   * Helper to create an accessible combobox input with autocomplete dropdown.
    */
-  _createCombobox({ container, label, indicatorClass, placeholder, inputId, onSelect }) {
+  _createCombobox(config) {
     const doc = this.doc;
     const directory = this.directory;
 
-    const group = doc.createElement('div');
-    group.className = 'combobox-group';
-
-    // Label with accent dot
-    const labelRow = doc.createElement('div');
-    labelRow.className = 'combobox-label-row';
-
-    const dot = doc.createElement('span');
-    dot.className = `combobox-dot ${indicatorClass}`;
-    dot.setAttribute('aria-hidden', 'true');
-
-    const labelEl = doc.createElement('label');
-    labelEl.className = 'combobox-label';
-    labelEl.htmlFor = inputId;
-    labelEl.textContent = label;
-
-    labelRow.appendChild(dot);
-    labelRow.appendChild(labelEl);
-    group.appendChild(labelRow);
-
-    // Input Wrapper
-    const wrapper = doc.createElement('div');
-    wrapper.className = 'combobox-wrapper';
+    const inputWrapper = doc.createElement('div');
+    inputWrapper.className = 'combobox-wrapper';
 
     const input = doc.createElement('input');
-    input.id = inputId;
     input.type = 'text';
+    input.id = config.id;
     input.className = 'combobox-input';
-    input.placeholder = placeholder;
-    input.autocomplete = 'off';
-    input.spellcheck = false;
+    input.placeholder = config.placeholder;
     input.setAttribute('role', 'combobox');
     input.setAttribute('aria-autocomplete', 'list');
     input.setAttribute('aria-expanded', 'false');
+    input.setAttribute('aria-label', config.ariaLabel);
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('spellcheck', 'false');
 
-    // Clear Button
     const clearBtn = doc.createElement('button');
     clearBtn.type = 'button';
     clearBtn.className = 'combobox-clear-btn';
-    clearBtn.setAttribute('aria-label', `Clear ${label.toLowerCase()} city`);
-    clearBtn.setAttribute('tabindex', '-1');
-    clearBtn.innerHTML = '&times;';
+    clearBtn.setAttribute('title', 'Clear selection');
+    clearBtn.setAttribute('aria-label', 'Clear selection');
+    clearBtn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    `;
     clearBtn.style.display = 'none';
 
-    // Dropdown Listbox
     const dropdown = doc.createElement('ul');
     dropdown.className = 'combobox-dropdown';
     dropdown.setAttribute('role', 'listbox');
-    dropdown.setAttribute('aria-label', `${label} suggestions`);
+    dropdown.setAttribute('aria-label', `${config.ariaLabel} results`);
     dropdown.style.display = 'none';
 
-    wrapper.appendChild(input);
-    wrapper.appendChild(clearBtn);
-    wrapper.appendChild(dropdown);
-    group.appendChild(wrapper);
-    container.appendChild(group);
+    inputWrapper.appendChild(input);
+    inputWrapper.appendChild(clearBtn);
+    inputWrapper.appendChild(dropdown);
 
-    // State for this combobox instance
-    let results = [];
     let activeIndex = -1;
+    let results = [];
     let isOpen = false;
-    let debounceTimer = null;
     let selectedCity = null;
+    let debounceTimer = null;
 
     const openDropdown = () => {
-      if (results.length > 0) {
-        dropdown.style.display = 'block';
-        isOpen = true;
-        input.setAttribute('aria-expanded', 'true');
-      }
+      if (results.length === 0) return;
+      isOpen = true;
+      dropdown.style.display = 'block';
+      input.setAttribute('aria-expanded', 'true');
     };
 
     const closeDropdown = () => {
-      dropdown.style.display = 'none';
       isOpen = false;
-      activeIndex = -1;
+      dropdown.style.display = 'none';
       input.setAttribute('aria-expanded', 'false');
-      input.removeAttribute('aria-activedescendant');
+      activeIndex = -1;
     };
 
     const updateActiveItem = (newIndex) => {
-      const items = dropdown.children;
-      for (let i = 0; i < items.length; i++) {
-        if (i === newIndex) {
-          items[i].classList.add('active');
-          items[i].setAttribute('aria-selected', 'true');
-          input.setAttribute('aria-activedescendant', items[i].id);
-          // Auto-scroll inside dropdown if needed
-          if (typeof items[i].scrollIntoView === 'function') {
-            items[i].scrollIntoView({ block: 'nearest' });
-          }
-        } else {
-          items[i].classList.remove('active');
-          items[i].setAttribute('aria-selected', 'false');
-        }
+      const items = dropdown.querySelectorAll('.combobox-option');
+      if (activeIndex >= 0 && items[activeIndex]) {
+        items[activeIndex].classList.remove('active', 'is-active');
+        items[activeIndex].setAttribute('aria-selected', 'false');
       }
       activeIndex = newIndex;
+      if (activeIndex >= 0 && items[activeIndex]) {
+        items[activeIndex].classList.add('active', 'is-active');
+        items[activeIndex].setAttribute('aria-selected', 'true');
+        if (typeof items[activeIndex].scrollIntoView === 'function') {
+          items[activeIndex].scrollIntoView({ block: 'nearest' });
+        }
+      }
     };
 
     const renderResults = () => {
-      // Clear dropdown
-      while (dropdown.firstChild) {
-        dropdown.removeChild(dropdown.firstChild);
-      }
-
+      dropdown.innerHTML = '';
       if (results.length === 0) {
-        const emptyItem = doc.createElement('li');
-        emptyItem.className = 'combobox-empty';
-        emptyItem.textContent = 'No matching cities found';
-        dropdown.appendChild(emptyItem);
-        openDropdown();
+        closeDropdown();
         return;
       }
 
       results.forEach((city, index) => {
-        const item = doc.createElement('li');
-        item.id = `${inputId}-option-${index}`;
-        item.className = 'combobox-option';
-        item.setAttribute('role', 'option');
-        item.setAttribute('aria-selected', 'false');
+        const li = doc.createElement('li');
+        li.className = 'combobox-option';
+        li.setAttribute('role', 'option');
+        li.setAttribute('id', `${config.id}-opt-${index}`);
+        li.setAttribute('aria-selected', 'false');
 
-        const mainText = doc.createElement('span');
-        mainText.className = 'option-city-name';
-        mainText.textContent = city.name;
+        const nameSpan = doc.createElement('span');
+        nameSpan.className = 'option-city-name';
+        nameSpan.textContent = city.name;
 
-        const countryTag = doc.createElement('span');
-        countryTag.className = 'option-country-tag';
-        countryTag.textContent = city.country;
+        const countrySpan = doc.createElement('span');
+        countrySpan.className = 'option-country-tag';
+        countrySpan.textContent = city.country;
 
-        const coordHint = doc.createElement('span');
-        coordHint.className = 'option-coord-hint';
-        coordHint.textContent = `${Math.abs(city.lat).toFixed(1)}°${city.lat >= 0 ? 'N' : 'S'}, ${Math.abs(city.lng).toFixed(1)}°${city.lng >= 0 ? 'E' : 'W'}`;
+        const popSpan = doc.createElement('span');
+        popSpan.className = 'option-coord-hint';
+        popSpan.textContent = city.population ? Number(city.population).toLocaleString() : '';
 
-        const textRow = doc.createElement('div');
-        textRow.className = 'option-text-row';
-        textRow.appendChild(mainText);
-        textRow.appendChild(countryTag);
+        li.appendChild(nameSpan);
+        li.appendChild(countrySpan);
+        li.appendChild(popSpan);
 
-        item.appendChild(textRow);
-        item.appendChild(coordHint);
-
-        item.addEventListener('mousedown', (e) => {
-          // Prevent input blur before click registers
+        li.addEventListener('mousedown', (e) => {
           if (e.preventDefault) e.preventDefault();
         });
-
-        item.addEventListener('click', () => {
+        li.addEventListener('click', () => {
           selectCity(city);
         });
 
-        item.addEventListener('mouseenter', () => {
-          updateActiveItem(index);
-        });
-
-        dropdown.appendChild(item);
+        dropdown.appendChild(li);
       });
 
       activeIndex = -1;
@@ -675,18 +700,18 @@ export class FlightHUD {
       input.value = `${city.name}, ${city.country}`;
       clearBtn.style.display = 'block';
       closeDropdown();
-      onSelect(city);
+      config.onSelect(city);
     };
 
     // Input handlers
-    input.addEventListener('input', (e) => {
+    input.addEventListener('input', () => {
       const val = input.value;
       if (val.length > 0) {
         clearBtn.style.display = 'block';
       } else {
         clearBtn.style.display = 'none';
         selectedCity = null;
-        onSelect(null);
+        config.onSelect(null);
       }
 
       if (debounceTimer) clearTimeout(debounceTimer);
@@ -704,7 +729,6 @@ export class FlightHUD {
     });
 
     input.addEventListener('blur', () => {
-      // Small timeout to allow mousedown on options to execute
       setTimeout(() => {
         closeDropdown();
       }, 150);
@@ -747,10 +771,11 @@ export class FlightHUD {
       results = [];
       closeDropdown();
       input.focus();
-      onSelect(null);
+      config.onSelect(null);
     });
 
     return {
+      inputWrapper,
       input,
       dropdown,
       clearBtn,
@@ -813,29 +838,22 @@ export class FlightHUD {
 
   /**
    * Updates all telemetry metrics based on geodesic engine result and selected endpoints.
-   *
-   * @param {object|null} geodesicResult - Computed geodesic result from GeodesicEngine
-   * @param {object|null} [origin] - Optional override for origin city
-   * @param {object|null} [dest] - Optional override for destination city
    */
   updateTelemetry(geodesicResult, origin = null, dest = null) {
-    this.geodesicResult = geodesicResult;
-    if (origin !== null) this.originCity = normalizeCityRecord(origin);
-    if (dest !== null) this.destCity = normalizeCityRecord(dest);
+    this.geodesicResult = geodesicResult || null;
+    if (origin) this.originCity = normalizeCityRecord(origin);
+    if (dest) this.destCity = normalizeCityRecord(dest);
 
-    if (!geodesicResult || typeof geodesicResult.distanceKm !== 'number') {
-      // Reset to idle state
-      if (this.distanceKmEl) this.distanceKmEl.textContent = '—';
-      if (this.distanceMilesEl) this.distanceMilesEl.textContent = '—';
-      if (this.durationEffectiveEl) this.durationEffectiveEl.textContent = '—';
-      if (this.durationNominalEl) this.durationNominalEl.textContent = '—';
+    if (!geodesicResult) {
+      if (this.distanceKmEl) this.distanceKmEl.textContent = '— km';
+      if (this.distanceMilesEl) this.distanceMilesEl.textContent = '— mi';
+      if (this.durationEffectiveEl) this.durationEffectiveEl.textContent = '0h 00m';
+      if (this.durationNominalEl) this.durationNominalEl.textContent = 'Calibrated cruise: 870 km/h';
       if (this.windBadgeEl) {
-        this.windBadgeEl.textContent = 'Awaiting Route';
-        this.windBadgeEl.className = 'wind-badge';
+        this.windBadgeEl.className = 'wind-badge wind-badge-neutral';
+        this.windBadgeEl.textContent = 'Neutral';
       }
-      if (this.windDescEl) {
-        this.windDescEl.textContent = 'Select departure and arrival cities to calculate prevailing winds.';
-      }
+      if (this.windDescEl) this.windDescEl.textContent = 'No active flight route';
       if (this.originCoordEl) this.originCoordEl.textContent = '—';
       if (this.midpointCoordEl) this.midpointCoordEl.textContent = '—';
       if (this.destCoordEl) this.destCoordEl.textContent = '—';
@@ -847,14 +865,14 @@ export class FlightHUD {
     const {
       distanceKm,
       distanceMiles,
-      sphericalMidpoint,
-      isAntipodal,
       nominalFlightTimeHours,
+      effectiveFlightTimeHours,
       prevailingWindAdjustmentHours,
-      effectiveFlightTimeHours
+      sphericalMidpoint,
+      isAntipodal
     } = geodesicResult;
 
-    // 1. Total Distance Formatting
+    // 1. Distance
     const dist = formatDistance(distanceKm, distanceMiles);
     if (this.floatingSummaryEl) {
       if (this.originCity && this.destCity && dist) {
@@ -872,16 +890,16 @@ export class FlightHUD {
       : nominalFlightTimeHours + (prevailingWindAdjustmentHours || 0);
     const nomHours = typeof nominalFlightTimeHours === 'number'
       ? nominalFlightTimeHours
-      : (distanceKm / 900);
+      : (distanceKm / 870);
 
     if (this.durationEffectiveEl) {
       this.durationEffectiveEl.textContent = formatDuration(effHours);
     }
     if (this.durationNominalEl) {
-      if (prevailingWindAdjustmentHours > 0) {
+      if (Math.abs(prevailingWindAdjustmentHours) > 0.05) {
         this.durationNominalEl.textContent = `Nominal: ${formatDuration(nomHours)}`;
       } else {
-        this.durationNominalEl.textContent = 'Cruising speed: 900 km/h';
+        this.durationNominalEl.textContent = 'Calibrated cruise: 870 km/h';
       }
     }
 
@@ -892,7 +910,11 @@ export class FlightHUD {
       if (windInfo.type === 'headwind') {
         this.windBadgeEl.textContent = `+${windInfo.penaltyMinutes}m Headwind`;
       } else if (windInfo.type === 'tailwind') {
-        this.windBadgeEl.textContent = 'Optimal Tailwind';
+        if (windInfo.penaltyMinutes < 0) {
+          this.windBadgeEl.textContent = `${windInfo.penaltyMinutes}m Tailwind`;
+        } else {
+          this.windBadgeEl.textContent = 'Optimal Tailwind';
+        }
       } else {
         this.windBadgeEl.textContent = 'Neutral';
       }
@@ -928,14 +950,39 @@ export class FlightHUD {
 
     // 5. Antipodal Educational Callout Badge
     if (this.antipodalBadge) {
-      if (isAntipodal) {
-        this.antipodalBadge.style.display = 'block';
-        this.antipodalBadge.classList.add('visible');
+      this.antipodalBadge.style.display = isAntipodal ? 'block' : 'none';
+    }
+  }
+
+  /**
+   * Switches the active projection between 'orthographic' and 'robinson'.
+   */
+  setProjection(type) {
+    if (type !== 'orthographic' && type !== 'robinson') return;
+    this.projectionType = type;
+    if (this.orthoBtn && this.robinsonBtn) {
+      if (type === 'orthographic') {
+        this.orthoBtn.classList.add('is-active');
+        this.orthoBtn.setAttribute('aria-pressed', 'true');
+        this.robinsonBtn.classList.remove('is-active');
+        this.robinsonBtn.setAttribute('aria-pressed', 'false');
       } else {
-        this.antipodalBadge.style.display = 'none';
-        this.antipodalBadge.classList.remove('visible');
+        this.robinsonBtn.classList.add('is-active');
+        this.robinsonBtn.setAttribute('aria-pressed', 'true');
+        this.orthoBtn.classList.remove('is-active');
+        this.orthoBtn.setAttribute('aria-pressed', 'false');
       }
     }
+    if (typeof this.onProjectionChange === 'function') {
+      this.onProjectionChange(this.projectionType);
+    }
+  }
+
+  /**
+   * Returns current active projection name ('orthographic' | 'robinson').
+   */
+  getProjection() {
+    return this.projectionType;
   }
 
   /**
@@ -971,6 +1018,7 @@ export class FlightHUD {
   getDest() {
     return this.destCity;
   }
+
   /**
    * Collapses/minimizes the HUD panel, revealing the full globe.
    */
@@ -1031,7 +1079,6 @@ export class FlightHUD {
     return this.isCollapsed;
   }
 
-
   /**
    * Returns a map of key DOM elements for automated test assertions.
    */
@@ -1047,6 +1094,10 @@ export class FlightHUD {
       swapBtn: this.swapBtn,
       recenterBtn: this.recenterBtn,
       toggleBtn: this.toggleBtn,
+      projToggle: this.projToggle,
+      projectionToggle: this.projToggle,
+      orthoBtn: this.orthoBtn,
+      robinsonBtn: this.robinsonBtn,
       handleBar: this.handleBar,
       floatingTrigger: this.floatingTrigger,
       floatingSummary: this.floatingSummaryEl,
@@ -1072,6 +1123,9 @@ export class FlightHUD {
     if (this.destCombobox) this.destCombobox.destroy();
     if (this.hudElement && this.hudElement.parentElement) {
       this.hudElement.parentElement.removeChild(this.hudElement);
+    }
+    if (this.projToggle && this.projToggle.parentElement) {
+      this.projToggle.parentElement.removeChild(this.projToggle);
     }
     if (this.floatingTrigger && this.floatingTrigger.parentElement) {
       this.floatingTrigger.parentElement.removeChild(this.floatingTrigger);

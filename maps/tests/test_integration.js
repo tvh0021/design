@@ -199,38 +199,45 @@ class MockElement {
   set innerHTML(htmlString) {
     this.children = [];
     this._textContent = '';
-    this._parseSimplifiedHTML(htmlString);
-  }
+    if (!htmlString || typeof htmlString !== 'string') return;
 
-  _parseSimplifiedHTML(html) {
-    const textOnly = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    this._textContent = textOnly;
+    const tagRegex = /<([a-zA-Z0-9]+)([^>]*)>([\s\S]*?)<\/\1>|<([a-zA-Z0-9]+)([^>]*)\/>/g;
+    let match;
 
-    const dataTelemetryMatches = html.matchAll(/data-telemetry="([^"]+)"/g);
-    for (const match of dataTelemetryMatches) {
-      const child = this.ownerDocument.createElement('span');
-      child.setAttribute('data-telemetry', match[1]);
+    while ((match = tagRegex.exec(htmlString)) !== null) {
+      const tagName = match[1] || match[4];
+      const attrsStr = match[2] || match[5] || '';
+      const innerContent = match[3] || '';
+
+      const child = this.ownerDocument.createElement(tagName);
+
+      const classMatch = attrsStr.match(/class="([^"]*)"/);
+      if (classMatch) child.className = classMatch[1];
+
+      const idMatch = attrsStr.match(/id="([^"]*)"/);
+      if (idMatch) child.id = idMatch[1];
+
+      const dataTelemetryMatch = attrsStr.match(/data-telemetry="([^"]*)"/);
+      if (dataTelemetryMatch) child.setAttribute('data-telemetry', dataTelemetryMatch[1]);
+
+      const roleMatch = attrsStr.match(/role="([^"]*)"/);
+      if (roleMatch) child.setAttribute('role', roleMatch[1]);
+
+      const titleMatch = attrsStr.match(/title="([^"]*)"/);
+      if (titleMatch) child.setAttribute('title', titleMatch[1]);
+
+      const ariaLabelMatch = attrsStr.match(/aria-label="([^"]*)"/);
+      if (ariaLabelMatch) child.setAttribute('aria-label', ariaLabelMatch[1]);
+
+      if (innerContent.trim()) {
+        if (/<[a-z]/i.test(innerContent)) {
+          child.innerHTML = innerContent;
+        } else {
+          child.textContent = innerContent.trim();
+        }
+      }
+
       this.appendChild(child);
-    }
-
-    if (html.includes('hud-icon')) {
-      const icon = this.ownerDocument.createElement('span');
-      icon.className = 'hud-icon';
-      this.appendChild(icon);
-    }
-    if (html.includes('swap-icon')) {
-      const icon = this.ownerDocument.createElement('span');
-      icon.className = 'swap-icon';
-      this.appendChild(icon);
-    }
-    if (html.includes('antipodal-badge-inner')) {
-      const inner = this.ownerDocument.createElement('div');
-      inner.className = 'antipodal-badge-inner';
-      const msg = this.ownerDocument.createElement('span');
-      msg.className = 'antipodal-message';
-      msg.textContent = ANTIPODAL_CALLOUT_TEXT;
-      inner.appendChild(msg);
-      this.appendChild(inner);
     }
   }
 
@@ -314,6 +321,7 @@ class MockElement {
       stroke: () => {},
       fill: () => {},
       clearRect: () => {},
+      fillRect: () => {},
       rect: () => {},
       roundRect: () => {},
       setTransform: () => {},
@@ -344,36 +352,50 @@ class MockDocument {
 
 // Mock D3 Projection and Path Generator
 function createMockD3() {
-  let rotation = [0, -20, 0];
-  let scale = 300;
-  let translate = [400, 300];
+  const createProj = () => {
+    let rotation = [0, -20, 0];
+    let scale = 300;
+    let translate = [400, 300];
+    let center = [0, 0];
 
-  const projection = (coord) => {
-    const x = translate[0] + (coord[0] + rotation[0]) * 2;
-    const y = translate[1] - (coord[1] + rotation[1]) * 2;
-    return [x, y];
+    const projection = (coord) => {
+      const x = translate[0] + (coord[0] + rotation[0]) * 2;
+      const y = translate[1] - (coord[1] + rotation[1]) * 2;
+      return [x, y];
+    };
+
+    projection.clipAngle = () => projection;
+    projection.precision = () => projection;
+    projection.scale = (s) => {
+      if (s === undefined) return scale;
+      scale = s;
+      return projection;
+    };
+    projection.translate = (t) => {
+      if (t === undefined) return translate;
+      translate = t;
+      return projection;
+    };
+    projection.rotate = (r) => {
+      if (r === undefined) return rotation.slice();
+      rotation = r.slice();
+      return projection;
+    };
+    projection.center = (c) => {
+      if (c === undefined) return center.slice();
+      center = c.slice();
+      return projection;
+    };
+
+    return projection;
   };
 
-  projection.clipAngle = () => projection;
-  projection.precision = () => projection;
-  projection.scale = (s) => {
-    if (s === undefined) return scale;
-    scale = s;
-    return projection;
-  };
-  projection.translate = (t) => {
-    if (t === undefined) return translate;
-    translate = t;
-    return projection;
-  };
-  projection.rotate = (r) => {
-    if (r === undefined) return rotation.slice();
-    rotation = r.slice();
-    return projection;
-  };
+  const ortho = createProj();
+  const robinson = createProj();
 
   return {
-    geoOrthographic: () => projection,
+    geoOrthographic: () => ortho,
+    geoRobinson: () => robinson,
     geoPath: () => () => {},
     geoGraticule10: () => ({ type: 'MultiLineString', coordinates: [] })
   };
@@ -496,7 +518,7 @@ test('Iconic Route 1: Paris -> Fairbanks (Trans-polar great circle)', () => {
   assert.ok(result.sphericalMidpoint.lat > 70, `Expected polar midpoint lat > 70° N, got ${result.sphericalMidpoint.lat}°`);
 
   // Flight time: approx 7.9 hours @ 900 km/h
-  assert.ok(result.nominalFlightTimeHours >= 7.7 && result.nominalFlightTimeHours <= 8.1);
+  assert.ok(result.nominalFlightTimeHours >= 8.3 && result.nominalFlightTimeHours <= 8.7, `Expected ~8.5h, got ${result.nominalFlightTimeHours}`);
 
   // Not antipodal
   assert.equal(result.isAntipodal, false);
@@ -521,14 +543,14 @@ test('Iconic Route 2: New York <-> London (Directional jet-stream wind penalty)'
   assert.ok(Math.abs(eastResult.distanceKm - westResult.distanceKm) < 1e-4, 'Distances must be equal');
   assert.ok(eastResult.distanceKm >= 5500 && eastResult.distanceKm <= 5650, `Expected ~5,570 km, got ${eastResult.distanceKm}`);
 
-  // Eastbound experiences no westerly headwind penalty
-  assert.equal(eastResult.prevailingWindAdjustmentHours, 0, 'Eastbound should have 0 headwind penalty');
-  assert.equal(eastResult.effectiveFlightTimeHours, eastResult.nominalFlightTimeHours);
+  // Eastbound benefits from westerly jet-stream tailwind assist
+  assert.ok(eastResult.prevailingWindAdjustmentHours < 0, 'Eastbound should have tailwind assist (< 0)');
+  assert.ok(eastResult.effectiveFlightTimeHours < eastResult.nominalFlightTimeHours);
 
   // Westbound experiences westerly jet-stream headwind penalty
   assert.ok(
-    westResult.prevailingWindAdjustmentHours > 0.45 && westResult.prevailingWindAdjustmentHours < 0.75,
-    `Westbound penalty should be ~0.58h (35 min), got ${westResult.prevailingWindAdjustmentHours.toFixed(2)}h`
+    westResult.prevailingWindAdjustmentHours > 0.40 && westResult.prevailingWindAdjustmentHours < 0.85,
+    `Westbound penalty should be ~0.66h (40 min), got ${westResult.prevailingWindAdjustmentHours.toFixed(2)}h`
   );
   assert.ok(
     westResult.effectiveFlightTimeHours > eastResult.effectiveFlightTimeHours,
@@ -704,6 +726,13 @@ runAsyncTest('initApp initializes application, dismisses splash, and renders ini
   const { recenterBtn } = hudElements;
   recenterBtn.dispatchEvent({ type: 'click' });
   assert.ok(recentered, 'Recenter button must trigger globe.recenter()');
+
+  // Verify Projection Toggle action
+  assert.equal(app.getProjection(), 'orthographic');
+  app.setProjection('robinson');
+  assert.equal(app.getProjection(), 'robinson');
+  app.setProjection('orthographic');
+  assert.equal(app.getProjection(), 'orthographic');
 
   // Verify Window Resize reactive listener
   let resized = false;

@@ -734,6 +734,45 @@ test('Drawer handle, toggle button, and floating trigger fire collapse/expand', 
   hud.destroy();
 });
 
+test('Projection toggle switches between Globe and Robinson and triggers callback', () => {
+  const { doc, container } = createTestEnvironment();
+  let changedProj = null;
+  const hud = createFlightHUD(container, {
+    document: doc,
+    initialProjection: 'orthographic',
+    onProjectionChange: (type) => { changedProj = type; }
+  });
+
+  const elements = hud.getElements();
+  assert.ok(elements.projToggle, 'Projection toggle group must exist');
+  assert.ok(elements.projToggle.parentElement === container, 'Projection switch must live outside the console');
+  hud.collapse();
+  assert.ok(elements.projToggle.parentElement === container, 'Hiding the console must leave projection controls mounted');
+  assert.ok(elements.orthoBtn, 'Ortho button must exist');
+  assert.ok(elements.robinsonBtn, 'Robinson button must exist');
+
+  assert.equal(hud.getProjection(), 'orthographic');
+  assert.equal(elements.orthoBtn.getAttribute('aria-pressed'), 'true');
+  assert.equal(elements.robinsonBtn.getAttribute('aria-pressed'), 'false');
+
+  // Click Robinson button
+  elements.robinsonBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getProjection(), 'robinson');
+  assert.equal(changedProj, 'robinson');
+  assert.equal(elements.robinsonBtn.getAttribute('aria-pressed'), 'true');
+  assert.equal(elements.orthoBtn.getAttribute('aria-pressed'), 'false');
+
+  // Click Ortho button
+  elements.orthoBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getProjection(), 'orthographic');
+  assert.equal(changedProj, 'orthographic');
+  hud.expand();
+  assert.ok(elements.projToggle.parentElement === container);
+
+  hud.destroy();
+  assert.equal(container.children.length, 0, 'Destroy must remove the independent projection switch');
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);

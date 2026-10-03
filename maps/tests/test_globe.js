@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
 import { createGlobeRenderer } from '../src/globe.js';
+import { computeGeodesic } from '../src/geodesic.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -119,6 +120,7 @@ function createMockCanvas(width = 800, height = 600) {
     stroke: () => drawnElements.push({ type: 'stroke' }),
     fill: () => drawnElements.push({ type: 'fill' }),
     clearRect: (x, y, w, h) => drawnElements.push({ type: 'clearRect', x, y, w, h }),
+    fillRect: (x, y, w, h) => drawnElements.push({ type: 'fillRect', x, y, w, h }),
     rect: (x, y, w, h) => drawnElements.push({ type: 'rect', x, y, w, h }),
     roundRect: (x, y, w, h, r) => drawnElements.push({ type: 'roundRect', x, y, w, h, r }),
     setTransform: () => {},
@@ -178,39 +180,54 @@ function createMockContainer(canvas) {
 
 // Mock D3 Projection and Path Generator
 function createMockD3() {
-  let rotation = [0, -20, 0];
-  let scale = 300;
-  let translate = [400, 300];
+  const createProjectionMock = () => {
+    let projRot = [0, -20, 0];
+    let projScale = 300;
+    let projTrans = [400, 300];
+    let projCenter = [0, 0];
 
-  const projection = (coord) => {
-    // Orthographic math projection mock: return [x, y]
-    const x = translate[0] + (coord[0] + rotation[0]) * 2;
-    const y = translate[1] - (coord[1] + rotation[1]) * 2;
-    return [x, y];
+    const proj = (coord) => {
+      const x = projTrans[0] + (coord[0] + projRot[0]) * 2;
+      const y = projTrans[1] - (coord[1] + projRot[1]) * 2;
+      return [x, y];
+    };
+    proj.clipAngle = () => proj;
+    proj.precision = () => proj;
+    proj.scale = (s) => {
+      if (s === undefined) return projScale;
+      projScale = s;
+      return proj;
+    };
+    proj.translate = (t) => {
+      if (t === undefined) return projTrans;
+      projTrans = t;
+      return proj;
+    };
+    proj.rotate = (r) => {
+      if (r === undefined) return projRot;
+      projRot = r;
+      return proj;
+    };
+    proj.center = (c) => {
+      if (c === undefined) return projCenter;
+      projCenter = c;
+      return proj;
+    };
+    return proj;
   };
 
-  projection.clipAngle = () => projection;
-  projection.precision = () => projection;
-  projection.scale = (s) => {
-    if (s === undefined) return scale;
-    scale = s;
-    return projection;
-  };
-  projection.translate = (t) => {
-    if (t === undefined) return translate;
-    translate = t;
-    return projection;
-  };
-  projection.rotate = (r) => {
-    if (r === undefined) return rotation;
-    rotation = r;
-    return projection;
-  };
+  const ortho = createProjectionMock();
+  const robinson = createProjectionMock();
 
-  const path = (obj) => {
-    // draws into context
+  return {
+    geoOrthographic: () => ortho,
+    geoRobinson: () => robinson,
+    geoPath: (proj, ctx) => (obj) => {},
+    geoGraticule10: () => ({ type: 'MultiLineString', coordinates: [] })
   };
+};
 
+function _unusedD3() {
   return {
     geoOrthographic: () => projection,
     geoPath: (proj, ctx) => path,
@@ -636,6 +653,95 @@ test("verticalCenterRatio adjusts projection translation for mobile viewports", 
   const [, newCy] = controller.getProjection().translate();
   assert.equal(newCy, 400);
 
+  controller.destroy();
+});
+
+// 16. Test Projection Type Toggle (Orthographic <-> Robinson)
+test("setProjectionType toggles between orthographic and robinson", () => {
+  const { canvas } = createMockCanvas();
+  const container = createMockContainer(canvas);
+  const mockD3 = createMockD3();
+  const mockTopojson = createMockTopojson();
+
+  const controller = createGlobeRenderer(container, null, {
+    canvas,
+    d3: mockD3,
+    topojson: mockTopojson,
+    projectionType: 'orthographic',
+    terrain: false
+  });
+
+  assert.equal(controller.getProjectionType(), 'orthographic');
+
+  controller.setProjectionType('robinson');
+  assert.equal(controller.getProjectionType(), 'robinson');
+
+  controller.setProjectionType('orthographic');
+  assert.equal(controller.getProjectionType(), 'orthographic');
+
+  controller.destroy();
+});
+
+test('Robinson polar routes use an endpoint center on switch, route change, and recenter', () => {
+  const { canvas } = createMockCanvas();
+  const controller = createGlobeRenderer(createMockContainer(canvas), null, {
+    canvas, d3: createMockD3(), terrain: false
+  });
+  const origin = { lat: 25.0478, lng: 121.5319 };
+  const dest = { lat: -25.3007, lng: -57.6359 };
+  const route = { sphericalMidpoint: { lat: 90, lng: 0 }, pathCoordinates: [[origin.lng, origin.lat], [0, 90], [dest.lng, dest.lat]] };
+  function checkCenter() {
+    const [lng, lat] = controller.getProjection().center();
+    assert.equal(lng, 0);
+    assert.ok(Math.abs(lat) < 1, 'Polar route must keep endpoint latitudes in view');
+    assert.ok(Math.abs(controller.getRotation()[0] + 31.948) < 0.001, 'Center longitude must fall between endpoints');
+  }
+  controller.setRoute(route, origin, dest, false);
+  controller.setProjectionType('robinson');
+  checkCenter();
+  controller.recenter(false);
+  checkCenter();
+  controller.setRoute({ ...route, sphericalMidpoint: { lat: -90, lng: 0 } }, origin, dest, false);
+  checkCenter();
+  controller.destroy();
+});
+
+test('Near-antipodal globe framing contains the full polar route and both city markers', () => {
+  for (const [origin, dest] of [
+    [{ name: 'Taipei', lat: 25.0478, lng: 121.5319 }, { name: 'Asuncion', lat: -25.3007, lng: -57.6359 }],
+    [{ name: 'Madrid', lat: 40.4167, lng: -3.7167 }, { name: 'Wellington', lat: -41.2889, lng: 174.7772 }]
+  ]) {
+    const { canvas, drawnElements } = createMockCanvas();
+    const controller = createGlobeRenderer(createMockContainer(canvas), null, { canvas, d3: createMockD3(), terrain: false });
+    const route = computeGeodesic(origin, dest);
+    controller.setRoute(route, origin, dest, false);
+    controller.recenter(false);
+    const [yaw, pitch] = controller.getRotation();
+    const lat0 = -pitch * Math.PI / 180, lng0 = -yaw * Math.PI / 180;
+    for (const [lng, lat] of route.pathCoordinates) {
+      const phi = lat * Math.PI / 180, lambda = lng * Math.PI / 180;
+      const dot = Math.sin(lat0) * Math.sin(phi) + Math.cos(lat0) * Math.cos(phi) * Math.cos(lambda - lng0);
+      assert.ok(dot >= -1e-9, 'Every point of the polar fallback route must face the viewer');
+    }
+    for (const city of [origin, dest]) assert.ok(drawnElements.some(e => e.type === 'fillText' && e.text === city.name), 'Both city labels must be drawn');
+    controller.destroy();
+  }
+});
+
+test('Robinson fits the free viewport and opens a short route at regional zoom', () => {
+  const { canvas } = createMockCanvas();
+  const controller = createGlobeRenderer(createMockContainer(canvas), null, { canvas, d3: createMockD3(), terrain: false });
+  controller.setRobinsonViewportInsets({ left: 428, top: 80 });
+  controller.setProjectionType('robinson');
+  assert.deepEqual(controller.getProjection().translate(), [614, 340]);
+  const worldScale = controller.getScale();
+  const origin = { lat: 1.3, lng: 103.8 }, dest = { lat: 3.1478, lng: 101.6953 };
+  controller.setRoute(computeGeodesic(origin, dest), origin, dest, false);
+  assert.ok(controller.getScale() > worldScale * 10, 'Nearby cities need a regional default view');
+  assert.ok(controller.getScale() <= 2400, 'Default zoom must remain inside the existing zoom range');
+  const scale = controller.getScale();
+  controller.recenter(false);
+  assert.equal(controller.getScale(), scale, 'Recenter should restore the route default');
   controller.destroy();
 });
 

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Globe terrain alignment regression</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-geo-projection@4.0.0/dist/d3-geo-projection.min.js"></script>
+<style>body { background: #070a13; color: #f8fafc; font: 14px monospace; } #fixture { width: 800px; height: 600px; position: relative; } pre { white-space: pre-wrap; }</style>
+<h1>Globe terrain alignment regression</h1>
+<pre id="results">Running...</pre>
+<div id="fixture"></div>
+<script type="module">
+import { createGlobeRenderer } from '../src/globe.js';
+import { computeGeodesic } from '../src/geodesic.js';
+
+// Encode longitude and latitude into a texture so readPixels tests the actual
+// terrain shader against D3, rather than repeating its rotation mathematics.
+const texture = document.createElement('canvas');
+texture.width = 512;
+texture.height = 256;
+const textureCtx = texture.getContext('2d');
+const pixels = textureCtx.createImageData(texture.width, texture.height);
+for (let y = 0; y < texture.height; y++) {
+  for (let x = 0; x < texture.width; x++) {
+    const i = (y * texture.width + x) * 4;
+    pixels.data[i] = Math.round(255 * x / (texture.width - 1));
+    pixels.data[i + 1] = Math.round(255 * y / (texture.height - 1));
+    pixels.data[i + 2] = 255;
+    pixels.data[i + 3] = 255;
+  }
+}
+textureCtx.putImageData(pixels, 0, 0);
+const controller = createGlobeRenderer(document.querySelector('#fixture'), null, {
+  d3: window.d3, width: 800, height: 600, initialRotation: [0, 0, 0],
+  terrainTextureUrl: texture.toDataURL()
+});
+const canvas = controller.getCanvas();
+const glCanvas = document.querySelector('.globe-webgl-terrain');
+const gl = glCanvas?.getContext('webgl');
+const output = [];
+let checks = 0;
+
+function checkAlignment(label) {
+  const projection = controller.getProjection();
+  const [cx, cy] = projection.translate();
+  const radius = projection.scale();
+  const dpr = window.devicePixelRatio || 1;
+  controller.render();
+  for (const [dx, dy] of [[0, 0], [50, -50], [-50, 50]]) {
+    const px = Math.floor((cx + dx) * dpr);
+    const py = Math.floor((cy + dy) * dpr);
+    const point = [(px + 0.5) / dpr, (py + 0.5) / dpr];
+    const expected = projection.invert(point);
+    const pixel = new Uint8Array(4);
+    gl.readPixels(px, glCanvas.height - py - 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    if (!pixel[3]) throw new Error(`${label}: terrain pixel was not rendered`);
+    const x = (point[0] - cx) / radius;
+    const y = (point[1] - cy) / radius;
+    const z = Math.sqrt(1 - x * x - y * y);
+    const rim = (1 - z) ** 3 * 0.28;
+    // Divide out illumination using the texture's constant blue channel.
+    const illumination = pixel[2] / 255 - 0.83 * rim;
+    const u = (pixel[0] / 255 - 0.02 * rim) / illumination;
+    const v = (pixel[1] / 255 - 0.71 * rim) / illumination;
+    const terrain = [(u - 0.5) * 360, (0.5 - v) * 180];
+    const longitudeError = Math.abs(((terrain[0] - expected[0] + 540) % 360) - 180);
+    const latitudeError = Math.abs(terrain[1] - expected[1]);
+    // The diagnostic texture and framebuffer have 8-bit color precision.
+    if (longitudeError > 2 || latitudeError > 2) {
+      throw new Error(`${label}: terrain ${terrain.map(v => v.toFixed(2))} disagrees with overlay ${expected.map(v => v.toFixed(2))}`);
+    }
+    checks++;
+  }
+  output.push(`PASS ${label}`);
+}
+
+function mouseDrag(dx, dy) {
+  canvas.dispatchEvent(new MouseEvent('mousedown', { button: 0, clientX: 400, clientY: 300 }));
+  window.dispatchEvent(new MouseEvent('mousemove', { buttons: 1, clientX: 400 + dx, clientY: 300 + dy }));
+  window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }));
+}
+
+function touch(type, touches) {
+  const event = new Event(type, { cancelable: true });
+  Object.defineProperty(event, 'touches', { value: touches });
+  canvas.dispatchEvent(event);
+}
+
+try {
+  if (!gl) throw new Error('WebGL unavailable; cannot verify terrain alignment');
+  const deadline = performance.now() + 5000;
+  while (!gl.getParameter(gl.CURRENT_PROGRAM) ||
+    !gl.getUniform(gl.getParameter(gl.CURRENT_PROGRAM), gl.getUniformLocation(gl.getParameter(gl.CURRENT_PROGRAM), 'u_loaded'))) {
+    if (performance.now() > deadline) throw new Error('Terrain texture failed to load');
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
+  checkAlignment('initial globe');
+  for (const [label, lng, lat] of [['northern globe', 30, 40], ['southern globe', 135, -65]]) {
+    controller.rotateTo(lng, lat, false);
+    checkAlignment(label);
+    mouseDrag(60, 40);
+    checkAlignment(`${label} after mouse drag`);
+  }
+  const origin = { lat: 25.0478, lng: 121.5319 };
+  const dest = { lat: -25.3007, lng: -57.6359 };
+  controller.setRoute(computeGeodesic(origin, dest), origin, dest, false);
+  controller.setProjectionType('robinson');
+  for (const [width, height] of [[800, 600], [390, 844]]) {
+    controller.resize(width, height);
+    controller.recenter(false);
+    const p = controller.getProjection();
+    const bounds = window.d3.geoPath(p).bounds({ type: 'Sphere' });
+    if (bounds.flat().some(v => !Number.isFinite(v)) || bounds[0][0] < 0 || bounds[1][0] > width || bounds[0][1] < 0 || bounds[1][1] > height) {
+      throw new Error('Robinson world outline must fit the viewport');
+    }
+    for (const city of [origin, dest]) {
+      const [x, y] = p([city.lng, city.lat]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > width || y < 0 || y > height) {
+        throw new Error('Robinson polar route endpoints must remain visible');
+      }
+    }
+    checks += 3;
+    output.push(`PASS Robinson polar route and outline at ${width}x${height}`);
+  }
+  controller.resize(800, 600);
+  mouseDrag(-40, 20);
+  controller.setRoute(null, null, null, false);
+  controller.setProjectionType('orthographic');
+  checkAlignment('return from Robinson');
+  touch('touchstart', [{ clientX: 400, clientY: 300 }]);
+  touch('touchmove', [{ clientX: 440, clientY: 330 }]);
+  touch('touchend', []);
+  checkAlignment('after touch drag');
+  canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, cancelable: true }));
+  checkAlignment('after zoom');
+  window.terrainTestResult = { pass: true, checks };
+  output.push(`${checks} pixel alignment checks passed.`);
+} catch (error) {
+  window.terrainTestResult = { pass: false, error: error.message, checks };
+  output.push(`FAIL ${error.message}`);
+} finally {
+  document.querySelector('#results').textContent = output.join('\n');
+  controller.destroy();
+}
+</script>
+</html>
