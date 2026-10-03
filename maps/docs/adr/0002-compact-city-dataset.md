@@ -17,10 +17,10 @@ Options considered:
 
 ## Decision
 
-Pre-process `worldcities.csv` into a streamlined JSON payload (`cities10k.json`) containing the top 10,000 cities by population formatted as an array of 4-element arrays: `[city_ascii, country, round(lat, 4), round(lng, 4)]`.
+Pre-process `worldcities.csv` into the top 10,000 city records by population, then append the curated records in `curated_locations.json`. The runtime payload (`cities10k.json`) uses 4-element arrays: `[name, country, lat, lng]`.
 
 ## Consequences
 
-- **Positive**: Total uncompressed JSON payload is ~220 KB (~70 KB gzipped), parsing takes under 5 milliseconds on page load, and search autocomplete is instant across all 10,000 locations.
+- **Positive**: The original 10,000 city records retain their population order, and 111 selected geographic and heritage locations are searchable in the same directory.
 - **Negative**: Omits administrative subdivisions and raw population counts from the runtime display.
-- **Trade-off**: The user gets access to 10,000 global cities with sub-second page initialization.
+- **Trade-off**: The runtime directory contains 10,111 records. The filename `cities10k.json` retains its original name for compatibility.

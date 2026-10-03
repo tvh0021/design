@@ -6,13 +6,13 @@ When planning or analyzing long-distance global travel, users often rely on flat
 
 ## Solution
 
-A responsive, high-performance, browser-native web application hosted on GitHub Pages that interactively renders an orthographic 3D Earth globe. Users can select an origin and destination city from a curated database of 10,000 global cities through instant-search autocomplete dropdowns. The application immediately calculates the true spherical geodesic arc using 3D unit vectors, computes the spherical midpoint, smoothly slerp-rotates the globe so the midpoint faces the viewer, and displays accurate travel telemetry (distance in km and miles, flight time, and prevailing jet-stream wind penalties). Users can also freely drag-rotate and zoom the globe with touch or mouse controls.
+A responsive, high-performance, browser-native web application hosted on GitHub Pages that interactively renders an orthographic 3D Earth globe. Users can select an origin and destination from 10,000 global cities and 111 curated geographic and heritage locations through instant-search autocomplete dropdowns. The application immediately calculates the true spherical geodesic arc using 3D unit vectors, computes the spherical midpoint, smoothly slerp-rotates the globe so the midpoint faces the viewer, and displays travel telemetry (distance in km and miles, flight time, and prevailing jet-stream wind penalties). Users can also freely drag-rotate and zoom the globe with touch or mouse controls.
 
 ## User Stories
 
 1. As a visitor, I want to open the web page with zero installation, so that I can immediately explore global flight paths on any desktop or mobile browser.
-2. As a user, I want to type a city name into the origin search box and see instant autocomplete suggestions from 10,000 global cities, so that I can quickly select my departure point.
-3. As a user, I want to type a city name into the destination search box, so that I can pick my arrival point without scrolling through thousands of entries.
+2. As a user, I want to type into the origin search box and see autocomplete suggestions from the 10,000-city dataset and curated locations, so that I can quickly select my departure point.
+3. As a user, I want to type into the destination search box and see city and curated location matches, so that I can pick my arrival point without scrolling through thousands of entries.
 4. As a user, I want each city suggestion in the dropdown to display its country name, so that I can disambiguate cities with identical names (e.g., Paris, France vs. Paris, Texas).
 5. As a user, I want the globe to automatically rotate smoothly to center directly on the midpoint between the two chosen cities, so that the entire flight route is visible in the orthographic hemisphere.
 6. As a user, I want to see the shortest-distance geodesic path drawn as an illuminated arc on the globe, so that I can visualize the true curvature and route over continents and oceans.
@@ -33,7 +33,7 @@ A responsive, high-performance, browser-native web application hosted on GitHub 
 
 ### Architectural Decisions
 - **100% Client-Side Static App**: Vanilla ES modules + D3.js v7 (`d3-geo`, `topojson-client`). No Node runtime or backend server required. Hosted directly via GitHub Pages or embeddable in an `<iframe>`.
-- **Top 10,000 Compact Dataset**: Pre-process `worldcities.csv` into a compact JSON array of arrays: `[city_ascii, country, round(lat, 4), round(lng, 4)]` sorted by population descending. Total uncompressed payload ~220 KB (~70 KB gzipped).
+- **Compact Search Dataset**: Keep the top 10,000 cities from `worldcities.csv` in population order, then append 111 curated geographic and heritage locations. Each entry uses `[name, country, lat, lng]`.
 
 ### Mathematical & Algorithmic Contracts
 - **Spherical Coordinates**: Standard WGS84 spherical conversion:

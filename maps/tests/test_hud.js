@@ -437,11 +437,15 @@ await runAsyncTest('Combobox search queries directory and renders dropdown optio
   const { doc, container } = createTestEnvironment();
   const directory = new CityDirectory();
   directory.load([
-    ['Tokyo', 'Japan', 35.6895, 139.6917],
-    ['Yokohama', 'Japan', 35.4437, 139.6380],
     ['Paris', 'France', 48.8566, 2.3522],
-    ['Papeete', 'French Polynesia', -17.5350, -149.5696]
+    ...Array.from({ length: 60 }, (_, i) => [`Par City ${i + 1}`, 'Testland', 0, i / 100])
   ]);
+  const originalSearch = directory.search.bind(directory);
+  const searchCalls = [];
+  directory.search = (query, limit) => {
+    searchCalls.push({ query, limit });
+    return originalSearch(query, limit);
+  };
 
   let selectedOrigin = null;
   const hud = createFlightHUD(container, {
@@ -452,15 +456,22 @@ await runAsyncTest('Combobox search queries directory and renders dropdown optio
 
   const { originInput, originDropdown } = hud.getElements();
 
-  // Simulate typing 'Par'
+  // One character does not search. Two or more characters wait for the 100 ms debounce.
+  originInput.value = 'P';
+  originInput.dispatchEvent({ type: 'input' });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(originDropdown.style.display, 'none', 'One character should not open the dropdown');
+  assert.equal(searchCalls.length, 0, 'One character should not query the directory');
+
   originInput.value = 'Par';
   originInput.dispatchEvent({ type: 'input' });
-
-  // Wait for debounce timeout (50ms)
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(originDropdown.style.display, 'none', 'Dropdown should wait for the debounce');
   await new Promise((r) => setTimeout(r, 80));
 
   assert.equal(originDropdown.style.display, 'block', 'Dropdown should open on search results');
-  assert.ok(originDropdown.children.length >= 1, 'Dropdown should contain suggestion items');
+  assert.equal(originDropdown.children.length, 50, 'Dropdown should show up to 50 results');
+  assert.equal(searchCalls.at(-1).limit, 50, 'Search should request 50 results');
 
   const firstOption = originDropdown.children[0];
   assert.ok(firstOption.textContent.includes('Paris'), 'First suggestion should be Paris');
@@ -494,12 +505,12 @@ await runAsyncTest('Combobox handles ArrowDown, ArrowUp, Enter, and Escape', asy
 
   const { destInput, destDropdown } = hud.getElements();
 
-  destInput.value = 'M';
+  destInput.value = 'Ma';
   destInput.dispatchEvent({ type: 'input' });
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 120));
 
   assert.equal(destDropdown.style.display, 'block');
-  assert.equal(destDropdown.children.length, 3);
+  assert.equal(destDropdown.children.length, 2);
 
   // ArrowDown to highlight Madrid (index 0)
   destInput.dispatchEvent({ type: 'keydown', key: 'ArrowDown', preventDefault: () => {} });
@@ -523,7 +534,7 @@ await runAsyncTest('Combobox handles ArrowDown, ArrowUp, Enter, and Escape', asy
   // Re-trigger dropdown and test Escape key
   destInput.value = 'Mel';
   destInput.dispatchEvent({ type: 'input' });
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 120));
   assert.equal(destDropdown.style.display, 'block');
 
   destInput.dispatchEvent({ type: 'keydown', key: 'Escape', preventDefault: () => {} });

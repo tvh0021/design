@@ -603,6 +603,9 @@ export class FlightHUD {
     let isOpen = false;
     let selectedCity = null;
     let debounceTimer = null;
+    const minQueryLength = 2;
+    const searchResultLimit = 50;
+    const searchDebounceMs = 100;
 
     const openDropdown = () => {
       if (results.length === 0) return;
@@ -680,19 +683,35 @@ export class FlightHUD {
 
     const executeSearch = (query) => {
       const q = (query || '').trim();
-      if (!q) {
+      if (q.length < minQueryLength) {
         results = [];
         closeDropdown();
         return;
       }
 
       if (directory && typeof directory.search === 'function') {
-        results = directory.search(q, 8);
+        results = directory.search(q, searchResultLimit);
       } else {
         results = [];
       }
 
       renderResults();
+    };
+
+    const scheduleSearch = (query) => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+
+      const q = (query || '').trim();
+      if (q.length < minQueryLength) {
+        results = [];
+        closeDropdown();
+        return;
+      }
+
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        executeSearch(input.value);
+      }, searchDebounceMs);
     };
 
     const selectCity = (city) => {
@@ -714,17 +733,14 @@ export class FlightHUD {
         config.onSelect(null);
       }
 
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        executeSearch(input.value);
-      }, 50);
+      scheduleSearch(val);
     });
 
     input.addEventListener('focus', () => {
-      if (input.value.trim().length > 0 && results.length > 0) {
+      if (input.value.trim().length >= minQueryLength && results.length > 0) {
         openDropdown();
-      } else if (input.value.trim().length > 0) {
-        executeSearch(input.value);
+      } else {
+        scheduleSearch(input.value);
       }
     });
 
@@ -738,7 +754,7 @@ export class FlightHUD {
     input.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowDown') {
         if (!isOpen) {
-          executeSearch(input.value);
+          scheduleSearch(input.value);
         } else if (results.length > 0) {
           if (e.preventDefault) e.preventDefault();
           const nextIndex = activeIndex < results.length - 1 ? activeIndex + 1 : 0;
@@ -795,7 +811,7 @@ export class FlightHUD {
         }
       },
       getSelectedCity: () => selectedCity,
-      search: (q) => executeSearch(q),
+      search: (q) => scheduleSearch(q),
       getResults: () => results,
       isOpen: () => isOpen,
       getActiveIndex: () => activeIndex,

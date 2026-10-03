@@ -8,6 +8,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const dataPath = path.resolve(__dirname, '../data/cities10k.json');
+const curatedPath = path.resolve(__dirname, '../data/curated_locations.json');
+const baseCityCount = 10000;
+const curatedLocationCount = 111;
+const datasetRecordCount = baseCityCount + curatedLocationCount;
 
 console.log('--- Running CityDirectory Automated Test Suite ---');
 
@@ -16,20 +20,53 @@ console.log('\n[Test 1] Verifying cities10k.json payload...');
 assert(fs.existsSync(dataPath), 'cities10k.json must exist');
 const stats = fs.statSync(dataPath);
 const rawData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+const curatedData = JSON.parse(fs.readFileSync(curatedPath, 'utf8'));
 
 console.log(`  File size: ${stats.size} bytes (${(stats.size / 1024).toFixed(2)} KB)`);
-console.log(`  Total city records: ${rawData.length}`);
-assert.equal(rawData.length, 10000, 'cities10k.json must contain exactly 10,000 cities');
+console.log(`  Total records: ${rawData.length}`);
+assert.equal(rawData.length, datasetRecordCount, 'Dataset must contain 10,000 cities plus 111 curated locations');
+assert.equal(curatedData.length, curatedLocationCount, 'curated_locations.json must contain 111 locations');
+assert.deepEqual(rawData.slice(baseCityCount), curatedData, 'Curated locations must follow the original 10,000 city records');
 assert(Array.isArray(rawData[0]), 'First record must be an array');
 assert.equal(rawData[0].length, 4, 'Records must be 4-element arrays: [name, country, lat, lng]');
+assert.equal(rawData[baseCityCount][0], 'Longyearbyen', 'Curated locations must follow the original city records');
+
+const normalizeName = (value) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const baseNames = new Set(rawData.slice(0, baseCityCount).map((row) => normalizeName(row[0])));
+const curatedNames = new Set();
+for (const [name, , lat, lng] of curatedData) {
+  assert(!curatedNames.has(normalizeName(name)), `Duplicate curated location name: ${name}`);
+  assert(!baseNames.has(normalizeName(name)), `Curated location already exists in city list: ${name}`);
+  curatedNames.add(normalizeName(name));
+  assert(Number.isFinite(lat) && lat >= -90 && lat <= 90, `Invalid latitude for ${name}`);
+  assert(Number.isFinite(lng) && lng >= -180 && lng <= 180, `Invalid longitude for ${name}`);
+}
+
+const distanceKm = (a, b) => {
+  const radians = (degrees) => degrees * Math.PI / 180;
+  const lat1 = radians(a[2]);
+  const lat2 = radians(b[2]);
+  const dLat = lat2 - lat1;
+  const dLng = radians(b[3] - a[3]);
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6371.0088 * Math.asin(Math.sqrt(h));
+};
+let closestCuratedPair = Infinity;
+for (let i = 0; i < curatedData.length; i += 1) {
+  for (let j = i + 1; j < curatedData.length; j += 1) {
+    closestCuratedPair = Math.min(closestCuratedPair, distanceKm(curatedData[i], curatedData[j]));
+  }
+}
+assert(closestCuratedPair >= 20, `Curated locations must be at least 20 km apart; closest pair is ${closestCuratedPair.toFixed(2)} km`);
 console.log('✓ Payload file verified.');
 
 // 2. Directory Initialization & Load
 console.log('\n[Test 2] Initializing CityDirectory and loading dataset...');
 const directory = new CityDirectory();
 directory.load(rawData);
-assert.equal(directory.getAll().length, 10000, 'getAll() must return 10,000 records');
-console.log('✓ Directory successfully loaded 10,000 cities.');
+assert.equal(directory.getAll().length, datasetRecordCount, 'getAll() must return all city and curated location records');
+console.log('✓ Directory successfully loaded all records.');
 
 // 3. Search "Tokyo"
 console.log('\n[Test 3] Testing search("Tokyo")...');
@@ -43,6 +80,13 @@ assert.equal(topTokyo.id, 0);
 assert.equal(topTokyo.lat, 35.6839);
 assert.equal(topTokyo.lng, 139.7744);
 console.log('✓ Tokyo search verified with exact coordinates and highest population rank.');
+
+const longyearbyen = directory.search('Longyearbyen', 50)[0];
+assert.equal(longyearbyen?.id, baseCityCount, 'Curated locations must be searchable in the directory');
+assert.equal(longyearbyen.name, 'Longyearbyen');
+assert.equal(longyearbyen.country, 'Norway');
+const kilauea = directory.search('Kilauea', 50)[0];
+assert.equal(kilauea?.name, 'Kīlauea', 'Search should normalize accents in curated location names');
 
 // 4. Search "Paris"
 console.log('\n[Test 4] Testing search("Paris")...');
@@ -136,9 +180,11 @@ assert.equal(city0.id, 0);
 const cityLast = directory.getById(9999);
 assert(cityLast !== null);
 assert.equal(cityLast.id, 9999);
+assert.equal(directory.getById(10000).name, 'Longyearbyen');
+assert.equal(directory.getById(10110).name, 'Chavín de Huántar');
 
 assert.equal(directory.getById(-1), null);
-assert.equal(directory.getById(10000), null);
+assert.equal(directory.getById(10111), null);
 assert.equal(directory.getById('0'), null);
 assert.equal(directory.getById(null), null);
 console.log('✓ getById lookup and boundary checks verified.');
