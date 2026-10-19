@@ -16,7 +16,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
-import { createGlobeRenderer, encodeLut16, getRobinsonFragmentSource } from '../src/globe.js';
+import { createGlobeRenderer, encodeLut16, getRobinsonFragmentSource, selectPlaceDots } from '../src/globe.js';
 import { computeGeodesic } from '../src/geodesic.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -877,6 +877,41 @@ test('Robinson LUT decode in the shader reproduces the encoded latitude and half
   }
   assert.ok(worstLat < 0.01, `Latitude decode error ${worstLat.toFixed(4)} deg exceeds 0.01 deg`);
   assert.ok(worstHw < 1e-4, `Half-width decode error ${worstHw.toExponential(2)} exceeds 1e-4`);
+});
+
+test('City dots keep the top-N places by population inside the visible window', () => {
+  // 100 places on a 10 px grid, in population order. Identity projection.
+  const places = Array.from({ length: 100 }, (_, i) => ({ name: `P${i}`, x: (i % 10) * 40, y: Math.floor(i / 10) * 40 }));
+  const project = (p) => [p.x, p.y];
+  const rect = { x0: 0, x1: 1000, y0: 0, y1: 1000 };
+
+  const all = selectPlaceDots(places, project, rect, { limit: 20, minSpacing: 16 });
+  assert.equal(all.length, 20);
+  assert.deepEqual(all.map((d) => d.index), Array.from({ length: 20 }, (_, i) => i), 'Most populous places come first');
+
+  // Zooming into a region: only places inside the window count, still ranked.
+  const region = { x0: 200, x1: 360, y0: 200, y1: 360 };
+  const zoomed = selectPlaceDots(places, project, region, { limit: 20, minSpacing: 16 });
+  assert.ok(zoomed.length > 0 && zoomed.length <= 20);
+  assert.ok(zoomed.every((d) => d.x >= 200 && d.x <= 360 && d.y >= 200 && d.y <= 360));
+  assert.equal(zoomed[0].index, 55, 'First dot is the most populous place in view');
+
+  // Off-map places (project returns null) are skipped.
+  const hidden = selectPlaceDots(places, (p, i) => (i < 50 ? null : [p.x, p.y]), rect, { limit: 5 });
+  assert.deepEqual(hidden.map((d) => d.index), [50, 51, 52, 53, 54]);
+});
+
+test('City dots skip crowded places and places under the route pins', () => {
+  const places = [
+    { name: 'A', x: 100, y: 100 },
+    { name: 'A-suburb', x: 108, y: 100 },
+    { name: 'Origin', x: 300, y: 300 },
+    { name: 'B', x: 200, y: 100 }
+  ];
+  const dots = selectPlaceDots(places, (p) => [p.x, p.y], { x0: 0, x1: 500, y0: 0, y1: 500 }, {
+    limit: 20, minSpacing: 16, exclude: [[302, 300]]
+  });
+  assert.deepEqual(dots.map((d) => d.place.name), ['A', 'B']);
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);

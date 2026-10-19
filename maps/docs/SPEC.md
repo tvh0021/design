@@ -6,7 +6,7 @@ When planning or analyzing long-distance global travel, users often rely on flat
 
 ## Solution
 
-A responsive, high-performance, browser-native web application hosted on GitHub Pages that interactively renders an orthographic 3D Earth globe. Users can select an origin and destination from 10,000 global cities and 111 curated geographic and heritage locations through instant-search autocomplete dropdowns. The application immediately calculates the true spherical geodesic arc using 3D unit vectors, computes the spherical midpoint, smoothly slerp-rotates the globe so the midpoint faces the viewer, and displays travel telemetry (distance in km and miles, flight time, and prevailing jet-stream wind penalties). Users can also freely drag-rotate and zoom the globe with touch or mouse controls.
+A responsive, high-performance, browser-native web application hosted on GitHub Pages that interactively renders an orthographic 3D Earth globe. Users can select an origin and destination from 10,000 global cities and 109 curated geographic and heritage locations through instant-search autocomplete dropdowns. The application immediately calculates the true spherical geodesic arc using 3D unit vectors, computes the spherical midpoint, smoothly slerp-rotates the globe so the midpoint faces the viewer, and displays travel telemetry (distance in km and miles, flight time, and prevailing jet-stream wind penalties). Users can also freely drag-rotate and zoom the globe with touch or mouse controls.
 
 ## User Stories
 
@@ -28,6 +28,7 @@ A responsive, high-performance, browser-native web application hosted on GitHub 
 16. As an aviation enthusiast, I want antipodal routes to default to a trans-polar route over the North Pole, so that the path aligns with standard polar aviation navigation conventions.
 17. As a mobile user, I want the UI controls to collapse into an ergonomic drawer or bottom card, so that the interactive globe remains unencumbered on small screens.
 18. As a site owner, I want the application assets to be under 400 KB total, so that the page loads in under 1 second on GitHub Pages.
+19. As a user, I want small dots on the most populous cities in the current view (about 20 at a time, re-ranked as I pan and zoom), with each city's name shown when I hover over or tap a dot, so that I can orient myself at any zoom level.
 
 ## Implementation Decisions
 
@@ -35,7 +36,7 @@ The default route is Los Angeles, United States → London, United Kingdom.
 
 ### Architectural Decisions
 - **100% Client-Side Static App**: Vanilla ES modules + D3.js v7 (`d3-geo`, `topojson-client`). No Node runtime or backend server required. Hosted directly via GitHub Pages or embeddable in an `<iframe>`.
-- **Compact Search Dataset**: Keep the top 10,000 cities from `worldcities.csv` in population order, then append 111 curated geographic and heritage locations. Each entry uses `[name, country, lat, lng]`.
+- **Compact Search Dataset**: Keep the top 10,000 cities from `worldcities.csv` in population order, then append 109 curated geographic and heritage locations. The North and South Poles are excluded because routes ending at a pole render poorly in the Robinson projection. Each entry uses `[name, country, lat, lng]`.
 
 ### Mathematical & Algorithmic Contracts
 - **Spherical Coordinates**: Standard WGS84 spherical conversion:

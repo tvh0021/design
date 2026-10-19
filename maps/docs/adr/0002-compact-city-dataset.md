@@ -21,6 +21,6 @@ Pre-process `worldcities.csv` into the top 10,000 city records by population, th
 
 ## Consequences
 
-- **Positive**: The original 10,000 city records retain their population order, and 111 selected geographic and heritage locations are searchable in the same directory.
+- **Positive**: The original 10,000 city records retain their population order, and 109 selected geographic and heritage locations are searchable in the same directory.
 - **Negative**: Omits administrative subdivisions and raw population counts from the runtime display.
-- **Trade-off**: The runtime directory contains 10,111 records. The filename `cities10k.json` retains its original name for compatibility.
+- **Trade-off**: The runtime directory contains 10,109 records. The filename `cities10k.json` retains its original name for compatibility.

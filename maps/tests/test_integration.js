@@ -499,7 +499,7 @@ test('data assets cities10k.json and world-110m.json exist and are valid JSON', 
   const cities = JSON.parse(readFileSync(citiesPath, 'utf-8'));
   const world = JSON.parse(readFileSync(worldPath, 'utf-8'));
 
-  assert.equal(cities.length, 10111, 'cities10k.json must have 10,000 cities plus 111 curated locations');
+  assert.equal(cities.length, 10109, 'cities10k.json must have 10,000 cities plus 109 curated locations');
   assert.equal(world.type, 'Topology', 'world-110m.json must be a Topology');
 });
 

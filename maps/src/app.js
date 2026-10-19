@@ -111,6 +111,12 @@ export async function initApp(options = {}) {
       ...(options.globeOptions || {})
     });
 
+    // Population-ranked cities for the zoom-dependent city dots. Curated
+    // places (kind 'place') are not population-ranked, so they are left out.
+    if (typeof globe.setPlaces === 'function' && Array.isArray(directory.records)) {
+      globe.setPlaces(directory.records.filter((r) => r && r.kind === 'city'));
+    }
+
     let currentOrigin = initialOrigin;
     let currentDest = initialDest;
     let currentGeodesic = null;

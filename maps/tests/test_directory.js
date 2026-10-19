@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 const dataPath = path.resolve(__dirname, '../data/cities10k.json');
 const curatedPath = path.resolve(__dirname, '../data/curated_locations.json');
 const baseCityCount = 10000;
-const curatedLocationCount = 111;
+const curatedLocationCount = 109;
 const datasetRecordCount = baseCityCount + curatedLocationCount;
 
 console.log('--- Running CityDirectory Automated Test Suite ---');
@@ -24,8 +24,8 @@ const curatedData = JSON.parse(fs.readFileSync(curatedPath, 'utf8'));
 
 console.log(`  File size: ${stats.size} bytes (${(stats.size / 1024).toFixed(2)} KB)`);
 console.log(`  Total records: ${rawData.length}`);
-assert.equal(rawData.length, datasetRecordCount, 'Dataset must contain 10,000 cities plus 111 curated locations');
-assert.equal(curatedData.length, curatedLocationCount, 'curated_locations.json must contain 111 locations');
+assert.equal(rawData.length, datasetRecordCount, 'Dataset must contain 10,000 cities plus 109 curated locations');
+assert.equal(curatedData.length, curatedLocationCount, 'curated_locations.json must contain 109 locations');
 assert.deepEqual(rawData.slice(baseCityCount), curatedData, 'Curated locations must follow the original 10,000 city records');
 assert(Array.isArray(rawData[0]), 'First record must be an array');
 assert.equal(rawData[0].length, 4, 'Records must be 4-element arrays: [name, country, lat, lng]');
@@ -33,6 +33,11 @@ assert.equal(rawData[baseCityCount][0], 'Longyearbyen', 'Curated locations must 
 
 const normalizeName = (value) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 const baseNames = new Set(rawData.slice(0, baseCityCount).map((row) => normalizeName(row[0])));
+// The poles are excluded: routes ending at a pole render badly in Robinson.
+for (const [name, , lat] of curatedData) {
+  assert(Math.abs(lat) < 85, `Curated location ${name} is too close to a pole (lat ${lat})`);
+}
+
 const curatedNames = new Set();
 for (const [name, , lat, lng] of curatedData) {
   assert(!curatedNames.has(normalizeName(name)), `Duplicate curated location name: ${name}`);
@@ -235,10 +240,10 @@ const cityLast = directory.getById(9999);
 assert(cityLast !== null);
 assert.equal(cityLast.id, 9999);
 assert.equal(directory.getById(10000).name, 'Longyearbyen');
-assert.equal(directory.getById(10110).name, 'Chavín de Huántar');
+assert.equal(directory.getById(10108).name, 'Chavín de Huántar');
 
 assert.equal(directory.getById(-1), null);
-assert.equal(directory.getById(10111), null);
+assert.equal(directory.getById(10109), null);
 assert.equal(directory.getById('0'), null);
 assert.equal(directory.getById(null), null);
 console.log('✓ getById lookup and boundary checks verified.');

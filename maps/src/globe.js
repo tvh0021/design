@@ -64,6 +64,42 @@ function normalizeMidpoint(mid) {
 }
 
 /**
+ * Picks the population-ranked places to show as dots in the current view.
+ * places must be sorted by descending population. project(place, index)
+ * returns screen [x, y] or null when the place is off-map. A place is kept
+ * when it falls inside rect and sits at least minSpacing px from every dot
+ * already kept and from each point in exclude (route pins). Scanning stops
+ * once limit dots are found, so the result is the top-N visible places.
+ *
+ * @returns {Array<{place: object, index: number, x: number, y: number}>}
+ */
+export function selectPlaceDots(places, project, rect, { limit = 20, minSpacing = 16, exclude = [] } = {}) {
+  const dots = [];
+  if (!Array.isArray(places) || typeof project !== 'function' || !rect || limit <= 0) return dots;
+  const minSq = minSpacing * minSpacing;
+  for (let i = 0; i < places.length && dots.length < limit; i++) {
+    const pt = project(places[i], i);
+    if (!pt) continue;
+    const x = pt[0];
+    const y = pt[1];
+    if (!(x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1)) continue;
+    let crowded = false;
+    for (let j = 0; j < exclude.length && !crowded; j++) {
+      const dx = exclude[j][0] - x;
+      const dy = exclude[j][1] - y;
+      crowded = dx * dx + dy * dy < minSq;
+    }
+    for (let j = 0; j < dots.length && !crowded; j++) {
+      const dx = dots[j].x - x;
+      const dy = dots[j].y - y;
+      crowded = dx * dx + dy * dy < minSq;
+    }
+    if (!crowded) dots.push({ place: places[i], index: i, x, y });
+  }
+  return dots;
+}
+
+/**
  * Determines whether a given [lng, lat] coordinate is visible.
  * In orthographic mode, checks if it lies on the visible front hemisphere (angular distance <= 90°).
  * In Robinson mode, checks if it lies within latitude [-90, 90] and projected viewport bounds.
@@ -646,6 +682,9 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     // bright relief, so borders get a dark halo under a brighter line.
     terrainBorderHalo: 'rgba(5, 10, 24, 0.55)',
     terrainBorder: 'rgba(255, 244, 214, 0.85)',
+    placeDot: '#9ca3af',
+    placeDotOutline: 'rgba(8, 12, 28, 0.85)',
+    placeDotHover: '#e5e7eb',
     terrainCoast: 'rgba(5, 10, 24, 0.35)',
     graticule: 'rgba(255, 255, 255, 0.06)',
     haloOuter: 'rgba(6, 182, 212, 0.22)',
@@ -857,6 +896,15 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let currentRouteGeoJson = null;
   let currentMidpoint = null;
 
+  // Population-ranked city dots ("places"). placeVecs caches unit vectors so
+  // the orthographic view can cull the far side before projecting.
+  const placeDotLimit = options.placeDotLimit || 20;
+  const placeDotSpacing = options.placeDotSpacing || 22;
+  let placeList = [];
+  let placeVecs = null;
+  let placeDots = [];
+  let hoveredPlace = null;
+
   function orthographicTranslation() {
     const { left, right, top, bottom } = viewportInsets;
     return [(width + left - right) / 2, (height + top - bottom) * verticalCenterRatio];
@@ -1043,6 +1091,11 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.restore();
     }
 
+    // 5b. Population-ranked city dots for the current view
+    placeDots = computePlaceDots(activeProj);
+    if (hoveredPlace && !placeDots.some((d) => d.place === hoveredPlace)) hoveredPlace = null;
+    drawPlaceDots();
+
     // 6. Geodesic flight path line (with illuminated cyan glow)
     if (currentRouteGeoJson) {
       ctx.save();
@@ -1109,6 +1162,129 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
         }
       }
     }
+
+    // 9. Name label for the hovered / tapped city dot
+    const hoveredDot = hoveredPlace && placeDots.find((d) => d.place === hoveredPlace);
+    if (hoveredDot) {
+      const text = hoveredDot.place.country ? `${hoveredDot.place.name}, ${hoveredDot.place.country}` : hoveredDot.place.name;
+      drawLabelBadge(hoveredDot.x, hoveredDot.y, text, hoveredDot.x > width * 0.6 ? 'left' : 'right', 12);
+    }
+  }
+
+  function setPlaces(list) {
+    placeList = Array.isArray(list)
+      ? list.filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng) && p.name)
+      : [];
+    const toRad = Math.PI / 180;
+    placeVecs = new Float64Array(placeList.length * 3);
+    for (let i = 0; i < placeList.length; i++) {
+      const phi = placeList[i].lat * toRad;
+      const lam = placeList[i].lng * toRad;
+      placeVecs[i * 3] = Math.cos(phi) * Math.cos(lam);
+      placeVecs[i * 3 + 1] = Math.cos(phi) * Math.sin(lam);
+      placeVecs[i * 3 + 2] = Math.sin(phi);
+    }
+    hoveredPlace = null;
+    render();
+  }
+
+  // Visible screen area: the canvas minus the HUD insets.
+  function placeRect() {
+    const pad = 6;
+    return {
+      x0: viewportInsets.left + pad,
+      x1: width - viewportInsets.right - pad,
+      y0: viewportInsets.top + pad,
+      y1: height - viewportInsets.bottom - pad
+    };
+  }
+
+  function computePlaceDots(proj) {
+    if (!placeList.length || typeof proj !== 'function') return [];
+    const rect = placeRect();
+    if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) return [];
+    const toRad = Math.PI / 180;
+    let cull;
+
+    if (projectionType === 'robinson') {
+      // Projected y depends only on latitude, so the center column bounds the band.
+      const [tx] = proj.translate();
+      const latAt = (y, fallback) => {
+        const g = typeof proj.invert === 'function' ? proj.invert([tx, y]) : null;
+        return g && Number.isFinite(g[1]) && Math.abs(g[1]) <= 90 ? g[1] : fallback;
+      };
+      const latMax = latAt(rect.y0, 90) + 1;
+      const latMin = latAt(rect.y1, -90) - 1;
+      cull = (p) => p.lat > latMax || p.lat < latMin;
+    } else {
+      // Skip places farther from the view center than the farthest visible corner.
+      const rot = proj.rotate();
+      const [tx, ty] = proj.translate();
+      const k = proj.scale();
+      const phi0 = -rot[1] * toRad;
+      const lam0 = -rot[0] * toRad;
+      const c = [Math.cos(phi0) * Math.cos(lam0), Math.cos(phi0) * Math.sin(lam0), Math.sin(phi0)];
+      const d = Math.max(
+        Math.hypot(rect.x0 - tx, rect.y0 - ty), Math.hypot(rect.x1 - tx, rect.y0 - ty),
+        Math.hypot(rect.x0 - tx, rect.y1 - ty), Math.hypot(rect.x1 - tx, rect.y1 - ty)
+      );
+      // Floor at ~78 deg from center: cities squeezed onto the limb read as clutter.
+      const cosLimit = Math.max(0.2, d >= k ? 0 : Math.cos(Math.asin(d / k)) - 1e-4);
+      cull = (p, i) => (
+        c[0] * placeVecs[i * 3] + c[1] * placeVecs[i * 3 + 1] + c[2] * placeVecs[i * 3 + 2]
+      ) < cosLimit;
+    }
+
+    const exclude = [];
+    for (const city of [currentOrigin, currentDest]) {
+      const coord = city && getCityCoords(city);
+      if (coord && isCoordVisible(coord, proj, projectionType, width, height)) {
+        const pt = proj(coord);
+        if (pt && isFinite(pt[0]) && isFinite(pt[1])) exclude.push(pt);
+      }
+    }
+
+    return selectPlaceDots(placeList, (p, i) => {
+      if (cull(p, i)) return null;
+      const pt = proj([p.lng, p.lat]);
+      return pt && isFinite(pt[0]) && isFinite(pt[1]) ? pt : null;
+    }, rect, { limit: placeDotLimit, minSpacing: placeDotSpacing, exclude });
+  }
+
+  function drawPlaceDots() {
+    if (!placeDots.length) return;
+    ctx.save();
+    for (const dot of placeDots) {
+      const hovered = dot.place === hoveredPlace;
+      ctx.beginPath();
+      ctx.arc(dot.x, dot.y, hovered ? 8.4 : 5.6, 0, Math.PI * 2);
+      ctx.fillStyle = hovered ? palette.placeDotHover : palette.placeDot;
+      ctx.fill();
+      ctx.strokeStyle = palette.placeDotOutline;
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Nearest visible dot within radius px of a canvas point, or null.
+  function placeDotAt(x, y, radius) {
+    let best = null;
+    let bestSq = radius * radius;
+    for (const dot of placeDots) {
+      const dSq = (dot.x - x) * (dot.x - x) + (dot.y - y) * (dot.y - y);
+      if (dSq <= bestSq) {
+        best = dot;
+        bestSq = dSq;
+      }
+    }
+    return best;
+  }
+
+  function setHoveredPlace(place) {
+    if (place === hoveredPlace) return;
+    hoveredPlace = place;
+    render();
   }
 
   // Interpolated route coordinate at fraction t in [0, 1] along the sampled geodesic.
@@ -1236,41 +1412,45 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.lineWidth = 1.2;
     ctx.stroke();
 
-    if (name) {
-      ctx.font = '600 11px system-ui, -apple-system, sans-serif';
-      const textMetrics = ctx.measureText(name);
-      const textW = textMetrics.width;
-      const textH = 14;
-      const padX = 7;
-      const padY = 4;
-      const badgeW = textW + padX * 2;
-      const badgeH = textH + padY * 2;
+    ctx.restore();
+    if (name) drawLabelBadge(x, y, name, align, 10);
+  }
 
-      let badgeX;
-      if (align === 'left') {
-        badgeX = x - badgeW - 10;
-      } else {
-        badgeX = x + 10;
-      }
-      const badgeY = y - badgeH / 2;
+  function drawLabelBadge(x, y, name, align = 'right', offset = 10) {
+    ctx.save();
+    ctx.font = '600 11px system-ui, -apple-system, sans-serif';
+    const textMetrics = ctx.measureText(name);
+    const textW = textMetrics.width;
+    const textH = 14;
+    const padX = 7;
+    const padY = 4;
+    const badgeW = textW + padX * 2;
+    const badgeH = textH + padY * 2;
 
-      ctx.beginPath();
-      if (typeof ctx.roundRect === 'function') {
-        ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
-      } else {
-        ctx.rect(badgeX, badgeY, badgeW, badgeH);
-      }
-      ctx.fillStyle = palette.pinTextBg;
-      ctx.fill();
-      ctx.strokeStyle = palette.pinTextBorder;
-      ctx.lineWidth = 0.8;
-      ctx.stroke();
-
-      ctx.fillStyle = palette.pinText;
-      ctx.textBaseline = 'middle';
-      ctx.textAlign = 'left';
-      ctx.fillText(name, badgeX + padX, badgeY + badgeH / 2);
+    let badgeX;
+    if (align === 'left') {
+      badgeX = x - badgeW - offset;
+    } else {
+      badgeX = x + offset;
     }
+    const badgeY = y - badgeH / 2;
+
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+    } else {
+      ctx.rect(badgeX, badgeY, badgeW, badgeH);
+    }
+    ctx.fillStyle = palette.pinTextBg;
+    ctx.fill();
+    ctx.strokeStyle = palette.pinTextBorder;
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+
+    ctx.fillStyle = palette.pinText;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillText(name, badgeX + padX, badgeY + badgeH / 2);
     ctx.restore();
   }
 
@@ -1605,6 +1785,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let touchStartScale = 0;
 
   function onTouchStart(e) {
+    onTapStart(e);
     if (animFrameId) {
       cancelAnim(animFrameId);
       animFrameId = null;
@@ -1680,6 +1861,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   }
 
   function onTouchEnd(e) {
+    if (e.type !== 'touchcancel') onTapEnd(e);
     if (e.touches.length === 0) {
       isDragging = false;
       isPinching = false;
@@ -1715,7 +1897,48 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
   }
 
+  // City dot hover (desktop) and tap (touch) labels
+  function canvasPoint(clientX, clientY) {
+    const r = typeof canvas.getBoundingClientRect === 'function' ? canvas.getBoundingClientRect() : null;
+    return r ? [clientX - r.left, clientY - r.top] : [clientX, clientY];
+  }
+
+  function onHoverMove(e) {
+    if (isDragging || !placeDots.length) {
+      if (!isDragging && hoveredPlace) setHoveredPlace(null);
+      return;
+    }
+    const [x, y] = canvasPoint(e.clientX, e.clientY);
+    const dot = placeDotAt(x, y, 10);
+    canvas.style.cursor = dot ? 'pointer' : 'grab';
+    setHoveredPlace(dot ? dot.place : null);
+  }
+
+  function onHoverLeave() {
+    if (!isDragging) canvas.style.cursor = 'grab';
+    setHoveredPlace(null);
+  }
+
+  let tapStart = null;
+  function onTapStart(e) {
+    tapStart = e.touches && e.touches.length === 1
+      ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+  }
+
+  function onTapEnd(e) {
+    const t = e.changedTouches && e.changedTouches[0];
+    if (!tapStart || !t || (e.touches && e.touches.length > 0)) return;
+    const moved = Math.hypot(t.clientX - tapStart.x, t.clientY - tapStart.y);
+    tapStart = null;
+    if (moved > 8) return;
+    const [x, y] = canvasPoint(t.clientX, t.clientY);
+    const dot = placeDotAt(x, y, 16);
+    setHoveredPlace(dot ? dot.place : null);
+  }
+
   // Attach event listeners
+  canvas.addEventListener('mousemove', onHoverMove);
+  canvas.addEventListener('mouseleave', onHoverLeave);
   canvas.addEventListener('mousedown', onMouseDown);
   canvas.addEventListener('touchstart', onTouchStart, { passive: false });
   canvas.addEventListener('touchmove', onTouchMove, { passive: false });
@@ -1737,6 +1960,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     resizeObserver.observe(containerElement);
   }
 
+  if (Array.isArray(options.places)) setPlaces(options.places);
+
   // Initial draw
   render();
 
@@ -1747,6 +1972,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       animFrameId = null;
     }
 
+    canvas.removeEventListener('mousemove', onHoverMove);
+    canvas.removeEventListener('mouseleave', onHoverLeave);
     canvas.removeEventListener('mousedown', onMouseDown);
     canvas.removeEventListener('touchstart', onTouchStart);
     canvas.removeEventListener('touchmove', onTouchMove);
@@ -1788,6 +2015,9 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     destroy,
     render,
     setDetailTopology,
+    setPlaces,
+    getPlaceDots: () => placeDots.map((d) => ({ name: d.place.name, country: d.place.country, x: d.x, y: d.y })),
+    getHoveredPlace: () => (hoveredPlace ? { name: hoveredPlace.name, country: hoveredPlace.country } : null),
     getRotation: () => getActiveProjection().rotate().slice(),
     getScale: () => getActiveProjection().scale(),
     getProjection: () => getActiveProjection(),
