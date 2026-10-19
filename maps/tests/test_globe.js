@@ -16,7 +16,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
-import { createGlobeRenderer } from '../src/globe.js';
+import { createGlobeRenderer, encodeLut16, getRobinsonFragmentSource } from '../src/globe.js';
 import { computeGeodesic } from '../src/geodesic.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -124,6 +124,10 @@ function createMockCanvas(width = 800, height = 600) {
     rect: (x, y, w, h) => drawnElements.push({ type: 'rect', x, y, w, h }),
     roundRect: (x, y, w, h, r) => drawnElements.push({ type: 'roundRect', x, y, w, h, r }),
     setTransform: () => {},
+    translate: () => {},
+    closePath: () => {},
+    rotate: () => {},
+    scale: () => {},
     scale: () => {},
     measureText: (text) => ({ width: text.length * 7 }),
     fillText: (text, x, y) => drawnElements.push({ type: 'fillText', text, x, y }),
@@ -622,6 +626,89 @@ test("maps/data/etopo.jpg exists and is a valid JPEG binary", () => {
 });
 
 
+// 14a. Progressive 8k terrain texture: power-of-two 8192x4096 JPEG within an 8 MB budget
+test('etopo-8k.jpg exists, is an 8192x4096 JPEG and <= 8 MB', () => {
+  const p = resolve(__dirname, '../data/etopo-8k.jpg');
+  assert.ok(existsSync(p), 'etopo-8k.jpg must exist in maps/data/');
+  const buf = readFileSync(p);
+  assert.ok(buf.length <= 8 * 1024 * 1024, `etopo-8k.jpg must stay <= 8 MB, got ${buf.length}`);
+  assert.equal(buf[0], 0xFF);
+  assert.equal(buf[1], 0xD8);
+  // Walk JPEG markers to the SOF segment and read its dimensions.
+  let i = 2, dims = null;
+  while (i < buf.length - 9) {
+    if (buf[i] !== 0xFF) { i++; continue; }
+    const marker = buf[i + 1];
+    const len = buf.readUInt16BE(i + 2);
+    if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) || (marker >= 0xC9 && marker <= 0xCB)) {
+      dims = { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
+      break;
+    }
+    i += 2 + len;
+  }
+  assert.deepEqual(dims, { w: 8192, h: 4096 });
+});
+
+// 14b. Detail (50m) border asset integrity and payload budget
+test('world-50m.json detail asset exists, is valid TopoJSON and <= 350 KB', () => {
+  const assetPath = resolve(__dirname, '../data/world-50m.json');
+  assert.ok(existsSync(assetPath), 'Asset maps/data/world-50m.json must exist');
+  const fileBuffer = readFileSync(assetPath);
+  const fileSizeKB = fileBuffer.length / 1024;
+  assert.ok(fileSizeKB <= 350, `Detail asset size (${fileSizeKB.toFixed(1)} KB) must be <= 350 KB`);
+  const topo = JSON.parse(fileBuffer.toString('utf-8'));
+  assert.equal(topo.type, 'Topology');
+  assert.ok(topo.objects.countries && topo.objects.land, 'Detail topology must have countries and land');
+});
+
+// 14c. Detail topology is drawn on idle frames only; base topology during drag/animation
+test('setDetailTopology swaps to detail features when idle and back to base while dragging', () => {
+  const { canvas } = createMockCanvas();
+  const container = createMockContainer(canvas);
+  const drawn = [];
+  const mockD3 = createMockD3();
+  mockD3.geoPath = () => (obj) => { if (obj && obj.tag) drawn.push(obj.tag); };
+  const mockTopojson = {
+    feature: (topology, object) => ({ type: 'FeatureCollection', features: [], tag: topology.tag + ':land' }),
+    mesh: (topology) => ({ type: 'MultiLineString', coordinates: [], tag: topology.tag + ':borders' })
+  };
+  const baseTopo = { type: 'Topology', tag: 'base', objects: { land: {}, countries: {} } };
+  const detailTopo = { type: 'Topology', tag: 'detail', objects: { land: {}, countries: {} } };
+
+  const controller = createGlobeRenderer(container, baseTopo, {
+    canvas, d3: mockD3, topojson: mockTopojson, terrain: false
+  });
+  assert.equal(typeof controller.setDetailTopology, 'function');
+
+  drawn.length = 0;
+  controller.render();
+  assert.deepEqual(drawn, ['base:land', 'base:borders'], 'base features before detail is loaded');
+
+  drawn.length = 0;
+  controller.setDetailTopology(detailTopo);
+  assert.deepEqual(drawn, ['detail:land', 'detail:borders'], 'detail features drawn once idle');
+
+  // Simulate a mouse drag: interaction frames must use the base topology.
+  drawn.length = 0;
+  canvas.dispatchEvent({ type: 'mousedown', button: 0, clientX: 10, clientY: 10 });
+  controller.render();
+  assert.deepEqual(drawn, ['base:land', 'base:borders'], 'base features while dragging');
+  drawn.length = 0;
+  globalThis.window._dispatch('mouseup', {});
+  assert.deepEqual(drawn, ['detail:land', 'detail:borders'], 'detail frame drawn when the drag ends');
+
+  // Non-animated rotateTo leaves no animation running, so detail is used again.
+  drawn.length = 0;
+  controller.rotateTo(10, 10, false);
+  assert.ok(drawn.includes('detail:borders') || drawn.includes('base:borders'));
+
+  controller.setDetailTopology(null);
+  drawn.length = 0;
+  controller.render();
+  assert.deepEqual(drawn, ['base:land', 'base:borders'], 'clearing detail restores base');
+  controller.destroy();
+});
+
 // 15. Test Vertical Center Ratio & Projection Translate
 test("verticalCenterRatio adjusts projection translation for mobile viewports", () => {
   const { canvas } = createMockCanvas();
@@ -766,6 +853,30 @@ test('Viewport insets frame both projections and survive ratio changes and resiz
   controller.setRobinsonViewportInsets({ bottom: 400 });
   assert.deepEqual(controller.getProjection().translate(), [195, 222], 'Legacy alias must update both projections');
   controller.destroy();
+});
+
+test('Robinson LUT decode in the shader reproduces the encoded latitude and half-width', () => {
+  // Regression: the shader decoded hi/lo bytes as r + g/255, which read every
+  // latitude ~0.35-0.6 deg too far north, so terrain sat south of the borders.
+  const src = getRobinsonFragmentSource();
+  const latExpr = src.match(/float lat = \((.+)\) \* 2\.0 - 1\.0;/);
+  const hwExpr = src.match(/float hw = (.+);/);
+  assert.ok(latExpr && hwExpr, 'Shader must contain the lat and hw decode expressions');
+  const decLat = new Function('t', `return ${latExpr[1]};`);
+  const decHw = new Function('t', `return ${hwExpr[1]};`);
+  let worstLat = 0;
+  let worstHw = 0;
+  for (let lat = -90; lat <= 90; lat += 0.25) {
+    const [h, l] = encodeLut16(lat / 90 * 0.5 + 0.5);
+    const got = (decLat({ r: h / 255, g: l / 255 }) * 2 - 1) * 90;
+    worstLat = Math.max(worstLat, Math.abs(got - lat));
+  }
+  for (let v = 0; v <= 1; v += 0.001) {
+    const [h, l] = encodeLut16(v);
+    worstHw = Math.max(worstHw, Math.abs(decHw({ b: h / 255, a: l / 255 }) - v));
+  }
+  assert.ok(worstLat < 0.01, `Latitude decode error ${worstLat.toFixed(4)} deg exceeds 0.01 deg`);
+  assert.ok(worstHw < 1e-4, `Half-width decode error ${worstHw.toExponential(2)} exceeds 1e-4`);
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);

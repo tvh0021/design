@@ -31,6 +31,8 @@ export async function initApp(options = {}) {
   const fetchFn = options.fetch || (typeof window !== 'undefined' && window.fetch ? window.fetch.bind(window) : globalThis.fetch);
   const citiesUrl = options.citiesUrl || 'data/cities10k.json';
   const worldUrl = options.worldUrl || 'data/world-110m.json';
+  // Higher-detail borders, fetched after first paint and only drawn on idle frames.
+  const detailWorldUrl = options.detailWorldUrl === undefined ? 'data/world-50m.json' : options.detailWorldUrl;
 
   try {
     // 1. Load city directory and world topology concurrently
@@ -72,13 +74,13 @@ export async function initApp(options = {}) {
       if (matches.length > 0) initialOrigin = matches[0];
     }
     if (!initialOrigin) {
-      const singaporeMatches = directory.search('Singapore');
-      initialOrigin = singaporeMatches.length > 0 ? singaporeMatches[0] : {
-        id: 135,
-        name: 'Singapore',
-        country: 'Singapore',
-        lat: 1.3,
-        lng: 103.8
+      const losAngelesMatches = directory.search('Los Angeles');
+      initialOrigin = losAngelesMatches.length > 0 ? losAngelesMatches[0] : {
+        id: 27,
+        name: 'Los Angeles',
+        country: 'United States',
+        lat: 34.1139,
+        lng: -118.4068
       };
     }
 
@@ -88,13 +90,13 @@ export async function initApp(options = {}) {
       if (matches.length > 0) initialDest = matches[0];
     }
     if (!initialDest) {
-      const newYorkMatches = directory.search('New York');
-      initialDest = newYorkMatches.length > 0 ? newYorkMatches[0] : {
-        id: 12,
-        name: 'New York',
-        country: 'United States',
-        lat: 40.6943,
-        lng: -73.9249
+      const londonMatches = directory.search('London');
+      initialDest = londonMatches.length > 0 ? londonMatches[0] : {
+        id: 33,
+        name: 'London',
+        country: 'United Kingdom',
+        lat: 51.5072,
+        lng: -0.1275
       };
     }
 
@@ -113,6 +115,14 @@ export async function initApp(options = {}) {
     let currentDest = initialDest;
     let currentGeodesic = null;
     let isSwapping = false;
+
+    if (detailWorldUrl && typeof globe.setDetailTopology === 'function') {
+      Promise.resolve()
+        .then(() => fetchFn(detailWorldUrl))
+        .then((r) => (r && r.ok ? r.json() : null))
+        .then((topology) => { if (topology) globe.setDetailTopology(topology); })
+        .catch(() => { /* detail layer is optional; base topology stays in use */ });
+    }
 
     /**
      * Updates geodesic computation, telemetry card, and globe camera/path.

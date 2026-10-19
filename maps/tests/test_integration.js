@@ -14,7 +14,7 @@
  *    - Madrid -> Wellington (Antipodal pair ~180° separation)
  * 3. End-to-end application lifecycle via initApp:
  *    - Async data loading and CityDirectory indexation
- *    - Default initial route (Singapore -> New York)
+ *    - Default initial route (Los Angeles -> London)
  *    - Reactive origin/destination selection
  *    - 1-click Swap cities route reversal and wind telemetry update
  *    - Recenter globe camera trigger
@@ -325,6 +325,10 @@ class MockElement {
       rect: () => {},
       roundRect: () => {},
       setTransform: () => {},
+      translate: () => {},
+      closePath: () => {},
+      rotate: () => {},
+      scale: () => {},
       scale: () => {},
       measureText: (text) => ({ width: (text || '').length * 7 }),
       fillText: () => {},
@@ -667,7 +671,7 @@ function createMockAppEnvironment() {
   return { doc, globeContainer, hudContainer, loadingSplash, mockWindow };
 }
 
-await runAsyncTest('initApp initializes application, dismisses splash, and renders initial Singapore -> New York route', async () => {
+await runAsyncTest('initApp initializes application, dismisses splash, and renders initial Los Angeles -> London route', async () => {
   const { doc, globeContainer, hudContainer, loadingSplash, mockWindow } = createMockAppEnvironment();
   const mockD3 = createMockD3();
 
@@ -687,16 +691,16 @@ await runAsyncTest('initApp initializes application, dismisses splash, and rende
   assert.ok(app.globe, 'Globe renderer should be initialized');
   assert.ok(app.hud, 'FlightHUD should be initialized');
 
-  // Verify default initial iconic route is Singapore -> New York
+  // Verify default initial iconic route is Los Angeles -> London
   const origin = app.getOrigin();
   const dest = app.getDest();
-  assert.equal(origin?.name, 'Singapore');
-  assert.equal(dest?.name, 'New York');
+  assert.equal(origin?.name, 'Los Angeles');
+  assert.equal(dest?.name, 'London');
 
   // Verify geodesic calculation
   const geodesic = app.getGeodesic();
   assert.ok(geodesic, 'Geodesic calculation must be active');
-  assert.ok(geodesic.distanceKm > 15300 && geodesic.distanceKm < 15400, `Singapore->New York distance ~15,330 km, got ${geodesic.distanceKm}`);
+  assert.ok(geodesic.distanceKm > 8700 && geodesic.distanceKm < 8800, `Los Angeles->London distance ~8,760 km, got ${geodesic.distanceKm}`);
 
   // Verify loading splash dismissal
   assert.ok(loadingSplash.classList.contains('hidden'), 'Loading splash should have .hidden class applied');
@@ -706,30 +710,30 @@ await runAsyncTest('initApp initializes application, dismisses splash, and rende
   assert.equal(hudElements.distanceKm.textContent, `${Math.round(geodesic.distanceKm).toLocaleString('en-US')} km`);
   assert.equal(hudElements.distanceMiles.textContent, `${Math.round(geodesic.distanceMiles).toLocaleString('en-US')} mi`);
   assert.ok(hudElements.durationEffective.textContent.includes('h '), 'Effective duration must be displayed');
-  assert.ok(hudElements.originCoord.textContent.includes('1.30° N'), 'Origin coordinates must be displayed');
-  assert.ok(hudElements.destCoord.textContent.includes('40.69° N'), 'Destination coordinates must be displayed');
+  assert.ok(hudElements.originCoord.textContent.includes('34.11° N'), 'Origin coordinates must be displayed');
+  assert.ok(hudElements.destCoord.textContent.includes('51.51° N'), 'Destination coordinates must be displayed');
 
-  assert.equal(origin.lng, 103.8);
-  assert.equal(dest.country, 'United States');
-  assert.equal(dest.lng, -73.9249);
+  assert.equal(origin.lng, -118.4068);
+  assert.equal(dest.country, 'United Kingdom');
+  assert.equal(dest.lng, -0.1275);
   app.hud.originCombobox.clearBtn.dispatchEvent({ type: 'click' });
   assert.equal(app.getGeodesic(), geodesic, 'Clearing search text must preserve telemetry and route');
   assert.equal(app.getOrigin(), origin);
   app.hud.originCombobox.input.blur();
-  assert.equal(hudElements.originInput.value, 'Singapore, Singapore');
+  assert.equal(hudElements.originInput.value, 'Los Angeles, United States');
 
   // Verify swap button reverse action
   const { swapBtn } = hudElements;
   assert.ok(swapBtn, 'Swap button must exist');
   swapBtn.dispatchEvent({ type: 'click' });
 
-  // Route is now New York -> Singapore
-  assert.equal(app.getOrigin()?.name, 'New York');
-  assert.equal(app.getDest()?.name, 'Singapore');
+  // Route is now London -> Los Angeles
+  assert.equal(app.getOrigin()?.name, 'London');
+  assert.equal(app.getDest()?.name, 'Los Angeles');
 
   // Telemetry updates when the route is reversed
-  assert.ok(app.getGeodesic().prevailingWindAdjustmentHours < 0, 'Reversed route must have tailwind assistance');
-  assert.ok(hudElements.windBadge.textContent.includes('Tailwind'), 'HUD should display tailwind badge');
+  assert.ok(app.getGeodesic().prevailingWindAdjustmentHours > 0, 'Reversed westbound route must carry a headwind penalty');
+  assert.ok(hudElements.windBadge.textContent.includes('Headwind'), 'HUD should display headwind badge');
 
   // Verify Recenter button action
   let recentered = false;

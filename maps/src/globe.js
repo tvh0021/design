@@ -151,10 +151,90 @@ function cartesianToGeo(v) {
 }
 
 /**
+ * Robinson LUT values are 16-bit integers split over two 8-bit texture
+ * channels. The sampler returns each byte as byte/255, so the shader must
+ * rebuild (hi * 256 + lo) / 65535 as r * 65280/65535 + g * 255/65535.
+ */
+export const LUT16_HI_SCALE = 65280 / 65535;
+export const LUT16_LO_SCALE = 255 / 65535;
+const LUT16_HI_GLSL = LUT16_HI_SCALE.toFixed(10);
+const LUT16_LO_GLSL = LUT16_LO_SCALE.toFixed(10);
+
+/** Encodes a 0..1 value as [hi, lo] bytes. */
+export function encodeLut16(v01) {
+  const q = Math.max(0, Math.min(65535, Math.round(v01 * 65535)));
+  return [Math.floor(q / 256), q % 256];
+}
+
+/** Decodes sampler-normalized channels exactly as the Robinson shader does. */
+export function decodeLut16(hiNorm, loNorm) {
+  return hiNorm * Number(LUT16_HI_GLSL) + loNorm * Number(LUT16_LO_GLSL);
+}
+
+const ROBINSON_FS_BODY = `
+    varying vec2 v_uv;
+
+    uniform sampler2D u_texture;
+    uniform sampler2D u_lut;
+    uniform vec2 u_resolution;
+    uniform vec2 u_origin;     // screen position (device px) of (center lng, lat 0)
+    uniform float u_scale;     // projection scale in device px
+    uniform float u_centerLng; // radians
+    uniform float u_yMax;      // projected |y| at the poles for scale 1
+    uniform float u_xMax;      // projected x at lng 180, lat 0 for scale 1
+    uniform float u_lutSize;
+    uniform float u_loaded;
+
+    #define PI 3.141592653589793
+
+    vec2 decodeLut(float i) {
+      vec4 t = texture2D(u_lut, vec2((i + 0.5) / u_lutSize, 0.5));
+      // Each value is a 16-bit integer split hi/lo over two 8-bit channels.
+      float lat = (t.r * ${LUT16_HI_GLSL} + t.g * ${LUT16_LO_GLSL}) * 2.0 - 1.0; // normalized lat / 90
+      float hw = t.b * ${LUT16_HI_GLSL} + t.a * ${LUT16_LO_GLSL};                // half width / xMax
+      return vec2(lat, hw);
+    }
+
+    void main() {
+      if (u_loaded < 0.5) discard;
+      vec2 screenCoord = vec2(v_uv.x * u_resolution.x, (1.0 - v_uv.y) * u_resolution.y);
+      float rx = (screenCoord.x - u_origin.x) / u_scale;
+      float ry = (u_origin.y - screenCoord.y) / u_scale;
+
+      float ny = ry / u_yMax;               // -1 (south pole) .. 1 (north pole)
+      float edgeY = (u_yMax - abs(ry)) * u_scale;
+      if (edgeY < -1.0) discard;
+      float f = clamp(ny * 0.5 + 0.5, 0.0, 1.0) * (u_lutSize - 1.0);
+      float i0 = floor(f);
+      vec2 a = decodeLut(i0);
+      vec2 b = decodeLut(min(i0 + 1.0, u_lutSize - 1.0));
+      vec2 lh = mix(a, b, f - i0);
+      float phi = lh.x * PI * 0.5;
+      float hw = lh.y * u_xMax;
+
+      float edgeX = (hw - abs(rx)) * u_scale;
+      if (edgeX < -1.0) discard;
+      float lambda = clamp(rx / hw, -1.0, 1.0) * PI + u_centerLng;
+
+      float texU = fract(lambda / (2.0 * PI) + 0.5);
+      float texV = clamp(0.5 - phi / PI, 0.001, 0.999);
+      vec3 color = texture2D(u_texture, vec2(texU, texV)).rgb * 0.92;
+
+      float alpha = clamp(min(edgeX, edgeY) + 0.5, 0.0, 1.0);
+      gl_FragColor = vec4(color, alpha * 0.9);
+    }
+  `;
+
+/** Returns the Robinson fragment shader source (for tests). */
+export function getRobinsonFragmentSource() {
+  return ROBINSON_FS_BODY;
+}
+
+/**
  * WebGL Physical Terrain Layer
  * Raymarches NOAA ETOPO1 relief on a true sphere beneath vector borders.
  */
-function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUrl, onLoaded) {
+function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUrl, onLoaded, robinsonLut, hiResUrl) {
   if (typeof document === 'undefined') return null;
 
   const glCanvas = document.createElement('canvas');
@@ -188,8 +268,15 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     }
   `;
 
-  const fsSource = `
+  const precisionHeader = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    #else
     precision mediump float;
+    #endif
+  `;
+
+  const fsSource = precisionHeader + `
     varying vec2 v_uv;
 
     uniform sampler2D u_texture;
@@ -238,6 +325,12 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     }
   `;
 
+  // Robinson (pseudo-cylindrical) inverse mapping. Robinson has no closed-form
+  // inverse, so a lookup table built from d3's own projection (see
+  // buildRobinsonLut) maps normalized projected y -> (latitude, half-width at
+  // that latitude). The flat map is then just a texture lookup per pixel.
+  const fsRobinsonSource = precisionHeader + ROBINSON_FS_BODY;
+
   function createShader(type, src) {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, src);
@@ -249,15 +342,21 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     return shader;
   }
 
-  const vs = createShader(gl.VERTEX_SHADER, vsSource);
-  const fs = createShader(gl.FRAGMENT_SHADER, fsSource);
-  if (!vs || !fs) return null;
+  function createProgram(fsSrc) {
+    const vs = createShader(gl.VERTEX_SHADER, vsSource);
+    const fs = createShader(gl.FRAGMENT_SHADER, fsSrc);
+    if (!vs || !fs) return null;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+    return prog;
+  }
 
-  const program = gl.createProgram();
-  gl.attachShader(program, vs);
-  gl.attachShader(program, fs);
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+  const program = createProgram(fsSource);
+  if (!program) return null;
+  const robinsonProgram = robinsonLut ? createProgram(fsRobinsonSource) : null;
 
   gl.useProgram(program);
 
@@ -283,28 +382,99 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
   const uRotMat = gl.getUniformLocation(program, 'u_rotMatrix');
   const uLoaded = gl.getUniformLocation(program, 'u_loaded');
 
+  let rob = null;
+  let lutTexture = null;
+  if (robinsonProgram) {
+    const u = (name) => gl.getUniformLocation(robinsonProgram, name);
+    rob = {
+      posLoc: gl.getAttribLocation(robinsonProgram, 'a_position'),
+      uTexture: u('u_texture'), uLut: u('u_lut'), uRes: u('u_resolution'), uOrigin: u('u_origin'),
+      uScale: u('u_scale'), uCenterLng: u('u_centerLng'), uYMax: u('u_yMax'), uXMax: u('u_xMax'),
+      uLutSize: u('u_lutSize'), uLoaded: u('u_loaded')
+    };
+    lutTexture = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, lutTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, robinsonLut.size, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, robinsonLut.data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
   const texture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([13, 20, 36, 255]));
 
   let isLoaded = false;
-  const img = new Image();
-  img.crossOrigin = 'anonymous';
-  img.onload = () => {
+  let hiResActive = false;
+
+  function uploadTexture(img) {
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    // Mipmaps keep a high-resolution texture free of shimmer when the globe is
+    // zoomed out and many texels collapse into one screen pixel. WebGL1 requires
+    // power-of-two dimensions for mipmapping, so fall back to plain LINEAR otherwise.
+    const isPot = (n) => n > 0 && (n & (n - 1)) === 0;
+    if (isPot(img.width) && isPot(img.height)) {
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      const aniso = gl.getExtension('EXT_texture_filter_anisotropic')
+        || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
+      if (aniso) {
+        const maxAniso = gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) || 1;
+        gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(4, maxAniso));
+      }
+    } else {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  }
+
+  // Decode off the main thread where supported so the swap does not stall a frame.
+  function loadImage(url, onReady, onFail) {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const ready = typeof img.decode === 'function' ? img.decode().catch(() => {}) : Promise.resolve();
+      ready.then(() => onReady(img));
+    };
+    img.onerror = () => { if (onFail) onFail(); };
+    img.src = url;
+  }
+
+  // The high-res texture is a progressive upgrade: only fetched once the base
+  // texture is showing, and only on GPUs that can hold it. Devices that report
+  // low memory (Chrome's navigator.deviceMemory) keep the base texture.
+  function canUseHiRes() {
+    if (!hiResUrl) return false;
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
+    if (maxTex < 8192) return false;
+    const mem = typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined;
+    if (typeof mem === 'number' && mem < 4) return false;
+    return true;
+  }
+
+  loadImage(textureUrl, (img) => {
+    if (hiResActive) return;
+    uploadTexture(img);
     isLoaded = true;
     if (typeof onLoaded === 'function') onLoaded();
-  };
-  img.onerror = () => {
+    if (canUseHiRes()) {
+      loadImage(hiResUrl, (hi) => {
+        uploadTexture(hi);
+        hiResActive = true;
+        if (typeof onLoaded === 'function') onLoaded();
+      });
+    }
+  }, () => {
     isLoaded = false;
-  };
-  img.src = textureUrl;
+  });
 
   function resize(newW, newH, newDpr) {
     glCanvas.width = Math.round(newW * newDpr);
@@ -352,6 +522,11 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.useProgram(program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.uniform2f(uRes, w * currentDpr, h * currentDpr);
     gl.uniform2f(uCenter, cx * currentDpr, cy * currentDpr);
     gl.uniform1f(uRadius, r * currentDpr);
@@ -361,6 +536,39 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     gl.uniformMatrix3fv(uRotMat, false, rotMat);
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  /**
+   * Flat Robinson terrain. originX/originY: screen px of (centerLng, 0);
+   * scale: projection scale in CSS px; centerLng in degrees.
+   */
+  function renderRobinson(w, h, currentDpr, originX, originY, scale, centerLngDeg) {
+    if (!isLoaded || !rob) return false;
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(robinsonProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.enableVertexAttribArray(rob.posLoc);
+    gl.vertexAttribPointer(rob.posLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, lutTexture);
+    gl.uniform1i(rob.uTexture, 0);
+    gl.uniform1i(rob.uLut, 1);
+    gl.uniform2f(rob.uRes, w * currentDpr, h * currentDpr);
+    gl.uniform2f(rob.uOrigin, originX * currentDpr, originY * currentDpr);
+    gl.uniform1f(rob.uScale, scale * currentDpr);
+    gl.uniform1f(rob.uCenterLng, centerLngDeg * Math.PI / 180);
+    gl.uniform1f(rob.uYMax, robinsonLut.yMax);
+    gl.uniform1f(rob.uXMax, robinsonLut.xMax);
+    gl.uniform1f(rob.uLutSize, robinsonLut.size);
+    gl.uniform1f(rob.uLoaded, 1.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.activeTexture(gl.TEXTURE0);
+    return true;
   }
 
   function destroy() {
@@ -373,9 +581,41 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     glCanvas,
     resize,
     render,
+    renderRobinson,
+    hasRobinson: () => !!rob,
     destroy,
-    isLoaded: () => isLoaded
+    isLoaded: () => isLoaded,
+    isHiRes: () => hiResActive
   };
+}
+
+/**
+ * Builds the Robinson inverse lookup table from d3's projection so the WebGL
+ * overlay lines up exactly with the vector layers drawn by d3.geoPath.
+ * Entry i covers normalized projected y from -1 (south pole) to +1 (north pole)
+ * and stores latitude/90 and the half-width (x at lng 180) relative to xMax,
+ * each as a 16-bit value split over two bytes.
+ */
+function buildRobinsonLut(d3, size = 512) {
+  if (!d3 || typeof d3.geoRobinson !== 'function') return null;
+  const unit = d3.geoRobinson().scale(1).translate([0, 0]).rotate([0, 0, 0]).center([0, 0]);
+  if (typeof unit.invert !== 'function') return null;
+  const xMax = unit([180, 0])[0];
+  const yMax = -unit([0, 90])[1];
+  if (!(xMax > 0) || !(yMax > 0)) return null;
+  const data = new Uint8Array(size * 4);
+  const enc16 = encodeLut16;
+  for (let i = 0; i < size; i++) {
+    const ny = (i / (size - 1)) * 2 - 1;
+    const sy = -ny * yMax * 0.99999; // screen y (down) for this projected y
+    const inv = unit.invert([0, sy]);
+    const lat = inv && Number.isFinite(inv[1]) ? Math.max(-90, Math.min(90, inv[1])) : (ny < 0 ? -90 : 90);
+    const hw = unit([180, lat])[0];
+    const [l0, l1] = enc16(lat / 90 * 0.5 + 0.5);
+    const [h0, h1] = enc16(Math.max(0, Math.min(1, hw / xMax)));
+    data[i * 4] = l0; data[i * 4 + 1] = l1; data[i * 4 + 2] = h0; data[i * 4 + 3] = h1;
+  }
+  return { size, data, xMax, yMax };
 }
 
 /**
@@ -402,19 +642,29 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     land: '#1e293b',
     landStroke: 'rgba(255, 255, 255, 0.12)',
     countryBorder: 'rgba(255, 255, 255, 0.28)',
+    // Over the terrain texture a faint white line vanishes against snow/ice and
+    // bright relief, so borders get a dark halo under a brighter line.
+    terrainBorderHalo: 'rgba(5, 10, 24, 0.55)',
+    terrainBorder: 'rgba(255, 244, 214, 0.85)',
+    terrainCoast: 'rgba(5, 10, 24, 0.35)',
     graticule: 'rgba(255, 255, 255, 0.06)',
     haloOuter: 'rgba(6, 182, 212, 0.22)',
     haloMid: 'rgba(6, 182, 212, 0.08)',
     haloBorder: 'rgba(6, 182, 212, 0.45)',
-    geodesic: '#06b6d4',
-    geodesicGlow: 'rgba(6, 182, 212, 0.35)',
-    geodesicInnerGlow: 'rgba(6, 182, 212, 0.70)',
+    // Periwinkle route: reads clearly over ocean blues and vegetated land without going neon.
+    geodesic: '#8f7bff',
+    geodesicGlow: 'rgba(143, 123, 255, 0.35)',
+    geodesicInnerGlow: 'rgba(143, 123, 255, 0.70)',
     origin: '#f59e0b',
     originAura: 'rgba(245, 158, 11, 0.35)',
-    dest: '#10b981',
-    destAura: 'rgba(16, 185, 129, 0.35)',
+    // Rose destination: emerald vanished against vegetated land.
+    dest: '#fb4a5c',
+    destAura: 'rgba(251, 74, 92, 0.38)',
     midpoint: '#38bdf8',
     midpointAura: 'rgba(56, 189, 248, 0.35)',
+    plane: '#ffffff',
+    planeOutline: 'rgba(8, 12, 28, 0.85)',
+    planeAura: 'rgba(143, 123, 255, 0.28)',
     pinTextBg: 'rgba(7, 10, 19, 0.88)',
     pinTextBorder: 'rgba(255, 255, 255, 0.22)',
     pinText: '#f8fafc',
@@ -460,34 +710,60 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   const ctx = canvas.getContext ? canvas.getContext('2d') : null;
 
-  // Extract Landmass & Sovereign Country Borders from TopoJSON
-  let landFeature = null;
-  let countryBordersFeature = null;
-
-  if (worldTopology && topojson && typeof topojson.feature === 'function') {
-    if (worldTopology.objects) {
-      if (worldTopology.objects.land) {
-        landFeature = topojson.feature(worldTopology, worldTopology.objects.land);
-      }
-      if (worldTopology.objects.countries) {
-        if (!landFeature) {
-          landFeature = topojson.feature(worldTopology, worldTopology.objects.countries);
+  // Extract Landmass & Sovereign Country Borders from TopoJSON (or GeoJSON)
+  function extractFeatures(topology) {
+    let land = null;
+    let borders = null;
+    if (topology && topojson && typeof topojson.feature === 'function') {
+      if (topology.objects) {
+        if (topology.objects.land) {
+          land = topojson.feature(topology, topology.objects.land);
         }
-        try {
-          if (typeof topojson.mesh === 'function') {
-            countryBordersFeature = topojson.mesh(
-              worldTopology,
-              worldTopology.objects.countries,
-              (a, b) => a !== b
-            );
+        if (topology.objects.countries) {
+          if (!land) {
+            land = topojson.feature(topology, topology.objects.countries);
           }
-        } catch (e) {
-          countryBordersFeature = null;
+          try {
+            if (typeof topojson.mesh === 'function') {
+              borders = topojson.mesh(
+                topology,
+                topology.objects.countries,
+                (a, b) => a !== b
+              );
+            }
+          } catch (e) {
+            borders = null;
+          }
         }
+      } else if (topology.type === 'FeatureCollection' || topology.type === 'Feature') {
+        land = topology;
       }
-    } else if (worldTopology.type === 'FeatureCollection' || worldTopology.type === 'Feature') {
-      landFeature = worldTopology;
     }
+    return { land, borders };
+  }
+
+  // Two levels of detail: the base (light, e.g. 110m) topology is always used while
+  // the globe is being dragged or animated so interaction stays smooth; an optional
+  // detail (e.g. simplified 50m) topology is drawn for idle frames only.
+  const baseFeatures = extractFeatures(worldTopology);
+  let detailFeatures = null;
+  let landFeature = baseFeatures.land;
+  let countryBordersFeature = baseFeatures.borders;
+
+  function setDetailTopology(topology) {
+    const extracted = topology ? extractFeatures(topology) : { land: null, borders: null };
+    detailFeatures = extracted.land || extracted.borders ? extracted : null;
+    render();
+  }
+
+  function selectDetailLevel() {
+    const interacting = isDragging || isPinching || animFrameId !== null;
+    const useDetail = !!detailFeatures && !interacting;
+    landFeature = useDetail ? (detailFeatures.land || baseFeatures.land) : baseFeatures.land;
+    countryBordersFeature = useDetail
+      ? (detailFeatures.borders || baseFeatures.borders)
+      : baseFeatures.borders;
+    return useDetail;
   }
 
   // Pre-generate graticule (parallels and meridians)
@@ -556,14 +832,23 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   // Initialize WebGL ETOPO terrain layer if enabled
   const terrainEnabled = options.terrain !== false;
   const terrainUrl = options.terrainTextureUrl || 'data/etopo.jpg';
+  // Progressive 8k upgrade; pass terrainHiResUrl: null to disable.
+  const terrainHiResUrl = options.terrainHiResUrl === undefined ? 'data/etopo-8k.jpg' : options.terrainHiResUrl;
   let webglTerrain = null;
 
   if (terrainEnabled) {
     const initDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+    let robinsonLut = null;
+    try { robinsonLut = buildRobinsonLut(d3); } catch (e) { robinsonLut = null; }
     webglTerrain = initWebGLTerrain(containerElement, canvas, width, height, initDpr, terrainUrl, () => {
       render();
-    });
+    }, robinsonLut, terrainHiResUrl);
   }
+
+  // Interaction/animation state (read by render() to pick the detail level)
+  let isDragging = false;
+  let isPinching = false;
+  let animFrameId = null;
 
   // Application state
   let currentGeodesic = null;
@@ -643,6 +928,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   // Rendering routines
   function render() {
     if (!ctx) return;
+    selectDetailLevel();
     const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
     const activeProj = getActiveProjection();
     const path = d3.geoPath(activeProj, ctx);
@@ -652,10 +938,18 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     const r = activeProj.scale();
     const rot = activeProj.rotate();
 
-    // Render WebGL physical terrain sphere only in orthographic mode
-    const hasTerrain = !isRobinson && webglTerrain && webglTerrain.isLoaded();
-    if (hasTerrain) {
-      webglTerrain.render(width, height, dpr, cx, cy, r, rot);
+    // Render WebGL terrain: raymarched sphere (orthographic) or flat inverse-mapped map (Robinson)
+    let hasTerrain = false;
+    if (webglTerrain && webglTerrain.isLoaded()) {
+      if (isRobinson) {
+        const origin = robinsonProj([robinsonCenterLng, 0]);
+        if (origin && Number.isFinite(origin[0]) && Number.isFinite(origin[1])) {
+          hasTerrain = webglTerrain.renderRobinson(width, height, dpr, origin[0], origin[1], r, robinsonCenterLng);
+        }
+      } else {
+        webglTerrain.render(width, height, dpr, cx, cy, r, rot);
+        hasTerrain = true;
+      }
     }
 
     ctx.clearRect(0, 0, width, height);
@@ -665,8 +959,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.save();
       ctx.beginPath();
       path({ type: 'Sphere' });
-      ctx.fillStyle = palette.ocean;
-      ctx.fill();
+      if (!hasTerrain) {
+        ctx.fillStyle = palette.ocean;
+        ctx.fill();
+      }
       ctx.lineWidth = 1.4;
       ctx.strokeStyle = palette.haloBorder;
       ctx.stroke();
@@ -720,7 +1016,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
         ctx.fillStyle = palette.land;
         ctx.fill();
       }
-      ctx.strokeStyle = palette.landStroke;
+      ctx.strokeStyle = hasTerrain ? palette.terrainCoast : palette.landStroke;
       ctx.lineWidth = 0.85;
       ctx.stroke();
       ctx.restore();
@@ -731,9 +1027,19 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.save();
       ctx.beginPath();
       path(countryBordersFeature);
-      ctx.strokeStyle = palette.countryBorder;
-      ctx.lineWidth = 0.75;
-      ctx.stroke();
+      ctx.lineJoin = 'round';
+      if (hasTerrain) {
+        ctx.strokeStyle = palette.terrainBorderHalo;
+        ctx.lineWidth = 2.4;
+        ctx.stroke();
+        ctx.strokeStyle = palette.terrainBorder;
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = palette.countryBorder;
+        ctx.lineWidth = 0.75;
+        ctx.stroke();
+      }
       ctx.restore();
     }
 
@@ -765,13 +1071,18 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.restore();
     }
 
-    // 7. Spherical midpoint marker
+    // 7. Aircraft marker at the spherical midpoint, nose pointing along the route
     if (currentMidpoint) {
       const midCoord = [currentMidpoint.lng, currentMidpoint.lat];
       if (isCoordVisible(midCoord, activeProj, projectionType, width, height)) {
         const pt = activeProj(midCoord);
         if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
-          drawMidpointMarker(pt[0], pt[1]);
+          const heading = routeHeadingAt(0.5, activeProj);
+          if (heading === null) {
+            drawMidpointMarker(pt[0], pt[1]);
+          } else {
+            drawPlaneMarker(pt[0], pt[1], heading);
+          }
         }
       }
     }
@@ -800,7 +1111,87 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
   }
 
-  // Draw spherical midpoint marker
+  // Interpolated route coordinate at fraction t in [0, 1] along the sampled geodesic.
+  function routePointAt(t) {
+    const coords = currentRouteGeoJson && currentRouteGeoJson.coordinates;
+    if (!coords || coords.length < 2) return null;
+    const f = Math.max(0, Math.min(1, t)) * (coords.length - 1);
+    const i = Math.min(coords.length - 2, Math.floor(f));
+    const u = f - i;
+    const a = coords[i];
+    const b = coords[i + 1];
+    let dLng = b[0] - a[0];
+    if (dLng > 180) dLng -= 360;
+    if (dLng < -180) dLng += 360;
+    return [a[0] + dLng * u, a[1] + (b[1] - a[1]) * u];
+  }
+
+  // Screen-space heading (radians, canvas orientation) of travel at fraction t.
+  // Returns null when either neighbour sample is off-globe or unprojectable.
+  function routeHeadingAt(t, proj) {
+    const eps = 0.01;
+    const before = routePointAt(t - eps);
+    const after = routePointAt(t + eps);
+    if (!before || !after) return null;
+    if (!isCoordVisible(before, proj, projectionType, width, height)) return null;
+    if (!isCoordVisible(after, proj, projectionType, width, height)) return null;
+    const p0 = proj(before);
+    const p1 = proj(after);
+    if (!p0 || !p1 || !isFinite(p0[0]) || !isFinite(p0[1]) || !isFinite(p1[0]) || !isFinite(p1[1])) return null;
+    const dx = p1[0] - p0[0];
+    const dy = p1[1] - p0[1];
+    if (Math.hypot(dx, dy) < 1e-6) return null;
+    return Math.atan2(dy, dx);
+  }
+
+  // Top-down airliner silhouette, nose along +x before rotation by heading.
+  function drawPlaneMarker(x, y, heading) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(heading);
+    const s = 1.15;
+    ctx.scale(s, s);
+
+    ctx.beginPath();
+    ctx.arc(0, 0, 11, 0, Math.PI * 2);
+    ctx.fillStyle = palette.planeAura;
+    ctx.fill();
+
+    ctx.beginPath();
+    // Nose
+    ctx.moveTo(10, 0);
+    ctx.lineTo(7.5, -1.4);
+    // Right wing (screen-down side)
+    ctx.lineTo(2.2, -1.4);
+    ctx.lineTo(-2.5, -8.5);
+    ctx.lineTo(-5, -8.5);
+    ctx.lineTo(-3, -1.4);
+    // Fuselage to tail
+    ctx.lineTo(-7.2, -1.1);
+    ctx.lineTo(-9.5, -4.2);
+    ctx.lineTo(-11, -4.2);
+    ctx.lineTo(-10.2, -0.9);
+    ctx.lineTo(-10.2, 0.9);
+    ctx.lineTo(-11, 4.2);
+    ctx.lineTo(-9.5, 4.2);
+    ctx.lineTo(-7.2, 1.1);
+    // Left wing
+    ctx.lineTo(-3, 1.4);
+    ctx.lineTo(-5, 8.5);
+    ctx.lineTo(-2.5, 8.5);
+    ctx.lineTo(2.2, 1.4);
+    ctx.lineTo(7.5, 1.4);
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = palette.planeOutline;
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+    ctx.fillStyle = palette.plane;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Draw spherical midpoint marker (fallback when the heading cannot be resolved)
   function drawMidpointMarker(x, y) {
     ctx.save();
     ctx.beginPath();
@@ -884,7 +1275,6 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   }
 
   // Animation controller
-  let animFrameId = null;
   const requestAnim = typeof requestAnimationFrame !== 'undefined'
     ? requestAnimationFrame
     : (cb) => setTimeout(cb, 16);
@@ -1019,7 +1409,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
     if (projectionType === 'robinson') {
       if (webglTerrain && webglTerrain.glCanvas) {
-        webglTerrain.glCanvas.style.display = 'none';
+        webglTerrain.glCanvas.style.display = webglTerrain.hasRobinson() ? 'block' : 'none';
       }
       if (robinsonProj && currentMidpoint) {
         centerRobinsonOnRoute();
@@ -1141,7 +1531,6 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   }
 
   // Interactivity: Drag to rotate (Orthographic) or pan (Robinson)
-  let isDragging = false;
   let dragStartX = 0;
   let dragStartY = 0;
   let dragStartRot = [0, 0, 0];
@@ -1206,10 +1595,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     }
+    if (detailFeatures) render();
   }
 
   // Interactivity: Touch drag & Pinch zoom
-  let isPinching = false;
   let touchStartX = 0;
   let touchStartY = 0;
   let touchStartDist = 0;
@@ -1295,6 +1684,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       isDragging = false;
       isPinching = false;
       touchStartDist = 0;
+      if (detailFeatures) render();
     } else if (e.touches.length === 1) {
       isPinching = false;
       isDragging = true;
@@ -1397,6 +1787,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     getVerticalCenterRatio: () => verticalCenterRatio,
     destroy,
     render,
+    setDetailTopology,
     getRotation: () => getActiveProjection().rotate().slice(),
     getScale: () => getActiveProjection().scale(),
     getProjection: () => getActiveProjection(),

@@ -31,7 +31,7 @@ A responsive, high-performance, browser-native web application hosted on GitHub 
 
 ## Implementation Decisions
 
-The default route is Singapore, Singapore → New York, United States.
+The default route is Los Angeles, United States → London, United Kingdom.
 
 ### Architectural Decisions
 - **100% Client-Side Static App**: Vanilla ES modules + D3.js v7 (`d3-geo`, `topojson-client`). No Node runtime or backend server required. Hosted directly via GitHub Pages or embeddable in an `<iframe>`.
@@ -79,4 +79,4 @@ The default route is Singapore, Singapore → New York, United States.
 
 ## Further Notes
 
-- The resulting application directory in `maps/` should include `index.html`, `app.js`, `geodesic.js`, `directory.js`, `style.css`, and the bundled dataset `cities10k.json` plus `world-110m.json`.
+- The resulting application directory in `maps/` should include `index.html`, `app.js`, `geodesic.js`, `directory.js`, `style.css`, and the bundled dataset `cities10k.json` plus `world-110m.json` (base borders, always used while dragging) and `world-50m.json` (simplified 50m borders, drawn on idle frames only), the 4096x2048 `etopo.jpg` base terrain texture, and the 8192x4096 `etopo-8k.jpg` texture that replaces it after first paint on GPUs whose MAX_TEXTURE_SIZE is at least 8192.
