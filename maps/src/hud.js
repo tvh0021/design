@@ -129,6 +129,7 @@ function normalizeCityRecord(city) {
   if (typeof city === 'object' && !Array.isArray(city)) {
     return {
       id: city.id ?? null,
+      kind: city.kind || 'city',
       name: city.name || '',
       country: city.country || '',
       lat: typeof city.lat === 'number' ? city.lat : 0,
@@ -138,6 +139,7 @@ function normalizeCityRecord(city) {
   if (Array.isArray(city) && city.length >= 4) {
     return {
       id: null,
+      kind: city[4] || 'city',
       name: city[0] || '',
       country: city[1] || '',
       lat: typeof city[2] === 'number' ? city[2] : 0,
@@ -200,10 +202,10 @@ export class FlightHUD {
 
     // Set initial values if provided
     if (this.originCity) {
-      this.originCombobox.setValue(`${this.originCity.name}, ${this.originCity.country}`);
+      this.originCombobox.setSelectedCity(this.originCity);
     }
     if (this.destCity) {
-      this.destCombobox.setValue(`${this.destCity.name}, ${this.destCity.country}`);
+      this.destCombobox.setSelectedCity(this.destCity);
     }
   }
 
@@ -404,7 +406,7 @@ export class FlightHUD {
 
     this.originCombobox = this._createCombobox({
       id: 'hud-origin-input',
-      placeholder: 'Search origin (e.g. Paris, Tokyo, New York)...',
+      placeholder: 'Search origin (e.g. Singapore, London)...',
       ariaLabel: 'Search origin city',
       onSelect: (city) => {
         this.originCity = city;
@@ -452,7 +454,7 @@ export class FlightHUD {
 
     this.destCombobox = this._createCombobox({
       id: 'hud-dest-input',
-      placeholder: 'Search destination (e.g. San Francisco, London)...',
+      placeholder: 'Search destination (e.g. New York, London)...',
       ariaLabel: 'Search destination city',
       onSelect: (city) => {
         this.destCity = city;
@@ -500,7 +502,7 @@ export class FlightHUD {
 
         <!-- Duration Metric -->
         <div class="telemetry-metric-block metric-duration">
-          <div class="metric-label">FLIGHT DURATION <span class="metric-sublabel">@ 870 km/h</span></div>
+          <div class="metric-label">FLIGHT TIME</div>
           <div class="metric-value-primary" data-telemetry="duration-effective">—</div>
           <div class="metric-value-secondary" data-telemetry="duration-nominal">—</div>
         </div>
@@ -604,11 +606,10 @@ export class FlightHUD {
     let selectedCity = null;
     let debounceTimer = null;
     const minQueryLength = 2;
-    const searchResultLimit = 50;
+    const searchResultLimit = 10;
     const searchDebounceMs = 100;
 
     const openDropdown = () => {
-      if (results.length === 0) return;
       isOpen = true;
       dropdown.style.display = 'block';
       input.setAttribute('aria-expanded', 'true');
@@ -640,7 +641,13 @@ export class FlightHUD {
     const renderResults = () => {
       dropdown.innerHTML = '';
       if (results.length === 0) {
-        closeDropdown();
+        const hint = doc.createElement('li');
+        hint.className = 'combobox-empty';
+        hint.setAttribute('role', 'presentation');
+        hint.textContent = input.value.trim().length === 1 ? 'Type one more letter…' : 'No matches';
+        dropdown.appendChild(hint);
+        activeIndex = -1;
+        openDropdown();
         return;
       }
 
@@ -659,13 +666,17 @@ export class FlightHUD {
         countrySpan.className = 'option-country-tag';
         countrySpan.textContent = city.country;
 
-        const popSpan = doc.createElement('span');
-        popSpan.className = 'option-coord-hint';
-        popSpan.textContent = city.population ? Number(city.population).toLocaleString() : '';
-
-        li.appendChild(nameSpan);
-        li.appendChild(countrySpan);
-        li.appendChild(popSpan);
+        const textRow = doc.createElement('div');
+        textRow.className = 'option-text-row';
+        textRow.appendChild(nameSpan);
+        if (city.kind === 'place') {
+          const chip = doc.createElement('span');
+          chip.className = 'option-place-chip';
+          chip.textContent = 'place';
+          textRow.appendChild(chip);
+        }
+        textRow.appendChild(countrySpan);
+        li.appendChild(textRow);
 
         li.addEventListener('mousedown', (e) => {
           if (e.preventDefault) e.preventDefault();
@@ -700,11 +711,14 @@ export class FlightHUD {
 
     const scheduleSearch = (query) => {
       if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = null;
+      results = [];
+      closeDropdown();
 
       const q = (query || '').trim();
       if (q.length < minQueryLength) {
-        results = [];
-        closeDropdown();
+        dropdown.innerHTML = '';
+        if (q.length === 1) renderResults();
         return;
       }
 
@@ -715,11 +729,14 @@ export class FlightHUD {
     };
 
     const selectCity = (city) => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = null;
       selectedCity = city;
       input.value = `${city.name}, ${city.country}`;
       clearBtn.style.display = 'block';
       closeDropdown();
       config.onSelect(city);
+      input.blur();
     };
 
     // Input handlers
@@ -729,25 +746,25 @@ export class FlightHUD {
         clearBtn.style.display = 'block';
       } else {
         clearBtn.style.display = 'none';
-        selectedCity = null;
-        config.onSelect(null);
       }
 
       scheduleSearch(val);
     });
 
+    const selectedLabel = () => selectedCity ? `${selectedCity.name}, ${selectedCity.country}` : '';
     input.addEventListener('focus', () => {
-      if (input.value.trim().length >= minQueryLength && results.length > 0) {
-        openDropdown();
-      } else {
-        scheduleSearch(input.value);
-      }
+      this.hudElement.classList.add('is-searching');
+      if (input.value !== selectedLabel()) scheduleSearch(input.value);
     });
 
     input.addEventListener('blur', () => {
-      setTimeout(() => {
-        closeDropdown();
-      }, 150);
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = null;
+      results = [];
+      closeDropdown();
+      input.value = selectedLabel();
+      clearBtn.style.display = input.value ? 'block' : 'none';
+      this.hudElement.classList.remove('is-searching');
     });
 
     // Keyboard Navigation
@@ -780,14 +797,17 @@ export class FlightHUD {
     });
 
     // Clear Button Handler
+    clearBtn.addEventListener('mousedown', (e) => {
+      if (e.preventDefault) e.preventDefault();
+    });
     clearBtn.addEventListener('click', () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = null;
       input.value = '';
       clearBtn.style.display = 'none';
-      selectedCity = null;
       results = [];
       closeDropdown();
       input.focus();
-      config.onSelect(null);
     });
 
     return {
@@ -801,6 +821,10 @@ export class FlightHUD {
       },
       getValue: () => input.value,
       setSelectedCity: (city) => {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = null;
+        results = [];
+        closeDropdown();
         selectedCity = city;
         if (city) {
           input.value = `${city.name}, ${city.country}`;
@@ -864,7 +888,7 @@ export class FlightHUD {
       if (this.distanceKmEl) this.distanceKmEl.textContent = '— km';
       if (this.distanceMilesEl) this.distanceMilesEl.textContent = '— mi';
       if (this.durationEffectiveEl) this.durationEffectiveEl.textContent = '0h 00m';
-      if (this.durationNominalEl) this.durationNominalEl.textContent = 'Calibrated cruise: 870 km/h';
+      if (this.durationNominalEl) this.durationNominalEl.textContent = 'Cruise 870 km/h';
       if (this.windBadgeEl) {
         this.windBadgeEl.className = 'wind-badge wind-badge-neutral';
         this.windBadgeEl.textContent = 'Neutral';
@@ -913,9 +937,9 @@ export class FlightHUD {
     }
     if (this.durationNominalEl) {
       if (Math.abs(prevailingWindAdjustmentHours) > 0.05) {
-        this.durationNominalEl.textContent = `Nominal: ${formatDuration(nomHours)}`;
+        this.durationNominalEl.textContent = `Nominal ${formatDuration(nomHours)} · 870 km/h`;
       } else {
-        this.durationNominalEl.textContent = 'Calibrated cruise: 870 km/h';
+        this.durationNominalEl.textContent = 'Cruise 870 km/h';
       }
     }
 

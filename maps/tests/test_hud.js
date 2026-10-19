@@ -229,10 +229,14 @@ class MockElement {
   }
 
   focus() {
+    if (this.ownerDocument.activeElement === this) return;
+    this.ownerDocument.activeElement?.blur();
+    this.ownerDocument.activeElement = this;
     this.dispatchEvent({ type: 'focus', target: this });
   }
 
   blur() {
+    if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = null;
     this.dispatchEvent({ type: 'blur', target: this });
   }
 
@@ -280,6 +284,8 @@ function matchesSelector(el, selector) {
 }
 
 class MockDocument {
+  activeElement = null;
+
   createElement(tagName) {
     return new MockElement(tagName, this);
   }
@@ -460,7 +466,10 @@ await runAsyncTest('Combobox search queries directory and renders dropdown optio
   originInput.value = 'P';
   originInput.dispatchEvent({ type: 'input' });
   await new Promise((r) => setTimeout(r, 120));
-  assert.equal(originDropdown.style.display, 'none', 'One character should not open the dropdown');
+  assert.equal(originDropdown.style.display, 'block', 'One character should show a hint');
+  assert.equal(originDropdown.children.length, 1);
+  assert.equal(originDropdown.children[0].className, 'combobox-empty');
+  assert.equal(originDropdown.children[0].textContent, 'Type one more letter…');
   assert.equal(searchCalls.length, 0, 'One character should not query the directory');
 
   originInput.value = 'Par';
@@ -470,11 +479,15 @@ await runAsyncTest('Combobox search queries directory and renders dropdown optio
   await new Promise((r) => setTimeout(r, 80));
 
   assert.equal(originDropdown.style.display, 'block', 'Dropdown should open on search results');
-  assert.equal(originDropdown.children.length, 50, 'Dropdown should show up to 50 results');
-  assert.equal(searchCalls.at(-1).limit, 50, 'Search should request 50 results');
+  assert.equal(originDropdown.children.length, 10, 'Dropdown should show up to 10 results');
+  assert.equal(searchCalls.at(-1).limit, 10, 'Search should request 10 results');
 
   const firstOption = originDropdown.children[0];
   assert.ok(firstOption.textContent.includes('Paris'), 'First suggestion should be Paris');
+  assert.equal(firstOption.children.length, 1);
+  assert.equal(firstOption.children[0].className, 'option-text-row');
+  assert.equal(firstOption.children[0].children.length, 2);
+  assert.equal(firstOption.querySelector('.option-coord-hint'), null);
 
   // Click on first option
   firstOption.dispatchEvent({ type: 'click' });
@@ -483,6 +496,118 @@ await runAsyncTest('Combobox search queries directory and renders dropdown optio
   assert.equal(originDropdown.style.display, 'none', 'Dropdown should close on selection');
   assert.equal(selectedOrigin?.name, 'Paris');
 
+  hud.destroy();
+});
+
+await runAsyncTest('Combobox preserves selections through edits, clearing and blur, and only searches changed text on focus', async () => {
+  const { doc, container } = createTestEnvironment();
+  const directory = new CityDirectory();
+  directory.load([['Singapore', 'Singapore', 1.3, 103.8], ['London', 'United Kingdom', 51.5, -0.12]]);
+  const calls = [];
+  const hud = createFlightHUD(container, {
+    document: doc, directory, initialOrigin: directory.getById(0),
+    onOriginSelect: city => calls.push(city)
+  });
+  const box = hud.originCombobox;
+  box.input.focus();
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(box.isOpen(), false, 'Focusing the initial selected label must keep results closed');
+  assert.equal(box.getSelectedCity().name, 'Singapore');
+  assert.ok(hud.hudElement.classList.contains('is-searching'));
+
+  box.input.value = 'Lo';
+  box.input.dispatchEvent({ type: 'input' });
+  box.input.blur();
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(box.input.value, 'Singapore, Singapore');
+  assert.equal(box.isOpen(), false, 'Blur must cancel pending searches');
+  assert.equal(hud.hudElement.classList.contains('is-searching'), false);
+
+  box.clearBtn.dispatchEvent({ type: 'click' });
+  assert.equal(box.input.value, '');
+  assert.equal(box.getSelectedCity().name, 'Singapore');
+  assert.equal(calls.length, 0, 'Clear must retain the route');
+  box.input.dispatchEvent({ type: 'input' });
+  assert.equal(calls.length, 0, 'Empty input must retain the route');
+  box.input.blur();
+  assert.equal(box.input.value, 'Singapore, Singapore');
+
+  box.input.value = 'Lo';
+  box.input.focus();
+  await new Promise(r => setTimeout(r, 120));
+  box.dropdown.children[0].dispatchEvent({ type: 'click' });
+  box.input.blur();
+  assert.equal(box.input.value, 'London, United Kingdom');
+  assert.equal(box.getSelectedCity().name, 'London');
+  assert.equal(calls.length, 1, 'Only a real selection changes the route');
+  box.input.focus();
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(box.isOpen(), false, 'Focusing a newly selected label must keep results closed');
+  hud.destroy();
+});
+
+await runAsyncTest('Mouse and Enter selections blur the input and return the HUD from searching', async () => {
+  for (const selection of ['mouse', 'keyboard']) {
+    const { doc, container } = createTestEnvironment();
+    const directory = new CityDirectory();
+    directory.load([['Singapore', 'Singapore', 1.3, 103.8], ['London', 'United Kingdom', 51.5, -0.12]]);
+    const hud = createFlightHUD(container, { document: doc, directory, initialOrigin: directory.getById(0) });
+    const box = hud.originCombobox;
+    box.input.focus();
+    box.input.value = 'Lo';
+    box.input.dispatchEvent({ type: 'input' });
+    await new Promise(r => setTimeout(r, 120));
+    assert.equal(doc.activeElement, box.input);
+    assert.ok(hud.hudElement.classList.contains('is-searching'));
+
+    if (selection === 'mouse') {
+      box.dropdown.children[0].dispatchEvent({ type: 'mousedown', preventDefault() {} });
+      box.dropdown.children[0].dispatchEvent({ type: 'click' });
+    } else {
+      box.input.dispatchEvent({ type: 'keydown', key: 'ArrowDown', preventDefault() {} });
+      box.input.dispatchEvent({ type: 'keydown', key: 'Enter', preventDefault() {} });
+    }
+
+    assert.equal(hud.hudElement.classList.contains('is-searching'), false, selection);
+    assert.notEqual(doc.activeElement, box.input, selection);
+    assert.equal(box.input.value, 'London, United Kingdom', 'Blur must preserve the new selected label');
+    assert.equal(hud.getOrigin().name, 'London');
+    assert.equal(box.isOpen(), false);
+    hud.destroy();
+  }
+});
+
+await runAsyncTest('Combobox shows non-selectable hints and marks curated places', async () => {
+  const { doc, container } = createTestEnvironment();
+  const directory = new CityDirectory();
+  directory.load([['Louvre', 'France', 48.86, 2.34, 'place']]);
+  let selected = null;
+  const hud = createFlightHUD(container, { document: doc, directory, onOriginSelect: city => { selected = city; } });
+  const box = hud.originCombobox;
+  box.input.value = ' L ';
+  box.input.dispatchEvent({ type: 'input' });
+  assert.equal(box.dropdown.children[0].textContent, 'Type one more letter…');
+  box.input.dispatchEvent({ type: 'keydown', key: 'ArrowDown' });
+  box.input.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  assert.equal(selected, null);
+  box.input.value = 'zz';
+  box.input.dispatchEvent({ type: 'input' });
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(box.dropdown.children[0].textContent, 'No matches');
+  assert.equal(box.dropdown.children[0].className, 'combobox-empty');
+  box.input.value = 'Lo';
+  box.input.dispatchEvent({ type: 'input' });
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(box.dropdown.querySelector('.option-place-chip').textContent, 'place');
+  box.dropdown.children[0].dispatchEvent({ type: 'click' });
+  assert.equal(hud.getOrigin().kind, 'place');
+  box.input.blur();
+  assert.equal(box.input.value, 'Louvre, France');
+  hud.setOrigin(null);
+  box.input.value = 'unfinished';
+  box.input.dispatchEvent({ type: 'input' });
+  box.input.blur();
+  assert.equal(box.input.value, '', 'Unselected fields revert to empty on blur');
   hud.destroy();
 });
 
@@ -619,7 +744,10 @@ test('updateTelemetry renders distance, flight times, wind effect, and coordinat
 
   // Flight duration
   assert.ok(el.durationEffective.textContent.includes('h '));
-  assert.ok(el.durationNominal.textContent.includes('Nominal:'));
+  assert.ok(el.durationNominal.textContent.includes('Nominal '));
+
+  assert.ok(el.durationNominal.textContent.endsWith(' · 870 km/h'));
+  assert.ok(readFileSync(resolve(__dirname, '../src/hud.js'), 'utf-8').includes('<div class="metric-label">FLIGHT TIME</div>'));
 
   // Jet stream westbound headwind penalty
   assert.ok(el.windBadge.textContent.includes('Headwind'));
@@ -633,6 +761,8 @@ test('updateTelemetry renders distance, flight times, wind effect, and coordinat
   // Not antipodal
   assert.equal(el.antipodalBadge.style.display, 'none');
 
+  hud.updateTelemetry(computeGeodesic(origin, origin), origin, origin);
+  assert.equal(el.durationNominal.textContent, 'Cruise 870 km/h');
   hud.destroy();
 });
 

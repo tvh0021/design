@@ -100,6 +100,60 @@ assert.equal(topParis.lat, 48.8566);
 assert.equal(topParis.lng, 2.3522);
 console.log('✓ Paris, France prioritized correctly.');
 
+// Default route endpoints and curated ranking contracts.
+assert.equal(directory.search('New York')[0].name, 'New York');
+assert.equal(directory.search('New York')[0].country, 'United States');
+assert.equal(directory.search('New York')[0].lat, 40.6943);
+assert.equal(directory.search('New York')[0].lng, -73.9249);
+assert.equal(topTokyo.kind, 'city');
+assert.equal(longyearbyen.kind, 'place');
+assert.ok(Object.isFrozen(longyearbyen));
+const ranked = new CityDirectory();
+ranked.load([
+  ['Old Lo City', 'Testland', 0, 0],
+  ['Lo Place', 'Testland', 0, 0, 'place'],
+  ['Lo City Large', 'Testland', 0, 0],
+  ['Lo City Small', 'Testland', 0, 0],
+  ['Lo Heritage', 'Testland', 0, 0, 'place']
+]);
+assert.deepEqual(ranked.search('Lo').map(c => c.name), [
+  'Lo City Large', 'Lo City Small', 'Lo Place', 'Lo Heritage', 'Old Lo City'
+]);
+assert.deepEqual(ranked.search('Lo', 3).map(c => c.name), ['Lo City Large', 'Lo City Small', 'Lo Place']);
+ranked.load([['Lo City', 'Testland', 0, 0], ['Lo Place', 'Testland', 0, 0]], { curatedStartIndex: 1 });
+assert.equal(ranked.getById(1).kind, 'place');
+
+assert.ok(directory.search('Ever').some(city => city.name === 'Mount Everest'),
+  'Word-start matches must include Mount Everest in the default results');
+assert.equal(directory.search('Francisco').find(city => !city.name.startsWith('Francisco')).name, 'San Francisco',
+  'San Francisco must be the first word-start match after city prefixes');
+ranked.load([
+  ['Northfrancisco', 'Testland', 0, 0],
+  ['Mount Francisco', 'Testland', 0, 0, 'place'],
+  ['San Francisco', 'United States', 37.77, -122.42],
+  ['Other Francisco', 'Testland', 0, 0]
+]);
+assert.equal(ranked.search('Francisco')[0].name, 'San Francisco');
+ranked.load([
+  ['Clove', 'Testland', 0, 0],
+  ['Old Lo Place', 'Testland', 0, 0, 'place'],
+  ['Old\tLo City', 'Testland', 0, 0],
+  ['Lo Place', 'Testland', 0, 0, 'place'],
+  ['Lo City Large', 'Testland', 0, 0],
+  ['Lo City Small', 'Testland', 0, 0],
+  ['New Lo City', 'Testland', 0, 0],
+  ['New Lo Place', 'Testland', 0, 0, 'place'],
+  ['Other', 'Lo Country', 0, 0]
+]);
+assert.deepEqual(ranked.search('Lo').map(city => city.name), [
+  'Lo City Large', 'Lo City Small', 'Lo Place', 'Old\tLo City', 'New Lo City',
+  'Old Lo Place', 'New Lo Place', 'Clove', 'Other'
+]);
+assert.deepEqual(ranked.search('Lo', 2).map(city => city.name), ['Lo City Large', 'Lo City Small']);
+assert.deepEqual(ranked.search('Lo', 4).map(city => city.name), [
+  'Lo City Large', 'Lo City Small', 'Lo Place', 'Old\tLo City'
+]);
+
 // 5. Case-insensitivity & Diacritics
 console.log('\n[Test 5] Testing case-insensitivity & diacritics...');
 const lowerTokyo = directory.search('tokyo');

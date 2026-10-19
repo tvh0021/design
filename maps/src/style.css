@@ -150,7 +150,7 @@ canvas.globe-canvas:active {
   flex-direction: column;
   gap: 16px;
   padding: 20px;
-  overflow-y: auto;
+  overflow: visible;
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
   transition: transform var(--transition-normal), opacity var(--transition-normal);
@@ -578,11 +578,11 @@ canvas.globe-canvas:active {
 }
 
 .combobox-option {
-  padding: 8px 10px;
+  min-height: 34px;
+  padding: 7px 10px;
   border-radius: 6px;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
   cursor: pointer;
   transition: background-color var(--transition-fast);
 }
@@ -598,6 +598,8 @@ canvas.globe-canvas:active {
 
 .option-text-row {
   display: flex;
+  width: 100%;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -613,6 +615,8 @@ canvas.globe-canvas:active {
 }
 
 .option-country-tag {
+  flex-shrink: 0;
+  margin-left: auto;
   font-size: 0.65rem;
   color: var(--color-text-muted);
   background: rgba(255, 255, 255, 0.05);
@@ -621,10 +625,13 @@ canvas.globe-canvas:active {
   white-space: nowrap;
 }
 
-.option-coord-hint {
-  font-size: 0.625rem;
-  color: var(--color-text-subtle);
-  font-variant-numeric: tabular-nums;
+.option-place-chip {
+  flex-shrink: 0;
+  font-size: 0.59375rem;
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  padding: 1px 4px;
 }
 
 .combobox-empty {
@@ -828,6 +835,10 @@ canvas.globe-canvas:active {
     right: max(12px, env(safe-area-inset-right, 0px));
   }
 
+  .hud-proj-toggle:has(~ .geodesic-hud.is-searching) {
+    display: none;
+  }
+
   .hud-proj-btn {
     min-height: 44px;
   }
@@ -846,9 +857,19 @@ canvas.globe-canvas:active {
     border-right: none;
     border-bottom: none;
     padding: 10px 16px calc(16px + env(safe-area-inset-bottom, 0px)) 16px;
-    gap: 12px;
+    gap: 8px;
     box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
     transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
+  }
+
+  .geodesic-hud.is-searching {
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    bottom: auto;
+    max-height: calc(100vh - env(safe-area-inset-top, 0px) - 12px);
+  }
+
+  .combobox-dropdown {
+    max-height: 40vh;
   }
 
   .geodesic-hud.is-minimized {
@@ -861,7 +882,7 @@ canvas.globe-canvas:active {
     display: flex;
     justify-content: center;
     align-items: center;
-    padding: 4px 0 10px 0;
+    padding: 2px 0 4px;
     cursor: pointer;
     touch-action: pan-y;
   }
@@ -898,7 +919,7 @@ canvas.globe-canvas:active {
   }
 
   .hud-header {
-    padding-bottom: 10px;
+    padding-bottom: 6px;
   }
 
   .hud-title {
@@ -906,7 +927,30 @@ canvas.globe-canvas:active {
   }
 
   .hud-subtitle {
+    display: none;
+  }
+
+  .hud-telemetry-card {
+    padding: 10px;
+    gap: 8px;
+  }
+
+  .telemetry-coords-block {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding-top: 8px;
+  }
+
+  .coord-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .coord-val {
     font-size: 0.625rem;
+    line-height: 1.4;
   }
 
   .telemetry-grid {

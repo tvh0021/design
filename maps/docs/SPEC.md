@@ -31,6 +31,8 @@ A responsive, high-performance, browser-native web application hosted on GitHub 
 
 ## Implementation Decisions
 
+The default route is Singapore, Singapore → New York, United States.
+
 ### Architectural Decisions
 - **100% Client-Side Static App**: Vanilla ES modules + D3.js v7 (`d3-geo`, `topojson-client`). No Node runtime or backend server required. Hosted directly via GitHub Pages or embeddable in an `<iframe>`.
 - **Compact Search Dataset**: Keep the top 10,000 cities from `worldcities.csv` in population order, then append 111 curated geographic and heritage locations. Each entry uses `[name, country, lat, lng]`.
@@ -65,7 +67,9 @@ A responsive, high-performance, browser-native web application hosted on GitHub 
   - Antimeridian crossing (e.g. Tokyo to San Francisco, Fiji to Hawaii): verify path does not wrap the long way around $360^\circ$.
   - Equator-straddling routes: verify midpoint latitude and longitude.
   - Jet stream penalty: verify Westbound flight time > Eastbound flight time for London $\leftrightarrow$ New York.
-  - City search: prefix match, case-insensitivity, and population priority ordering.
+  - City search: case-insensitivity and ranking by city prefixes in population order, curated place prefixes, then substring matches.
+  - Search dropdown: 2-character minimum, 100 ms debounce, at most 10 results, and hints for one character or no matches. Editing or clearing search text retains the selected route until a new selection; blur restores its display label.
+  - Responsive framing: both projections use the viewport area left free by the desktop panel or mobile sheet.
 
 ## Out of Scope
 

@@ -14,7 +14,7 @@
  *    - Madrid -> Wellington (Antipodal pair ~180° separation)
  * 3. End-to-end application lifecycle via initApp:
  *    - Async data loading and CityDirectory indexation
- *    - Default initial iconic route (Paris -> Tokyo)
+ *    - Default initial route (Singapore -> New York)
  *    - Reactive origin/destination selection
  *    - 1-click Swap cities route reversal and wind telemetry update
  *    - Recenter globe camera trigger
@@ -432,6 +432,13 @@ test('index.html is valid standalone HTML5 with meta viewport', () => {
   assert.ok(html.includes('width=device-width'), 'Viewport must be responsive for mobile/iframe embedding');
 });
 
+test('index.html loads Inter with preconnects and all requested weights', () => {
+  const html = readFileSync(resolve(__dirname, '../index.html'), 'utf-8');
+  assert.ok(html.includes('rel="preconnect" href="https://fonts.googleapis.com"'));
+  assert.ok(html.includes('rel="preconnect" href="https://fonts.gstatic.com" crossorigin'));
+  assert.ok(html.includes('family=Inter:wght@400;500;600;700'));
+});
+
 test('index.html includes required external CDN scripts', () => {
   const html = readFileSync(resolve(__dirname, '../index.html'), 'utf-8');
   assert.ok(
@@ -660,7 +667,7 @@ function createMockAppEnvironment() {
   return { doc, globeContainer, hudContainer, loadingSplash, mockWindow };
 }
 
-runAsyncTest('initApp initializes application, dismisses splash, and renders initial Paris -> Tokyo route', async () => {
+await runAsyncTest('initApp initializes application, dismisses splash, and renders initial Singapore -> New York route', async () => {
   const { doc, globeContainer, hudContainer, loadingSplash, mockWindow } = createMockAppEnvironment();
   const mockD3 = createMockD3();
 
@@ -680,40 +687,49 @@ runAsyncTest('initApp initializes application, dismisses splash, and renders ini
   assert.ok(app.globe, 'Globe renderer should be initialized');
   assert.ok(app.hud, 'FlightHUD should be initialized');
 
-  // Verify default initial iconic route is Paris -> Tokyo
+  // Verify default initial iconic route is Singapore -> New York
   const origin = app.getOrigin();
   const dest = app.getDest();
-  assert.equal(origin?.name, 'Paris');
-  assert.equal(dest?.name, 'Tokyo');
+  assert.equal(origin?.name, 'Singapore');
+  assert.equal(dest?.name, 'New York');
 
   // Verify geodesic calculation
   const geodesic = app.getGeodesic();
   assert.ok(geodesic, 'Geodesic calculation must be active');
-  assert.ok(geodesic.distanceKm > 9600 && geodesic.distanceKm < 9800, `Paris->Tokyo distance ~9,710 km, got ${geodesic.distanceKm}`);
+  assert.ok(geodesic.distanceKm > 15300 && geodesic.distanceKm < 15400, `Singapore->New York distance ~15,330 km, got ${geodesic.distanceKm}`);
 
   // Verify loading splash dismissal
   assert.ok(loadingSplash.classList.contains('hidden'), 'Loading splash should have .hidden class applied');
 
   // Verify HUD telemetry card values
   const hudElements = app.hud.getElements();
-  assert.ok(hudElements.distanceKm.textContent.includes('9,7'), `Distance should display ~9,710 km, got: ${hudElements.distanceKm.textContent}`);
-  assert.ok(hudElements.distanceMiles.textContent.includes('6,0'), `Miles should display ~6,030 mi, got: ${hudElements.distanceMiles.textContent}`);
+  assert.equal(hudElements.distanceKm.textContent, `${Math.round(geodesic.distanceKm).toLocaleString('en-US')} km`);
+  assert.equal(hudElements.distanceMiles.textContent, `${Math.round(geodesic.distanceMiles).toLocaleString('en-US')} mi`);
   assert.ok(hudElements.durationEffective.textContent.includes('h '), 'Effective duration must be displayed');
-  assert.ok(hudElements.originCoord.textContent.includes('48.86° N'), 'Origin coordinates must be displayed');
-  assert.ok(hudElements.destCoord.textContent.includes('35.68° N'), 'Destination coordinates must be displayed');
+  assert.ok(hudElements.originCoord.textContent.includes('1.30° N'), 'Origin coordinates must be displayed');
+  assert.ok(hudElements.destCoord.textContent.includes('40.69° N'), 'Destination coordinates must be displayed');
+
+  assert.equal(origin.lng, 103.8);
+  assert.equal(dest.country, 'United States');
+  assert.equal(dest.lng, -73.9249);
+  app.hud.originCombobox.clearBtn.dispatchEvent({ type: 'click' });
+  assert.equal(app.getGeodesic(), geodesic, 'Clearing search text must preserve telemetry and route');
+  assert.equal(app.getOrigin(), origin);
+  app.hud.originCombobox.input.blur();
+  assert.equal(hudElements.originInput.value, 'Singapore, Singapore');
 
   // Verify swap button reverse action
   const { swapBtn } = hudElements;
   assert.ok(swapBtn, 'Swap button must exist');
   swapBtn.dispatchEvent({ type: 'click' });
 
-  // Route is now Tokyo -> Paris
-  assert.equal(app.getOrigin()?.name, 'Tokyo');
-  assert.equal(app.getDest()?.name, 'Paris');
+  // Route is now New York -> Singapore
+  assert.equal(app.getOrigin()?.name, 'New York');
+  assert.equal(app.getDest()?.name, 'Singapore');
 
-  // Telemetry updated to reflect westward flight headwind
-  assert.ok(app.getGeodesic().prevailingWindAdjustmentHours > 0, 'Westward Tokyo->Paris flight must have wind delay');
-  assert.ok(hudElements.windBadge.textContent.includes('Headwind'), 'HUD should display headwind delay badge');
+  // Telemetry updates when the route is reversed
+  assert.ok(app.getGeodesic().prevailingWindAdjustmentHours < 0, 'Reversed route must have tailwind assistance');
+  assert.ok(hudElements.windBadge.textContent.includes('Tailwind'), 'HUD should display tailwind badge');
 
   // Verify Recenter button action
   let recentered = false;
@@ -758,6 +774,39 @@ runAsyncTest('initApp initializes application, dismisses splash, and renders ini
   app.destroy();
   assert.equal(globeContainer.children.length, 0, 'Globe canvas should be cleaned up on destroy');
   assert.equal(hudContainer.children.length, 0, 'HUD aside should be cleaned up on destroy');
+});
+
+await runAsyncTest('Default fallbacks match dataset coordinates and mobile insets frame both projections', async () => {
+  const { doc, globeContainer, hudContainer, mockWindow } = createMockAppEnvironment();
+  const previousWindow = globalThis.window;
+  mockWindow.innerWidth = 390;
+  mockWindow.innerHeight = 844;
+  globalThis.window = mockWindow;
+  let app;
+  try {
+    app = await initApp({
+      document: doc, globeContainer, hudContainer, citiesData: [], worldTopology,
+      d3: createMockD3(), topojson: mockTopojson,
+      globeOptions: { width: 390, height: 844, terrain: false, fixedSize: true }
+    });
+    for (const city of [app.getOrigin(), app.getDest()]) {
+      const tuple = rawCities.find(row => row[0] === city.name && row[1] === city.country);
+      assert.deepEqual([city.name, city.country, city.lat, city.lng], tuple);
+    }
+    app.hud.hudElement.offsetHeight = 400;
+    app.updateRoute(app.getOrigin(), app.getDest(), false);
+    assert.deepEqual(app.globe.getProjection().translate(), [195, 256]);
+    app.setProjection('robinson');
+    assert.deepEqual(app.globe.getProjection().translate(), [195, 256]);
+    app.hud.collapse();
+    assert.deepEqual(app.globe.getProjection().translate(), [195, 462]);
+    app.hud.expand();
+    assert.deepEqual(app.globe.getProjection().translate(), [195, 256]);
+  } finally {
+    if (app) app.destroy();
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
 });
 
 // Run summary

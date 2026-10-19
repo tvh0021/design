@@ -24,11 +24,14 @@ export class CityDirectory {
   /**
    * Loads an array of city tuples: [name, country, lat, lng]
    * or city objects: { name, country, lat, lng }
+   * A fifth tuple element or object kind can mark a curated 'place'. Otherwise
+   * records at curatedStartIndex (default 10,000) and beyond are places.
    * The input is expected to be pre-sorted in descending population order.
    *
    * @param {Array<Array|Object>} data
+   * @param {{curatedStartIndex?: number}} [options]
    */
-  load(data) {
+  load(data, { curatedStartIndex = 10000 } = {}) {
     if (!Array.isArray(data)) {
       this.cities = [];
       this.records = [];
@@ -42,6 +45,7 @@ export class CityDirectory {
     for (let id = 0; id < n; id++) {
       const item = data[id];
       let name, country, lat, lng;
+      const kind = (Array.isArray(item) ? item[4] : item?.kind) || (id >= curatedStartIndex ? 'place' : 'city');
 
       if (Array.isArray(item)) {
         name = item[0] ?? '';
@@ -66,7 +70,8 @@ export class CityDirectory {
         name,
         country,
         lat,
-        lng
+        lng,
+        kind
       });
       this.records[id] = publicCity;
 
@@ -78,6 +83,7 @@ export class CityDirectory {
       this.cities[id] = {
         city: publicCity,
         nameNorm,
+        nameWords: nameNorm.split(/\s+/),
         countryNorm,
         fullNameNorm
       };
@@ -107,8 +113,9 @@ export class CityDirectory {
   }
 
   /**
-   * Searches cities by name (or country), prioritizing prefix matches
-   * over substring matches, maintaining descending population rank order.
+   * Searches names (or countries), ranking city prefixes in population order,
+   * then curated place prefixes, word starts (cities before places), substrings,
+   * and country matches.
    *
    * @param {string} query
    * @param {number} [limit=10]
@@ -125,19 +132,26 @@ export class CityDirectory {
     }
 
     const prefixMatches = [];
+    const placePrefixMatches = [];
+    const wordStartMatches = [];
+    const placeWordStartMatches = [];
     const substringMatches = [];
     const fallbackMatches = [];
 
     const total = this.cities.length;
     for (let i = 0; i < total; i++) {
       const entry = this.cities[i];
-      const { city, nameNorm, countryNorm, fullNameNorm } = entry;
+      const { city, nameNorm, nameWords, countryNorm, fullNameNorm } = entry;
 
       if (nameNorm.startsWith(q)) {
-        prefixMatches.push(city);
+        if (city.kind === 'place') placePrefixMatches.push(city);
+        else prefixMatches.push(city);
         if (prefixMatches.length >= limit) {
           return prefixMatches;
         }
+      } else if (nameWords.some(word => word.startsWith(q))) {
+        const matches = city.kind === 'place' ? placeWordStartMatches : wordStartMatches;
+        if (matches.length < limit) matches.push(city);
       } else if (nameNorm.includes(q)) {
         if (prefixMatches.length + substringMatches.length < limit * 2) {
           substringMatches.push(city);
@@ -149,7 +163,9 @@ export class CityDirectory {
       }
     }
 
-    const combined = prefixMatches.concat(substringMatches, fallbackMatches);
+    const combined = prefixMatches.concat(
+      placePrefixMatches, wordStartMatches, placeWordStartMatches, substringMatches, fallbackMatches
+    );
     return combined.slice(0, limit);
   }
 }

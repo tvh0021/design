@@ -514,17 +514,17 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     .translate([width / 2, height * verticalCenterRatio])
     .rotate(initialRot.slice());
 
-  let robinsonViewportInsets = { left: 0, right: 0, top: 0, bottom: 0 };
+  let viewportInsets = { left: 0, right: 0, top: 0, bottom: 0 };
   let robinsonRouteDistance = 0;
   // D3's Robinson unit sphere spans 2π horizontally and 3.18683 vertically.
   function worldRobinsonScale() {
-    const availableWidth = Math.max(1, width - robinsonViewportInsets.left - robinsonViewportInsets.right - 48);
-    const availableHeight = Math.max(1, height - robinsonViewportInsets.top - robinsonViewportInsets.bottom - 48);
+    const availableWidth = Math.max(1, width - viewportInsets.left - viewportInsets.right - 48);
+    const availableHeight = Math.max(1, height - viewportInsets.top - viewportInsets.bottom - 48);
     return Math.max(1, Math.min(availableWidth / (2 * Math.PI), availableHeight / 3.1868315878));
   }
   function defaultRobinsonScale() {
-    const availableWidth = Math.max(1, width - robinsonViewportInsets.left - robinsonViewportInsets.right - 48);
-    const availableHeight = Math.max(1, height - robinsonViewportInsets.top - robinsonViewportInsets.bottom - 48);
+    const availableWidth = Math.max(1, width - viewportInsets.left - viewportInsets.right - 48);
+    const availableHeight = Math.max(1, height - viewportInsets.top - viewportInsets.bottom - 48);
     if (robinsonRouteDistance > 0 && robinsonRouteDistance < 1500) {
       // A world overview makes nearby city pins overlap. Open short routes at
       // a regional scale, within the same zoom range as the wheel/pinch controls.
@@ -572,21 +572,27 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let currentRouteGeoJson = null;
   let currentMidpoint = null;
 
+  function orthographicTranslation() {
+    const { left, right, top, bottom } = viewportInsets;
+    return [(width + left - right) / 2, (height + top - bottom) * verticalCenterRatio];
+  }
+
   function robinsonTranslation() {
-    const { left, right, top, bottom } = robinsonViewportInsets;
+    const { left, right, top, bottom } = viewportInsets;
     return [(width + left - right) / 2, (height + top - bottom) / 2];
   }
 
-  function setRobinsonViewportInsets(insets = {}) {
+  function setViewportInsets(insets = {}) {
     const zoomRatio = robinsonScale / defaultRobinsonScale();
-    robinsonViewportInsets = {
+    viewportInsets = {
       left: Math.max(0, insets.left || 0), right: Math.max(0, insets.right || 0),
       top: Math.max(0, insets.top || 0), bottom: Math.max(0, insets.bottom || 0)
     };
     robinsonScale = defaultRobinsonScale() * zoomRatio;
     minRobinsonScale = worldRobinsonScale() * 0.4;
     if (robinsonProj) robinsonProj.scale(robinsonScale).translate(robinsonTranslation());
-    if (projectionType === 'robinson') render();
+    orthoProj.translate(orthographicTranslation());
+    render();
   }
 
   // A polar fallback path includes both endpoints and the North Pole. Center
@@ -622,7 +628,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       ctx.scale(dpr, dpr);
     }
 
-    orthoProj.translate([width / 2, height * verticalCenterRatio]);
+    orthoProj.translate(orthographicTranslation());
     if (robinsonProj) {
       robinsonProj.translate(robinsonTranslation());
     }
@@ -1092,8 +1098,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       return;
     }
 
-    const startY = getActiveProjection().translate()[1];
-    const targetY = height * targetRatio;
+    const startRatio = verticalCenterRatio;
     const startTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     const duration = 280;
 
@@ -1101,9 +1106,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       const elapsed = now - startTime;
       const t = Math.min(1, elapsed / duration);
       const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-      const currentY = startY + (targetY - startY) * ease;
-      verticalCenterRatio = currentY / height;
-      orthoProj.translate([width / 2, currentY]);
+      verticalCenterRatio = startRatio + (targetRatio - startRatio) * ease;
+      orthoProj.translate(orthographicTranslation());
       if (robinsonProj) {
         robinsonProj.translate(robinsonTranslation());
       }
@@ -1387,7 +1391,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     resize,
     setProjectionType,
     getProjectionType: () => projectionType,
-    setRobinsonViewportInsets,
+    setViewportInsets,
+    setRobinsonViewportInsets: setViewportInsets,
     setVerticalCenterRatio,
     getVerticalCenterRatio: () => verticalCenterRatio,
     destroy,

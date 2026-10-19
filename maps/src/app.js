@@ -55,9 +55,8 @@ export async function initApp(options = {}) {
       directory.load(citiesData);
     }
 
-    // 2. Mobile drawer layout detection
-    const isMobileInitial = typeof window !== 'undefined' && window.innerWidth < 640 && window.innerHeight > window.innerWidth;
-    const initialVerticalRatio = isMobileInitial ? 0.28 : 0.50;
+    // Insets place the projection in the free area on desktop and mobile.
+    const initialVerticalRatio = 0.50;
 
     // Check URL query parameters for custom initial route or projection
     const urlParams = typeof window !== 'undefined' && window.location?.search ? new URLSearchParams(window.location.search) : null;
@@ -73,13 +72,13 @@ export async function initApp(options = {}) {
       if (matches.length > 0) initialOrigin = matches[0];
     }
     if (!initialOrigin) {
-      const parisMatches = directory.search('Paris');
-      initialOrigin = parisMatches.length > 0 ? parisMatches[0] : {
-        id: 34,
-        name: 'Paris',
-        country: 'France',
-        lat: 48.8566,
-        lng: 2.3522
+      const singaporeMatches = directory.search('Singapore');
+      initialOrigin = singaporeMatches.length > 0 ? singaporeMatches[0] : {
+        id: 135,
+        name: 'Singapore',
+        country: 'Singapore',
+        lat: 1.3,
+        lng: 103.8
       };
     }
 
@@ -89,13 +88,13 @@ export async function initApp(options = {}) {
       if (matches.length > 0) initialDest = matches[0];
     }
     if (!initialDest) {
-      const tokyoMatches = directory.search('Tokyo');
-      initialDest = tokyoMatches.length > 0 ? tokyoMatches[0] : {
-        id: 0,
-        name: 'Tokyo',
-        country: 'Japan',
-        lat: 35.6839,
-        lng: 139.7744
+      const newYorkMatches = directory.search('New York');
+      initialDest = newYorkMatches.length > 0 ? newYorkMatches[0] : {
+        id: 12,
+        name: 'New York',
+        country: 'United States',
+        lat: 40.6943,
+        lng: -73.9249
       };
     }
 
@@ -131,7 +130,7 @@ export async function initApp(options = {}) {
         hud.updateTelemetry(null, origin, dest);
         globe.setRoute(null, origin, dest, false);
       }
-      updateRobinsonViewport();
+      updateViewportInsets();
       return currentGeodesic;
     }
 
@@ -142,15 +141,7 @@ export async function initApp(options = {}) {
       initialDest,
       document: doc,
       initialProjection: resolvedProjection,
-      onCollapseChange: (isCollapsed) => {
-        updateRobinsonViewport();
-        const isMobile = typeof window !== 'undefined' && window.innerWidth < 640 && window.innerHeight > window.innerWidth;
-        if (isMobile) {
-          globe.setVerticalCenterRatio(isCollapsed ? 0.50 : 0.28, true);
-        } else {
-          globe.setVerticalCenterRatio(0.50, true);
-        }
-      },
+      onCollapseChange: () => updateViewportInsets(),
       onOriginSelect: (city) => {
         if (isSwapping) return;
         updateRoute(city, currentDest, true);
@@ -174,17 +165,21 @@ export async function initApp(options = {}) {
       }
     });
 
-    function updateRobinsonViewport() {
-      if (typeof globe.setRobinsonViewportInsets !== 'function') return;
+    function updateViewportInsets() {
+      if (typeof globe.setViewportInsets !== 'function') return;
       const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
       const panel = hud.hudElement;
       const hidden = hud.getIsCollapsed();
-      globe.setRobinsonViewportInsets({
-        left: !isMobile && !hidden ? panel.offsetLeft + panel.offsetWidth + 24 : 0,
+      globe.setViewportInsets({
+        left: !isMobile && !hidden ? (panel.offsetLeft || 0) + (panel.offsetWidth || 0) + 24 : 0,
         top: 80,
-        bottom: isMobile && !hidden ? panel.offsetHeight + 12 : 0
+        bottom: isMobile && !hidden ? (panel.offsetHeight || 0) + 12 : 0
       });
     }
+
+    const panelObserver = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => updateViewportInsets()) : null;
+    if (panelObserver) panelObserver.observe(hud.hudElement);
 
     // Tap on globe canvas outside HUD collapses the sheet on mobile to reveal full globe
     const onGlobeTap = () => {
@@ -203,14 +198,13 @@ export async function initApp(options = {}) {
 
     // 7. Window resize handler
     const onResize = () => {
-      const isMobile = typeof window !== 'undefined' && window.innerWidth < 640 && window.innerHeight > window.innerWidth;
-      const targetRatio = (isMobile && !hud.getIsCollapsed()) ? 0.28 : 0.50;
+      const targetRatio = 0.50;
       if (globe && typeof globe.setVerticalCenterRatio === 'function') {
         globe.setVerticalCenterRatio(targetRatio, false);
       }
       if (globe && typeof globe.resize === 'function') {
         globe.resize();
-        updateRobinsonViewport();
+        updateViewportInsets();
       }
     };
 
@@ -245,6 +239,7 @@ export async function initApp(options = {}) {
         if (globeContainer && typeof globeContainer.removeEventListener === 'function') {
           globeContainer.removeEventListener('click', onGlobeTap);
         }
+        if (panelObserver) panelObserver.disconnect();
         globe.destroy();
         hud.destroy();
       }

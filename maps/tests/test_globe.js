@@ -745,6 +745,29 @@ test('Robinson fits the free viewport and opens a short route at regional zoom',
   controller.destroy();
 });
 
+test('Viewport insets frame both projections and survive ratio changes and resizing', () => {
+  const { canvas } = createMockCanvas();
+  const controller = createGlobeRenderer(createMockContainer(canvas), null, {
+    canvas, d3: createMockD3(), terrain: false, width: 1280, height: 800
+  });
+  controller.setViewportInsets({ left: 428, right: 20, top: 80, bottom: 40 });
+  assert.deepEqual(controller.getProjection().translate(), [844, 420]);
+  controller.setVerticalCenterRatio(0.4, false);
+  assert.deepEqual(controller.getProjection().translate(), [844, 336]);
+  controller.setVerticalCenterRatio(0.5, false);
+  controller.setProjectionType('robinson');
+  assert.deepEqual(controller.getProjection().translate(), [844, 420]);
+  controller.resize(390, 844);
+  controller.setViewportInsets({ top: 80, bottom: 400 });
+  assert.deepEqual(controller.getProjection().translate(), [195, 262]);
+  assert.ok(Math.abs(controller.getScale() - Math.min(342 / (2 * Math.PI), 316 / 3.1868315878)) < 1e-9);
+  controller.setProjectionType('orthographic');
+  assert.deepEqual(controller.getProjection().translate(), [195, 262]);
+  controller.setRobinsonViewportInsets({ bottom: 400 });
+  assert.deepEqual(controller.getProjection().translate(), [195, 222], 'Legacy alias must update both projections');
+  controller.destroy();
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);
