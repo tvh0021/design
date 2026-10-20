@@ -48,6 +48,9 @@ pub fn word_candidate_matches(body: &str, candidate: &str, vocabulary: &BTreeSet
 }
 
 /// Check every exported file, including inline assets, before publishing.
+/// Public repo names and exact URLs bypass word checks only. Paths and IDs
+/// remain forbidden throughout each file. Production callers use an empty
+/// vocabulary; fixture audits can exclude known template words.
 pub fn check(
     conn: &Connection,
     out: &Path,

@@ -462,3 +462,42 @@ fn allowlisted_project_publishes_with_config_override_and_no_push() {
     assert!(!body.contains("/home/demo/private"));
     assert_eq!(git(&root, &["log", "-1", "--format=%s"]), publish::MESSAGE);
 }
+
+#[test]
+fn public_allowlist_exempts_words_and_urls_but_never_paths_or_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = fixture(&tmp.path().join("usage.db"));
+    store
+        .conn
+        .execute("UPDATE sessions SET project_name = 'public-repo'", [])
+        .unwrap();
+    let out = tmp.path().join("pages");
+    std::fs::create_dir(&out).unwrap();
+    let file = out.join("index.html");
+    let public = std::collections::BTreeMap::from([(
+        "/home/demo/private".to_owned(),
+        "https://github.com/private/public-repo".to_owned(),
+    )]);
+    let safe = "<a href=\"https://github.com/private/public-repo\">public-repo</a>";
+    std::fs::write(&file, safe).unwrap();
+    usage_habit_report::privacy::check(&store.conn, &out, None, &public, &Default::default())
+        .unwrap();
+    for leaked in [
+        "private",
+        "https://github.com/demo/unapproved",
+        "<style>/home/demo/private</style>",
+        "<script>private-session-id</script>",
+    ] {
+        std::fs::write(&file, format!("{safe}{leaked}")).unwrap();
+        assert!(
+            usage_habit_report::privacy::check(
+                &store.conn,
+                &out,
+                None,
+                &public,
+                &Default::default()
+            )
+            .is_err()
+        );
+    }
+}
