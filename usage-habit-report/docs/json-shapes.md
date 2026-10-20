@@ -98,6 +98,14 @@ the T3 thread id stage. Flags: `--rows`, `--since`, `--json`.
 | `rows` | array? (null unless `--rows`), oldest first, see below |
 | `active_seconds` | integer? (whole session and linked descendants, idle gaps removed) |
 | `idle_gap_seconds` | integer (900) |
+| `parent` | object?: `{tool: string, session_id: string, lineage_source: string?}` |
+
+`parent` identifies the parent across tools. `lineage_source` is `t3` or
+`timing` for imported T3 delegations, and null for harness-recorded parents.
+The existing `parent_session_id` remains present. Native harness parents take
+priority. Timing matches require exactly one unclaimed child whose first event
+is within 60 seconds after delegation starts, with matching projects when both
+are known. Titles never participate.
 
 `started_at`, `ended_at`, `elapsed_seconds` and `active_seconds` describe the
 session, not the `--since` window. `models`, `usage`, `subagents` and `rows` cover requests in
@@ -204,7 +212,8 @@ A bare array (no wrapper), unpriced rows first:
 
 Project time fields sum the whole cached duration of each top-level session
 selected by the session window, not only its events in that window. Linked
-children are already covered by their parent. An unlinked child counts as a
+children, including children in another tool, are already covered by their parent.
+A cross-tool tree contributes time to its root session's project and tool. An unlinked child counts as a
 top-level session. Token and session-count fields retain their existing meaning.
 
 ## `query agents`
@@ -214,10 +223,26 @@ top-level session. Token and session-count fields retain their existing meaning.
 | `generated_at` | string |
 | `since` | string? |
 | `coverage` | object keyed by tool: `{supported: boolean, note: string}` |
-| `totals` | `{top_level_sessions, sessions_with_subagents, subagent_sessions, unlinked_subagent_sessions}`, all integers |
+| `totals` | `{top_level_sessions, sessions_with_subagents, subagent_sessions, unlinked_subagent_sessions, cross_tool_links, timing_matched_links, parents_with_imported_children}`, all integers |
 | `subagent_token_share` | `{subagent_tokens: integer, total_tokens: integer, share: number?}` |
 | `histogram[]` | `{bucket: string, min: integer, max: integer?, sessions: integer}` |
-| `by_tool[]` | `{tool, top_level_sessions, sessions_with_subagents, subagent_sessions, unlinked_subagent_sessions, subagent_tokens, total_tokens: integer-valued, subagent_token_share: number?}` (`tool` is a string) |
+| `by_tool[]` | `{tool, top_level_sessions, sessions_with_subagents, subagent_sessions, unlinked_subagent_sessions, subagent_tokens, total_tokens: integer-valued, subagent_token_share: number?}` (`tool` is a string); also `cross_tool_links`, `timing_matched_links`, `parents_with_imported_children` (integers) |
 | `model_mix` | `{main_thread: [ModelMixEntry], subagent: [ModelMixEntry]}`; `ModelMixEntry` is `{model: string?, requests: integer, tokens: integer, request_share: number}` |
 | `subagent_efforts[]` | `{effort: string?, requests: integer}` |
 | `heaviest_fanouts[]` | `{tool: string, session_id: string, title: string?, subagent_count: integer, subagent_models: [{model: string?, requests}], subagent_efforts: [{effort: string?, requests}], subagent_tokens: integer, total_tokens: integer, subagent_token_share: number?, max_concurrent_fanout: integer}`, at most 10 |
+
+`cross_tool_links` counts imported links whose parent and child tools differ.
+`timing_matched_links` counts imported links with `lineage_source: timing`,
+including same-tool matches. These counts can overlap. `parents_with_imported_children`
+counts distinct parents with a `t3` or `timing` child. Per-tool link counts
+refer to the parent's tool. Tree metrics, including fan-outs and per-tree token
+shares, include descendants across tools. Tool filters select the root's tool
+for tree metrics and the request's tool for the overall token share and model
+mix. With `--since`, a link counts when its child has a request in the window.
+The dashboard coverage note uses these per-tool counts.
+
+Internal `codex-auto-review` requests are excluded at ingest. Sources containing
+only those requests create no sessions or event timelines. The v7 migration
+removes their existing requests and sessions and rewinds affected sources to
+correct mixed timelines on the next scan. They contribute no requests, tokens,
+cost, session count, active time, or model entries to any report.

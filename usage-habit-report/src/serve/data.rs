@@ -577,7 +577,7 @@ pub fn session_lists(
                    {ELAPSED_SQL} AS elapsed, w.n, w.cost, w.unpriced, COALESCE(s.active_ms / 1000, 0) AS active
             FROM w JOIN sessions s ON s.tool = w.tool AND s.session_id = w.session_id
             WHERE NOT EXISTS (SELECT 1 FROM sessions p
-                WHERE p.tool = s.tool AND p.session_id = s.parent_session_id)
+                WHERE p.tool = COALESCE(s.parent_tool, s.tool) AND p.session_id = s.parent_session_id)
             ORDER BY {order}, s.tool, s.session_id
             LIMIT {SESSION_ROWS}"#
         );

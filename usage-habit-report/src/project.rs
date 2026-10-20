@@ -169,6 +169,7 @@ pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichRepor
             report.projects_from_t3 += from_t3 as u64;
         }
     }
+    t3::enrich_lineage(&tx, t3_paths)?;
     tx.commit()?;
     report.elapsed = start.elapsed();
     Ok(report)
@@ -270,11 +271,11 @@ fn cells(
     let mut stmt = conn.prepare(
         r#"SELECT project, tool, COUNT(*),
                   COALESCE(SUM(CASE WHEN NOT EXISTS (
-                      SELECT 1 FROM sessions p WHERE p.tool = sessions.tool
+                      SELECT 1 FROM sessions p WHERE p.tool = COALESCE(sessions.parent_tool, sessions.tool)
                       AND p.session_id = sessions.parent_session_id)
                       THEN active_ms / 1000 ELSE 0 END), 0),
                   COALESCE(SUM(CASE WHEN NOT EXISTS (
-                      SELECT 1 FROM sessions p WHERE p.tool = sessions.tool
+                      SELECT 1 FROM sessions p WHERE p.tool = COALESCE(sessions.parent_tool, sessions.tool)
                       AND p.session_id = sessions.parent_session_id)
                       THEN MAX(0, (ended_at_ms - started_at_ms) / 1000) ELSE 0 END), 0)
            FROM sessions

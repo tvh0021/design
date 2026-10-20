@@ -1,8 +1,6 @@
-//! T3 Code enrichment. T3's `state.sqlite` maps its threads to the Codex and
-//! Antigravity sessions it drives; this attaches the T3 thread id and title to
-//! those sessions and supplies a working directory where the harness log has
-//! none. The database is opened `immutable=1` (read-only, WAL ignored) and is
-//! never written. Claude Code sessions get no T3 link.
+//! T3 enrichment reads legacy thread metadata and v2 cross-provider delegation
+//! records. Native session ids resolve lineage across all supported harnesses.
+//! Databases are opened read-only with `immutable=1`, ignoring WAL files.
 
 use crate::antigravity::sqlite_uri;
 use anyhow::{Context, Result};
@@ -38,7 +36,9 @@ pub fn default_paths() -> Vec<PathBuf> {
     };
     [".t3", ".t3-personal"]
         .iter()
-        .map(|d| home.join(d).join("userdata/state.sqlite"))
+        .flat_map(|d| {
+            ["state.sqlite", "statev2.sqlite"].map(|name| home.join(d).join("userdata").join(name))
+        })
         .filter(|p| p.is_file())
         .collect()
 }
@@ -318,4 +318,228 @@ mod tests {
         merge(&mut a, b);
         assert_eq!(a[&k].thread_id, "first");
     }
+}
+
+fn tool_name(provider: &str) -> Option<&'static str> {
+    match provider {
+        "codex" => Some("codex"),
+        "claudeAgent" | "claude-code" => Some("claude-code"),
+        "antigravity" => Some("antigravity"),
+        _ => None,
+    }
+}
+
+type SessionKey = (String, String);
+
+#[derive(Debug)]
+struct Delegation {
+    id: String,
+    parent: SessionKey,
+    child: Option<SessionKey>,
+    child_tool: String,
+    started: Option<i64>,
+}
+
+fn has_table(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+        [table],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn load_delegations(path: &Path) -> Result<Vec<Delegation>> {
+    let conn = Connection::open_with_flags(
+        sqlite_uri(path, "mode=ro&immutable=1"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    if !has_table(&conn, "orchestration_v2_projection_subagents") {
+        return Ok(vec![]);
+    }
+    let mut threads: HashMap<String, SessionKey> = HashMap::new();
+    let mut provider_threads: HashMap<String, SessionKey> = HashMap::new();
+    if has_table(&conn, "provider_session_runtime") {
+        let mut stmt = conn.prepare("SELECT thread_id, provider_name, resume_cursor_json FROM provider_session_runtime ORDER BY thread_id")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let provider: String = r.get(1)?;
+            let cursor: Option<String> = r.get(2)?;
+            if let (Some(tool), Some(id)) = (
+                tool_name(&provider),
+                cursor.as_deref().and_then(|v| {
+                    let value: serde_json::Value = serde_json::from_str(v).ok()?;
+                    let field = if provider == "claudeAgent" {
+                        "resume"
+                    } else if provider == "codex" {
+                        "threadId"
+                    } else {
+                        "sessionId"
+                    };
+                    value
+                        .get(field)?
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                }),
+            ) {
+                threads.insert(r.get(0)?, (tool.into(), id));
+            }
+        }
+    }
+    if has_table(&conn, "orchestration_v2_projection_provider_threads") {
+        let mut stmt = conn.prepare("SELECT thread_id, provider, payload_json, provider_thread_id FROM orchestration_v2_projection_provider_threads ORDER BY updated_at, provider_thread_id")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let provider: String = r.get(1)?;
+            let payload: String = r.get(2)?;
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            if let (Some(tool), Some(id)) = (
+                tool_name(&provider),
+                v.pointer("/nativeThreadRef/nativeId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()),
+            ) {
+                let key = (tool.to_owned(), id.to_owned());
+                provider_threads.insert(r.get(3)?, key.clone());
+                threads.insert(r.get(0)?, key);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let has_provider_thread = conn
+        .prepare("SELECT provider_thread_id FROM orchestration_v2_projection_subagents LIMIT 0")
+        .is_ok();
+    let sql = format!(
+        "SELECT thread_id, child_thread_id, provider, started_at, subagent_id, {} FROM orchestration_v2_projection_subagents ORDER BY started_at, subagent_id",
+        if has_provider_thread {
+            "provider_thread_id"
+        } else {
+            "NULL"
+        }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let parent: String = r.get(0)?;
+        let child: Option<String> = r.get(1)?;
+        let provider: String = r.get(2)?;
+        let started: Option<String> = r.get(3)?;
+        let (Some(parent), Some(child_tool)) = (threads.get(&parent), tool_name(&provider)) else {
+            continue;
+        };
+        let provider_thread: Option<String> = r.get(5)?;
+        out.push(Delegation {
+            id: r.get(4)?,
+            parent: parent.clone(),
+            child: child
+                .and_then(|c| threads.get(&c).cloned())
+                .or_else(|| provider_thread.and_then(|id| provider_threads.get(&id).cloned())),
+            child_tool: child_tool.into(),
+            started: started
+                .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+                .map(|v| v.timestamp_millis()),
+        });
+    }
+    Ok(out)
+}
+
+/// Import only unambiguous, unclaimed children. Harness parents always win.
+/// Native ids are authoritative; timestamps are a fallback only when the native
+/// child cannot be found in the usage store. No title participates in matching.
+pub fn enrich_lineage(tx: &Transaction, paths: &[PathBuf]) -> Result<()> {
+    let mut delegations = Vec::new();
+    for path in paths.iter().filter(|p| p.is_file()) {
+        match load_delegations(path) {
+            Ok(rows) => delegations.extend(rows),
+            Err(_) => continue, // Optional enrichment must not prevent ingest.
+        }
+    }
+    let exists = |key: &SessionKey| -> Result<bool> {
+        Ok(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE tool = ?1 AND session_id = ?2)",
+            params![key.0, key.1],
+            |r| r.get(0),
+        )?)
+    };
+    // Resolve candidates before writing, so two delegations cannot win the
+    // same timing candidate merely because one happened to be processed first.
+    let mut pending = Vec::new();
+    let mut claims: HashMap<SessionKey, std::collections::HashSet<String>> = HashMap::new();
+    for d in &delegations {
+        if let Some(child) = &d.child {
+            claims
+                .entry(child.clone())
+                .or_default()
+                .insert(d.id.clone());
+        }
+    }
+    for d in delegations {
+        let already_imported: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE lineage_id = ?1)",
+            [&d.id],
+            |r| r.get(0),
+        )?;
+        if already_imported {
+            continue;
+        }
+        if !exists(&d.parent)? {
+            continue;
+        }
+        let exact = d.child.as_ref().filter(|c| exists(c).unwrap_or(false));
+        let (child, source) = if let Some(child) = exact {
+            (child.clone(), "t3")
+        } else {
+            let Some(start) = d.started else { continue };
+            let candidates = tx.prepare(
+                "SELECT s.tool, s.session_id FROM sessions s JOIN sessions p ON p.tool = ?1 AND p.session_id = ?2
+                 WHERE s.tool = ?3 AND s.parent_session_id IS NULL
+                   AND (SELECT MIN(start_ms) FROM session_events e WHERE e.tool = s.tool AND e.session_id = s.session_id) BETWEEN ?4 AND ?4 + 60000
+                   AND (COALESCE(s.project, s.cwd) IS NULL OR COALESCE(p.project, p.cwd) IS NULL
+                        OR COALESCE(s.project, s.cwd) = COALESCE(p.project, p.cwd))")?
+                .query_map(params![d.parent.0, d.parent.1, d.child_tool, start], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if candidates.len() != 1 {
+                continue;
+            }
+            (candidates[0].clone(), "timing")
+        };
+        if child != d.parent {
+            pending.push((d.parent, child, source, d.id));
+        }
+    }
+    for (_, child, _, id) in &pending {
+        claims.entry(child.clone()).or_default().insert(id.clone());
+    }
+    // Exact evidence takes priority over timing evidence.
+    pending.sort_by_key(|(_, _, source, _)| *source == "timing");
+    for (parent, child, source, id) in pending {
+        if source == "timing" && claims[&child].len() != 1 {
+            continue;
+        }
+        // Reject cycles before writing. UNION also bounds traversal of existing malformed trees.
+        let cycle: bool = tx.query_row(
+            "WITH RECURSIVE ancestors(tool, sid) AS (
+                SELECT ?1, ?2 UNION SELECT COALESCE(s.parent_tool, s.tool), s.parent_session_id FROM sessions s
+                JOIN ancestors a ON s.tool = a.tool AND s.session_id = a.sid WHERE s.parent_session_id IS NOT NULL
+             ) SELECT EXISTS(SELECT 1 FROM ancestors WHERE tool = ?3 AND sid = ?4)",
+            params![parent.0, parent.1, child.0, child.1], |r| r.get(0))?;
+        if cycle {
+            continue;
+        }
+        let changed = tx.execute("UPDATE sessions SET parent_tool = ?3, parent_session_id = ?4, lineage_source = ?5, lineage_id = ?6, is_subagent = 1
+            WHERE tool = ?1 AND session_id = ?2 AND parent_session_id IS NULL", params![child.0, child.1, parent.0, parent.1, source, id])?;
+        if changed > 0 {
+            tx.execute(
+                "UPDATE requests SET is_subagent = 1 WHERE tool = ?1 AND session_id = ?2",
+                params![child.0, child.1],
+            )?;
+            crate::store::refresh_ancestors(tx, &child.0, &child.1)?;
+        }
+    }
+    Ok(())
 }

@@ -250,6 +250,13 @@ pub struct RequestRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct Parent {
+    pub tool: String,
+    pub session_id: String,
+    pub lineage_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionReport {
     pub generated_at: String,
     /// RFC 3339 lower bound on request time, or null for all time.
@@ -283,6 +290,7 @@ pub struct SessionReport {
     pub rows: Option<Vec<RequestRow>>,
     pub active_seconds: Option<i64>,
     pub idle_gap_seconds: i64,
+    pub parent: Option<Parent>,
 }
 
 /// Everything about one session. `since_ms` keeps requests at or after it in
@@ -420,6 +428,12 @@ pub fn session_report(
         project,
         project_name,
         is_subagent,
+        parent: parent.as_ref().map(|id| -> Result<Parent> {
+            let (parent_tool, lineage_source) = conn.query_row(
+                "SELECT COALESCE(parent_tool, tool), lineage_source FROM sessions WHERE tool = ?1 AND session_id = ?2",
+                params![tool, sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(Parent { tool: parent_tool, session_id: id.clone(), lineage_source })
+        }).transpose()?,
         parent_session_id: parent,
         agent_type,
         t3_thread_id,
@@ -449,6 +463,7 @@ fn session_label(
     session_id: &str,
 ) -> Result<(Option<String>, Option<String>)> {
     let mut at = session_id.to_string();
+    let mut tool = tool.to_string();
     for _ in 0..32 {
         let (is_sub, parent, rule, rule_src): (
             i64,
@@ -468,6 +483,7 @@ fn session_label(
         if is_sub != 0 {
             match parent {
                 Some(p) => {
+                    tool = conn.query_row("SELECT COALESCE(parent_tool, tool) FROM sessions WHERE tool = ?1 AND session_id = ?2", params![tool, at], |r| r.get(0))?;
                     at = p;
                     continue;
                 }

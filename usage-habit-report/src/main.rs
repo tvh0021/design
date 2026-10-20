@@ -45,7 +45,7 @@ struct ScanArgs {
     #[arg(long = "antigravity-dir")]
     antigravity_dirs: Vec<PathBuf>,
     /// T3 Code state database, read-only; repeatable; a missing path is skipped
-    /// [default: ~/.t3/userdata/state.sqlite and ~/.t3-personal/userdata/state.sqlite]
+    /// [default: state.sqlite and statev2.sqlite under ~/.t3 and ~/.t3-personal]
     #[arg(long = "t3-state")]
     t3_states: Vec<PathBuf>,
 }
@@ -701,6 +701,10 @@ fn codex_summary_line(c: &codex::CodexScanReport) -> String {
         s.files_seen, s.files_read, s.bytes_read, s.rows_added, s.sessions_added
     );
     for (n, what) in [
+        (
+            a.internal_review_requests_excluded,
+            "internal codex-auto-review requests excluded",
+        ),
         (s.files_reset, "files re-read after shrinking"),
         (
             c.files_relocated,
