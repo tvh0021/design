@@ -186,7 +186,7 @@ section rather than wrapping.
 
 ## Copy
 
-- Sentence case. "Window totals", not "WINDOW TOTALS".
+- Sentence case. "Estimated API cost", not "ESTIMATED API COST".
 - State the window and the clock in plain words: "4 weeks to Tue 20 Oct,
   00:56 local time".
 - Empty store: "No usage recorded yet. Run `usage-habit-report scan` to read
@@ -205,8 +205,10 @@ and request/cost window semantics stay the same.
 as `serve`. Its public audience changes navigation to relative HTML files
 and removes private fields before rendering. A note near the top states the
 generation date and window. Project names are pseudonyms without path
-tooltips. Session lists keep the tool, project, and figures, with no title
-column. Heaviest fan-outs become an omission note; the rest of the agents
-panel stays. Estimated dollar figures round independently to whole dollars,
+tooltips, and the project table has no active-time column. The sessions
+section is one summary line (session, project and fan-out counts) with no
+per-session rows. The agents panel keeps the histogram and model mix but
+drops the heaviest fan-outs and the per-tool coverage and lineage notes.
+Active time appears nowhere in the export. Estimated dollar figures round independently to whole dollars,
 including exact aggregates computed before rounding. The spend note explains
 why rounded rows may not add up. All existing visual tokens stay the same.

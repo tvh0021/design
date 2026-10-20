@@ -589,7 +589,8 @@ fn agents_panel(p: &Page) -> String {
     body.push_str("</div></div>");
 
     if p.audience.is_public() {
-        body.push_str("<p class=\"note\">Heaviest fan-outs omitted from this export because session titles are private.</p>");
+        // Per-session fan-outs and per-tool coverage notes stay private.
+        return body;
     } else if a.heaviest_fanouts.is_empty() {
         body.push_str("<p class=\"empty\">No session in this window spawned subagents.</p>");
     } else {
@@ -698,8 +699,14 @@ fn projects_panel(p: &Page) -> String {
     if pr.lines.is_empty() {
         return nothing_here(p);
     }
-    let mut body = String::from(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><thead><tr><th scope=\"col\">Project</th><th scope=\"col\">Sessions</th><th scope=\"col\">Active time</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th><th scope=\"col\" class=\"l\">Tools</th></tr></thead><tbody>",
+    let public = p.audience.is_public();
+    let time_header = if public {
+        ""
+    } else {
+        "<th scope=\"col\">Active time</th>"
+    };
+    let mut body = format!(
+        "<div class=\"table-wrap\"><table class=\"ledger\"><thead><tr><th scope=\"col\">Project</th><th scope=\"col\">Sessions</th>{time_header}<th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th><th scope=\"col\" class=\"l\">Tools</th></tr></thead><tbody>",
     );
     for l in &pr.lines {
         let r = &l.row;
@@ -712,9 +719,13 @@ fn projects_panel(p: &Page) -> String {
         };
         let _ = write!(
             body,
-            "<tr><th scope=\"row\">{name}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"bar\">{}</td></tr>",
+            "<tr><th scope=\"row\">{name}</th><td>{}</td>{}<td>{}</td><td>{}</td><td class=\"bar\">{}</td></tr>",
             fmt_int(r.sessions),
-            fmt_elapsed(l.active_seconds),
+            if public {
+                String::new()
+            } else {
+                format!("<td>{}</td>", fmt_elapsed(l.active_seconds))
+            },
             fmt_int(all_tokens(&r.tokens)),
             p.audience
                 .usd(r.tokens.estimated_cost_usd, r.tokens.unpriced_requests),
@@ -786,6 +797,14 @@ fn sessions_panel(p: &Page) -> String {
     let sl = &p.sessions;
     if sl.longest.is_empty() {
         return nothing_here(p);
+    }
+    if p.audience.is_public() {
+        return format!(
+            "<p>{} top-level sessions across {} projects had activity in this window; {} of them spawned subagents. Per-session figures are left out of this export.</p>",
+            fmt_int(p.agents.totals.top_level_sessions as i64),
+            fmt_int(p.projects.count as i64),
+            fmt_int(p.agents.totals.sessions_with_subagents as i64)
+        );
     }
     let mut body = String::from("<div class=\"stack\">");
     body.push_str(&session_table(p, "Longest, by active time", &sl.longest));
@@ -920,30 +939,34 @@ fn panels(p: &Page) -> String {
     let idle_minutes = crate::store::IDLE_GAP_SECONDS / 60;
     s.push_str(&section(
         "projects",
-        "Time and cost by project",
+        if p.audience.is_public() { "Cost by project" } else { "Time and cost by project" },
         &format!(
-            "{scope} Sessions, tokens and cost match <code>query projects{since}</code>{}. Active time adds up top-level sessions after removing gaps longer than {idle_minutes} minutes. Linked child activity bridges their parent's gaps; unlinked children count separately.",
+            "{scope} Sessions, tokens and cost match <code>query projects{since}</code>{}.{}",
             match p.tool {
                 Some(t) => format!(" counting {t} only"),
                 None => String::new(),
-            }
+            },
+            if p.audience.is_public() { String::new() } else { format!(" Active time adds up top-level sessions after removing gaps longer than {idle_minutes} minutes. Linked child activity bridges their parent's gaps; unlinked children count separately.") }
         ),
         &projects_panel(p),
     ));
     s.push_str(&section(
         "sessions",
-        "Longest and costliest sessions",
-        &format!(
-            "{scope} Top-level sessions with a request in the window. Active time covers the whole session and its linked children; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. {}",
-            if p.audience.is_public() { "Session titles are removed from this export." } else { "Titles are the first line of the opening prompt." }
-        ),
+        if p.audience.is_public() { "Sessions" } else { "Longest and costliest sessions" },
+        &if p.audience.is_public() {
+            format!("{scope} Counts match <code>query agents{since}</code> and <code>query projects{since}</code>.")
+        } else {
+            format!(
+                "{scope} Top-level sessions with a request in the window. Active time covers the whole session and its linked children; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. Titles are the first line of the opening prompt."
+            )
+        },
         &sessions_panel(p),
     ));
     s.push_str(&section(
         "cache",
         "Cache-read ratio",
         &format!(
-            "{scope} Cache-read tokens as a share of all input: uncached, cache read and cache write. Same figures as the window totals."
+            "{scope} Cache-read tokens as a share of all input: uncached, cache read and cache write. Same figures as the estimated API cost section."
         ),
         &cache_panel(p),
     ));
@@ -961,7 +984,7 @@ fn panels(p: &Page) -> String {
             } else {
                 "by week, counted back from now"
             },
-            if p.audience.is_public() { "Figures are rounded independently to the nearest dollar; displayed rows may not add up." } else { "Each column adds up to the cost in the window totals." }
+            if p.audience.is_public() { "Figures are rounded independently to the nearest dollar; displayed rows may not add up." } else { "Each column adds up to the estimated API cost." }
         ),
         &spend_panel(p),
     ));
@@ -1027,7 +1050,7 @@ pub fn render(p: &Page) -> String {
         }
         None => format!("Same window. The total row matches <code>{cmd}</code>."),
     };
-    s.push_str(&section("totals", "Window totals", &note, &totals(p)));
+    s.push_str(&section("totals", "Estimated API cost", &note, &totals(p)));
     s.push_str(&panels(p));
     s.push_str("</main>\n<footer>\n<p>");
     let _ = write!(

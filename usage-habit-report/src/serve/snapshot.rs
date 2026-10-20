@@ -233,7 +233,10 @@ mod tests {
             assert!(s.title.is_none());
         }
         let html = html::render(&p);
-        assert!(html.contains("Heaviest fan-outs omitted"));
+        assert!(!html.contains("Heaviest fan-outs"));
+        assert!(!html.contains("Active time"));
+        assert!(!html.contains("delegation records"));
+        assert!(html.contains("Per-session figures are left out of this export."));
         assert!(!html.contains("Demo task"));
         assert!(!html.contains("untitled session"));
     }
@@ -301,7 +304,7 @@ mod tests {
             assert!(!amount.contains('.'));
         }
         assert!(html.contains("Costs are estimates"));
-        assert!(html.contains("estimated cost"));
+        assert!(html.contains("Estimated API cost"));
     }
 
     #[test]
