@@ -77,7 +77,7 @@ fn find_dbs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn sqlite_uri(path: &Path, query: &str) -> String {
+pub(crate) fn sqlite_uri(path: &Path, query: &str) -> String {
     let mut s = String::from("file:");
     for c in path.to_string_lossy().chars() {
         match c {

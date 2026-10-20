@@ -93,6 +93,13 @@ const MIGRATIONS: &[&str] = &[
         UPDATE requests SET canonical_model = NULL, cost_usd = NULL WHERE id = NEW.id;
     END;
     "#,
+    // v4 (ticket 05): project folder name next to the resolved project path,
+    // and lookups by project and by T3 thread id.
+    r#"
+    ALTER TABLE sessions ADD COLUMN project_name TEXT;
+    CREATE INDEX sessions_project ON sessions (project);
+    CREATE INDEX sessions_t3_thread ON sessions (t3_thread_id);
+    "#,
 ];
 
 pub struct Store {

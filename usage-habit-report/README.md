@@ -32,7 +32,7 @@ command from fetching model rates; see [Pricing](#pricing).
 ### `scan`
 
 ```sh
-usage-habit-report scan [--claude-dir ~/.claude/projects] [--codex-dir ~/.codex] [--antigravity-dir DIR]...
+usage-habit-report scan [--claude-dir ~/.claude/projects] [--codex-dir ~/.codex] [--antigravity-dir DIR]... [--t3-state FILE]...
 ```
 
 Reads every log file from the byte offset where the previous scan stopped,
@@ -44,6 +44,7 @@ re-read from byte 0 after its old rows are dropped. Output:
 claude-code: 120 files seen, 120 files read, 250000000 bytes read, 5000 rows added, 120 sessions added
 codex: 900 files seen, 900 files read, 3000000000 bytes read, 40000 rows added, 890 sessions added, 300 repeated token_count events skipped
 antigravity: 48 databases seen, 48 databases read, 175000000 bytes read, 8800 rows added, 48 sessions added
+enrich: 1480 sessions given a project (0 from a T3 directory), 11 without a directory; t3: 2 databases read, 417 sessions linked; 0.01 s
 elapsed: 4.50 s
 priced: 61500 rows checked, 61000 with an estimated cost, 500 without a price
 ```
@@ -54,7 +55,9 @@ the Codex ones are explained under [Codex ingest](#codex-ingest).
 A second scan over unchanged logs reports `0 files read, 0 bytes read`
 (`0 databases read` for Antigravity). Antigravity databases are read whole
 when they change; see [Antigravity ingest](#antigravity-ingest).
-After reading, `scan` runs the price step (see [Pricing](#pricing)).
+After reading, `scan` runs the enrich step (see
+[Projects and T3](#projects-and-t3)) and then the price step (see
+[Pricing](#pricing)).
 
 ### `query summary`
 
@@ -132,6 +135,111 @@ first, so a name the canonical table does not cover shows up at the top.
 JSON is an array of `{tool, model, canonical_model, litellm_key, priced,
 requests}`.
 
+### `query project`
+
+```sh
+usage-habit-report query project <path-or-name> [--json] [--since 12h|7d|2w]
+```
+
+One project's totals with a per-tool breakdown. The key is matched, in
+order, against: the exact project path; the project of the directory the key
+names, when it exists on disk (so `.` or any folder inside a repo works); the
+project's folder name, case-insensitively.
+
+- No match: exit code 1, `project not found: <key>` on stderr, and with
+  `--json` `{"error": "not found", "key": "<key>"}` on stdout.
+- Several projects share the folder name: exit code 2 and a list of the
+  candidates on stdout (a table, or with `--json`
+  `{"error": "ambiguous", "key": "<key>", "candidates": [{"project", "name", "sessions"}]}`).
+  Pass the full path instead.
+
+JSON shape:
+
+```json
+{
+  "generated_at": "2026-10-20T04:48:43Z",
+  "since": null,
+  "rates_fetched_at": "2026-10-20T04:21:42Z",
+  "project": "/home/demo/alpha",
+  "name": "alpha",
+  "sessions": 7,
+  "first_request_at": "2026-10-03T14:53:08Z",
+  "last_request_at": "2026-10-20T02:55:39Z",
+  "requests": 669,
+  "input_tokens": 1090013,
+  "cache_read_input_tokens": 70159210,
+  "cache_creation_input_tokens": 1925151,
+  "output_tokens": 462999,
+  "estimated_cost_usd": 44.67,
+  "unpriced_requests": 0,
+  "tools": [
+    {
+      "tool": "claude-code",
+      "sessions": 3,
+      "first_request_at": "2026-10-03T14:53:08Z",
+      "last_request_at": "2026-10-20T02:55:39Z",
+      "requests": 434,
+      "input_tokens": 9272,
+      "cache_read_input_tokens": 47555306,
+      "cache_creation_input_tokens": 1925151,
+      "output_tokens": 262459,
+      "estimated_cost_usd": 40.77,
+      "unpriced_requests": 0
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `generated_at`, `since`, `rates_fetched_at` | string / null | As in `query summary` |
+| `project` | string | Project path as stored in `sessions.project` |
+| `name` | string | Last path component of `project` |
+| `sessions` | integer | Sessions of the project; with `--since`, those that ended (or, with no end time, started) inside the window |
+| `first_request_at`, `last_request_at` | string or null | RFC 3339 UTC time of the earliest and latest request in the window; null when there are none |
+| `requests` … `unpriced_requests` | | Token totals, as in `query summary`, over requests of the project's sessions inside the window |
+| `tools[]` | array | The same fields per tool (`tool` instead of `project`/`name`), largest token total first |
+
+Subagent sessions count as sessions of the project of their own working
+directory, which is normally the parent's.
+
+### `query projects`
+
+```sh
+usage-habit-report query projects [--json] [--since 12h|7d|2w]
+```
+
+Every project with its totals, largest token total first. JSON:
+
+```json
+{
+  "generated_at": "2026-10-20T04:48:43Z",
+  "since": "2026-10-13T04:48:49Z",
+  "rates_fetched_at": "2026-10-20T04:21:42Z",
+  "projects": [
+    {
+      "project": "/home/demo/alpha",
+      "name": "alpha",
+      "sessions": 86,
+      "first_request_at": "2026-10-13T05:02:11Z",
+      "last_request_at": "2026-10-19T23:40:00Z",
+      "requests": 5659,
+      "input_tokens": 5851988,
+      "cache_read_input_tokens": 649671219,
+      "cache_creation_input_tokens": 7655912,
+      "output_tokens": 2233655,
+      "estimated_cost_usd": 185.62,
+      "unpriced_requests": 12
+    }
+  ]
+}
+```
+
+Each entry has the fields of `query project` without `tools`. Sessions with
+no known directory, and requests whose session row is missing, are collected
+in one entry with `project` and `name` null, so the request counts add up to
+`query summary`'s total over the same window.
+
 ### `rates update` and `rates apply`
 
 ```sh
@@ -206,6 +314,54 @@ or when the command just refreshed the rates, every row is re-priced. A
 trigger clears `canonical_model` and `cost_usd` whenever a later merge
 changes a row's model or token counts, so a row priced mid-stream is priced
 again with its final counts.
+
+## Projects and T3
+
+The enrich step runs after every `scan`. It only touches sessions that have
+no project (and, for T3, no thread id) yet, so a second scan does nothing.
+
+**Project.** A session's project is derived from its recorded `cwd`:
+
+- Inside a git repository: the repository's toplevel, found by walking up to
+  the nearest directory holding `.git`. When `.git` is a file (a linked
+  worktree), its `gitdir:` folder's `commondir` leads to the main
+  repository's `.git`, and the main repository's toplevel is the project, so
+  every worktree of a repository is one project. A `.git` file without
+  `commondir` (a submodule) or whose common dir is not a `.git` folder (a
+  worktree of a bare repository) leaves that directory as its own project.
+- Outside a repository: the directory itself.
+- A directory that no longer exists (for example a deleted worktree): the
+  `cwd` string as recorded.
+
+Existing directories are canonicalized first (symlinks resolved, so `/tmp/x`
+becomes `/private/tmp/x` on macOS). `sessions.project` holds the path and
+`sessions.project_name` its last component. Each distinct `cwd` is resolved
+once per run.
+
+**T3.** T3 Code keeps a state database at `~/.t3/userdata/state.sqlite` (and
+`~/.t3-personal/userdata/state.sqlite` for a second profile).
+`--t3-state FILE` (repeatable) replaces both; a path that does not exist is
+skipped silently, so `--t3-state /nonexistent` turns the step off. Each
+database is opened with `immutable=1`, read-only, and never written. One that
+fails to open or read gets one `notice:` line on stderr and is skipped;
+nothing else changes.
+
+- `provider_session_runtime.resume_cursor_json` names the harness session:
+  `{"threadId": "<codex session id>"}` for `codex` rows,
+  `{"schemaVersion": 1, "sessionId": "<conversation id>"}` for `antigravity`
+  rows. Other providers are ignored; Claude Code sessions get no T3 link.
+- `sessions.t3_thread_id` is the row's `thread_id` and `sessions.t3_title`
+  the `projection_threads.title`. A later scan refreshes the title of a
+  session already linked to the same thread. When a session appears in more
+  than one database, the first database in the list wins.
+- A session with no recorded `cwd` uses the thread's `worktree_path`, else
+  its project's `projection_projects.workspace_root`, for project resolution.
+  That directory is not written to `cwd`.
+
+**Session keys.** `query::resolve_session(key)` finds a session by exact
+`session_id`, then exact `t3_thread_id`, then `session_id` prefix; the first
+stage with a match decides, and several matches at that stage are reported
+as ambiguous.
 
 ## Claude Code ingest
 
@@ -351,7 +507,7 @@ again with its final counts.
   only prompts at or past it add to `user_turns`. A database whose steps fall
   below `offset` is reset and re-read.
 
-## Store schema (v3)
+## Store schema (v4)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
 `src/store.rs`.
@@ -362,9 +518,10 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
 - `sessions`: one row per `(tool, session_id)`, with `is_subagent`,
   `parent_session_id`, `agent_type`, `title`, `cwd`, `started_at_ms`,
   `ended_at_ms`, `user_turns`, and `model_source` (Antigravity:
-  `measured` or `guessed`). The nullable columns `project`,
-  `t3_thread_id`, `t3_title`, `label`, and `label_source` are reserved for
-  later tickets.
+  `measured` or `guessed`). `project`, `project_name` (v4), `t3_thread_id`,
+  and `t3_title` are filled by the enrich step (see
+  [Projects and T3](#projects-and-t3)). The nullable columns `label` and
+  `label_source` are reserved for a later ticket.
 - `requests`: one row per `(tool, request_key)`, with `session_id`,
   `is_subagent`, `source_id`, `ts_ms`, `model`, `effort`, and the four token
   counts. `reasoning_tokens` is filled where the harness reports it (Codex,
@@ -374,6 +531,8 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   carried between incremental scans.
 - Trigger `requests_unprice` (v3, ticket 04): clears `canonical_model` and
   `cost_usd` when a row's model or token counts change.
+- v4 (ticket 05): `sessions.project_name`, and indexes on `sessions.project`
+  and `sessions.t3_thread_id`.
 
 ## Tests
 
@@ -382,5 +541,8 @@ cargo test
 ```
 
 The fixtures in `tests/fixtures/` are hand-written. The Antigravity
-databases and their protobuf blobs are built inside `tests/antigravity.rs`. Never commit real
+databases and their protobuf blobs are built inside `tests/antigravity.rs`,
+and the T3 state databases inside `src/t3.rs` and `tests/projects_cli.rs`.
+Project-resolution tests run `git init` and `git worktree add` in temporary
+folders, so `git` must be on `PATH`. Never commit real
 transcript content: this repository is public.
