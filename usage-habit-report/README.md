@@ -672,7 +672,7 @@ later exports as project costs change.
 
 Review the temporary output before publishing. Copy the reviewed files into
 `usage-habit-report/site/` in the repository and commit them when you want to
-publish. GitHub Pages copies that folder to `/usage/`, next to `/maps/`.
+publish. GitHub Pages copies that folder to `/usage/`; the flight visualizer is at `/map/`.
 The deploy workflow uses committed HTML and does not build Rust. The checked-in
 placeholder says that no snapshot has been generated yet.
 
