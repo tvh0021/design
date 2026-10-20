@@ -285,6 +285,7 @@ fn cli_summary_json_shape() {
         let out = std::process::Command::new(bin)
             .args(args)
             .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+            .env("HOME", tmp.path()) // keep other harnesses' default folders out
             .output()
             .unwrap();
         assert!(
