@@ -207,7 +207,10 @@ and request/cost window semantics stay the same.
 as `serve`. Its public audience changes navigation to relative HTML files
 and removes private fields before rendering. A note near the top states the
 generation date and window. Project names are pseudonyms without path
-tooltips, and the project table has no active-time column. The sessions
+tooltips, except exact paths opted into `[public_projects]`: those rows carry
+the GitHub URL separately and render its last segment as a repository link.
+Shared URLs do not merge project rows. Private dashboard names and tooltips
+stay unchanged. The project table has no active-time column. The sessions
 section is one summary line (session, project and fan-out counts) with no
 per-session rows. The agents panel keeps the histogram and model mix but
 drops the heaviest fan-outs and the per-tool coverage and lineage notes.

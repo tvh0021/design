@@ -38,3 +38,11 @@ pub fn default_db() -> Result<PathBuf> {
 pub fn claude_projects() -> Result<PathBuf> {
     Ok(home()?.join(".claude").join("projects"))
 }
+
+/// Override only this application's configuration file, never a harness config.
+pub fn config_file() -> Result<PathBuf> {
+    match std::env::var_os("USAGE_HABIT_REPORT_CONFIG") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(config_dir()?.join("config.toml")),
+    }
+}

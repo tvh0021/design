@@ -16,7 +16,7 @@ use std::fmt::Write;
 pub const CSS: &str = include_str!("../../assets/dashboard.css");
 pub const JS: &str = include_str!("../../assets/dashboard.js");
 
-/// Public pages link only to files emitted in the same snapshot run.
+/// Public pages link to generated files and explicitly public repositories.
 #[derive(Debug, Clone, Default)]
 pub enum Audience {
     #[default]
@@ -704,6 +704,17 @@ fn all_tokens(t: &Tokens) -> i64 {
     t.input_tokens + t.cache_read_input_tokens + t.cache_creation_input_tokens + t.output_tokens
 }
 
+fn public_project(name: &str, url: Option<&str>) -> String {
+    match url {
+        Some(url) => format!(
+            "<a href=\"{}\" rel=\"noopener\">{}</a>",
+            esc(url),
+            esc(name)
+        ),
+        None => esc(name),
+    }
+}
+
 fn projects_panel(p: &Page) -> String {
     let pr = &p.projects;
     if pr.lines.is_empty() {
@@ -721,7 +732,9 @@ fn projects_panel(p: &Page) -> String {
     for l in &pr.lines {
         let r = &l.row;
         let name = match (&r.project, &r.name) {
-            (_, Some(name)) if p.audience.is_public() => esc(name),
+            (_, Some(name)) if p.audience.is_public() => {
+                public_project(name, l.project_url.as_deref())
+            }
             (Some(path), Some(name)) => {
                 format!("<span title=\"{}\">{}</span>", esc(path), esc(name))
             }
@@ -753,7 +766,7 @@ fn projects_panel(p: &Page) -> String {
         );
     }
     foot.push_str(if p.audience.is_public() {
-        "Project pseudonyms are shared across this export. Tool shares are percentages of requests."
+        "Linked projects are public on GitHub. Other project names are pseudonyms shared across this export. Tool shares are percentages of requests."
     } else {
         "Hover a name for its full path. Tool shares are percentages of requests."
     });
@@ -775,7 +788,9 @@ fn session_table(p: &Page, caption: &str, rows: &[SessionLine]) -> String {
     );
     for r in rows {
         let project = match (&r.project, &r.project_name) {
-            (_, Some(name)) if p.audience.is_public() => esc(name),
+            (_, Some(name)) if p.audience.is_public() => {
+                public_project(name, r.project_url.as_deref())
+            }
             (Some(path), Some(name)) => {
                 format!("<span title=\"{}\">{}</span>", esc(path), esc(name))
             }
@@ -1098,6 +1113,50 @@ pub fn render_missing(db_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_session_tables_link_repositories_and_private_tables_keep_paths() {
+        let store = crate::serve::data::tests::panel_fixture();
+        let mut page = super::super::routes::load_page(
+            &store.conn,
+            super::super::routes::Params {
+                window: Some(Window::All),
+                tool: None,
+            },
+            crate::serve::data::tests::NOW,
+            &chrono::Local,
+            None,
+        )
+        .unwrap();
+        for line in page
+            .sessions
+            .longest
+            .iter_mut()
+            .chain(&mut page.sessions.costliest)
+        {
+            line.project = Some("/home/demo/public-checkout".into());
+            line.project_name = Some("public-repo".into());
+            line.project_url = Some("https://github.com/demo/public-repo".into());
+        }
+        for rows in [&page.sessions.longest, &page.sessions.costliest] {
+            assert!(!rows.is_empty());
+            let local = session_table(&page, "fixture", rows);
+            assert!(
+                local.contains("<span title=\"/home/demo/public-checkout\">public-repo</span>")
+            );
+            assert!(!local.contains("https://github.com/"));
+        }
+        page.audience = Audience::Public {
+            windows: Window::ALL.to_vec(),
+        };
+        for rows in [&page.sessions.longest, &page.sessions.costliest] {
+            let public = session_table(&page, "fixture", rows);
+            assert!(public.contains(
+                "<a href=\"https://github.com/demo/public-repo\" rel=\"noopener\">public-repo</a>"
+            ));
+            assert!(!public.contains("/home/demo/"));
+        }
+    }
 
     #[test]
     fn number_formats() {

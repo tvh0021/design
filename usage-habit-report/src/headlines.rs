@@ -23,7 +23,7 @@ impl Sources {
             codex_session_index: codex_home.join("session_index.jsonl"),
             antigravity_summaries: home.join(".gemini/antigravity/conversation_summaries.db"),
         };
-        let config = crate::paths::config_dir()?.join("config.toml");
+        let config = crate::paths::config_file()?;
         let text = match std::fs::read_to_string(&config) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
