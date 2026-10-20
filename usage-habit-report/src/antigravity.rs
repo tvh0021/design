@@ -177,6 +177,7 @@ pub struct Conversation {
     pub label: Option<&'static str>,
     /// Workspace from the trajectory metadata (native layout).
     pub cwd: Option<String>,
+    pub events: Vec<(i64, i64)>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     /// `idx` of every user prompt step.
@@ -403,7 +404,14 @@ pub fn read_conversation(conn: &Connection, session_id: &str) -> Result<Conversa
         c.max_idx = Some(c.max_idx.map_or(idx, |m| m.max(idx)));
         let created = proto::bytes(&meta, 1).and_then(proto::timestamp_ms);
         let ended = proto::bytes(&meta, 7).and_then(proto::timestamp_ms);
-        for t in [created, ended].into_iter().flatten() {
+        let generation_start = proto::bytes(&meta, 6).and_then(proto::timestamp_ms);
+        if let Some(start) = created.or(generation_start).or(ended) {
+            c.events.push((
+                start,
+                ended.or(generation_start).unwrap_or(start).max(start),
+            ));
+        }
+        for t in [created, generation_start, ended].into_iter().flatten() {
             c.started_at_ms = Some(c.started_at_ms.map_or(t, |s| s.min(t)));
             c.ended_at_ms = Some(c.ended_at_ms.map_or(t, |e| e.max(t)));
         }
@@ -662,6 +670,12 @@ fn scan_db(store: &mut Store, db: &Path, st: &mut AntigravityStats) -> Result<()
             .execute(params![TOOL, key, r])?;
         }
     }
+    // SQLite steps may change in place, so replace this source's intervals.
+    tx.execute(
+        "DELETE FROM session_events WHERE source_id = ?1",
+        params![source_id],
+    )?;
+    store::record_events(&tx, TOOL, &session_id, source_id, &conv.events)?;
     store::update_source(&tx, source_id, next_idx as u64, size, mtime_ms, now_ms())?;
     tx.commit()?;
 

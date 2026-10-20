@@ -622,10 +622,10 @@ filter, states its window, and names any tool with no requests in it:
   (with a tool filter, that tool's `by_tool` row).
 - **Time and cost by project**: the ten costliest projects with sessions,
   tokens and cost from `query projects`, active time (the sum of each
-  top-level session's `elapsed_seconds` as `query session` reports it), and
+  top-level session's `active_seconds` as `query session` reports it), and
   the tool mix by requests. The full path is in the name's tooltip.
 - **Longest and costliest sessions**: top eight top-level sessions by
-  elapsed time and by estimated cost, titled by `sessions.title` (the stored
+  active time and by estimated cost, titled by `sessions.title` (the stored
   first line of the opening prompt); figures match `query session <id>
   --since <window>`.
 - **Cache-read ratio**: per tool, cache reads over all input (uncached, cache
@@ -887,7 +887,31 @@ Gemini / Antigravity, in `~/.gemini/config/mcp_config.json`:
 }
 ```
 
-## Store schema (v5)
+## Active time
+
+`active_seconds` merges every recorded event in a session with all linked child
+session timelines, then subtracts gaps longer than 15 minutes. A gap of exactly
+15 minutes remains active. Antigravity steps include their recorded start/end
+interval; Claude Code and Codex events are timestamp points. An isolated point
+contributes zero time. Codex copied fork history is excluded from active time.
+`elapsed_seconds` keeps the wall span. `idle_gap_seconds` reports the threshold.
+
+Project and per-tool active totals sum top-level sessions only. Linked children
+report their own active time but are covered by their parent in totals. Children
+with no linked parent count separately; the multi-agent panel reports their count
+per tool. Session and project time covers whole sessions selected by the window,
+while requests and costs still cover requests inside the window.
+
+Ingest stores timestamp-only intervals in `session_events` and caches the merged
+duration in `sessions.active_ms`. Every changed session recomputes its ancestors
+inside the same transaction, including when a child is read after its parent.
+Queries and the read-only dashboard never reread transcripts or compute gaps.
+The v6 migration preserves usage and manual labels and rewinds source cursors
+once, so the next scan can backfill non-request event timestamps. Sessions whose
+logs are no longer present keep a null active time and contribute zero to time
+totals. Run `rebuild` to discard usage whose source logs have been deleted.
+
+## Store schema (v6)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
 `src/store.rs`.
@@ -913,6 +937,8 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   `cost_usd` when a row's model or token counts change.
 - v4 (ticket 05): `sessions.project_name`, and indexes on `sessions.project`
   and `sessions.t3_thread_id`.
+- v6 (ticket 13): `sessions.active_ms` and `session_events`, timestamp-only
+  intervals keyed by source and session for incremental tree recomputation.
 - `session_labels` (v5, ticket 06): `(tool, session_id)` primary key, `label`,
   `set_at` (epoch ms). Hand-set labels; independent of the raw-log rows.
 

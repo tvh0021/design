@@ -96,10 +96,16 @@ the T3 thread id stage. Flags: `--rows`, `--since`, `--json`.
 | `usage` | object: Tokens plus `reasoning_tokens: integer?` (null when no request reports it) |
 | `subagents` | object? (null for a subagent session), see below |
 | `rows` | array? (null unless `--rows`), oldest first, see below |
+| `active_seconds` | integer? (whole session and linked descendants, idle gaps removed) |
+| `idle_gap_seconds` | integer (900) |
 
-`started_at`, `ended_at` and `elapsed_seconds` describe the session, not the
-`--since` window. `models`, `usage`, `subagents` and `rows` cover requests in
-the window; `usage` counts the session's own transcript, not its subagents.
+`started_at`, `ended_at`, `elapsed_seconds` and `active_seconds` describe the
+session, not the `--since` window. `models`, `usage`, `subagents` and `rows` cover requests in
+the window. Active time merges timestamp-only event intervals for the session
+and its linked descendants, then removes every gap strictly greater than
+`idle_gap_seconds`. One isolated timestamp contributes zero seconds. A missing
+timeline reports null until its source is scanned. `usage` counts the session's
+own transcript, not its subagents.
 
 `subagents` (same definitions as `query agents`; tokens are uncached input plus output):
 
@@ -176,7 +182,7 @@ A bare array (no wrapper), unpriced rows first:
 | `generated_at` | string |
 | `since` | string? |
 | `rates_fetched_at` | string |
-| `projects[]` | Tokens plus `project: string?`, `name: string?`, `sessions: integer`, `first_request_at: string?`, `last_request_at: string?`; null `project`/`name` is the row for sessions with no known directory |
+| `projects[]` | Tokens plus `project: string?`, `name: string?`, `sessions: integer`, `first_request_at: string?`, `last_request_at: string?`, `active_seconds: integer`, `elapsed_seconds: integer`, `idle_gap_seconds: integer`; null `project`/`name` is the row for sessions with no known directory |
 
 ## `query project <key>`
 
@@ -188,10 +194,18 @@ A bare array (no wrapper), unpriced rows first:
 | `project` | string |
 | `name` | string |
 | `sessions` | integer |
+| `active_seconds` | integer (sum of top-level sessions, including unlinked children) |
+| `elapsed_seconds` | integer (sum of top-level wall spans) |
+| `idle_gap_seconds` | integer (900) |
 | `first_request_at` | string? |
 | `last_request_at` | string? |
 | plus Tokens | for the whole project |
-| `tools[]` | Tokens plus `tool: string`, `sessions: integer`, `first_request_at: string?`, `last_request_at: string?` |
+| `tools[]` | Tokens plus `tool: string`, `sessions: integer`, `first_request_at: string?`, `last_request_at: string?`, `active_seconds: integer`, `elapsed_seconds: integer`, `idle_gap_seconds: integer` |
+
+Project time fields sum the whole cached duration of each top-level session
+selected by the session window, not only its events in that window. Linked
+children are already covered by their parent. An unlinked child counts as a
+top-level session. Token and session-count fields retain their existing meaning.
 
 ## `query agents`
 

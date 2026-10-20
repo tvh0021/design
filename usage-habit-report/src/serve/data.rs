@@ -447,7 +447,7 @@ pub type ToolMix = Vec<(String, i64, Option<f64>)>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectLine {
     pub row: crate::project::ProjectRow,
-    /// Sum of `elapsed_seconds` (as `query session` defines it) over the
+    /// Sum of cached `active_seconds` over the
     /// project's top-level sessions in the window.
     pub active_seconds: i64,
     /// (tool, requests, estimated cost) for each tool with requests here,
@@ -501,27 +501,6 @@ pub fn projects(
     });
     rows.truncate(PROJECT_ROWS);
 
-    // Active time over the same sessions `query projects` counts (ended, or
-    // lacking an end started, at or after the window start), top-level only:
-    // subagents run inside their parent's time.
-    let sql = format!(
-        r#"WITH {WINDOW_CTE}
-        SELECT s.project, COALESCE(SUM({ELAPSED_SQL}), 0)
-        FROM sessions s LEFT JOIN w ON w.tool = s.tool AND w.session_id = s.session_id
-        WHERE s.is_subagent = 0 AND (?2 IS NULL OR s.tool = ?2)
-          AND (?3 OR COALESCE(s.ended_at_ms, s.started_at_ms) >= ?1)
-        GROUP BY s.project"#
-    );
-    let mut active: std::collections::HashMap<Option<String>, i64> = Default::default();
-    let mut stmt = conn.prepare(&sql)?;
-    let mut q = stmt.query(params![
-        since_ms.unwrap_or(i64::MIN),
-        tool,
-        since_ms.is_none()
-    ])?;
-    while let Some(r) = q.next()? {
-        active.insert(r.get(0)?, r.get(1)?);
-    }
     let mut mix: std::collections::HashMap<Option<String>, ToolMix> = Default::default();
     for (project, t) in by_tool {
         if t.tokens.requests == 0 {
@@ -539,7 +518,7 @@ pub fn projects(
             let mut tools = mix.remove(&row.project).unwrap_or_default();
             tools.sort_by_key(|(t, _, _)| tool_order(t));
             ProjectLine {
-                active_seconds: active.get(&row.project).copied().unwrap_or(0),
+                active_seconds: row.active_seconds,
                 tools,
                 row,
             }
@@ -568,6 +547,7 @@ pub struct SessionLine {
     pub project_name: Option<String>,
     /// As `query session`'s `elapsed_seconds` (the whole session, not the window).
     pub elapsed_seconds: i64,
+    pub active_seconds: i64,
     /// Requests in the window (the session's own transcript).
     pub requests: i64,
     pub cost_usd: Option<f64>,
@@ -583,7 +563,7 @@ pub struct SessionLists {
     pub costliest: Vec<SessionLine>,
 }
 
-/// Top-level sessions with a request in the window, by elapsed time and by
+/// Top-level sessions with a request in the window, by active time and by
 /// estimated cost. Figures match `query session <id> --since <window>`.
 pub fn session_lists(
     conn: &Connection,
@@ -594,9 +574,10 @@ pub fn session_lists(
         let sql = format!(
             r#"WITH {WINDOW_CTE}
             SELECT s.tool, s.session_id, s.title, s.project, s.project_name,
-                   {ELAPSED_SQL} AS elapsed, w.n, w.cost, w.unpriced
+                   {ELAPSED_SQL} AS elapsed, w.n, w.cost, w.unpriced, COALESCE(s.active_ms / 1000, 0) AS active
             FROM w JOIN sessions s ON s.tool = w.tool AND s.session_id = w.session_id
-            WHERE s.is_subagent = 0
+            WHERE NOT EXISTS (SELECT 1 FROM sessions p
+                WHERE p.tool = s.tool AND p.session_id = s.parent_session_id)
             ORDER BY {order}, s.tool, s.session_id
             LIMIT {SESSION_ROWS}"#
         );
@@ -610,6 +591,7 @@ pub fn session_lists(
                     project: r.get(3)?,
                     project_name: r.get(4)?,
                     elapsed_seconds: r.get(5)?,
+                    active_seconds: r.get(9)?,
                     requests: r.get(6)?,
                     cost_usd: r.get(7)?,
                     unpriced: r.get(8)?,
@@ -619,9 +601,9 @@ pub fn session_lists(
         Ok(rows)
     };
     Ok(SessionLists {
-        longest: run("elapsed DESC, w.cost DESC")?,
+        longest: run("active DESC, w.cost DESC")?,
         costliest: {
-            let mut v = run("w.cost DESC, elapsed DESC")?;
+            let mut v = run("w.cost DESC, active DESC")?;
             v.retain(|s| s.cost_usd.is_some());
             v
         },
@@ -1003,6 +985,20 @@ pub(crate) mod tests {
                 )
                 .unwrap();
         }
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET active_ms = MAX(0, ended_at_ms - started_at_ms) / 2",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET active_ms = 1200000 WHERE session_id = 'x1'",
+                [],
+            )
+            .unwrap();
         // A hand-set label wins over the rule label.
         store
             .conn
@@ -1306,7 +1302,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn projects_match_query_projects_and_session_elapsed() {
+    fn projects_match_query_projects_and_session_active() {
         let store = panel_fixture();
         for (w, tool) in scopes() {
             let since = w.since_ms(NOW);
@@ -1337,12 +1333,14 @@ pub(crate) mod tests {
                     line.tools.iter().map(|t| t.1).sum::<i64>(),
                     row.tokens.requests
                 );
-                // Active time is the sum of `query session` elapsed over the
+                // Active time is the sum of `query session` active time over the
                 // project's top-level sessions that `query projects` counts.
                 let mut stmt = store
                     .conn
                     .prepare(
-                        "SELECT tool, session_id FROM sessions WHERE is_subagent = 0
+                        "SELECT tool, session_id FROM sessions s WHERE NOT EXISTS (
+                            SELECT 1 FROM sessions p WHERE p.tool = s.tool
+                            AND p.session_id = s.parent_session_id)
                          AND project IS ?1 AND (?2 IS NULL OR tool = ?2)
                          AND (?3 IS NULL OR COALESCE(ended_at_ms, started_at_ms) >= ?3)",
                     )
@@ -1364,7 +1362,7 @@ pub(crate) mod tests {
                         };
                         crate::query::session_report(&store.conn, &r, since, false, NOW)
                             .unwrap()
-                            .elapsed_seconds
+                            .active_seconds
                             .unwrap_or(0)
                     })
                     .sum();
@@ -1381,7 +1379,7 @@ pub(crate) mod tests {
         // Costliest first; the no-directory row is present for codex.
         let p = projects(&store.conn, None, None, NOW).unwrap();
         assert_eq!(p.lines[0].row.project.as_deref(), Some("/home/demo/alpha"));
-        assert_eq!(p.lines[0].active_seconds, 7_200 + 1_800 + DAY / 1000);
+        assert_eq!(p.lines[0].active_seconds, (7_200 + 1_800 + DAY / 1000) / 2);
         assert!(p.lines.iter().any(|l| l.row.project.is_none()));
     }
 
@@ -1399,7 +1397,8 @@ pub(crate) mod tests {
                     matched_by: crate::query::MatchedBy::SessionId,
                 };
                 let rep = crate::query::session_report(&store.conn, &r, since, false, NOW).unwrap();
-                assert!(!rep.is_subagent);
+                assert!(!rep.is_subagent || rep.parent_session_id.as_deref() == Some("gone"));
+                assert_eq!(s.active_seconds, rep.active_seconds.unwrap_or(0));
                 assert_eq!(Some(s.elapsed_seconds), rep.elapsed_seconds);
                 assert_eq!(s.requests, rep.usage.tokens.requests);
                 assert!(close(s.cost_usd, rep.usage.tokens.estimated_cost_usd));
@@ -1407,12 +1406,13 @@ pub(crate) mod tests {
                 assert_eq!(s.title, rep.title);
             }
             for pair in l.longest.windows(2) {
-                assert!(pair[0].elapsed_seconds >= pair[1].elapsed_seconds);
+                assert!(pair[0].active_seconds >= pair[1].active_seconds);
             }
         }
         let l = session_lists(&store.conn, None, None).unwrap();
-        // x1 spans 37 days; x2 has no recorded span and falls back to its requests.
-        assert_eq!(l.longest[0].session_id, "x1");
+        // x1 spans 37 days but has only 20 active minutes; g1 is active longest.
+        assert_eq!(l.longest[0].session_id, "g1");
+        // x2 has no recorded span and falls back to its requests.
         assert_eq!(
             l.longest
                 .iter()
@@ -1422,7 +1422,7 @@ pub(crate) mod tests {
             900
         );
         assert_eq!(l.costliest[0].session_id, "x1");
-        assert_eq!(l.longest.len(), 5);
+        assert_eq!(l.longest.len(), 6);
     }
 
     #[test]

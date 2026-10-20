@@ -302,6 +302,7 @@ pub struct Chunk {
     /// Task kind of the opening prompt (see `labels`); the prompt is not kept.
     pub label: Option<&'static str>,
     pub cwd: Option<String>,
+    pub events: Vec<(i64, i64)>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     pub user_turns: i64,
@@ -319,6 +320,7 @@ impl Chunk {
             title: None,
             label: None,
             cwd: None,
+            events: Vec::new(),
             started_at_ms: None,
             ended_at_ms: None,
             user_turns: 0,
@@ -344,17 +346,8 @@ impl Chunk {
         let line_no = self.cursor.next_line;
         self.cursor.next_line += 1;
 
-        // Most lines (reasoning, tool calls, item events) are irrelevant and
-        // large; decide from the leading fields whether to parse at all.
-        let ts_ms = sniff_str(line, b"{\"timestamp\":\"").and_then(parse_ts_ms);
-        if let Some(t) = ts_ms {
-            self.started_at_ms = Some(self.started_at_ms.map_or(t, |s| s.min(t)));
-            self.ended_at_ms = Some(self.ended_at_ms.map_or(t, |e| e.max(t)));
-        }
-        if !wanted(line) {
-            return;
-        }
-
+        // Read the header of every event, including tool and reasoning records.
+        // RawValue leaves the potentially large payload uninterpreted.
         let rec: Rec = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(_) => {
@@ -362,8 +355,20 @@ impl Chunk {
                 return;
             }
         };
-        let ts_ms = ts_ms.or_else(|| rec.timestamp.as_deref().and_then(parse_ts_ms));
+        let ts_ms = rec.timestamp.as_deref().and_then(parse_ts_ms);
         let ordinal = rec.ordinal.unwrap_or(line_no);
+        // The first session_meta is the fork's own creation event. Subsequent
+        // copied history must not bridge idle gaps in the child's timeline.
+        if let Some(t) = ts_ms {
+            if !self.cursor.meta_seen || !self.is_copied(ordinal, ts_ms) {
+                self.events.push((t, t));
+            }
+            self.started_at_ms = Some(self.started_at_ms.map_or(t, |s| s.min(t)));
+            self.ended_at_ms = Some(self.ended_at_ms.map_or(t, |e| e.max(t)));
+        }
+        if !wanted(line) {
+            return;
+        }
         let Some(payload) = rec.payload else { return };
         let payload = payload.get();
         match rec.kind.as_ref() {
@@ -632,13 +637,6 @@ fn request_text(text: &str) -> Option<String> {
 /// Title candidate from one typed block (see `request_text`).
 pub fn title_from(text: &str) -> Option<String> {
     make_title(&request_text(text)?)
-}
-
-/// Value of a string field that starts exactly at `prefix` at byte 0.
-fn sniff_str<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a str> {
-    let rest = line.strip_prefix(prefix)?;
-    let end = rest.iter().position(|&b| b == b'"')?;
-    std::str::from_utf8(&rest[..end]).ok()
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -986,6 +984,7 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
              ON CONFLICT(source_id) DO UPDATE SET state = excluded.state",
             params![source_id, serde_json::to_string(&chunk.cursor)?],
         )?;
+        store::record_events(&tx, TOOL, &session_id, source_id, &chunk.events)?;
         stats.files_read += 1;
         stats.bytes_read += consumed;
         stats.bad_lines += chunk.bad_lines;

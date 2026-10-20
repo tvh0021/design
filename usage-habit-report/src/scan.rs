@@ -162,6 +162,13 @@ fn scan_file(
                 stats.rows_added += 1;
             }
         }
+        store::record_events(
+            &tx,
+            claude::TOOL,
+            &kind.session_id,
+            source_id,
+            &chunk.events,
+        )?;
         stats.files_read += 1;
         stats.bytes_read += consumed;
         stats.bad_lines += chunk.bad_lines;

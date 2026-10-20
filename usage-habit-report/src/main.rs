@@ -449,7 +449,13 @@ fn main() -> Result<()> {
             let start = std::time::Instant::now();
             let tx = store.conn.transaction()?;
             // Children first; `session_labels` is not touched.
-            for table in ["codex_cursors", "requests", "sessions", "sources"] {
+            for table in [
+                "session_events",
+                "codex_cursors",
+                "requests",
+                "sessions",
+                "sources",
+            ] {
                 tx.execute(&format!("DELETE FROM {table}"), [])?;
             }
             tx.commit()?;
