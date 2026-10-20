@@ -1,0 +1,708 @@
+//! Projects: each session belongs to the git toplevel of its working directory
+//! (worktrees collapse into their main repository), or to the directory itself
+//! outside a repository. Resolution runs as the `enrich` step after ingest;
+//! this module also holds the read side (`query project`, `query projects`).
+
+use crate::query::{Tokens, rfc3339};
+use crate::t3;
+use anyhow::Result;
+use rusqlite::{Connection, params};
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// The project a working directory belongs to.
+///
+/// - Inside a repository: its toplevel (the nearest ancestor holding `.git`).
+///   For a linked worktree (`.git` is a file pointing into
+///   `<main>/.git/worktrees/<name>`), the main repository's toplevel, so every
+///   worktree of a repo is one project. Submodules stay their own project.
+/// - Outside a repository: the directory itself.
+/// - A path that no longer exists: the string as recorded.
+///
+/// Existing paths are canonicalized first (symlinks resolved).
+pub fn resolve(cwd: &str) -> String {
+    let Ok(dir) = std::fs::canonicalize(cwd) else {
+        return cwd.to_string();
+    };
+    for d in dir.ancestors() {
+        let dot_git = d.join(".git");
+        let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        if meta.is_dir() {
+            return d.to_string_lossy().into_owned();
+        }
+        if meta.is_file() {
+            let main = main_toplevel(d, &dot_git);
+            return main
+                .unwrap_or_else(|| d.to_path_buf())
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    dir.to_string_lossy().into_owned()
+}
+
+/// For a `.git` file (`gitdir: <path>`), the main worktree's toplevel when the
+/// gitdir is a linked worktree's admin folder (it has a `commondir` file and
+/// the common dir is a `.git` folder). None for submodules, bare-repo
+/// worktrees, and anything unreadable.
+fn main_toplevel(toplevel: &Path, dot_git: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(dot_git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir = toplevel.join(gitdir);
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = std::fs::canonicalize(gitdir.join(common.trim())).ok()?;
+    if common.file_name()? != ".git" {
+        return None; // bare repository: no main worktree to collapse into
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
+/// Last path component, or the whole string for `/` and the like.
+pub fn project_name(project: &str) -> String {
+    Path::new(project)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| project.to_string())
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct EnrichReport {
+    pub t3: t3::T3Report,
+    /// Sessions that got a project this run.
+    pub projects_set: u64,
+    /// Of those, sessions whose directory came from T3 (no recorded cwd).
+    pub projects_from_t3: u64,
+    /// Sessions still without a project because no directory is known.
+    pub without_cwd: u64,
+    pub elapsed: Duration,
+}
+
+/// The enrich step: attach T3 thread ids and titles, then resolve the project
+/// of every session that has none yet. T3 databases that are missing are
+/// skipped; ones that fail to open or read get one notice on stderr.
+pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichReport> {
+    let start = Instant::now();
+    let mut report = EnrichReport::default();
+    let mut links = t3::Links::new();
+    for p in t3_paths {
+        if !p.is_file() {
+            continue;
+        }
+        match t3::load(p) {
+            Ok(l) => {
+                report.t3.databases_read += 1;
+                t3::merge(&mut links, l);
+            }
+            Err(e) => {
+                report.t3.databases_unreadable += 1;
+                eprintln!(
+                    "notice: T3 state database {} unreadable, skipping T3 links: {e:#}",
+                    p.display()
+                );
+            }
+        }
+    }
+
+    let tx = conn.transaction()?;
+    report.t3.sessions_linked = t3::apply(&tx, &links)?;
+
+    let pending: Vec<(i64, String, String, Option<String>)> = tx
+        .prepare("SELECT id, tool, session_id, cwd FROM sessions WHERE project IS NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut cache: HashMap<String, String> = HashMap::new();
+    {
+        let mut update =
+            tx.prepare("UPDATE sessions SET project = ?2, project_name = ?3 WHERE id = ?1")?;
+        for (id, tool, session_id, cwd) in pending {
+            let (dir, from_t3) = match cwd.filter(|c| !c.is_empty()) {
+                Some(c) => (c, false),
+                None => match links
+                    .get(&(tool, session_id))
+                    .and_then(|l| l.workspace.clone())
+                {
+                    Some(w) => (w, true),
+                    None => {
+                        report.without_cwd += 1;
+                        continue;
+                    }
+                },
+            };
+            let project = cache.entry(dir).or_insert_with_key(|d| resolve(d)).clone();
+            update.execute(params![id, project, project_name(&project)])?;
+            report.projects_set += 1;
+            report.projects_from_t3 += from_t3 as u64;
+        }
+    }
+    tx.commit()?;
+    report.elapsed = start.elapsed();
+    Ok(report)
+}
+
+/// One project's totals. `project` and `name` are null for the row that
+/// collects sessions with no known directory.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProjectRow {
+    pub project: Option<String>,
+    pub name: Option<String>,
+    pub sessions: i64,
+    pub first_request_at: Option<String>,
+    pub last_request_at: Option<String>,
+    #[serde(flatten)]
+    pub tokens: Tokens,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ToolRow {
+    pub tool: String,
+    pub sessions: i64,
+    pub first_request_at: Option<String>,
+    pub last_request_at: Option<String>,
+    #[serde(flatten)]
+    pub tokens: Tokens,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectDetail {
+    pub generated_at: String,
+    pub since: Option<String>,
+    pub rates_fetched_at: Option<String>,
+    #[serde(flatten)]
+    pub project: ProjectRow,
+    pub tools: Vec<ToolRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectList {
+    pub generated_at: String,
+    pub since: Option<String>,
+    pub rates_fetched_at: Option<String>,
+    pub projects: Vec<ProjectRow>,
+}
+
+/// Raw aggregate for one (project, tool) cell.
+#[derive(Debug, Default, Clone)]
+struct Cell {
+    sessions: i64,
+    first_ms: Option<i64>,
+    last_ms: Option<i64>,
+    tokens: Tokens,
+}
+
+fn add_tokens(a: &mut Tokens, b: &Tokens) {
+    a.requests += b.requests;
+    a.input_tokens += b.input_tokens;
+    a.cache_read_input_tokens += b.cache_read_input_tokens;
+    a.cache_creation_input_tokens += b.cache_creation_input_tokens;
+    a.output_tokens += b.output_tokens;
+    a.unpriced_requests += b.unpriced_requests;
+    if let Some(c) = b.estimated_cost_usd {
+        *a.estimated_cost_usd.get_or_insert(0.0) += c;
+    }
+}
+
+fn add_cell(a: &mut Cell, b: &Cell) {
+    a.sessions += b.sessions;
+    a.first_ms = match (a.first_ms, b.first_ms) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    };
+    a.last_ms = a.last_ms.max(b.last_ms);
+    add_tokens(&mut a.tokens, &b.tokens);
+}
+
+/// Aggregates per (project, tool). With `since_ms`, sessions count when they
+/// ended (or, lacking an end, started) at or after it, and requests when their
+/// timestamp is; without it, everything counts.
+/// `only` restricts to one project.
+fn cells(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    only: Option<&str>,
+) -> Result<BTreeMap<(Option<String>, String), Cell>> {
+    let since = since_ms.unwrap_or(i64::MIN);
+    let mut out: BTreeMap<(Option<String>, String), Cell> = BTreeMap::new();
+    let mut stmt = conn.prepare(
+        r#"SELECT project, tool, COUNT(*) FROM sessions
+           WHERE (?3 OR COALESCE(ended_at_ms, started_at_ms) >= ?1)
+             AND (?2 IS NULL OR project = ?2)
+           GROUP BY project, tool"#,
+    )?;
+    let mut rows = stmt.query(params![since, only, since_ms.is_none()])?;
+    while let Some(r) = rows.next()? {
+        out.entry((r.get(0)?, r.get(1)?)).or_default().sessions = r.get(2)?;
+    }
+    let mut stmt = conn.prepare(
+        r#"SELECT s.project, r.tool, COUNT(*),
+                  SUM(r.input_tokens), SUM(r.cache_read_input_tokens),
+                  SUM(r.cache_creation_input_tokens), SUM(r.output_tokens),
+                  SUM(r.cost_usd), COUNT(*) - COUNT(r.cost_usd),
+                  MIN(r.ts_ms), MAX(r.ts_ms)
+           FROM requests r
+           LEFT JOIN sessions s ON s.tool = r.tool AND s.session_id = r.session_id
+           WHERE r.ts_ms >= ?1 AND (?2 IS NULL OR s.project = ?2)
+           GROUP BY s.project, r.tool"#,
+    )?;
+    let mut rows = stmt.query(params![since, only])?;
+    while let Some(r) = rows.next()? {
+        let c = out.entry((r.get(0)?, r.get(1)?)).or_default();
+        c.tokens = Tokens {
+            requests: r.get(2)?,
+            input_tokens: r.get(3)?,
+            cache_read_input_tokens: r.get(4)?,
+            cache_creation_input_tokens: r.get(5)?,
+            output_tokens: r.get(6)?,
+            estimated_cost_usd: r.get(7)?,
+            unpriced_requests: r.get(8)?,
+        };
+        c.first_ms = r.get(9)?;
+        c.last_ms = r.get(10)?;
+    }
+    Ok(out)
+}
+
+fn total_tokens(t: &Tokens) -> i64 {
+    t.input_tokens + t.cache_read_input_tokens + t.cache_creation_input_tokens + t.output_tokens
+}
+
+fn project_row(project: Option<String>, c: Cell) -> ProjectRow {
+    ProjectRow {
+        name: project.as_deref().map(project_name),
+        project,
+        sessions: c.sessions,
+        first_request_at: c.first_ms.map(rfc3339),
+        last_request_at: c.last_ms.map(rfc3339),
+        tokens: c.tokens,
+    }
+}
+
+/// Every project with totals, largest token total first. Sessions without a
+/// project are collected in one row with null `project` and `name`.
+pub fn list(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<ProjectList> {
+    let mut by_project: BTreeMap<Option<String>, Cell> = BTreeMap::new();
+    for ((project, _tool), c) in cells(conn, since_ms, None)? {
+        add_cell(by_project.entry(project).or_default(), &c);
+    }
+    let mut projects: Vec<ProjectRow> = by_project
+        .into_iter()
+        .map(|(p, c)| project_row(p, c))
+        .collect();
+    projects.sort_by(|a, b| {
+        total_tokens(&b.tokens)
+            .cmp(&total_tokens(&a.tokens))
+            .then(b.sessions.cmp(&a.sessions))
+            .then(a.project.cmp(&b.project))
+    });
+    Ok(ProjectList {
+        generated_at: rfc3339(now_ms),
+        since: since_ms.map(rfc3339),
+        rates_fetched_at: None,
+        projects,
+    })
+}
+
+/// Totals for one project (an exact `sessions.project` value) with a per-tool
+/// breakdown, largest token total first.
+pub fn detail(
+    conn: &Connection,
+    project: &str,
+    since_ms: Option<i64>,
+    now_ms: i64,
+) -> Result<ProjectDetail> {
+    let mut total = Cell::default();
+    let mut tools = Vec::new();
+    for ((_, tool), c) in cells(conn, since_ms, Some(project))? {
+        add_cell(&mut total, &c);
+        tools.push(ToolRow {
+            tool,
+            sessions: c.sessions,
+            first_request_at: c.first_ms.map(rfc3339),
+            last_request_at: c.last_ms.map(rfc3339),
+            tokens: c.tokens,
+        });
+    }
+    tools.sort_by(|a, b| {
+        total_tokens(&b.tokens)
+            .cmp(&total_tokens(&a.tokens))
+            .then(a.tool.cmp(&b.tool))
+    });
+    Ok(ProjectDetail {
+        generated_at: rfc3339(now_ms),
+        since: since_ms.map(rfc3339),
+        rates_fetched_at: None,
+        project: project_row(Some(project.to_string()), total),
+        tools,
+    })
+}
+
+/// A project that matched a key, for the ambiguous-match listing.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Candidate {
+    pub project: String,
+    pub name: String,
+    pub sessions: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Lookup {
+    Found(String),
+    Ambiguous(Vec<Candidate>),
+    NotFound,
+}
+
+/// Find a project by key: exact stored path; then, when the key is an existing
+/// directory, the project it resolves to; then folder name, case-insensitive.
+pub fn lookup(conn: &Connection, key: &str) -> Result<Lookup> {
+    let key = match key.trim_end_matches('/') {
+        "" => key,
+        k => k,
+    };
+    let all: Vec<Candidate> = conn
+        .prepare(
+            "SELECT project, COALESCE(project_name, ''), COUNT(*) FROM sessions
+             WHERE project IS NOT NULL GROUP BY project ORDER BY project",
+        )?
+        .query_map([], |r| {
+            Ok(Candidate {
+                project: r.get(0)?,
+                name: r.get(1)?,
+                sessions: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if all.iter().any(|c| c.project == key) {
+        return Ok(Lookup::Found(key.to_string()));
+    }
+    if Path::new(key).exists() {
+        let resolved = resolve(key);
+        if all.iter().any(|c| c.project == resolved) {
+            return Ok(Lookup::Found(resolved));
+        }
+    }
+    let lower = key.to_lowercase();
+    let mut hits: Vec<Candidate> = all
+        .into_iter()
+        .filter(|c| c.name.to_lowercase() == lower)
+        .collect();
+    Ok(match hits.len() {
+        0 => Lookup::NotFound,
+        1 => Lookup::Found(hits.remove(0).project),
+        _ => Lookup::Ambiguous(hits),
+    })
+}
+
+fn cost_cell(t: &Tokens) -> String {
+    match t.estimated_cost_usd {
+        Some(c) if t.unpriced_requests > 0 => format!("${c:.2}*"),
+        Some(c) => format!("${c:.2}"),
+        None => "-".into(),
+    }
+}
+
+fn day(ts: &Option<String>) -> &str {
+    ts.as_deref().map_or("-", |s| s.get(..10).unwrap_or(s))
+}
+
+/// Left-align the first `left` columns, right-align the rest.
+fn table(rows: &[Vec<String>], left: usize) -> String {
+    let n = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..n)
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    let mut out = String::new();
+    for r in rows {
+        for (i, cell) in r.iter().enumerate() {
+            if i < left {
+                out.push_str(&format!("{:<w$}  ", cell, w = widths[i]));
+            } else {
+                out.push_str(&format!("{:>w$}  ", cell, w = widths[i]));
+            }
+        }
+        out.truncate(out.trim_end().len());
+        out.push('\n');
+    }
+    out
+}
+
+const TOKEN_HEADER: [&str; 6] = [
+    "requests",
+    "input",
+    "cache_read",
+    "cache_create",
+    "output",
+    "est. cost",
+];
+
+fn token_cells(t: &Tokens) -> [String; 6] {
+    [
+        t.requests.to_string(),
+        t.input_tokens.to_string(),
+        t.cache_read_input_tokens.to_string(),
+        t.cache_creation_input_tokens.to_string(),
+        t.output_tokens.to_string(),
+        cost_cell(t),
+    ]
+}
+
+pub fn render_list_table(l: &ProjectList) -> String {
+    let mut rows = vec![
+        ["name", "sessions", "first", "last"]
+            .iter()
+            .chain(TOKEN_HEADER.iter())
+            .chain(["project"].iter())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    ];
+    for p in &l.projects {
+        let mut r = vec![
+            p.name.clone().unwrap_or_else(|| "(no directory)".into()),
+            p.sessions.to_string(),
+            day(&p.first_request_at).to_string(),
+            day(&p.last_request_at).to_string(),
+        ];
+        r.extend(token_cells(&p.tokens));
+        r.push(p.project.clone().unwrap_or_default());
+        rows.push(r);
+    }
+    // Every column but the name and the trailing path is right-aligned; pad the
+    // path column by hand so it stays left-aligned.
+    let mut out = format!("since: {}\n", l.since.as_deref().unwrap_or("all time"));
+    let paths: Vec<String> = rows
+        .iter_mut()
+        .map(|r| r.pop().unwrap_or_default())
+        .collect();
+    for (line, path) in table(&rows, 1).lines().zip(paths) {
+        out.push_str(line);
+        out.push_str("  ");
+        out.push_str(&path);
+        out.truncate(out.trim_end().len());
+        out.push('\n');
+    }
+    out
+}
+
+pub fn render_detail_table(d: &ProjectDetail) -> String {
+    let p = &d.project;
+    let mut out = format!(
+        "project: {}\nname: {}\nsince: {}\nsessions: {}\nrequests: {} .. {}\n",
+        p.project.as_deref().unwrap_or(""),
+        p.name.as_deref().unwrap_or(""),
+        d.since.as_deref().unwrap_or("all time"),
+        p.sessions,
+        p.first_request_at.as_deref().unwrap_or("-"),
+        p.last_request_at.as_deref().unwrap_or("-"),
+    );
+    let mut rows = vec![
+        ["tool", "sessions"]
+            .iter()
+            .chain(TOKEN_HEADER.iter())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    ];
+    for t in &d.tools {
+        let mut r = vec![t.tool.clone(), t.sessions.to_string()];
+        r.extend(token_cells(&t.tokens));
+        rows.push(r);
+    }
+    let mut total = vec!["TOTAL".to_string(), p.sessions.to_string()];
+    total.extend(token_cells(&p.tokens));
+    rows.push(total);
+    out.push_str(&table(&rows, 1));
+    out
+}
+
+pub fn render_candidates_table(key: &str, c: &[Candidate]) -> String {
+    let mut out = format!("ambiguous: {} projects are named {key:?}\n", c.len());
+    let mut rows = vec![vec!["project".to_string(), "sessions".to_string()]];
+    for x in c {
+        rows.push(vec![x.project.clone(), x.sessions.to_string()]);
+    }
+    out.push_str(&table(&rows, 1));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git_init(dir: &Path) {
+        let ok = Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+
+    fn canon(p: &Path) -> String {
+        std::fs::canonicalize(p)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn repo_subdirectory_resolves_to_toplevel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("alpha");
+        git_init(&repo);
+        let sub = repo.join("src/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(resolve(sub.to_str().unwrap()), canon(&repo));
+        assert_eq!(resolve(repo.to_str().unwrap()), canon(&repo));
+    }
+
+    #[test]
+    fn worktree_collapses_into_main_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("main-repo");
+        git_init(&repo);
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = tmp.path().join("main-repo-wt");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"]);
+        assert!(wt.join(".git").is_file());
+        let sub = wt.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(resolve(wt.to_str().unwrap()), canon(&repo));
+        assert_eq!(resolve(sub.to_str().unwrap()), canon(&repo));
+    }
+
+    #[test]
+    fn gitdir_file_without_commondir_is_its_own_project() {
+        // Submodule layout: `.git` file points at `<super>/.git/modules/<name>`.
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = tmp.path().join("super");
+        git_init(&sup);
+        let modules = sup.join(".git/modules/child");
+        std::fs::create_dir_all(&modules).unwrap();
+        let child = sup.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join(".git"), "gitdir: ../.git/modules/child\n").unwrap();
+        assert_eq!(resolve(child.to_str().unwrap()), canon(&child));
+    }
+
+    #[test]
+    fn non_repo_and_missing_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain/dir");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(resolve(plain.to_str().unwrap()), canon(&plain));
+        let gone = tmp.path().join("no/such/dir");
+        assert_eq!(resolve(gone.to_str().unwrap()), gone.to_str().unwrap());
+        assert_eq!(project_name("/home/demo/alpha"), "alpha");
+        assert_eq!(project_name("/"), "/");
+    }
+
+    fn seed(conn: &Connection, rows: &[(&str, &str, Option<&str>)]) {
+        for (tool, sid, cwd) in rows {
+            conn.execute(
+                "INSERT INTO sessions (tool, session_id, cwd, started_at_ms, ended_at_ms)
+                 VALUES (?1, ?2, ?3, 1000, 2000)",
+                params![tool, sid, cwd],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn enrich_sets_projects_and_counts_missing_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("beta");
+        git_init(&repo);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let mut store = crate::store::Store::open_in_memory().unwrap();
+        let sub = repo.join("sub");
+        seed(
+            &store.conn,
+            &[
+                ("claude-code", "c1", Some(repo.to_str().unwrap())),
+                ("claude-code", "c2", Some(sub.to_str().unwrap())),
+                ("codex", "x1", Some("/no/such/place")),
+                ("antigravity", "a1", None),
+            ],
+        );
+        let r = enrich(&mut store.conn, &[tmp.path().join("missing.sqlite")]).unwrap();
+        assert_eq!(r.projects_set, 3);
+        assert_eq!(r.without_cwd, 1);
+        assert_eq!(r.t3.databases_read, 0);
+        let got: Vec<(String, Option<String>, Option<String>)> = store
+            .conn
+            .prepare("SELECT session_id, project, project_name FROM sessions ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let beta = canon(&repo);
+        assert_eq!(got[0], ("a1".into(), None, None));
+        assert_eq!(
+            got[1],
+            ("c1".into(), Some(beta.clone()), Some("beta".into()))
+        );
+        assert_eq!(got[2], ("c2".into(), Some(beta), Some("beta".into())));
+        assert_eq!(
+            got[3],
+            (
+                "x1".into(),
+                Some("/no/such/place".into()),
+                Some("place".into())
+            )
+        );
+        // A second run has nothing left to do.
+        let r = enrich(&mut store.conn, &[]).unwrap();
+        assert_eq!(r.projects_set, 0);
+        assert_eq!(r.without_cwd, 1);
+    }
+
+    #[test]
+    fn lookup_by_path_name_and_ambiguity() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        for (sid, p) in [
+            ("s1", "/w/one/app"),
+            ("s2", "/w/two/app"),
+            ("s3", "/w/Tool"),
+            ("s4", "/w/Tool"),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions (tool, session_id, project, project_name)
+                     VALUES ('codex', ?1, ?2, ?3)",
+                    params![sid, p, project_name(p)],
+                )
+                .unwrap();
+        }
+        let l = |k| lookup(&store.conn, k).unwrap();
+        assert_eq!(l("/w/one/app"), Lookup::Found("/w/one/app".into()));
+        assert_eq!(l("/w/one/app/"), Lookup::Found("/w/one/app".into()));
+        assert_eq!(l("tool"), Lookup::Found("/w/Tool".into()));
+        assert_eq!(l("nothing"), Lookup::NotFound);
+        match l("APP") {
+            Lookup::Ambiguous(c) => {
+                assert_eq!(c.len(), 2);
+                assert_eq!(c[0].project, "/w/one/app");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

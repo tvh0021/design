@@ -88,6 +88,66 @@ pub fn summary(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<
     })
 }
 
+/// How a session key matched.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchedBy {
+    SessionId,
+    T3ThreadId,
+    SessionIdPrefix,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionRef {
+    pub tool: String,
+    pub session_id: String,
+    pub matched_by: MatchedBy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLookup {
+    Found(SessionRef),
+    /// More than one session matched at the first stage that matched anything.
+    Ambiguous(Vec<SessionRef>),
+    NotFound,
+}
+
+/// Find a session by key: exact `session_id`, then exact `t3_thread_id`, then
+/// `session_id` prefix. The first stage with any match decides.
+pub fn resolve_session(conn: &Connection, key: &str) -> Result<SessionLookup> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Ok(SessionLookup::NotFound);
+    }
+    for (by, cond) in [
+        (MatchedBy::SessionId, "session_id = ?1"),
+        (MatchedBy::T3ThreadId, "t3_thread_id = ?1"),
+        (
+            MatchedBy::SessionIdPrefix,
+            "substr(session_id, 1, length(?1)) = ?1",
+        ),
+    ] {
+        let mut hits = conn
+            .prepare(&format!(
+                "SELECT tool, session_id FROM sessions WHERE {cond} ORDER BY tool, session_id"
+            ))?
+            .query_map(params![key], |r| {
+                Ok(SessionRef {
+                    tool: r.get(0)?,
+                    session_id: r.get(1)?,
+                    matched_by: by,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match hits.len() {
+            0 => continue,
+            1 => return Ok(SessionLookup::Found(hits.remove(0))),
+            _ => return Ok(SessionLookup::Ambiguous(hits)),
+        }
+    }
+    Ok(SessionLookup::NotFound)
+}
+
 pub fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
@@ -190,6 +250,53 @@ pub fn render_summary_table(s: &Summary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_session_stages() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        for (tool, sid, t3) in [
+            ("codex", "abc-111", Some("t3-thread-1")),
+            ("codex", "abc-222", None),
+            ("antigravity", "def-333", None),
+            ("claude-code", "t3-thread-1x", None),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions (tool, session_id, t3_thread_id) VALUES (?1, ?2, ?3)",
+                    params![tool, sid, t3],
+                )
+                .unwrap();
+        }
+        let r = |k| resolve_session(&store.conn, k).unwrap();
+        let found = |tool: &str, sid: &str, by| {
+            SessionLookup::Found(SessionRef {
+                tool: tool.into(),
+                session_id: sid.into(),
+                matched_by: by,
+            })
+        };
+        assert_eq!(
+            r("abc-111"),
+            found("codex", "abc-111", MatchedBy::SessionId)
+        );
+        // A T3 thread id beats a session id that merely starts with it.
+        assert_eq!(
+            r("t3-thread-1"),
+            found("codex", "abc-111", MatchedBy::T3ThreadId)
+        );
+        assert_eq!(
+            r("def"),
+            found("antigravity", "def-333", MatchedBy::SessionIdPrefix)
+        );
+        match r("abc") {
+            SessionLookup::Ambiguous(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r("zzz"), SessionLookup::NotFound);
+        assert_eq!(r("%"), SessionLookup::NotFound);
+        assert_eq!(r(""), SessionLookup::NotFound);
+    }
 
     #[test]
     fn since_forms() {

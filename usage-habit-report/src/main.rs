@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use usage_habit_report::{antigravity, codex, paths, query, rates, scan, store::Store};
+use usage_habit_report::{
+    antigravity, codex, paths, project, query, rates, scan, store::Store, t3,
+};
 
 #[derive(Parser)]
 #[command(
@@ -39,6 +41,10 @@ enum Command {
         /// [default: ~/.gemini/antigravity/conversations and the T3 bridge folders]
         #[arg(long = "antigravity-dir")]
         antigravity_dirs: Vec<PathBuf>,
+        /// T3 Code state database, read-only; repeatable; a missing path is skipped
+        /// [default: ~/.t3/userdata/state.sqlite and ~/.t3-personal/userdata/state.sqlite]
+        #[arg(long = "t3-state")]
+        t3_states: Vec<PathBuf>,
     },
     /// Read from the store.
     Query {
@@ -80,6 +86,27 @@ enum QueryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// One project's totals and per-tool breakdown, by path or folder name.
+    /// Exit 1 when nothing matches, 2 when several folders share the name.
+    Project {
+        /// Project path (or any directory inside it), or folder name.
+        key: String,
+        /// Print JSON (shape documented in README.md).
+        #[arg(long)]
+        json: bool,
+        /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Every project with totals.
+    Projects {
+        /// Print JSON (shape documented in README.md).
+        #[arg(long)]
+        json: bool,
+        /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 /// Load rates (refreshing when stale unless offline) and run the price step:
@@ -116,6 +143,7 @@ fn main() -> Result<()> {
             claude_dir,
             codex_dir,
             antigravity_dirs,
+            t3_states,
         } => {
             let scan_start = std::time::Instant::now();
             let root = match claude_dir {
@@ -178,6 +206,26 @@ fn main() -> Result<()> {
                     String::new()
                 },
             );
+            let t3_paths = if t3_states.is_empty() {
+                t3::default_paths()
+            } else {
+                t3_states
+            };
+            let e = project::enrich(&mut store.conn, &t3_paths)?;
+            println!(
+                "enrich: {} sessions given a project ({} from a T3 directory), {} without a directory; t3: {} databases read{}, {} sessions linked; {:.2} s",
+                e.projects_set,
+                e.projects_from_t3,
+                e.without_cwd,
+                e.t3.databases_read,
+                if e.t3.databases_unreadable > 0 {
+                    format!(", {} unreadable", e.t3.databases_unreadable)
+                } else {
+                    String::new()
+                },
+                e.t3.sessions_linked,
+                e.elapsed.as_secs_f64(),
+            );
             println!("elapsed: {:.2} s", scan_start.elapsed().as_secs_f64());
             let (_, stats) = priced(&mut store, cli.offline, false)?;
             print_price_stats(&stats);
@@ -208,6 +256,56 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 print!("{}", rates::render_models_table(&rows));
+            }
+        }
+        Command::Query {
+            what: QueryCommand::Project { key, json, since },
+        } => {
+            let now = scan::now_ms();
+            let since_ms = since_window(since, now)?;
+            let found = match project::lookup(&store.conn, &key)? {
+                project::Lookup::Found(p) => p,
+                project::Lookup::NotFound => {
+                    if json {
+                        let v = serde_json::json!({"error": "not found", "key": key});
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    }
+                    eprintln!("project not found: {key}");
+                    std::process::exit(1);
+                }
+                project::Lookup::Ambiguous(c) => {
+                    if json {
+                        let v =
+                            serde_json::json!({"error": "ambiguous", "key": key, "candidates": c});
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    } else {
+                        print!("{}", project::render_candidates_table(&key, &c));
+                    }
+                    eprintln!("ambiguous project name {key:?}: pass the full path");
+                    std::process::exit(2);
+                }
+            };
+            let (r, _) = priced(&mut store, cli.offline, false)?;
+            let mut d = project::detail(&store.conn, &found, since_ms, now)?;
+            d.rates_fetched_at = Some(r.file.fetched_at);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                print!("{}", project::render_detail_table(&d));
+            }
+        }
+        Command::Query {
+            what: QueryCommand::Projects { json, since },
+        } => {
+            let now = scan::now_ms();
+            let since_ms = since_window(since, now)?;
+            let (r, _) = priced(&mut store, cli.offline, false)?;
+            let mut l = project::list(&store.conn, since_ms, now)?;
+            l.rates_fetched_at = Some(r.file.fetched_at);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&l)?);
+            } else {
+                print!("{}", project::render_list_table(&l));
             }
         }
         Command::Rates {
@@ -244,6 +342,14 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--since 7d` as an absolute lower bound in epoch ms.
+fn since_window(since: Option<String>, now_ms: i64) -> Result<Option<i64>> {
+    Ok(since
+        .map(|s| query::parse_since(&s))
+        .transpose()?
+        .map(|w| now_ms - w))
 }
 
 fn codex_summary_line(c: &codex::CodexScanReport) -> String {
