@@ -287,6 +287,7 @@ fn cli_summary_json_shape() {
             .env("XDG_CONFIG_HOME", tmp.path().join("config"))
             .env("CODEX_HOME", tmp.path().join("no-codex"))
             .env("HOME", tmp.path()) // keep other harnesses' default folders out
+            .env("USAGE_HABIT_REPORT_OFFLINE", "1")
             .output()
             .unwrap();
         assert!(
