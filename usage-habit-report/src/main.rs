@@ -90,8 +90,8 @@ enum Command {
     Snapshot {
         #[arg(long)]
         out: PathBuf,
-        /// Export just one window; by default export all three.
-        #[arg(long, value_parser = ["4w", "12w", "all"])]
+        /// Export just one window; by default export all four.
+        #[arg(long, value_parser = ["1w", "4w", "12w", "all"])]
         window: Option<String>,
     },
     /// Open the dashboard: a loopback-only web page rendered from the store.

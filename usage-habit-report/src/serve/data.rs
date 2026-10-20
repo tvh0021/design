@@ -15,17 +15,24 @@ pub const TOOLS: [&str; 3] = ["claude-code", "codex", "antigravity"];
 /// How far back the page looks. Chosen with `?window=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
+    OneWeek,
     FourWeeks,
     TwelveWeeks,
     All,
 }
 
 impl Window {
-    pub const ALL: [Window; 3] = [Window::FourWeeks, Window::TwelveWeeks, Window::All];
+    pub const ALL: [Window; 4] = [
+        Window::OneWeek,
+        Window::FourWeeks,
+        Window::TwelveWeeks,
+        Window::All,
+    ];
 
     /// Query-string value; unknown values fall back to four weeks.
     pub fn parse(s: Option<&str>) -> Window {
         match s {
+            Some("1w") => Window::OneWeek,
             Some("12w") => Window::TwelveWeeks,
             Some("all") => Window::All,
             _ => Window::FourWeeks,
@@ -34,6 +41,7 @@ impl Window {
 
     pub fn key(self) -> &'static str {
         match self {
+            Window::OneWeek => "1w",
             Window::FourWeeks => "4w",
             Window::TwelveWeeks => "12w",
             Window::All => "all",
@@ -42,6 +50,7 @@ impl Window {
 
     pub fn label(self) -> &'static str {
         match self {
+            Window::OneWeek => "1 week",
             Window::FourWeeks => "4 weeks",
             Window::TwelveWeeks => "12 weeks",
             Window::All => "all time",
@@ -51,6 +60,7 @@ impl Window {
     /// The `--since` value that reproduces this window with `query summary`.
     pub fn since_arg(self) -> Option<&'static str> {
         match self {
+            Window::OneWeek => Some("1w"),
             Window::FourWeeks => Some("4w"),
             Window::TwelveWeeks => Some("12w"),
             Window::All => None,
@@ -61,6 +71,7 @@ impl Window {
     pub fn since_ms(self, now_ms: i64) -> Option<i64> {
         let week = 7 * 24 * 3_600_000i64;
         match self {
+            Window::OneWeek => Some(now_ms - week),
             Window::FourWeeks => Some(now_ms - 4 * week),
             Window::TwelveWeeks => Some(now_ms - 12 * week),
             Window::All => None,
@@ -882,6 +893,7 @@ pub(crate) mod tests {
     #[test]
     fn window_and_tool_parsing() {
         assert_eq!(Window::parse(None), Window::FourWeeks);
+        assert_eq!(Window::parse(Some("1w")), Window::OneWeek);
         assert_eq!(Window::parse(Some("12w")), Window::TwelveWeeks);
         assert_eq!(Window::parse(Some("all")), Window::All);
         assert_eq!(Window::parse(Some("junk")), Window::FourWeeks);
@@ -1480,6 +1492,9 @@ pub(crate) mod tests {
             let since = w.since_ms(NOW);
             let sp = spend(&store.conn, w, NOW, tool, &tz).unwrap();
             assert_eq!(sp.by_month, w == Window::All);
+            if w == Window::OneWeek {
+                assert_eq!(sp.periods.len(), 1);
+            }
             if w == Window::FourWeeks {
                 assert_eq!(sp.periods.len(), 4);
             }

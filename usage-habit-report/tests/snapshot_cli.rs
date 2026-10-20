@@ -138,7 +138,7 @@ fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(files.len(), 12);
+    assert_eq!(files.len(), 16);
     let mut matches = vec![0usize; categories.len()];
     for file in &files {
         let body = std::fs::read_to_string(file).unwrap();

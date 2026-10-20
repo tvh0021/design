@@ -153,7 +153,7 @@ A 4px base. Tokens: `--s-1` 4px, `--s-2` 8px, `--s-3` 12px, `--s-4` 16px,
 Top to bottom, one column:
 
 1. Header: page title, one sentence of provenance (sessions counted, store
-   read at). Then the controls: window (4 weeks, 12 weeks, all time) and
+   read at). Then the controls: window (1 week, 4 weeks, 12 weeks, all time) and
    tool filter (all, each tool), as link groups. The current choice is
    underlined with the ink and carries `aria-current="page"`.
 2. `section#activity`: the activity map. Rows are weekdays Monday to Sunday,

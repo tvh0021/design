@@ -653,11 +653,11 @@ every request, so a scan in another terminal shows up on reload and the
 dashboard never prices or migrates anything.
 
 The page shows an activity map of local-time hour by weekday, shaded by
-uncached input plus output tokens, with a window of 4 weeks (default), 12
-weeks, or all time (`?window=4w|12w|all`) and an optional tool filter
+uncached input plus output tokens, with a window of 1 week, 4 weeks (default),
+12 weeks, or all time (`?window=1w|4w|12w|all`) and an optional tool filter
 (`?tool=claude-code|codex|antigravity`). Hovering or focusing a cell shows
 its exact figures. The window totals under the map are the same figures as
-`query summary --since 4w` (or `12w`, or no `--since`) for the same window.
+`query summary --since 4w` (or `1w`, `12w`, or no `--since`) for the same window.
 Below the map and totals, every panel follows the same window and tool
 filter, states its window, and names any tool with no requests in it:
 
@@ -698,10 +698,10 @@ usage-habit-report snapshot --out /tmp/usage-public-12w --window 12w
 
 Exports the dashboard from the store read-only, without scanning, pricing,
 or network access. The default writes `index.html` for 4 weeks,
-`index-12w.html`, and `index-all.html`, plus three tool-filtered versions
-of each. Window and tool links use relative filenames and work from
+`index-1w.html`, `index-12w.html`, and `index-all.html`, plus three
+tool-filtered versions of each. Window and tool links use relative filenames and work from
 `file://`. Each document embeds the same CSS, JavaScript, templates, and
-queries as `serve`. With `--window 4w|12w|all`, only that window and its tool
+queries as `serve`. With `--window 1w|4w|12w|all`, only that window and its tool
 variants are written, with the all-tools page at `index.html`.
 
 Project names become `project A`, `project B`, and so on, ordered by
