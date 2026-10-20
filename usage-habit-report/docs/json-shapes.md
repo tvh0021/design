@@ -124,7 +124,7 @@ own transcript, not its subagents.
 | Field | Type |
 |-------|------|
 | `subagent_count` | integer (nested subagents included) |
-| `subagent_models` | array of `{model: string?, requests: integer}` |
+| `subagent_models` | array of `{model: string?, requests: integer}`; `model` is the canonical name where known |
 | `subagent_efforts` | array of `{effort: string?, requests: integer}` |
 | `subagent_tokens` | integer |
 | `total_tokens` | integer (session plus subagents) |
@@ -153,7 +153,7 @@ own transcript, not its subagents.
 | `since` | string? |
 | `rates_fetched_at` | string |
 | `totals` | Tokens |
-| `groups[]` | Tokens plus `tool: string`, `model: string?`; ordered by tool, then total tokens descending |
+| `groups[]` | Tokens plus `tool: string`, `model: string?` (the canonical name where one is known, else the raw name); ordered by tool, then total tokens descending |
 
 ## `query summary --group-by label`
 

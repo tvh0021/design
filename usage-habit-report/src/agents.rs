@@ -297,9 +297,10 @@ pub fn agents_report_for(
     let mut mix: HashMap<(String, String), Vec<ModelEffortCount>> = HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT tool, session_id, model, effort, COUNT(*) FROM requests
+            "SELECT tool, session_id, COALESCE(canonical_model, model) AS model, effort, COUNT(*)
+             FROM requests
              WHERE ts_ms >= ?1
-             GROUP BY tool, session_id, model, effort",
+             GROUP BY tool, session_id, 3, effort",
         )?;
         let mut rows = stmt.query(params![lo])?;
         while let Some(r) = rows.next()? {
@@ -454,9 +455,10 @@ pub fn agents_report_for(
     let (mut sub_tokens, mut total_tokens) = (0i64, 0i64);
     {
         let mut stmt = conn.prepare(
-            "SELECT is_subagent, model, COUNT(*), SUM(input_tokens + output_tokens)
+            "SELECT is_subagent, COALESCE(canonical_model, model) AS model, COUNT(*),
+                    SUM(input_tokens + output_tokens)
              FROM requests WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
-             GROUP BY is_subagent, model",
+             GROUP BY is_subagent, 2",
         )?;
         let mut rows = stmt.query(params![lo, tool])?;
         while let Some(r) = rows.next()? {
@@ -582,8 +584,8 @@ pub fn session_subagents(
          FROM requests WHERE tool = ?1 AND session_id = ?2 AND ts_ms >= ?3",
     )?;
     let mut mix_stmt = conn.prepare(
-        "SELECT model, effort, COUNT(*) FROM requests
-         WHERE tool = ?1 AND session_id = ?2 AND ts_ms >= ?3 GROUP BY model, effort",
+        "SELECT COALESCE(canonical_model, model) AS model, effort, COUNT(*) FROM requests
+         WHERE tool = ?1 AND session_id = ?2 AND ts_ms >= ?3 GROUP BY 1, effort",
     )?;
     let mut count = 0usize;
     let mut intervals = Vec::new();

@@ -59,17 +59,17 @@ fn offline_summary_uses_snapshot_and_reports_estimated_cost() {
     assert!(v["rates_fetched_at"].is_string());
     let groups = v["groups"].as_array().unwrap();
     let group = |m: &str| groups.iter().find(|g| g["model"] == m).unwrap();
-    let a = group("claude-opus-5-5")["estimated_cost_usd"]
-        .as_f64()
-        .unwrap();
-    let b = group("claude-opus-5-5-high")["estimated_cost_usd"]
-        .as_f64()
-        .unwrap();
-    assert!(a > 0.0 && b > a, "output costs more than input: {a} {b}");
+    // The `-high` variant folds into its canonical name: one group, two requests,
+    // priced as 1M input plus 1M output tokens.
+    assert!(groups.iter().all(|g| g["model"] != "claude-opus-5-5-high"));
+    let opus = group("claude-opus-5-5");
+    assert_eq!(opus["requests"], 2);
+    let a = opus["estimated_cost_usd"].as_f64().unwrap();
+    assert!(a > 0.0, "{a}");
     assert!(group("MODEL_PLACEHOLDER_M26")["estimated_cost_usd"].is_null());
     assert_eq!(group("MODEL_PLACEHOLDER_M26")["unpriced_requests"], 1);
     let total = v["totals"]["estimated_cost_usd"].as_f64().unwrap();
-    assert!((total - (a + b)).abs() < 1e-9);
+    assert!((total - a).abs() < 1e-9);
     assert_eq!(v["totals"]["unpriced_requests"], 2);
 
     let o = run(tmp.path(), &["--offline", "query", "summary"]);

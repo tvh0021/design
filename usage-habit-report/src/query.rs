@@ -38,17 +38,20 @@ pub struct Summary {
 }
 
 /// Totals and per-(tool, model) groups for requests at or after `since_ms`.
+/// Models are grouped under their canonical name where one is known, so
+/// `gemini-3.8-flash-n` and `gemini-3.8-flash` form one row; `query models`
+/// still lists the raw names.
 pub fn summary(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<Summary> {
     let mut stmt = conn.prepare(
-        r#"SELECT tool, model, COUNT(*),
+        r#"SELECT tool, COALESCE(canonical_model, model) AS model, COUNT(*),
                   SUM(input_tokens), SUM(cache_read_input_tokens),
                   SUM(cache_creation_input_tokens), SUM(output_tokens),
                   SUM(cost_usd), COUNT(*) - COUNT(cost_usd)
            FROM requests
            WHERE ts_ms >= ?1
-           GROUP BY tool, model
+           GROUP BY tool, 2
            ORDER BY tool, SUM(input_tokens + cache_read_input_tokens
-                              + cache_creation_input_tokens + output_tokens) DESC, model"#,
+                              + cache_creation_input_tokens + output_tokens) DESC, 2"#,
     )?;
     let groups = stmt
         .query_map(params![since_ms.unwrap_or(i64::MIN)], |r| {

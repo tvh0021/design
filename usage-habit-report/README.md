@@ -120,7 +120,7 @@ After reading, `scan` runs the enrich step (see
 usage-habit-report query summary [--json] [--since 12h|7d|2w] [--group-by tool-model|label]
 ```
 
-Token totals grouped by tool and model (the default), or by task label with
+Token totals grouped by tool and canonical model (the default; raw variants such as `gemini-3.8-flash-n` fold into `gemini-3.8-flash`, see `query models`), or by task label with
 `--group-by label` (see [Grouped by label](#grouped-by-label)). `--since` keeps requests whose
 timestamp falls within the last N hours (`h`), days (`d`), or weeks (`w`).
 Without `--json` it prints a table whose `est. cost` column is the estimated
