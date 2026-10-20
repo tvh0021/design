@@ -225,11 +225,27 @@ pub fn agents_report(
     since_ms: Option<i64>,
     now_ms: i64,
 ) -> Result<AgentsReport> {
+    agents_report_for(conn, since_ms, None, now_ms)
+}
+
+/// [`agents_report`] restricted to one tool's sessions and requests (all
+/// tools when `tool` is None). Subagent trees never cross tools, so every
+/// figure equals that tool's share of the unfiltered report; `by_tool` holds
+/// the same row `agents_report` gives for it.
+pub fn agents_report_for(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    tool: Option<&str>,
+    now_ms: i64,
+) -> Result<AgentsReport> {
     let lo = since_ms.unwrap_or(i64::MIN);
 
     let sessions = conn
-        .prepare("SELECT tool, session_id, is_subagent, parent_session_id, title FROM sessions")?
-        .query_map([], |r| {
+        .prepare(
+            "SELECT tool, session_id, is_subagent, parent_session_id, title FROM sessions
+             WHERE ?1 IS NULL OR tool = ?1",
+        )?
+        .query_map(params![tool], |r| {
             Ok(SessionRow {
                 tool: r.get(0)?,
                 id: r.get(1)?,
@@ -249,9 +265,10 @@ pub fn agents_report(
     let spans: HashMap<(String, String), Span> = conn
         .prepare(
             "SELECT tool, session_id, MIN(ts_ms), MAX(ts_ms), SUM(input_tokens + output_tokens)
-             FROM requests WHERE ts_ms >= ?1 GROUP BY tool, session_id",
+             FROM requests WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+             GROUP BY tool, session_id",
         )?
-        .query_map(params![lo], |r| {
+        .query_map(params![lo, tool], |r| {
             Ok((
                 (r.get(0)?, r.get(1)?),
                 Span {
@@ -267,9 +284,10 @@ pub fn agents_report(
     {
         let mut stmt = conn.prepare(
             "SELECT tool, session_id, model, effort, COUNT(*) FROM requests
-             WHERE ts_ms >= ?1 GROUP BY tool, session_id, model, effort",
+             WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+             GROUP BY tool, session_id, model, effort",
         )?;
-        let mut rows = stmt.query(params![lo])?;
+        let mut rows = stmt.query(params![lo, tool])?;
         while let Some(r) = rows.next()? {
             mix.entry((r.get(0)?, r.get(1)?))
                 .or_default()
@@ -410,9 +428,10 @@ pub fn agents_report(
     {
         let mut stmt = conn.prepare(
             "SELECT is_subagent, model, COUNT(*), SUM(input_tokens + output_tokens)
-             FROM requests WHERE ts_ms >= ?1 GROUP BY is_subagent, model",
+             FROM requests WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+             GROUP BY is_subagent, model",
         )?;
-        let mut rows = stmt.query(params![lo])?;
+        let mut rows = stmt.query(params![lo, tool])?;
         while let Some(r) = rows.next()? {
             let is_sub = r.get::<_, i64>(0)? != 0;
             let (n, tok): (i64, i64) = (r.get(2)?, r.get(3)?);

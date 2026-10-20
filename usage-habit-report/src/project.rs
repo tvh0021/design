@@ -267,15 +267,24 @@ fn cells(
     while let Some(r) = rows.next()? {
         out.entry((r.get(0)?, r.get(1)?)).or_default().sessions = r.get(2)?;
     }
+    // Requests are added up per session first, so the join to `sessions`
+    // runs once per session rather than once per request.
     let mut stmt = conn.prepare(
-        r#"SELECT s.project, r.tool, COUNT(*),
-                  SUM(r.input_tokens), SUM(r.cache_read_input_tokens),
-                  SUM(r.cache_creation_input_tokens), SUM(r.output_tokens),
-                  SUM(r.cost_usd), COUNT(*) - COUNT(r.cost_usd),
-                  MIN(r.ts_ms), MAX(r.ts_ms)
-           FROM requests r
+        r#"WITH r(tool, session_id, n, inp, cr, cc, outp, cost, unpriced, f, l) AS (
+               SELECT tool, session_id, COUNT(*),
+                      SUM(input_tokens), SUM(cache_read_input_tokens),
+                      SUM(cache_creation_input_tokens), SUM(output_tokens),
+                      SUM(cost_usd), COUNT(*) - COUNT(cost_usd),
+                      MIN(ts_ms), MAX(ts_ms)
+               FROM requests WHERE ts_ms >= ?1
+               GROUP BY tool, session_id
+           )
+           SELECT s.project, r.tool, SUM(r.n),
+                  SUM(r.inp), SUM(r.cr), SUM(r.cc), SUM(r.outp),
+                  SUM(r.cost), SUM(r.unpriced), MIN(r.f), MAX(r.l)
+           FROM r
            LEFT JOIN sessions s ON s.tool = r.tool AND s.session_id = r.session_id
-           WHERE r.ts_ms >= ?1 AND (?2 IS NULL OR s.project = ?2)
+           WHERE ?2 IS NULL OR s.project = ?2
            GROUP BY s.project, r.tool"#,
     )?;
     let mut rows = stmt.query(params![since, only])?;
@@ -314,9 +323,48 @@ fn project_row(project: Option<String>, c: Cell) -> ProjectRow {
 /// Every project with totals, largest token total first. Sessions without a
 /// project are collected in one row with null `project` and `name`.
 pub fn list(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<ProjectList> {
+    list_for(conn, since_ms, None, now_ms)
+}
+
+/// [`list`] counting only one tool's sessions and requests (all tools when
+/// `tool` is None).
+pub fn list_for(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    tool: Option<&str>,
+    now_ms: i64,
+) -> Result<ProjectList> {
+    Ok(list_with_tools(conn, since_ms, tool, now_ms)?.0)
+}
+
+/// Per-(project, tool) rows, keyed by project path (None: no known directory).
+pub type ProjectTools = Vec<(Option<String>, ToolRow)>;
+
+/// [`list_for`] plus the per-(project, tool) rows it adds up, ordered by
+/// project then tool, in one pass over the store.
+pub fn list_with_tools(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    tool: Option<&str>,
+    now_ms: i64,
+) -> Result<(ProjectList, ProjectTools)> {
     let mut by_project: BTreeMap<Option<String>, Cell> = BTreeMap::new();
-    for ((project, _tool), c) in cells(conn, since_ms, None)? {
-        add_cell(by_project.entry(project).or_default(), &c);
+    let mut tools = Vec::new();
+    for ((project, t), c) in cells(conn, since_ms, None)? {
+        if tool.is_some_and(|want| want != t) {
+            continue;
+        }
+        add_cell(by_project.entry(project.clone()).or_default(), &c);
+        tools.push((
+            project,
+            ToolRow {
+                tool: t,
+                sessions: c.sessions,
+                first_request_at: c.first_ms.map(rfc3339),
+                last_request_at: c.last_ms.map(rfc3339),
+                tokens: c.tokens,
+            },
+        ));
     }
     let mut projects: Vec<ProjectRow> = by_project
         .into_iter()
@@ -328,12 +376,15 @@ pub fn list(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<Pro
             .then(b.sessions.cmp(&a.sessions))
             .then(a.project.cmp(&b.project))
     });
-    Ok(ProjectList {
-        generated_at: rfc3339(now_ms),
-        since: since_ms.map(rfc3339),
-        rates_fetched_at: None,
-        projects,
-    })
+    Ok((
+        ProjectList {
+            generated_at: rfc3339(now_ms),
+            since: since_ms.map(rfc3339),
+            rates_fetched_at: None,
+            projects,
+        },
+        tools,
+    ))
 }
 
 /// Totals for one project (an exact `sessions.project` value) with a per-tool

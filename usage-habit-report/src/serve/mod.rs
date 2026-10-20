@@ -38,6 +38,10 @@ fn open_read_only(db: &Path) -> Result<Option<Connection>> {
     )
     .with_context(|| format!("opening {} read-only", db.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    // Every panel scans `requests`; a page cache that holds the whole store
+    // (64 MiB) lets the later scans hit memory instead of re-reading pages.
+    // Connection-local and read-only: nothing is written.
+    conn.execute_batch("PRAGMA cache_size = -65536;")?;
     Ok(Some(conn))
 }
 

@@ -400,7 +400,7 @@ pub fn effective_label(conn: &Connection, tool: &str, session_id: &str) -> Resul
 /// the label it is reported under. A subagent takes its root session's label,
 /// following `parent_session_id` through nested subagents. Subagents whose
 /// parent is unknown get a NULL label.
-const EFFECTIVE_LABELS: &str = r#"
+pub(crate) const EFFECTIVE_LABELS: &str = r#"
     RECURSIVE chain(tool, session_id, root_id, depth) AS (
         SELECT tool, session_id, session_id, 0 FROM sessions WHERE parent_session_id IS NULL
         UNION

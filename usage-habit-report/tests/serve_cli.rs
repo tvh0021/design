@@ -1,5 +1,5 @@
 //! `serve` listens on 127.0.0.1 only, prints its URL first, answers `/` with
-//! the dashboard, and 404s anything else.
+//! the dashboard with every panel, and 404s anything else.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -87,6 +87,16 @@ fn serves_the_dashboard_on_loopback() {
         body.contains("<tr class=\"total\"><th scope=\"row\">Total</th><td>1</td><td>100</td>")
     );
     assert!(!body.contains("http://") && !body.contains("https://"));
+    // Every ticket 10 panel renders; with no labels the matrix says what to run.
+    for id in ["models", "agents", "projects", "sessions", "cache", "spend"] {
+        assert!(
+            body.contains(&format!("<section id=\"{id}\"")),
+            "{id} missing"
+        );
+    }
+    assert!(body.contains("No labels yet. Run <code>usage-habit-report rebuild</code>"));
+    assert!(body.contains("<code>query agents</code>"));
+    assert!(body.contains("Spend by month"));
     let (status, _) = get(server.port, "/assets/anything");
     assert_eq!(status, 404);
     // The store is untouched: serve opens it read-only and never migrates or prices.

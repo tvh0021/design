@@ -12,7 +12,8 @@ information. This note is the source of truth for the tokens in
   different strengths. Nothing else is grey.
 - One hue per tool, and nothing else is coloured. Claude Code, Codex and
   Antigravity each own a hue. A hue appears on a tool's name, on its row
-  marker, and on the activity map when the map is filtered to that tool.
+  marker, on a stepped bar that belongs to that tool, and on the activity
+  map when the map is filtered to that tool.
   No hue is ever used for emphasis, state, or decoration.
 - Figures are tabular in a monospace from the system stack. No webfonts and
   no network requests of any kind; the page works offline.
@@ -87,6 +88,31 @@ The mix is `color-mix(in oklab, var(--ramp) N%, var(--paper))`. Level
 thresholds are quintiles of the non-empty cells so the map shows the shape
 of a habit rather than one heavy hour swamping the rest; the legend prints
 the token value at which each step begins.
+
+### Secondary panels
+
+The panels under the totals reuse the tokens above; nothing new is coloured.
+
+- **Model by task kind** uses the same six-step ramp with the same quintile
+  rule, over request counts. It is always the ink, even when the page is
+  filtered to one tool: hue marks a tool, and the matrix rows are models.
+  Each cell is a 10px swatch beside its figure rather than a shaded
+  background, so every figure stays ink on paper at full contrast (ink on a
+  48 % or 68 % step would fall under 4.5:1).
+- **Stepped bars** are a row of discrete 6 by 10px units with a 2px gap,
+  never a continuous or gradient fill. A share bar is 20 units (5 % each);
+  unfilled units are a 1px `--rule` inset, like an empty map cell. A count
+  bar (the subagent histogram) draws only its filled units, scaled to the
+  largest bucket. Filled units are the ink at the 68 % ramp step, or the
+  tool's hue at full strength when the bar belongs to one tool (cache-read
+  ratio, the per-project tool mix). The tool mix is a row marker: ten units
+  split by each tool's share of the project's requests.
+- **Quiet tables.** The condensed spend table is set in `--t-small` with
+  period labels in `--muted`, so it reads as a reference under the map, not
+  a second headline. Sub-lists inside a section (longest and costliest
+  sessions) are labelled with a table `caption` in `--muted` at body size,
+  not with a heading.
+- Session titles may wrap (up to 48ch) inside an otherwise single-line table.
 
 ## Type
 
