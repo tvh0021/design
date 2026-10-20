@@ -1,8 +1,8 @@
 # usage-habit-report
 
 A local store of token usage from AI coding harnesses. `scan` reads the
-harness logs into SQLite and `query` reports on them. Claude Code is supported
-now; Codex and Antigravity are planned.
+harness logs into SQLite and `query` reports on them. Claude Code and Codex
+are supported now; Antigravity is planned.
 
 No prompt or response text is stored. The one exception is the session title:
 the first line (up to 120 characters) of a session's opening prompt.
@@ -30,7 +30,7 @@ different store.
 ### `scan`
 
 ```sh
-usage-habit-report scan [--claude-dir ~/.claude/projects]
+usage-habit-report scan [--claude-dir ~/.claude/projects] [--codex-dir ~/.codex]
 ```
 
 Reads every log file from the byte offset where the previous scan stopped,
@@ -40,8 +40,12 @@ re-read from byte 0 after its old rows are dropped. Output:
 
 ```
 claude-code: 120 files seen, 120 files read, 250000000 bytes read, 5000 rows added, 120 sessions added
-elapsed: 0.25 s
+codex: 900 files seen, 900 files read, 3000000000 bytes read, 40000 rows added, 890 sessions added, 300 repeated token_count events skipped
+elapsed: 4.10 s
 ```
+
+Each tool line ends with counts of anything unusual it skipped or corrected;
+the Codex ones are explained under [Codex ingest](#codex-ingest).
 
 A second scan over unchanged logs reports `0 files read, 0 bytes read`.
 
@@ -88,13 +92,13 @@ JSON shape:
 | `since` | string or null | RFC 3339 UTC lower bound from `--since`; null means all time |
 | `totals` | object | Sum over all groups |
 | `groups[]` | array | One entry per (tool, model), ordered by tool, then total tokens descending |
-| `tool` | string | `claude-code` (later also `codex`, `antigravity`) |
+| `tool` | string | `claude-code` or `codex` (later also `antigravity`) |
 | `model` | string or null | Raw model name from the log; null when the log has none |
 | `requests` | integer | Billed model calls |
 | `input_tokens` | integer | Uncached input tokens |
 | `cache_read_input_tokens` | integer | Input tokens read from the prompt cache |
 | `cache_creation_input_tokens` | integer | Input tokens written to the prompt cache |
-| `output_tokens` | integer | Output tokens (includes thinking) |
+| `output_tokens` | integer | Output tokens (includes thinking / reasoning) |
 
 Subagent requests are included in the totals of the model that served them.
 
@@ -120,7 +124,79 @@ Subagent requests are included in the totals of the model that served them.
   earliest and latest record timestamps.
 - Lines that fail to parse are counted and reported by `scan`, then skipped.
 
-## Store schema (v1)
+## Codex ingest
+
+- Source: every `rollout-*.jsonl` and `rollout-*.jsonl.zst` under
+  `~/.codex/sessions/` (dated `YYYY/MM/DD/` folders) and
+  `~/.codex/archived_sessions/` (flat). `--codex-dir` (or `CODEX_HOME`) points
+  at a different Codex home. Codex zstd-compresses older rollouts; for those,
+  offsets and `bytes read` count decompressed bytes. An unchanged `.zst`
+  (same size and mtime) is skipped without being decompressed.
+- A rollout that is compressed in place or moved to `archived_sessions/` is
+  recognised by its file name minus the `.jsonl[.zst]` suffix. The new path
+  takes over the old source row and its offset, so nothing is counted twice.
+  If two copies are on disk at once, the tracked one (else the plain one) is
+  read and the other is skipped.
+- Session id is `session_meta.id` from the file's first record. A long session
+  can span several files (`rollout-<time>-<id>_<window>.jsonl`); they all
+  attach to session `<id>`. `cwd` comes from `session_meta.cwd`.
+- Model and effort come from the latest `turn_context` record (`model`,
+  `effort`). `session_meta` carries no model. Requests before any
+  `turn_context` get a null model; no default is filled in.
+- Requests, newer format: one per `token_usage_record` (one per model
+  response), keyed by its `response_id`. Older rollouts lack these records;
+  then requests come from `event_msg` / `token_count` records, keyed
+  `<file stem>#<ordinal>`. Once a file has a `token_usage_record`, its later
+  `token_count` records only update the running total.
+- `token_count` carries the cumulative `total_token_usage` and the latest
+  call's `last_token_usage`. A request is recorded each time the cumulative
+  total changes, and its counts are `last_token_usage`. On real data the two
+  agree on 46,651 of 46,665 changes. They disagree when the counter restarts
+  (it goes down) or jumps forward (seen after a user fork). There the
+  cumulative delta is wrong and `last_token_usage` is right. A `token_count` whose total
+  did not change repeats the previous one and is skipped. The newer
+  per-response records are preferred because about 0.4% of responses get a
+  `token_count` whose total never moved (`last_token_usage` all zero); the
+  `token_count` path loses those.
+- Token columns: Codex's `input_tokens` includes cached input, so
+  `input_tokens` = `input_tokens − cached_input_tokens − cache_write_input_tokens`,
+  `cache_read_input_tokens` = `cached_input_tokens`,
+  `cache_creation_input_tokens` = `cache_write_input_tokens` (always 0 so
+  far), `output_tokens` = `output_tokens`, and `reasoning_tokens` =
+  `reasoning_output_tokens` (part of the output, not on top of it). If cached
+  exceeds raw input, uncached input is clamped to 0 and counted.
+- User turns are `response_item` messages with `role: "user"`, unless every
+  text block is harness-injected. Injected blocks start with
+  `# AGENTS.md instructions` or one of these tags: `<environment_context>`,
+  `<user_instructions>`, `<recommended_plugins>`, `<skill>`,
+  `<external_codex_apps_open_page>`, `<turn_aborted>`,
+  `<send_user_message_question_reply>`, `<codex_delegation>`,
+  `<realtime_delegation>`, `<heartbeat>`, `<in-app-browser-context>`,
+  `<subagent_notification>`, `<codex_internal_context>`,
+  `<guardian_tool_descriptions>`, `<user_shell_command>`, `<image>`.
+  Sessions driven only by delegation (voice, or threads an agent created)
+  therefore have 0 turns and no title.
+- Title: first line of the first typed block. Codex Desktop wraps prompts in
+  IDE context (`# Files mentioned by the user`, `# Files pasted by ...`,
+  `# Selected text`); the title is the text after the `## My request...` line,
+  and none if that is empty.
+- Subagents: `session_meta.parent_thread_id` is the parent session id, and
+  `source.subagent` the kind. `is_subagent = 1` when either is present (or
+  `thread_source` is `subagent`). `agent_type` is `guardian` for auto-review
+  subagents (`{"other": "guardian"}`), and `thread_spawn` for spawned agents
+  (their `agent_role` when Codex records one; so far always null).
+  `session_meta.session_id` is the root session; it is not stored.
+- Forks (`forked_from_id` set, which includes most spawned subagents) begin
+  with a copy of the parent's history, including its `token_count` records.
+  Records with `ordinal` below `subagent_history_start_ordinal` are that copy;
+  for forks without that field, records within 1 s of the first record are.
+  The copy sets the running total and model, and adds no requests or turns.
+  A user fork (no parent) is a top-level session with null
+  `parent_session_id`.
+- Parser state between scans (running total, model, effort, fork cut) is kept
+  per source in `codex_cursors`.
+
+## Store schema (v2)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
 `src/store.rs`.
@@ -134,8 +210,11 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   reserved for later tickets.
 - `requests`: one row per `(tool, request_key)`, with `session_id`,
   `is_subagent`, `source_id`, `ts_ms`, `model`, `effort`, and the four token
-  counts. The nullable columns `canonical_model`, `reasoning_tokens`, and
-  `cost_usd` are reserved for later tickets.
+  counts. `reasoning_tokens` is filled for Codex (null for Claude Code). The
+  nullable columns `canonical_model` and `cost_usd` are reserved for later
+  tickets.
+- `codex_cursors` (v2): one row per Codex source, `state` = JSON parser state
+  carried between incremental scans.
 
 ## Tests
 
