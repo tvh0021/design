@@ -28,7 +28,7 @@ A responsive, high-performance, browser-native web application hosted on GitHub 
 16. As an aviation enthusiast, I want antipodal routes to default to a trans-polar route over the North Pole, so that the path aligns with standard polar aviation navigation conventions.
 17. As a mobile user, I want the UI controls to collapse into an ergonomic drawer or bottom card, so that the interactive globe remains unencumbered on small screens.
 18. As a site owner, I want the application assets to be under 400 KB total, so that the page loads in under 1 second on GitHub Pages.
-19. As a user, I want small dots on the most populous cities in the current view (about 20 at a time, re-ranked as I pan and zoom), with each city's name shown when I hover over or tap a dot, so that I can orient myself at any zoom level.
+19. As a user, I want small dots on the most populous cities in the current view (about 20 at a time, re-ranked as I pan and zoom), with each city's name shown when I hover over or tap a dot, so that I can orient myself at any zoom level. Selection is weighted toward the view center, so a sparse region (central Australia, Nevada) still shows dots near its middle rather than only large cities on the rim. On touch devices, which have no hover, the few most relevant dots (up to 4) keep their name labels without overlapping, and tapping any dot labels it too.
 
 ## Implementation Decisions
 

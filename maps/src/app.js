@@ -108,6 +108,7 @@ export async function initApp(options = {}) {
       canvas,
       verticalCenterRatio: initialVerticalRatio,
       projectionType: resolvedProjection,
+      ...(urlParams?.get('touchlabels') === '1' ? { touchLabels: true } : {}),
       ...(options.globeOptions || {})
     });
 

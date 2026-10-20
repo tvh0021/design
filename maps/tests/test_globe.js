@@ -914,6 +914,62 @@ test('City dots skip crowded places and places under the route pins', () => {
   assert.deepEqual(dots.map((d) => d.place.name), ['A', 'B']);
 });
 
+test('City dots: center weighting lets a small central place beat a big corner place', () => {
+  // 100 places ranked by index; only the first few are on screen.
+  const places = Array.from({ length: 100 }, (_, i) => ({ name: `P${i}`, x: 0, y: 0, shown: false }));
+  Object.assign(places[0], { name: 'Corner', x: 5, y: 5, shown: true });
+  Object.assign(places[7], { name: 'Center', x: 250, y: 250, shown: true });
+  const project = (p) => (p.shown ? [p.x, p.y] : null);
+  const rect = { x0: 0, x1: 500, y0: 0, y1: 500 };
+  const biased = selectPlaceDots(places, project, rect, { limit: 1, minSpacing: 16, centerBias: Math.log(10) });
+  assert.equal(biased[0].place.name, 'Center');
+  const plain = selectPlaceDots(places, project, rect, { limit: 1, minSpacing: 16 });
+  assert.equal(plain[0].place.name, 'Corner');
+});
+
+test('City dots: centerBias 0 reproduces pure population-rank order', () => {
+  const places = Array.from({ length: 30 }, (_, i) => ({ name: `P${i}`, x: (i % 6) * 80, y: Math.floor(i / 6) * 80 }));
+  const dots = selectPlaceDots(places, (p) => [p.x, p.y], { x0: 0, x1: 500, y0: 0, y1: 500 }, {
+    limit: 10, minSpacing: 16, center: [400, 400], centerBias: 0
+  });
+  assert.deepEqual(dots.map((d) => d.index), Array.from({ length: 10 }, (_, i) => i));
+});
+
+test('City dots: stickyBonus keeps a previously shown dot over an equal newcomer', () => {
+  // Adjacent ranks at the same distance from the center: the lower rank normally wins.
+  const places = Array.from({ length: 100 }, (_, i) => ({ name: `P${i}`, x: 0, y: 0, shown: false }));
+  Object.assign(places[10], { name: 'New', x: 100, y: 250, shown: true });
+  Object.assign(places[11], { name: 'Old', x: 400, y: 250, shown: true });
+  const project = (p) => (p.shown ? [p.x, p.y] : null);
+  const rect = { x0: 0, x1: 500, y0: 0, y1: 500 };
+  const opts = { limit: 1, minSpacing: 16, centerBias: Math.log(10) };
+  assert.equal(selectPlaceDots(places, project, rect, opts)[0].place.name, 'New');
+  const sticky = selectPlaceDots(places, project, rect, { ...opts, previous: [{ place: places[11] }] });
+  assert.equal(sticky[0].place.name, 'Old');
+});
+
+test('Touch devices label at most placeTouchLabelCount dots; desktop labels none', () => {
+  const places = Array.from({ length: 40 }, (_, i) => ({
+    name: `City${i}`, country: 'Land', lat: 30 + (Math.floor(i / 8) - 2) * 6, lng: (i % 8) * 12 - 40
+  }));
+  const run = (touchLabels) => {
+    const { canvas } = createMockCanvas();
+    const controller = createGlobeRenderer(createMockContainer(canvas), null, {
+      canvas, d3: createMockD3(), topojson: createMockTopojson(), width: 800, height: 600,
+      touchLabels, placeTouchLabelCount: 4
+    });
+    controller.setPlaces(places);
+    const dots = controller.getPlaceDots();
+    controller.destroy();
+    return dots;
+  };
+  const touch = run(true);
+  assert.ok(touch.length > 4, 'Fixture yields more dots than labels');
+  const labeled = touch.filter((d) => d.labeled).length;
+  assert.ok(labeled >= 1 && labeled <= 4, `labeled ${labeled}`);
+  assert.equal(run(false).filter((d) => d.labeled).length, 0);
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);

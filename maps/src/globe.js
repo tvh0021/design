@@ -64,25 +64,49 @@ function normalizeMidpoint(mid) {
 }
 
 /**
- * Picks the population-ranked places to show as dots in the current view.
- * places must be sorted by descending population. project(place, index)
- * returns screen [x, y] or null when the place is off-map. A place is kept
- * when it falls inside rect and sits at least minSpacing px from every dot
- * already kept and from each point in exclude (route pins). Scanning stops
- * once limit dots are found, so the result is the top-N visible places.
+ * Picks the places to show as dots in the current view. places must be sorted
+ * by descending population, so the index is the population rank. project(place,
+ * index) returns screen [x, y] or null when the place is off-map. Candidates
+ * inside rect are scored
+ *   ln(N / (rank + 1)) - centerBias * (r / R) + (stickyBonus if previously shown)
+ * where r is the pixel distance from center and R the half-diagonal of rect, so
+ * a sparse region still gets dots near its middle. Candidates are then taken in
+ * score order, skipping any closer than minSpacing px to a kept dot or to a
+ * point in exclude (route pins), until limit dots are kept. With centerBias 0 and
+ * no previous dots the score is monotonic in rank, i.e. plain top-N by population.
  *
- * @returns {Array<{place: object, index: number, x: number, y: number}>}
+ * @returns {Array<{place: object, index: number, x: number, y: number, score: number}>}
  */
-export function selectPlaceDots(places, project, rect, { limit = 20, minSpacing = 16, exclude = [] } = {}) {
+export function selectPlaceDots(places, project, rect, {
+  limit = 20, minSpacing = 16, exclude = [], center = null, centerBias = 0, previous = [], stickyBonus = 0.3
+} = {}) {
   const dots = [];
   if (!Array.isArray(places) || typeof project !== 'function' || !rect || limit <= 0) return dots;
-  const minSq = minSpacing * minSpacing;
-  for (let i = 0; i < places.length && dots.length < limit; i++) {
+  const cx = center ? center[0] : (rect.x0 + rect.x1) / 2;
+  const cy = center ? center[1] : (rect.y0 + rect.y1) / 2;
+  // Inscribed radius, not the half-diagonal: the globe disc never reaches the
+  // corners, so the half-diagonal would cap in-frame penalties near half of
+  // centerBias and let rim megacities outscore everything near the center.
+  const halfDiag = Math.min(rect.x1 - rect.x0, rect.y1 - rect.y0) / 2 || 1;
+  const prev = new Set();
+  for (const d of previous || []) prev.add(d.place);
+  const n = places.length;
+  const cands = [];
+  for (let i = 0; i < n; i++) {
     const pt = project(places[i], i);
     if (!pt) continue;
     const x = pt[0];
     const y = pt[1];
     if (!(x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1)) continue;
+    let score = Math.log(n / (i + 1));
+    if (centerBias) score -= centerBias * (Math.hypot(x - cx, y - cy) / halfDiag);
+    if (prev.has(places[i])) score += stickyBonus;
+    cands.push({ place: places[i], index: i, x, y, score });
+  }
+  cands.sort((a, b) => b.score - a.score || a.index - b.index);
+  const minSq = minSpacing * minSpacing;
+  for (let c = 0; c < cands.length && dots.length < limit; c++) {
+    const { x, y } = cands[c];
     let crowded = false;
     for (let j = 0; j < exclude.length && !crowded; j++) {
       const dx = exclude[j][0] - x;
@@ -94,7 +118,7 @@ export function selectPlaceDots(places, project, rect, { limit = 20, minSpacing 
       const dy = dots[j].y - y;
       crowded = dx * dx + dy * dy < minSq;
     }
-    if (!crowded) dots.push({ place: places[i], index: i, x, y });
+    if (!crowded) dots.push(cands[c]);
   }
   return dots;
 }
@@ -902,6 +926,14 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   const placeDotSpacing = options.placeDotSpacing || 22;
   let placeList = [];
   let placeVecs = null;
+  // null = zoom-dependent default, see centerBiasFor().
+  const placeDotCenterBias = options.placeDotCenterBias ?? null;
+  const placeTouchLabelCount = options.placeTouchLabelCount ?? 4;
+  const placeTapRadius = 24;
+  // Touch devices have no hover, so the most relevant dots keep their labels.
+  const touchLabels = options.touchLabels
+    ?? (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? !!window.matchMedia('(hover: none)').matches : false);
   let placeDots = [];
   let hoveredPlace = null;
 
@@ -1141,13 +1173,14 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
 
     // 8. City pins and labels (origin and destination)
+    const pinRects = [];
     if (currentOrigin) {
       const coord = getCityCoords(currentOrigin);
       if (coord && isCoordVisible(coord, activeProj, projectionType, width, height)) {
         const pt = activeProj(coord);
         if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
           const name = getCityName(currentOrigin);
-          drawCityPin(pt[0], pt[1], name, palette.origin, palette.originAura, 'left');
+          pinRects.push(drawCityPin(pt[0], pt[1], name, palette.origin, palette.originAura, 'left'));
         }
       }
     }
@@ -1158,16 +1191,34 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
         const pt = activeProj(coord);
         if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
           const name = getCityName(currentDest);
-          drawCityPin(pt[0], pt[1], name, palette.dest, palette.destAura, 'right');
+          pinRects.push(drawCityPin(pt[0], pt[1], name, palette.dest, palette.destAura, 'right'));
         }
       }
     }
 
     // 9. Name label for the hovered / tapped city dot
+    const dotLabel = (d) => (d.place.country ? `${d.place.name}, ${d.place.country}` : d.place.name);
+    const dotAlign = (d) => (d.x > width * 0.6 ? 'left' : 'right');
+    const taken = pinRects.filter(Boolean);
     const hoveredDot = hoveredPlace && placeDots.find((d) => d.place === hoveredPlace);
     if (hoveredDot) {
-      const text = hoveredDot.place.country ? `${hoveredDot.place.name}, ${hoveredDot.place.country}` : hoveredDot.place.name;
-      drawLabelBadge(hoveredDot.x, hoveredDot.y, text, hoveredDot.x > width * 0.6 ? 'left' : 'right', 12);
+      taken.push(drawLabelBadge(hoveredDot.x, hoveredDot.y, dotLabel(hoveredDot), dotAlign(hoveredDot), 12));
+    }
+    for (const d of placeDots) d.labeled = false;
+    if (touchLabels) {
+      // placeDots is in score order, so the first fits are the most relevant.
+      let shown = 0;
+      for (const d of placeDots) {
+        if (shown >= placeTouchLabelCount) break;
+        if (d === hoveredDot) { d.labeled = true; shown++; continue; }
+        const text = dotLabel(d);
+        const r = labelBadgeRect(d.x, d.y, text, dotAlign(d), 12);
+        if (taken.some((t) => rectsOverlap(t, r))) continue;
+        drawLabelBadge(d.x, d.y, text, dotAlign(d), 12);
+        taken.push(r);
+        d.labeled = true;
+        shown++;
+      }
     }
   }
 
@@ -1205,6 +1256,9 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) return [];
     const toRad = Math.PI / 180;
     let cull;
+    // Angular radius of the view in degrees: 180 when the whole world is in
+    // frame (Robinson), <= 90 for a hemisphere or a zoomed region.
+    let viewHalfAngle = 180;
 
     if (projectionType === 'robinson') {
       // Projected y depends only on latitude, so the center column bounds the band.
@@ -1216,6 +1270,14 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       const latMax = latAt(rect.y0, 90) + 1;
       const latMin = latAt(rect.y1, -90) - 1;
       cull = (p) => p.lat > latMax || p.lat < latMin;
+      // Half the longitude span across the rect at the equator, from the
+      // projection's px-per-degree there. (invert() wraps longitudes to +-180,
+      // so it cannot measure a span that crosses the antimeridian.)
+      const lng0 = -proj.rotate()[0];
+      const p0 = proj([lng0, 0]);
+      const p1 = proj([lng0 + 1, 0]);
+      const pxPerDeg = p0 && p1 ? Math.abs(p1[0] - p0[0]) : 0;
+      viewHalfAngle = pxPerDeg > 0 ? Math.min(180, (rect.x1 - rect.x0) / pxPerDeg / 2) : 180;
     } else {
       // Skip places farther from the view center than the farthest visible corner.
       const rot = proj.rotate();
@@ -1230,6 +1292,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       );
       // Floor at ~78 deg from center: cities squeezed onto the limb read as clutter.
       const cosLimit = Math.max(0.2, d >= k ? 0 : Math.cos(Math.asin(d / k)) - 1e-4);
+      const rIn = Math.min(rect.x1 - rect.x0, rect.y1 - rect.y0) / 2;
+      viewHalfAngle = rIn >= k ? 90 : Math.asin(rIn / k) / toRad;
       cull = (p, i) => (
         c[0] * placeVecs[i * 3] + c[1] * placeVecs[i * 3 + 1] + c[2] * placeVecs[i * 3 + 2]
       ) < cosLimit;
@@ -1248,7 +1312,24 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       if (cull(p, i)) return null;
       const pt = proj([p.lng, p.lat]);
       return pt && isFinite(pt[0]) && isFinite(pt[1]) ? pt : null;
-    }, rect, { limit: placeDotLimit, minSpacing: placeDotSpacing, exclude });
+    }, rect, {
+      limit: placeDotLimit,
+      minSpacing: placeDotSpacing,
+      exclude,
+      center: [(rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2],
+      centerBias: placeDotCenterBias ?? centerBiasFor(viewHalfAngle),
+      previous: placeDots
+    });
+  }
+
+  // Center bias for a view of the given angular radius. Full strength 2·ln(N)
+  // from a hemisphere (<= 80 deg) inward, fading to 0 at a whole-world view so
+  // the world map still shows the global top 20 instead of piling dots at its
+  // center.
+  function centerBiasFor(halfAngleDeg) {
+    const full = 2 * Math.log(Math.max(2, placeList.length));
+    const t = Math.min(1, Math.max(0, (180 - halfAngleDeg) / 100));
+    return full * t;
   }
 
   function drawPlaceDots() {
@@ -1413,27 +1494,34 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.stroke();
 
     ctx.restore();
-    if (name) drawLabelBadge(x, y, name, align, 10);
+    return name ? drawLabelBadge(x, y, name, align, 10) : null;
+  }
+
+  function rectsOverlap(a, b) {
+    return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+  }
+
+  // Badge geometry shared by drawing and overlap checks.
+  function labelBadgeRect(x, y, name, align = 'right', offset = 10) {
+    ctx.save();
+    ctx.font = '600 11px system-ui, -apple-system, sans-serif';
+    const textW = ctx.measureText(name).width;
+    ctx.restore();
+    const padX = 7;
+    const badgeW = textW + padX * 2;
+    const badgeH = 22;
+    const badgeX = align === 'left' ? x - badgeW - offset : x + offset;
+    const badgeY = y - badgeH / 2;
+    return { x0: badgeX, y0: badgeY, x1: badgeX + badgeW, y1: badgeY + badgeH, padX };
   }
 
   function drawLabelBadge(x, y, name, align = 'right', offset = 10) {
+    const rect = labelBadgeRect(x, y, name, align, offset);
+    const { x0: badgeX, y0: badgeY, padX } = rect;
+    const badgeW = rect.x1 - rect.x0;
+    const badgeH = rect.y1 - rect.y0;
     ctx.save();
     ctx.font = '600 11px system-ui, -apple-system, sans-serif';
-    const textMetrics = ctx.measureText(name);
-    const textW = textMetrics.width;
-    const textH = 14;
-    const padX = 7;
-    const padY = 4;
-    const badgeW = textW + padX * 2;
-    const badgeH = textH + padY * 2;
-
-    let badgeX;
-    if (align === 'left') {
-      badgeX = x - badgeW - offset;
-    } else {
-      badgeX = x + offset;
-    }
-    const badgeY = y - badgeH / 2;
 
     ctx.beginPath();
     if (typeof ctx.roundRect === 'function') {
@@ -1452,6 +1540,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     ctx.textAlign = 'left';
     ctx.fillText(name, badgeX + padX, badgeY + badgeH / 2);
     ctx.restore();
+    return rect;
   }
 
   // Animation controller
@@ -1932,7 +2021,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     tapStart = null;
     if (moved > 8) return;
     const [x, y] = canvasPoint(t.clientX, t.clientY);
-    const dot = placeDotAt(x, y, 16);
+    const dot = placeDotAt(x, y, placeTapRadius);
     setHoveredPlace(dot ? dot.place : null);
   }
 
@@ -2016,7 +2105,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     render,
     setDetailTopology,
     setPlaces,
-    getPlaceDots: () => placeDots.map((d) => ({ name: d.place.name, country: d.place.country, x: d.x, y: d.y })),
+    getPlaceDots: () => placeDots.map((d) => ({ name: d.place.name, country: d.place.country, x: d.x, y: d.y, labeled: !!d.labeled })),
     getHoveredPlace: () => (hoveredPlace ? { name: hoveredPlace.name, country: hoveredPlace.country } : null),
     getRotation: () => getActiveProjection().rotate().slice(),
     getScale: () => getActiveProjection().scale(),
