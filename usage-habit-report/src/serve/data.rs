@@ -630,6 +630,33 @@ pub struct Spend {
     pub periods: Vec<SpendPeriod>,
 }
 
+/// Exact aggregates are computed before any public rounding.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpendTotals {
+    pub rows: Vec<CostCell>,
+    pub columns: Vec<CostCell>,
+    pub all: CostCell,
+}
+
+impl Spend {
+    pub fn totals(&self) -> SpendTotals {
+        let mut totals = SpendTotals {
+            columns: vec![(None, 0); self.tools.len()],
+            ..Default::default()
+        };
+        for period in &self.periods {
+            let mut row = (None, 0);
+            for (i, &(cost, unpriced)) in period.cells.iter().enumerate() {
+                add_cost(&mut row, cost, unpriced);
+                add_cost(&mut totals.columns[i], cost, unpriced);
+                add_cost(&mut totals.all, cost, unpriced);
+            }
+            totals.rows.push(row);
+        }
+        totals
+    }
+}
+
 fn add_cost(cell: &mut CostCell, cost: Option<f64>, unpriced: i64) {
     if let Some(c) = cost {
         *cell.0.get_or_insert(0.0) += c;

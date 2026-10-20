@@ -640,6 +640,42 @@ renders in 110 to 260 ms. Everything is embedded in the page; it makes no
 network requests and needs no Node toolchain. The visual system is written
 down in [docs/design.md](docs/design.md).
 
+## Public snapshot
+
+```sh
+usage-habit-report snapshot --out /tmp/usage-public
+usage-habit-report snapshot --out /tmp/usage-public-12w --window 12w
+```
+
+Exports the dashboard from the store read-only, without scanning, pricing,
+or network access. The default writes `index.html` for 4 weeks,
+`index-12w.html`, and `index-all.html`, plus three tool-filtered versions
+of each. Window and tool links use relative filenames and work from
+`file://`. Each document embeds the same CSS, JavaScript, templates, and
+queries as `serve`. With `--window 4w|12w|all`, only that window and its tool
+variants are written, with the all-tools page at `index.html`.
+
+Project names become `project A`, `project B`, and so on, ordered by
+all-time estimated cost, then path for ties. One mapping covers every window
+and tool in a run. Paths, session titles, session and T3 thread ids, cwd,
+T3 titles, and per-request rows are absent. Session tables retain the tool,
+project pseudonym, elapsed time, request count, and estimated cost. The
+heaviest fan-outs list becomes an omission note; its panel's aggregate
+figures remain.
+
+Dollar figures round independently to the nearest dollar, including totals
+and activity-map readouts. Rounded rows may not add up. Real dates, local
+hours, tool and model names, task labels, token counts, and other aggregate
+figures stay. A note states the generation date and window; the footer keeps
+the data-load time. Pseudonyms are stable within one run and may change in
+later exports as project costs change.
+
+Review the temporary output before publishing. Copy the reviewed files into
+`usage-habit-report/site/` in the repository and commit them when you want to
+publish. GitHub Pages copies that folder to `/usage/`; the flight visualizer is at `/map/`.
+The deploy workflow uses committed HTML and does not build Rust. The checked-in
+placeholder says that no snapshot has been generated yet.
+
 ## Codex ingest
 
 - Source: every `rollout-*.jsonl` and `rollout-*.jsonl.zst` under

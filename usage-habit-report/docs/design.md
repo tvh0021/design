@@ -198,3 +198,15 @@ Project and session time figures use cached active time with gaps longer than
 15 minutes removed. Parent time includes linked child activity; totals count
 that tree once. The longest-session list sorts by active time. Layout, tokens,
 and request/cost window semantics stay the same.
+
+## Public export
+
+`snapshot` uses the same page model, queries, templates, and embedded assets
+as `serve`. Its public audience changes navigation to relative HTML files
+and removes private fields before rendering. A note near the top states the
+generation date and window. Project names are pseudonyms without path
+tooltips. Session lists keep the tool, project, and figures, with no title
+column. Heaviest fan-outs become an omission note; the rest of the agents
+panel stays. Estimated dollar figures round independently to whole dollars,
+including exact aggregates computed before rounding. The spend note explains
+why rounded rows may not add up. All existing visual tokens stay the same.

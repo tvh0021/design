@@ -86,6 +86,14 @@ enum Command {
         #[command(subcommand)]
         what: RatesCommand,
     },
+    /// Write a de-identified, offline dashboard with static window and tool links.
+    Snapshot {
+        #[arg(long)]
+        out: PathBuf,
+        /// Export just one window; by default export all three.
+        #[arg(long, value_parser = ["4w", "12w", "all"])]
+        window: Option<String>,
+    },
     /// Open the dashboard: a loopback-only web page rendered from the store.
     Serve {
         /// Port on 127.0.0.1; 0 picks a free one. The URL is printed.
@@ -421,6 +429,22 @@ fn main() -> Result<()> {
             },
         );
     }
+    if let Command::Snapshot { out, window } = cli.command {
+        let started = std::time::Instant::now();
+        let files = serve::snapshot::write(
+            &db,
+            &out,
+            window
+                .as_deref()
+                .map(|w| serve::data::Window::parse(Some(w))),
+            scan::now_ms(),
+        )?;
+        println!(
+            "snapshot: {files} files, {:.0} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        return Ok(());
+    }
     let mut store = Store::open(&db)?;
     if !cli.no_scan && matches!(cli.command, Command::Query { .. }) {
         catch_up(&mut store, cli.offline)?;
@@ -654,7 +678,9 @@ fn main() -> Result<()> {
             );
             print_price_stats(&stats);
         }
-        Command::Serve { .. } => unreachable!("handled before the store is opened"),
+        Command::Serve { .. } | Command::Snapshot { .. } => {
+            unreachable!("handled before the store is opened")
+        }
     }
     Ok(())
 }
