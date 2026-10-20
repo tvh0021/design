@@ -10,6 +10,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
+tiny_http = "0.12"
 ureq = "3.4.2"
 walkdir = "2.5.0"
 zstd = "0.14.3"

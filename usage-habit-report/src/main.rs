@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
-    agents, antigravity, codex, labels, paths, project, query, rates, scan, store::Store, t3,
+    agents, antigravity, codex, labels, paths, project, query, rates, scan, serve, store::Store, t3,
 };
 
 #[derive(Parser)]
@@ -79,6 +79,15 @@ enum Command {
     Rates {
         #[command(subcommand)]
         what: RatesCommand,
+    },
+    /// Open the dashboard: a loopback-only web page rendered from the store.
+    Serve {
+        /// Port on 127.0.0.1; 0 picks a free one. The URL is printed.
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Do not open the browser.
+        #[arg(long)]
+        no_open: bool,
     },
 }
 
@@ -396,6 +405,16 @@ fn main() -> Result<()> {
         Some(p) => p,
         None => paths::default_db()?,
     };
+    if let Command::Serve { port, no_open } = cli.command {
+        // Read-only: the dashboard never opens the store for writing.
+        return serve::run(
+            &db,
+            serve::Options {
+                port,
+                open_browser: !no_open,
+            },
+        );
+    }
     let mut store = Store::open(&db)?;
     if !cli.no_scan && matches!(cli.command, Command::Query { .. }) {
         catch_up(&mut store, cli.offline)?;
@@ -614,6 +633,7 @@ fn main() -> Result<()> {
             );
             print_price_stats(&stats);
         }
+        Command::Serve { .. } => unreachable!("handled before the store is opened"),
     }
     Ok(())
 }

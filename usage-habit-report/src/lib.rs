@@ -12,5 +12,6 @@ pub mod proto;
 pub mod query;
 pub mod rates;
 pub mod scan;
+pub mod serve;
 pub mod store;
 pub mod t3;
