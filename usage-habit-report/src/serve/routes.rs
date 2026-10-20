@@ -80,6 +80,7 @@ pub fn load_page(
     let sessions = data::session_lists(conn, since, params.tool)?;
     let spend = data::spend(conn, window, now_ms, params.tool, tz)?;
     Ok(Page {
+        audience: html::Audience::Private,
         window,
         tool: params.tool,
         now_label: clock_label(now_ms, tz),
@@ -92,6 +93,7 @@ pub fn load_page(
         agents,
         projects,
         sessions,
+        spend_totals: spend.totals(),
         spend,
         rates_fetched_at,
         load_ms: started.elapsed().as_secs_f64() * 1000.0,

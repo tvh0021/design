@@ -10,6 +10,7 @@
 pub mod data;
 pub mod html;
 pub mod routes;
+pub mod snapshot;
 
 use crate::{paths, rates, scan};
 use anyhow::{Context, Result};
@@ -28,7 +29,7 @@ pub struct Options {
 }
 
 /// Open the store read-only, or None when the file does not exist yet.
-fn open_read_only(db: &Path) -> Result<Option<Connection>> {
+pub(crate) fn open_read_only(db: &Path) -> Result<Option<Connection>> {
     if !db.exists() {
         return Ok(None);
     }

@@ -53,6 +53,9 @@ jobs:
           # Also mirror to /maps/ subpath so both root and subpath resolve identically
           mkdir -p _site/maps
           cp -r maps/* _site/maps/
+          # Publish the manually generated public usage snapshot
+          mkdir -p _site/usage
+          cp -r usage-habit-report/site/. _site/usage/
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3

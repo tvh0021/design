@@ -192,3 +192,15 @@ section rather than wrapping.
 - Empty store: "No usage recorded yet. Run `usage-habit-report scan` to read
   your logs."
 - Costs are "estimated" and the footer names the source and fetch time.
+
+## Public export
+
+`snapshot` uses the same page model, queries, templates, and embedded assets
+as `serve`. Its public audience changes navigation to relative HTML files
+and removes private fields before rendering. A note near the top states the
+generation date and window. Project names are pseudonyms without path
+tooltips. Session lists keep the tool, project, and figures, with no title
+column. Heaviest fan-outs become an omission note; the rest of the agents
+panel stays. Estimated dollar figures round independently to whole dollars,
+including exact aggregates computed before rounding. The spend note explains
+why rounded rows may not add up. All existing visual tokens stay the same.

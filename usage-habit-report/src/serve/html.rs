@@ -16,9 +16,37 @@ use std::fmt::Write;
 pub const CSS: &str = include_str!("../../assets/dashboard.css");
 pub const JS: &str = include_str!("../../assets/dashboard.js");
 
+/// Public pages link only to files emitted in the same snapshot run.
+#[derive(Debug, Clone, Default)]
+pub enum Audience {
+    #[default]
+    Private,
+    Public {
+        windows: Vec<Window>,
+    },
+}
+
+impl Audience {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Self::Public { .. })
+    }
+
+    fn usd(&self, cost: Option<f64>, unpriced: i64) -> String {
+        if self.is_public() {
+            match cost {
+                Some(c) => format!("${c:.0}{}", if unpriced > 0 { "*" } else { "" }),
+                None => "-".into(),
+            }
+        } else {
+            fmt_usd(cost, unpriced)
+        }
+    }
+}
+
 /// Everything the page shows, already computed; no database here.
 #[derive(Debug, Clone)]
 pub struct Page {
+    pub audience: Audience,
     pub window: Window,
     pub tool: Option<&'static str>,
     /// "Tue 20 Oct 2026, 00:56"
@@ -35,6 +63,7 @@ pub struct Page {
     pub projects: Projects,
     pub sessions: SessionLists,
     pub spend: Spend,
+    pub spend_totals: super::data::SpendTotals,
     /// Shown in the footer when a rates file names its fetch time.
     pub rates_fetched_at: Option<String>,
     /// How long the data took to load, for the footer.
@@ -101,7 +130,10 @@ pub fn section(id: &str, title: &str, note: &str, body: &str) -> String {
     s
 }
 
-fn href(window: Window, tool: Option<&str>) -> String {
+fn href(p: &Page, window: Window, tool: Option<&str>) -> String {
+    if let Audience::Public { windows } = &p.audience {
+        return super::snapshot::filename(window, tool, windows.len() == 1);
+    }
     match tool {
         Some(t) => format!("?window={}&amp;tool={}", window.key(), esc(t)),
         None => format!("?window={}", window.key()),
@@ -111,7 +143,11 @@ fn href(window: Window, tool: Option<&str>) -> String {
 fn controls(p: &Page) -> String {
     let mut s = String::from("<nav class=\"controls\" aria-label=\"Window and tool\">");
     s.push_str("<p class=\"group\"><span class=\"group-name\">Window</span>");
-    for w in Window::ALL {
+    let windows = match &p.audience {
+        Audience::Private => &Window::ALL[..],
+        Audience::Public { windows } => windows.as_slice(),
+    };
+    for &w in windows {
         let current = if w == p.window {
             " aria-current=\"page\""
         } else {
@@ -120,7 +156,7 @@ fn controls(p: &Page) -> String {
         let _ = write!(
             s,
             " <a href=\"{}\"{current}>{}</a>",
-            href(w, p.tool),
+            href(p, w, p.tool),
             w.label()
         );
     }
@@ -130,7 +166,11 @@ fn controls(p: &Page) -> String {
     } else {
         ""
     };
-    let _ = write!(s, " <a href=\"{}\"{current}>all</a>", href(p.window, None));
+    let _ = write!(
+        s,
+        " <a href=\"{}\"{current}>all</a>",
+        href(p, p.window, None)
+    );
     for t in TOOLS {
         let current = if p.tool == Some(t) {
             " aria-current=\"page\""
@@ -140,7 +180,7 @@ fn controls(p: &Page) -> String {
         let _ = write!(
             s,
             " <a class=\"tool\" data-tool=\"{t}\" href=\"{}\"{current}>{t}</a>",
-            href(p.window, Some(t))
+            href(p, p.window, Some(t))
         );
     }
     s.push_str("</p></nav>\n");
@@ -163,7 +203,7 @@ fn window_sentence(p: &Page) -> String {
     }
 }
 
-fn cell_readout(day: usize, hour: usize, c: &super::data::Cell) -> String {
+fn cell_readout(p: &Page, day: usize, hour: usize, c: &super::data::Cell) -> String {
     let span = format!(
         "{} {:02}:00 to {:02}:00",
         WEEKDAYS[day],
@@ -177,7 +217,7 @@ fn cell_readout(day: usize, hour: usize, c: &super::data::Cell) -> String {
         "{span}: {} tokens in {} requests, est. {}",
         fmt_int(c.tokens),
         fmt_int(c.requests),
-        fmt_usd(c.cost_usd, c.unpriced)
+        p.audience.usd(c.cost_usd, c.unpriced)
     )
 }
 
@@ -217,7 +257,7 @@ fn activity(p: &Page) -> String {
     for (d, row) in h.cells.iter().enumerate() {
         let _ = write!(body, "<tr><th scope=\"row\">{}</th>", WEEKDAYS[d]);
         for (hour, c) in row.iter().enumerate() {
-            let text = esc(&cell_readout(d, hour, c));
+            let text = esc(&cell_readout(p, d, hour, c));
             let _ = write!(
                 body,
                 "<td class=\"c\" data-level=\"{}\" tabindex=\"0\" aria-label=\"{text}\" data-readout=\"{text}\"></td>",
@@ -246,7 +286,7 @@ fn activity(p: &Page) -> String {
     body
 }
 
-fn tokens_cells(t: &Tokens) -> String {
+fn tokens_cells(p: &Page, t: &Tokens) -> String {
     format!(
         "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
         fmt_int(t.requests),
@@ -254,7 +294,7 @@ fn tokens_cells(t: &Tokens) -> String {
         fmt_int(t.cache_read_input_tokens),
         fmt_int(t.cache_creation_input_tokens),
         fmt_int(t.output_tokens),
-        fmt_usd(t.estimated_cost_usd, t.unpriced_requests)
+        p.audience.usd(t.estimated_cost_usd, t.unpriced_requests)
     )
 }
 
@@ -271,14 +311,14 @@ fn totals(p: &Page) -> String {
             body,
             "<tr><th scope=\"row\"><a class=\"tool\" data-tool=\"{0}\" href=\"{1}\">{0}</a></th>{2}</tr>",
             esc(&row.tool),
-            href(p.window, Some(&row.tool)),
-            tokens_cells(&row.tokens)
+            href(p, p.window, Some(&row.tool)),
+            tokens_cells(p, &row.tokens)
         );
     }
     let _ = write!(
         body,
         "<tr class=\"total\"><th scope=\"row\">Total</th>{}</tr>",
-        tokens_cells(&t.total)
+        tokens_cells(p, &t.total)
     );
     body.push_str("</tbody></table></div>");
     if t.total.unpriced_requests > 0 {
@@ -548,7 +588,9 @@ fn agents_panel(p: &Page) -> String {
     ));
     body.push_str("</div></div>");
 
-    if a.heaviest_fanouts.is_empty() {
+    if p.audience.is_public() {
+        body.push_str("<p class=\"note\">Heaviest fan-outs omitted from this export because session titles are private.</p>");
+    } else if a.heaviest_fanouts.is_empty() {
         body.push_str("<p class=\"empty\">No session in this window spawned subagents.</p>");
     } else {
         body.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Heaviest fan-outs, by most subagents running at once</caption><thead><tr><th scope=\"col\">Session</th><th scope=\"col\" class=\"l\">Tool</th><th scope=\"col\">Subagents</th><th scope=\"col\">Max concurrent</th><th scope=\"col\">Subagent tokens</th><th scope=\"col\">Share of session</th></tr></thead><tbody>");
@@ -658,6 +700,7 @@ fn projects_panel(p: &Page) -> String {
     for l in &pr.lines {
         let r = &l.row;
         let name = match (&r.project, &r.name) {
+            (_, Some(name)) if p.audience.is_public() => esc(name),
             (Some(path), Some(name)) => {
                 format!("<span title=\"{}\">{}</span>", esc(path), esc(name))
             }
@@ -669,7 +712,8 @@ fn projects_panel(p: &Page) -> String {
             fmt_int(r.sessions),
             fmt_elapsed(l.active_seconds),
             fmt_int(all_tokens(&r.tokens)),
-            fmt_usd(r.tokens.estimated_cost_usd, r.tokens.unpriced_requests),
+            p.audience
+                .usd(r.tokens.estimated_cost_usd, r.tokens.unpriced_requests),
             tool_mix(&l.tools)
         );
     }
@@ -683,7 +727,11 @@ fn projects_panel(p: &Page) -> String {
             fmt_int(pr.count as i64)
         );
     }
-    foot.push_str("Hover a name for its full path, a tool mix for its shares.");
+    foot.push_str(if p.audience.is_public() {
+        "Project pseudonyms are shared across this export. Hover a tool mix for its shares."
+    } else {
+        "Hover a name for its full path, a tool mix for its shares."
+    });
     if pr.lines.iter().any(|l| l.row.tokens.unpriced_requests > 0) {
         foot.push_str(" * leaves out requests whose model has no price.");
     }
@@ -691,26 +739,39 @@ fn projects_panel(p: &Page) -> String {
     body
 }
 
-fn session_table(caption: &str, rows: &[SessionLine]) -> String {
+fn session_table(p: &Page, caption: &str, rows: &[SessionLine]) -> String {
+    let title_header = if p.audience.is_public() {
+        ""
+    } else {
+        "<th scope=\"col\">Session</th>"
+    };
     let mut s = format!(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{caption}</caption><thead><tr><th scope=\"col\">Session</th><th scope=\"col\" class=\"l\">Tool</th><th scope=\"col\" class=\"l\">Project</th><th scope=\"col\">Elapsed</th><th scope=\"col\">Requests</th><th scope=\"col\">Est. cost</th></tr></thead><tbody>"
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{caption}</caption><thead><tr>{title_header}<th scope=\"col\" class=\"l\">Tool</th><th scope=\"col\" class=\"l\">Project</th><th scope=\"col\">Elapsed</th><th scope=\"col\">Requests</th><th scope=\"col\">Est. cost</th></tr></thead><tbody>"
     );
     for r in rows {
         let project = match (&r.project, &r.project_name) {
+            (_, Some(name)) if p.audience.is_public() => esc(name),
             (Some(path), Some(name)) => {
                 format!("<span title=\"{}\">{}</span>", esc(path), esc(name))
             }
             (Some(path), None) => esc(&crate::project::project_name(path)),
             _ => "<span class=\"untitled\">none</span>".into(),
         };
+        let title = if p.audience.is_public() {
+            String::new()
+        } else {
+            format!(
+                "<td class=\"title\">{}</td>",
+                title_cell(r.title.as_deref())
+            )
+        };
         let _ = write!(
             s,
-            "<tr><td class=\"title\">{}</td><td class=\"l\">{}</td><td class=\"l\">{project}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            title_cell(r.title.as_deref()),
+            "<tr>{title}<td class=\"l\">{}</td><td class=\"l\">{project}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             tool_name(&r.tool),
             fmt_elapsed(r.elapsed_seconds),
             fmt_int(r.requests),
-            fmt_usd(r.cost_usd, r.unpriced)
+            p.audience.usd(r.cost_usd, r.unpriced)
         );
     }
     s.push_str("</tbody></table></div>");
@@ -723,11 +784,12 @@ fn sessions_panel(p: &Page) -> String {
         return nothing_here(p);
     }
     let mut body = String::from("<div class=\"stack\">");
-    body.push_str(&session_table("Longest, by elapsed time", &sl.longest));
+    body.push_str(&session_table(p, "Longest, by elapsed time", &sl.longest));
     if sl.costliest.is_empty() {
         body.push_str("<p class=\"empty\">No priced requests in this window. Run <code>usage-habit-report rates update</code>, then any <code>query</code>, to price them.</p>");
     } else {
         body.push_str(&session_table(
+            p,
             "Costliest, by estimated cost",
             &sl.costliest,
         ));
@@ -795,35 +857,23 @@ fn spend_panel(p: &Page) -> String {
         body.push_str("<th scope=\"col\">Total</th>");
     }
     body.push_str("</tr></thead><tbody>");
-    let mut col_totals = vec![(None::<f64>, 0i64); sp.tools.len()];
-    for per in &sp.periods {
+    for (per, total) in sp.periods.iter().zip(&p.spend_totals.rows) {
         let _ = write!(body, "<tr><th scope=\"row\">{}</th>", esc(&per.label));
-        let mut row = (None::<f64>, 0i64);
-        for (i, (cost, unpriced)) in per.cells.iter().enumerate() {
-            let _ = write!(body, "<td>{}</td>", fmt_usd(*cost, *unpriced));
-            for acc in [&mut row, &mut col_totals[i]] {
-                if let Some(c) = cost {
-                    *acc.0.get_or_insert(0.0) += c;
-                }
-                acc.1 += unpriced;
-            }
+        for (cost, unpriced) in &per.cells {
+            let _ = write!(body, "<td>{}</td>", p.audience.usd(*cost, *unpriced));
         }
         if multi {
-            let _ = write!(body, "<td>{}</td>", fmt_usd(row.0, row.1));
+            let _ = write!(body, "<td>{}</td>", p.audience.usd(total.0, total.1));
         }
         body.push_str("</tr>");
     }
     body.push_str("<tr class=\"total\"><th scope=\"row\">Total</th>");
-    let mut all = (None::<f64>, 0i64);
-    for (cost, unpriced) in &col_totals {
-        let _ = write!(body, "<td>{}</td>", fmt_usd(*cost, *unpriced));
-        if let Some(c) = cost {
-            *all.0.get_or_insert(0.0) += c;
-        }
-        all.1 += unpriced;
+    for (cost, unpriced) in &p.spend_totals.columns {
+        let _ = write!(body, "<td>{}</td>", p.audience.usd(*cost, *unpriced));
     }
+    let all = p.spend_totals.all;
     if multi {
-        let _ = write!(body, "<td>{}</td>", fmt_usd(all.0, all.1));
+        let _ = write!(body, "<td>{}</td>", p.audience.usd(all.0, all.1));
     }
     body.push_str("</tr></tbody></table></div>");
     if all.1 > 0 {
@@ -879,7 +929,8 @@ fn panels(p: &Page) -> String {
         "sessions",
         "Longest and costliest sessions",
         &format!(
-            "{scope} Top-level sessions with a request in the window. Elapsed covers the whole session; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. Titles are the first line of the opening prompt."
+            "{scope} Top-level sessions with a request in the window. Elapsed covers the whole session; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. {}",
+            if p.audience.is_public() { "Session titles are removed from this export." } else { "Titles are the first line of the opening prompt." }
         ),
         &sessions_panel(p),
     ));
@@ -899,12 +950,13 @@ fn panels(p: &Page) -> String {
             "Spend by week"
         },
         &format!(
-            "{scope} Estimated cost {}. Each column adds up to the cost in the window totals.",
+            "{scope} Estimated cost {}. {}",
             if p.spend.by_month {
                 "by local calendar month"
             } else {
                 "by week, counted back from now"
-            }
+            },
+            if p.audience.is_public() { "Figures are rounded independently to the nearest dollar; displayed rows may not add up." } else { "Each column adds up to the cost in the window totals." }
         ),
         &spend_panel(p),
     ));
@@ -936,6 +988,14 @@ pub fn render(p: &Page) -> String {
         )
     };
     let _ = writeln!(s, "<p class=\"provenance\">{provenance}</p>");
+    if p.audience.is_public() {
+        let _ = writeln!(
+            s,
+            "<p class=\"note\">De-identified export. Generated {}. Window: {}. Dollar figures are rounded to the nearest dollar.</p>",
+            esc(&p.now_label),
+            p.window.label()
+        );
+    }
     s.push_str(&controls(p));
     s.push_str("</header>\n<main>\n");
     let note = format!(
