@@ -609,9 +609,36 @@ weeks, or all time (`?window=4w|12w|all`) and an optional tool filter
 (`?tool=claude-code|codex|antigravity`). Hovering or focusing a cell shows
 its exact figures. The window totals under the map are the same figures as
 `query summary --since 4w` (or `12w`, or no `--since`) for the same window.
-Everything is embedded in the page; it makes no network requests and needs
-no Node toolchain. The visual system is written down in
-[docs/design.md](docs/design.md).
+Below the map and totals, every panel follows the same window and tool
+filter, states its window, and names any tool with no requests in it:
+
+- **Model by task kind**: requests by canonical model (rows) and task label
+  (columns, `unlabelled` included), shaded with the map's stepped ramp.
+  Column totals equal the per-label totals of `query summary --group-by
+  label` for the window.
+- **Multi-agent habit**: the subagents-per-session histogram, main-thread
+  and subagent model mix, subagent token share, the ten heaviest fan-outs,
+  and each tool's coverage note, all from `query agents --since <window>`
+  (with a tool filter, that tool's `by_tool` row).
+- **Time and cost by project**: the ten costliest projects with sessions,
+  tokens and cost from `query projects`, active time (the sum of each
+  top-level session's `elapsed_seconds` as `query session` reports it), and
+  the tool mix by requests. The full path is in the name's tooltip.
+- **Longest and costliest sessions**: top eight top-level sessions by
+  elapsed time and by estimated cost, titled by `sessions.title` (the stored
+  first line of the opening prompt); figures match `query session <id>
+  --since <window>`.
+- **Cache-read ratio**: per tool, cache reads over all input (uncached, cache
+  read, cache write), from the window totals.
+- **Spend by week** (by month for all time): estimated cost per tool, weeks
+  counted back from now so they tile the window; each column adds up to the
+  window total.
+
+A panel with nothing to show says what to run (`scan`, `rebuild` for
+labels) instead of staying blank. On a store of about 79,000 requests a page
+renders in 110 to 260 ms. Everything is embedded in the page; it makes no
+network requests and needs no Node toolchain. The visual system is written
+down in [docs/design.md](docs/design.md).
 
 ## Codex ingest
 

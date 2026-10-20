@@ -282,8 +282,489 @@ pub fn store_facts(conn: &Connection) -> Result<StoreFacts> {
     })
 }
 
+/// Every task-kind column of the model matrix, in display order.
+pub fn task_kinds() -> Vec<String> {
+    crate::labels::KINDS
+        .iter()
+        .chain(std::iter::once(&crate::labels::UNLABELLED))
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// Model rows shown before the rest are folded into one "other models" row.
+pub const MATRIX_ROWS: usize = 12;
+
+/// One canonical model's requests per task kind (`counts` follows `kinds`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatrixRow {
+    /// Canonical model; None for requests with no known model.
+    pub model: Option<String>,
+    /// How many models this row stands for (more than 1 for the folded row).
+    pub models: usize,
+    pub counts: Vec<i64>,
+    pub total: i64,
+}
+
+/// Requests by canonical model and task-kind label. Column totals equal the
+/// per-label request counts of `query summary --group-by label` for the same
+/// window (summed over tools, or that tool's rows when filtered).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelMatrix {
+    pub kinds: Vec<String>,
+    pub rows: Vec<MatrixRow>,
+    pub col_totals: Vec<i64>,
+    pub total: i64,
+    /// Request count at which shade levels 1..=5 begin (quintiles of the
+    /// non-empty cells).
+    pub thresholds: Vec<i64>,
+}
+
+impl ModelMatrix {
+    /// Shade level 0..=5 for a cell's request count.
+    pub fn level(&self, n: i64) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        self.thresholds
+            .iter()
+            .filter(|t| n >= **t)
+            .count()
+            .clamp(1, 5)
+    }
+
+    /// Requests in the window that carry a task-kind label.
+    pub fn labelled(&self) -> i64 {
+        self.kinds
+            .iter()
+            .zip(&self.col_totals)
+            .filter(|(k, _)| k.as_str() != crate::labels::UNLABELLED)
+            .map(|(_, n)| n)
+            .sum()
+    }
+}
+
+pub fn model_matrix(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    tool: Option<&str>,
+) -> Result<ModelMatrix> {
+    let sql = format!(
+        r#"WITH {},
+        q(tool, session_id, model, n) AS (
+            SELECT tool, session_id, canonical_model, COUNT(*) FROM requests
+            WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+            GROUP BY 1, 2, 3
+        )
+        SELECT q.model, COALESCE(e.label, '{}'), SUM(q.n)
+        FROM q
+        LEFT JOIN eff e ON e.tool = q.tool AND e.session_id = q.session_id
+        GROUP BY 1, 2"#,
+        crate::labels::EFFECTIVE_LABELS,
+        crate::labels::UNLABELLED
+    );
+    let mut kinds = task_kinds();
+    let mut cells: Vec<(Option<String>, usize, i64)> = Vec::new();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![since_ms.unwrap_or(i64::MIN), tool])?;
+    while let Some(r) = rows.next()? {
+        let label: String = r.get(1)?;
+        // A label outside the known kinds still gets a column, so the
+        // column totals keep adding up to the label summary.
+        let k = match kinds.iter().position(|k| *k == label) {
+            Some(k) => k,
+            None => {
+                kinds.push(label);
+                kinds.len() - 1
+            }
+        };
+        cells.push((r.get(0)?, k, r.get(2)?));
+    }
+    let width = kinds.len();
+    let mut by_model: std::collections::BTreeMap<Option<String>, Vec<i64>> = Default::default();
+    for (model, k, n) in cells {
+        by_model.entry(model).or_insert_with(|| vec![0; width])[k] += n;
+    }
+    let mut all: Vec<MatrixRow> = by_model
+        .into_iter()
+        .map(|(model, mut counts)| {
+            counts.resize(width, 0);
+            MatrixRow {
+                model,
+                models: 1,
+                total: counts.iter().sum(),
+                counts,
+            }
+        })
+        .collect();
+    // Most requests first; the unknown-model row goes last among equals.
+    all.sort_by(|a, b| {
+        b.total
+            .cmp(&a.total)
+            .then_with(|| (a.model.is_none(), &a.model).cmp(&(b.model.is_none(), &b.model)))
+    });
+    if all.len() > MATRIX_ROWS {
+        let rest = all.split_off(MATRIX_ROWS - 1);
+        let mut folded = MatrixRow {
+            model: None,
+            models: rest.len(),
+            counts: vec![0; width],
+            total: 0,
+        };
+        for r in rest {
+            for (a, b) in folded.counts.iter_mut().zip(&r.counts) {
+                *a += b;
+            }
+            folded.total += r.total;
+        }
+        all.push(folded);
+    }
+    let mut col_totals = vec![0; width];
+    for r in &all {
+        for (a, b) in col_totals.iter_mut().zip(&r.counts) {
+            *a += b;
+        }
+    }
+    let thresholds = quintiles(
+        all.iter()
+            .flat_map(|r| r.counts.iter().copied())
+            .filter(|n| *n > 0)
+            .collect(),
+    );
+    Ok(ModelMatrix {
+        total: col_totals.iter().sum(),
+        kinds,
+        rows: all,
+        col_totals,
+        thresholds,
+    })
+}
+
+/// (tool, requests, estimated cost) per tool, in display order.
+pub type ToolMix = Vec<(String, i64, Option<f64>)>;
+
+/// One project row of the per-project panel: the `query projects` row plus
+/// active time and the tool mix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectLine {
+    pub row: crate::project::ProjectRow,
+    /// Sum of `elapsed_seconds` (as `query session` defines it) over the
+    /// project's top-level sessions in the window.
+    pub active_seconds: i64,
+    /// (tool, requests, estimated cost) for each tool with requests here,
+    /// in display order.
+    pub tools: ToolMix,
+}
+
+/// Projects shown, most estimated cost first.
+pub const PROJECT_ROWS: usize = 10;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Projects {
+    pub lines: Vec<ProjectLine>,
+    /// Projects with activity in the window, before the cut.
+    pub count: usize,
+}
+
+/// Elapsed seconds of a session as `query session` reports it: its own
+/// recorded start and end, else its first and last request in the window.
+const ELAPSED_SQL: &str =
+    "MAX(0, (COALESCE(s.ended_at_ms, w.l) - COALESCE(s.started_at_ms, w.f)) / 1000)";
+
+/// Per-session request figures in the window, as CTE `w`.
+const WINDOW_CTE: &str = r#"w(tool, session_id, n, cost, unpriced, f, l) AS (
+    SELECT tool, session_id, COUNT(*), SUM(cost_usd), COUNT(*) - COUNT(cost_usd),
+           MIN(ts_ms), MAX(ts_ms)
+    FROM requests WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+    GROUP BY tool, session_id
+)"#;
+
+pub fn projects(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    tool: Option<&str>,
+    now_ms: i64,
+) -> Result<Projects> {
+    let (list, by_tool) = crate::project::list_with_tools(conn, since_ms, tool, now_ms)?;
+    let mut rows: Vec<_> = list
+        .projects
+        .into_iter()
+        .filter(|p| p.sessions > 0 || p.tokens.requests > 0)
+        .collect();
+    let count = rows.len();
+    rows.sort_by(|a, b| {
+        b.tokens
+            .estimated_cost_usd
+            .unwrap_or(0.0)
+            .total_cmp(&a.tokens.estimated_cost_usd.unwrap_or(0.0))
+            .then(b.tokens.requests.cmp(&a.tokens.requests))
+            .then(a.project.cmp(&b.project))
+    });
+    rows.truncate(PROJECT_ROWS);
+
+    // Active time over the same sessions `query projects` counts (ended, or
+    // lacking an end started, at or after the window start), top-level only:
+    // subagents run inside their parent's time.
+    let sql = format!(
+        r#"WITH {WINDOW_CTE}
+        SELECT s.project, COALESCE(SUM({ELAPSED_SQL}), 0)
+        FROM sessions s LEFT JOIN w ON w.tool = s.tool AND w.session_id = s.session_id
+        WHERE s.is_subagent = 0 AND (?2 IS NULL OR s.tool = ?2)
+          AND (?3 OR COALESCE(s.ended_at_ms, s.started_at_ms) >= ?1)
+        GROUP BY s.project"#
+    );
+    let mut active: std::collections::HashMap<Option<String>, i64> = Default::default();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut q = stmt.query(params![
+        since_ms.unwrap_or(i64::MIN),
+        tool,
+        since_ms.is_none()
+    ])?;
+    while let Some(r) = q.next()? {
+        active.insert(r.get(0)?, r.get(1)?);
+    }
+    let mut mix: std::collections::HashMap<Option<String>, ToolMix> = Default::default();
+    for (project, t) in by_tool {
+        if t.tokens.requests == 0 {
+            continue;
+        }
+        mix.entry(project).or_default().push((
+            t.tool,
+            t.tokens.requests,
+            t.tokens.estimated_cost_usd,
+        ));
+    }
+    let lines = rows
+        .into_iter()
+        .map(|row| {
+            let mut tools = mix.remove(&row.project).unwrap_or_default();
+            tools.sort_by_key(|(t, _, _)| tool_order(t));
+            ProjectLine {
+                active_seconds: active.get(&row.project).copied().unwrap_or(0),
+                tools,
+                row,
+            }
+        })
+        .collect();
+    Ok(Projects { lines, count })
+}
+
+/// Display position of a tool: known tools in order, others after.
+pub fn tool_order(tool: &str) -> (usize, String) {
+    (
+        TOOLS.iter().position(|k| *k == tool).unwrap_or(TOOLS.len()),
+        tool.to_string(),
+    )
+}
+
+/// One top-level session in the longest and costliest lists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionLine {
+    pub tool: String,
+    pub session_id: String,
+    /// `sessions.title`: the first line of the opening prompt, at most 120
+    /// characters, stored at ingest. No other prompt text is read.
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub project_name: Option<String>,
+    /// As `query session`'s `elapsed_seconds` (the whole session, not the window).
+    pub elapsed_seconds: i64,
+    /// Requests in the window (the session's own transcript).
+    pub requests: i64,
+    pub cost_usd: Option<f64>,
+    pub unpriced: i64,
+}
+
+/// Rows in each of the two session lists.
+pub const SESSION_ROWS: usize = 8;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionLists {
+    pub longest: Vec<SessionLine>,
+    pub costliest: Vec<SessionLine>,
+}
+
+/// Top-level sessions with a request in the window, by elapsed time and by
+/// estimated cost. Figures match `query session <id> --since <window>`.
+pub fn session_lists(
+    conn: &Connection,
+    since_ms: Option<i64>,
+    tool: Option<&str>,
+) -> Result<SessionLists> {
+    let run = |order: &str| -> Result<Vec<SessionLine>> {
+        let sql = format!(
+            r#"WITH {WINDOW_CTE}
+            SELECT s.tool, s.session_id, s.title, s.project, s.project_name,
+                   {ELAPSED_SQL} AS elapsed, w.n, w.cost, w.unpriced
+            FROM w JOIN sessions s ON s.tool = w.tool AND s.session_id = w.session_id
+            WHERE s.is_subagent = 0
+            ORDER BY {order}, s.tool, s.session_id
+            LIMIT {SESSION_ROWS}"#
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![since_ms.unwrap_or(i64::MIN), tool], |r| {
+                Ok(SessionLine {
+                    tool: r.get(0)?,
+                    session_id: r.get(1)?,
+                    title: r.get(2)?,
+                    project: r.get(3)?,
+                    project_name: r.get(4)?,
+                    elapsed_seconds: r.get(5)?,
+                    requests: r.get(6)?,
+                    cost_usd: r.get(7)?,
+                    unpriced: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    };
+    Ok(SessionLists {
+        longest: run("elapsed DESC, w.cost DESC")?,
+        costliest: {
+            let mut v = run("w.cost DESC, elapsed DESC")?;
+            v.retain(|s| s.cost_usd.is_some());
+            v
+        },
+    })
+}
+
+/// (estimated cost, unpriced requests) of one spend cell.
+pub type CostCell = (Option<f64>, i64);
+
+/// One row of the condensed spend table: a week or a month.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpendPeriod {
+    /// "from 22 Sep" or "Oct 2026"
+    pub label: String,
+    /// One entry per tool in `Spend::tools`: (est. cost, unpriced requests).
+    pub cells: Vec<CostCell>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Spend {
+    pub by_month: bool,
+    pub tools: Vec<String>,
+    /// Oldest first.
+    pub periods: Vec<SpendPeriod>,
+}
+
+fn add_cost(cell: &mut CostCell, cost: Option<f64>, unpriced: i64) {
+    if let Some(c) = cost {
+        *cell.0.get_or_insert(0.0) += c;
+    }
+    cell.1 += unpriced;
+}
+
+/// Estimated cost per tool by week of the window (weeks counted back from
+/// `now_ms`, so they tile the window exactly), or by local calendar month
+/// for all time. Each tool's column adds up to its window total.
+pub fn spend(
+    conn: &Connection,
+    window: Window,
+    now_ms: i64,
+    tool: Option<&str>,
+    tz: &impl TimeZone,
+) -> Result<Spend> {
+    let tools: Vec<String> = match tool {
+        Some(t) => vec![t.to_string()],
+        None => {
+            let mut v: Vec<String> = conn
+                .prepare("SELECT DISTINCT tool FROM requests")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            v.sort_by_key(|t| tool_order(t));
+            v
+        }
+    };
+    let col = |t: &str| tools.iter().position(|x| x == t);
+    let week = 7 * 24 * 3_600_000i64;
+    if let Some(since) = window.since_ms(now_ms) {
+        let n = ((now_ms - since) / week) as usize;
+        let mut periods: Vec<SpendPeriod> = (0..n)
+            .rev()
+            .map(|k| SpendPeriod {
+                label: format!(
+                    "from {}",
+                    tz.timestamp_millis_opt(now_ms - (k as i64 + 1) * week)
+                        .single()
+                        .map(|t| t.fixed_offset().format("%-d %b").to_string())
+                        .unwrap_or_default()
+                ),
+                cells: vec![(None, 0); tools.len()],
+            })
+            .collect();
+        let mut stmt = conn.prepare(
+            r#"SELECT tool, MAX(0, (?3 - ts_ms) / ?4), SUM(cost_usd), COUNT(*) - COUNT(cost_usd)
+               FROM requests WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+               GROUP BY 1, 2"#,
+        )?;
+        let mut rows = stmt.query(params![since, tool, now_ms, week])?;
+        while let Some(r) = rows.next()? {
+            let t: String = r.get(0)?;
+            let back = (r.get::<_, i64>(1)? as usize).min(n - 1);
+            if let Some(c) = col(&t) {
+                add_cost(&mut periods[n - 1 - back].cells[c], r.get(2)?, r.get(3)?);
+            }
+        }
+        return Ok(Spend {
+            by_month: false,
+            tools,
+            periods,
+        });
+    }
+    // All time: local months, from 15-minute UTC buckets as in `heatmap`.
+    let mut stmt = conn.prepare(
+        r#"SELECT (ts_ms / 900000) * 900000, tool, SUM(cost_usd), COUNT(*) - COUNT(cost_usd)
+           FROM requests WHERE ?1 IS NULL OR tool = ?1
+           GROUP BY 1, 2"#,
+    )?;
+    let mut months: std::collections::BTreeMap<(i32, u32), Vec<CostCell>> = Default::default();
+    let mut rows = stmt.query(params![tool])?;
+    while let Some(r) = rows.next()? {
+        let start: i64 = r.get(0)?;
+        let t: String = r.get(1)?;
+        let (Some(local), Some(c)) = (tz.timestamp_millis_opt(start).single(), col(&t)) else {
+            continue;
+        };
+        let cells = months
+            .entry((local.year(), local.month()))
+            .or_insert_with(|| vec![(None, 0); tools.len()]);
+        add_cost(&mut cells[c], r.get(2)?, r.get(3)?);
+    }
+    // Fill the gaps so the months read as a continuous ledger.
+    let mut periods = Vec::new();
+    if let (Some(first), Some(last)) = (
+        months.keys().next().copied(),
+        months.keys().next_back().copied(),
+    ) {
+        let (mut y, mut m) = first;
+        while (y, m) <= last {
+            let cells = months
+                .remove(&(y, m))
+                .unwrap_or_else(|| vec![(None, 0); tools.len()]);
+            let label = chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                .map(|d| d.format("%b %Y").to_string())
+                .unwrap_or_default();
+            periods.push(SpendPeriod { label, cells });
+            (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        }
+    }
+    Ok(Spend {
+        by_month: true,
+        tools,
+        periods,
+    })
+}
+
+/// Cache reads as a share of all input (uncached + cache read + cache write);
+/// None when there is no input at all.
+pub fn cache_read_ratio(t: &Tokens) -> Option<f64> {
+    let all = t.input_tokens + t.cache_read_input_tokens + t.cache_creation_input_tokens;
+    (all > 0).then(|| t.cache_read_input_tokens as f64 / all as f64)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::FixedOffset;
 
@@ -404,5 +885,610 @@ mod tests {
         assert_eq!(parse_tool(Some("codex")), Some("codex"));
         assert_eq!(parse_tool(Some("vim")), None);
         assert_eq!(parse_tool(None), None);
+    }
+
+    pub(crate) const NOW: i64 = 1_792_400_000_000;
+    const DAY: i64 = 86_400_000;
+
+    /// Two tools plus an Antigravity session outside the 4-week window;
+    /// rule and hand-set labels, an unlabelled session, nested and unlinked
+    /// subagents, a session with no directory and one with no recorded span,
+    /// and requests with and without a price and a canonical model.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn panel_fixture() -> crate::store::Store {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let sessions: &[(
+            &str,
+            &str,
+            i64,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<i64>,
+            Option<i64>,
+        )] = &[
+            // tool, id, is_subagent, parent, label, project, started, ended
+            (
+                "claude-code",
+                "c1",
+                0,
+                None,
+                Some("coding"),
+                Some("/home/demo/alpha"),
+                Some(NOW - 10 * DAY),
+                Some(NOW - 10 * DAY + 7_200_000),
+            ),
+            (
+                "claude-code",
+                "c1-a",
+                1,
+                Some("c1"),
+                None,
+                Some("/home/demo/alpha"),
+                Some(NOW - 10 * DAY),
+                Some(NOW - 10 * DAY + 600_000),
+            ),
+            (
+                "claude-code",
+                "c1-b",
+                1,
+                Some("c1-a"),
+                None,
+                Some("/home/demo/alpha"),
+                Some(NOW - 10 * DAY + 60_000),
+                Some(NOW - 10 * DAY + 900_000),
+            ),
+            (
+                "claude-code",
+                "c2",
+                0,
+                None,
+                Some("writing"),
+                Some("/home/demo/alpha"),
+                Some(NOW - 2 * DAY),
+                Some(NOW - 2 * DAY + 1_800_000),
+            ),
+            (
+                "codex",
+                "x1",
+                0,
+                None,
+                Some("research"),
+                Some("/home/demo/beta"),
+                Some(NOW - 40 * DAY),
+                Some(NOW - 3 * DAY),
+            ),
+            ("codex", "x2", 0, None, None, None, None, None),
+            (
+                "codex",
+                "x3",
+                1,
+                Some("gone"),
+                None,
+                Some("/home/demo/beta"),
+                Some(NOW - 5 * DAY),
+                Some(NOW - 5 * DAY + 60_000),
+            ),
+            (
+                "antigravity",
+                "g1",
+                0,
+                None,
+                Some("debugging"),
+                Some("/home/demo/alpha"),
+                Some(NOW - 70 * DAY),
+                Some(NOW - 69 * DAY),
+            ),
+        ];
+        for (tool, id, sub, parent, label, project, started, ended) in sessions {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions (tool, session_id, is_subagent, parent_session_id, label,
+                         label_source, project, project_name, started_at_ms, ended_at_ms, title)
+                     VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?5 IS NULL THEN NULL ELSE 'rule' END,
+                         ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        tool,
+                        id,
+                        sub,
+                        parent,
+                        label,
+                        project,
+                        project.map(crate::project::project_name),
+                        started,
+                        ended,
+                        format!("Demo task {id}")
+                    ],
+                )
+                .unwrap();
+        }
+        // A hand-set label wins over the rule label.
+        store
+            .conn
+            .execute(
+                "INSERT INTO session_labels (tool, session_id, label, set_at) VALUES ('codex', 'x1', 'review', 0)",
+                [],
+            )
+            .unwrap();
+        let reqs: &[(
+            &str,
+            &str,
+            i64,
+            i64,
+            Option<&str>,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<f64>,
+        )] = &[
+            // tool, session, sub, ts, canonical, in, cache read, cache write, out, cost
+            (
+                "claude-code",
+                "c1",
+                0,
+                NOW - 10 * DAY,
+                Some("m-big"),
+                100,
+                1000,
+                50,
+                20,
+                Some(0.5),
+            ),
+            (
+                "claude-code",
+                "c1",
+                0,
+                NOW - 10 * DAY + 3_600_000,
+                Some("m-big"),
+                120,
+                2000,
+                0,
+                30,
+                Some(0.75),
+            ),
+            (
+                "claude-code",
+                "c1-a",
+                1,
+                NOW - 10 * DAY + 10_000,
+                Some("m-small"),
+                40,
+                300,
+                10,
+                5,
+                Some(0.05),
+            ),
+            (
+                "claude-code",
+                "c1-a",
+                1,
+                NOW - 10 * DAY + 500_000,
+                Some("m-small"),
+                40,
+                300,
+                0,
+                5,
+                Some(0.05),
+            ),
+            (
+                "claude-code",
+                "c1-b",
+                1,
+                NOW - 10 * DAY + 100_000,
+                Some("m-small"),
+                30,
+                200,
+                0,
+                5,
+                None,
+            ),
+            (
+                "claude-code",
+                "c2",
+                0,
+                NOW - 2 * DAY,
+                Some("m-big"),
+                300,
+                4000,
+                200,
+                60,
+                Some(2.0),
+            ),
+            (
+                "codex",
+                "x1",
+                0,
+                NOW - 40 * DAY,
+                Some("m-code"),
+                500,
+                5000,
+                0,
+                90,
+                Some(1.25),
+            ),
+            (
+                "codex",
+                "x1",
+                0,
+                NOW - 3 * DAY,
+                Some("m-code"),
+                600,
+                6000,
+                0,
+                80,
+                Some(1.5),
+            ),
+            ("codex", "x2", 0, NOW - DAY, None, 70, 0, 0, 7, None),
+            (
+                "codex",
+                "x2",
+                0,
+                NOW - DAY + 900_000,
+                Some("m-code"),
+                80,
+                800,
+                0,
+                8,
+                Some(0.2),
+            ),
+            (
+                "codex",
+                "x3",
+                1,
+                NOW - 5 * DAY,
+                Some("m-code"),
+                10,
+                100,
+                0,
+                1,
+                Some(0.01),
+            ),
+            (
+                "antigravity",
+                "g1",
+                0,
+                NOW - 70 * DAY,
+                Some("m-gem"),
+                900,
+                0,
+                0,
+                99,
+                Some(0.9),
+            ),
+        ];
+        for (i, (tool, sid, sub, ts, model, inp, cr, cc, out, cost)) in reqs.iter().enumerate() {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO requests (tool, request_key, session_id, is_subagent, ts_ms, model,
+                         canonical_model, input_tokens, cache_read_input_tokens,
+                         cache_creation_input_tokens, output_tokens, cost_usd)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![tool, format!("r{i}"), sid, sub, ts, model, inp, cr, cc, out, cost],
+                )
+                .unwrap();
+        }
+        store
+    }
+
+    fn close(a: Option<f64>, b: Option<f64>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    /// Every window and tool scope the page offers.
+    fn scopes() -> Vec<(Window, Option<&'static str>)> {
+        let mut v = Vec::new();
+        for w in Window::ALL {
+            v.push((w, None));
+            for t in TOOLS {
+                v.push((w, Some(t)));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn model_matrix_columns_match_label_summary() {
+        let store = panel_fixture();
+        for (w, tool) in scopes() {
+            let since = w.since_ms(NOW);
+            let m = model_matrix(&store.conn, since, tool).unwrap();
+            let s = crate::labels::summary_by_label(&store.conn, since, NOW).unwrap();
+            let mut want: std::collections::BTreeMap<String, i64> = Default::default();
+            for g in s.groups.iter().filter(|g| tool.is_none_or(|t| t == g.tool)) {
+                *want.entry(g.label.clone()).or_default() += g.tokens.requests;
+            }
+            let got: std::collections::BTreeMap<String, i64> = m
+                .kinds
+                .iter()
+                .cloned()
+                .zip(m.col_totals.iter().copied())
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            assert_eq!(got, want, "{w:?} {tool:?}");
+            assert_eq!(m.total, want.values().sum::<i64>());
+            for r in &m.rows {
+                assert_eq!(r.total, r.counts.iter().sum::<i64>());
+            }
+        }
+        // All time, all tools: the hand-set label wins, subagents inherit
+        // their root's label through two levels, and the unknown model has a row.
+        let m = model_matrix(&store.conn, None, None).unwrap();
+        let col = |k: &str| m.kinds.iter().position(|x| x == k).unwrap();
+        let row = |name: Option<&str>| m.rows.iter().find(|r| r.model.as_deref() == name).unwrap();
+        assert_eq!(row(Some("m-small")).counts[col("coding")], 3);
+        assert_eq!(row(Some("m-code")).counts[col("review")], 2);
+        assert_eq!(row(Some("m-code")).counts[col("research")], 0);
+        assert_eq!(row(Some("m-code")).counts[col("unlabelled")], 2);
+        assert_eq!(row(None).counts[col("unlabelled")], 1);
+        assert_eq!(m.kinds.len(), 9);
+        assert_eq!(m.level(0), 0);
+        assert!(m.labelled() > 0);
+    }
+
+    #[test]
+    fn model_matrix_folds_the_long_tail() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (tool, session_id, label) VALUES ('codex', 's', 'coding')",
+                [],
+            )
+            .unwrap();
+        for i in 0..(MATRIX_ROWS + 3) {
+            for k in 0..=i {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO requests (tool, request_key, session_id, ts_ms, canonical_model)
+                         VALUES ('codex', ?1, 's', 1, ?2)",
+                        params![format!("{i}-{k}"), format!("m{i:02}")],
+                    )
+                    .unwrap();
+            }
+        }
+        let m = model_matrix(&store.conn, None, None).unwrap();
+        assert_eq!(m.rows.len(), MATRIX_ROWS);
+        let folded = m.rows.last().unwrap();
+        assert_eq!(folded.models, 4);
+        // The four smallest models have 1..=4 requests.
+        assert_eq!(folded.total, 1 + 2 + 3 + 4);
+        let n = (MATRIX_ROWS + 3) as i64;
+        assert_eq!(m.total, n * (n + 1) / 2);
+    }
+
+    #[test]
+    fn agents_filter_matches_query_agents() {
+        let store = panel_fixture();
+        for w in Window::ALL {
+            let since = w.since_ms(NOW);
+            let full = crate::agents::agents_report(&store.conn, since, NOW).unwrap();
+            let same = crate::agents::agents_report_for(&store.conn, since, None, NOW).unwrap();
+            assert_eq!(
+                serde_json::to_value(&full).unwrap(),
+                serde_json::to_value(&same).unwrap()
+            );
+            for t in TOOLS {
+                let one =
+                    crate::agents::agents_report_for(&store.conn, since, Some(t), NOW).unwrap();
+                let want = full.by_tool.iter().find(|r| r.tool == t);
+                assert_eq!(one.by_tool.first(), want, "{w:?} {t}");
+                assert_eq!(
+                    one.totals.top_level_sessions,
+                    want.map_or(0, |r| r.top_level_sessions)
+                );
+                assert_eq!(
+                    one.totals.unlinked_subagent_sessions,
+                    want.map_or(0, |r| r.unlinked_subagent_sessions)
+                );
+                let fan: Vec<_> = full
+                    .heaviest_fanouts
+                    .iter()
+                    .filter(|f| f.tool == t)
+                    .collect();
+                assert_eq!(one.heaviest_fanouts.iter().collect::<Vec<_>>(), fan);
+                assert_eq!(
+                    one.histogram.iter().map(|b| b.sessions).sum::<usize>(),
+                    want.map_or(0, |r| r.top_level_sessions)
+                );
+            }
+        }
+        let full = crate::agents::agents_report(&store.conn, None, NOW).unwrap();
+        assert_eq!(full.heaviest_fanouts[0].subagent_count, 2);
+        assert_eq!(full.totals.unlinked_subagent_sessions, 1);
+    }
+
+    #[test]
+    fn projects_match_query_projects_and_session_elapsed() {
+        let store = panel_fixture();
+        for (w, tool) in scopes() {
+            let since = w.since_ms(NOW);
+            let p = projects(&store.conn, since, tool, NOW).unwrap();
+            let list = crate::project::list(&store.conn, since, NOW).unwrap();
+            for line in &p.lines {
+                let row = &line.row;
+                match tool {
+                    None => {
+                        let want = list
+                            .projects
+                            .iter()
+                            .find(|r| r.project == row.project)
+                            .unwrap();
+                        assert_eq!(row, want, "{w:?}");
+                    }
+                    Some(t) => {
+                        if let Some(proj) = &row.project {
+                            let d = crate::project::detail(&store.conn, proj, since, NOW).unwrap();
+                            let want = d.tools.iter().find(|x| x.tool == t).unwrap();
+                            assert_eq!(row.sessions, want.sessions);
+                            assert_eq!(row.tokens, want.tokens);
+                        }
+                    }
+                }
+                // Tool mix adds up to the project's requests.
+                assert_eq!(
+                    line.tools.iter().map(|t| t.1).sum::<i64>(),
+                    row.tokens.requests
+                );
+                // Active time is the sum of `query session` elapsed over the
+                // project's top-level sessions that `query projects` counts.
+                let mut stmt = store
+                    .conn
+                    .prepare(
+                        "SELECT tool, session_id FROM sessions WHERE is_subagent = 0
+                         AND project IS ?1 AND (?2 IS NULL OR tool = ?2)
+                         AND (?3 IS NULL OR COALESCE(ended_at_ms, started_at_ms) >= ?3)",
+                    )
+                    .unwrap();
+                let ids: Vec<(String, String)> = stmt
+                    .query_map(params![row.project, tool, since], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let want: i64 = ids
+                    .iter()
+                    .map(|(t, id)| {
+                        let r = crate::query::SessionRef {
+                            tool: t.clone(),
+                            session_id: id.clone(),
+                            matched_by: crate::query::MatchedBy::SessionId,
+                        };
+                        crate::query::session_report(&store.conn, &r, since, false, NOW)
+                            .unwrap()
+                            .elapsed_seconds
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                assert_eq!(
+                    line.active_seconds, want,
+                    "{w:?} {tool:?} {:?}",
+                    row.project
+                );
+            }
+            if tool.is_none() {
+                assert_eq!(p.count, list.projects.len());
+            }
+        }
+        // Costliest first; the no-directory row is present for codex.
+        let p = projects(&store.conn, None, None, NOW).unwrap();
+        assert_eq!(p.lines[0].row.project.as_deref(), Some("/home/demo/alpha"));
+        assert_eq!(p.lines[0].active_seconds, 7_200 + 1_800 + DAY / 1000);
+        assert!(p.lines.iter().any(|l| l.row.project.is_none()));
+    }
+
+    #[test]
+    fn session_lists_match_query_session() {
+        let store = panel_fixture();
+        for (w, tool) in scopes() {
+            let since = w.since_ms(NOW);
+            let l = session_lists(&store.conn, since, tool).unwrap();
+            for s in l.longest.iter().chain(&l.costliest) {
+                assert!(tool.is_none_or(|t| t == s.tool));
+                let r = crate::query::SessionRef {
+                    tool: s.tool.clone(),
+                    session_id: s.session_id.clone(),
+                    matched_by: crate::query::MatchedBy::SessionId,
+                };
+                let rep = crate::query::session_report(&store.conn, &r, since, false, NOW).unwrap();
+                assert!(!rep.is_subagent);
+                assert_eq!(Some(s.elapsed_seconds), rep.elapsed_seconds);
+                assert_eq!(s.requests, rep.usage.tokens.requests);
+                assert!(close(s.cost_usd, rep.usage.tokens.estimated_cost_usd));
+                assert_eq!(s.unpriced, rep.usage.tokens.unpriced_requests);
+                assert_eq!(s.title, rep.title);
+            }
+            for pair in l.longest.windows(2) {
+                assert!(pair[0].elapsed_seconds >= pair[1].elapsed_seconds);
+            }
+        }
+        let l = session_lists(&store.conn, None, None).unwrap();
+        // x1 spans 37 days; x2 has no recorded span and falls back to its requests.
+        assert_eq!(l.longest[0].session_id, "x1");
+        assert_eq!(
+            l.longest
+                .iter()
+                .find(|s| s.session_id == "x2")
+                .unwrap()
+                .elapsed_seconds,
+            900
+        );
+        assert_eq!(l.costliest[0].session_id, "x1");
+        assert_eq!(l.longest.len(), 5);
+    }
+
+    #[test]
+    fn cache_ratio_matches_summary() {
+        let store = panel_fixture();
+        let t = totals(&store.conn, None, None).unwrap();
+        let s = crate::query::summary(&store.conn, None, NOW).unwrap();
+        for row in &t.by_tool {
+            let (mut inp, mut cr, mut cc) = (0, 0, 0);
+            for g in s.groups.iter().filter(|g| g.tool == row.tool) {
+                inp += g.tokens.input_tokens;
+                cr += g.tokens.cache_read_input_tokens;
+                cc += g.tokens.cache_creation_input_tokens;
+            }
+            let want = (inp + cr + cc > 0).then(|| cr as f64 / (inp + cr + cc) as f64);
+            assert!(close(cache_read_ratio(&row.tokens), want));
+        }
+        assert_eq!(cache_read_ratio(&Tokens::default()), None);
+        let cc = &t.by_tool[0].tokens; // claude-code: 7800 read of 8690 input
+        assert!(close(cache_read_ratio(cc), Some(7800.0 / 8690.0)));
+    }
+
+    #[test]
+    fn spend_columns_add_up_to_window_totals() {
+        let store = panel_fixture();
+        let tz = FixedOffset::west_opt(4 * 3600).unwrap();
+        for (w, tool) in scopes() {
+            let since = w.since_ms(NOW);
+            let sp = spend(&store.conn, w, NOW, tool, &tz).unwrap();
+            assert_eq!(sp.by_month, w == Window::All);
+            if w == Window::FourWeeks {
+                assert_eq!(sp.periods.len(), 4);
+            }
+            if w == Window::TwelveWeeks {
+                assert_eq!(sp.periods.len(), 12);
+            }
+            let t = totals(&store.conn, since, tool).unwrap();
+            for (i, name) in sp.tools.iter().enumerate() {
+                let (mut cost, mut unpriced) = (None::<f64>, 0);
+                for p in &sp.periods {
+                    if let Some(c) = p.cells[i].0 {
+                        *cost.get_or_insert(0.0) += c;
+                    }
+                    unpriced += p.cells[i].1;
+                }
+                let want = t.by_tool.iter().find(|r| &r.tool == name);
+                assert!(
+                    close(cost, want.and_then(|r| r.tokens.estimated_cost_usd)),
+                    "{w:?} {tool:?} {name}"
+                );
+                assert_eq!(unpriced, want.map_or(0, |r| r.tokens.unpriced_requests));
+            }
+        }
+        // All time runs from the Antigravity month to now, gaps filled.
+        let sp = spend(&store.conn, Window::All, NOW, None, &tz).unwrap();
+        assert_eq!(
+            sp.periods
+                .iter()
+                .map(|p| p.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Aug 2026", "Sep 2026", "Oct 2026"]
+        );
+        assert_eq!(sp.tools, vec!["claude-code", "codex", "antigravity"]);
+        // The latest week holds the requests of the last seven days.
+        let sp = spend(&store.conn, Window::FourWeeks, NOW, Some("codex"), &tz).unwrap();
+        assert!(close(sp.periods[3].cells[0].0, Some(1.5 + 0.2 + 0.01)));
+        assert_eq!(sp.periods[3].cells[0].1, 1);
     }
 }

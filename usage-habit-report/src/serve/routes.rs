@@ -74,6 +74,11 @@ pub fn load_page(
     let facts = data::store_facts(conn)?;
     let heatmap = data::heatmap(conn, since, params.tool, tz)?;
     let totals = data::totals(conn, since, params.tool)?;
+    let models = data::model_matrix(conn, since, params.tool)?;
+    let agents = crate::agents::agents_report_for(conn, since, params.tool, now_ms)?;
+    let projects = data::projects(conn, since, params.tool, now_ms)?;
+    let sessions = data::session_lists(conn, since, params.tool)?;
+    let spend = data::spend(conn, window, now_ms, params.tool, tz)?;
     Ok(Page {
         window,
         tool: params.tool,
@@ -83,6 +88,11 @@ pub fn load_page(
         facts,
         heatmap,
         totals,
+        models,
+        agents,
+        projects,
+        sessions,
+        spend,
         rates_fetched_at,
         load_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
@@ -209,5 +219,103 @@ mod tests {
         let india = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
         assert_eq!(tz_label(ts, &india), "UTC+05:30");
         assert_eq!(tz_label(ts, &FixedOffset::east_opt(0).unwrap()), "UTC");
+    }
+
+    #[test]
+    fn renders_every_panel_in_order() {
+        use crate::serve::data::tests::{NOW, panel_fixture};
+        let store = panel_fixture();
+        let ids = [
+            "activity", "totals", "models", "agents", "projects", "sessions", "cache", "spend",
+        ];
+        for query in [
+            "",
+            "window=12w",
+            "window=all",
+            "tool=codex",
+            "window=all&tool=antigravity",
+        ] {
+            let html = render_dashboard(&store.conn, query, NOW, None).unwrap();
+            assert_offline(&html);
+            let mut at = 0;
+            for id in ids {
+                let pos = html[at..]
+                    .find(&format!("<section id=\"{id}\""))
+                    .unwrap_or_else(|| panic!("{id} missing or out of order for {query:?}"));
+                at += pos;
+            }
+        }
+        let html = render_dashboard(&store.conn, "window=all", NOW, None).unwrap();
+        // Model matrix: label columns and the total row (12 requests).
+        assert!(html.contains("<th scope=\"col\">data-analysis</th>"));
+        assert!(html.contains("<th scope=\"col\">unlabelled</th>"));
+        assert!(html.contains("<code>query summary --group-by label</code>"));
+        assert!(html.contains("<td>12</td></tr></tbody></table></div><p class=\"legend\""));
+        assert!(html.contains("<span class=\"untitled\">unknown model</span>"));
+        // Agents: coverage sentences for each tool, the unlinked subagent.
+        assert!(html.contains("<code>query agents</code>"));
+        assert!(html.contains("Child conversations are linked to their parent"));
+        assert!(html.contains("1 <span class=\"tool\" data-tool=\"codex\">codex</span> subagent sessions have no linked parent"));
+        assert!(html.contains("Heaviest fan-outs"));
+        // Projects: folder name with the full path in a title; tool mix.
+        assert!(html.contains("<span title=\"/home/demo/alpha\">alpha</span>"));
+        assert!(html.contains("no known directory"));
+        assert!(html.contains("role=\"img\" aria-label=\"claude-code 86 %, antigravity 14 %"));
+        // Sessions: titles from sessions.title, both lists.
+        assert!(html.contains("Longest, by elapsed time"));
+        assert!(html.contains("Costliest, by estimated cost"));
+        assert!(html.contains("<td class=\"title\">Demo task x1</td>"));
+        assert!(
+            !html.contains("Demo task c1-a"),
+            "subagent sessions are not listed"
+        );
+        // Cache: claude-code 7,800 of 8,690 input, and the cache-write caveat.
+        assert!(html.contains("<td>7,800</td><td>8,690</td><td>89.8 %</td>"));
+        assert!(html.contains("No cache writes recorded for"));
+        // Spend: by month for all time, with the unpriced footnote.
+        assert!(html.contains("Spend by month"));
+        assert!(html.contains("<th scope=\"row\">Aug 2026</th>"));
+        assert!(html.contains("* leaves out 2 requests whose model has no price."));
+
+        // Four weeks: Antigravity has no requests, and every panel says so.
+        let html = render_dashboard(&store.conn, "", NOW, None).unwrap();
+        let missing = "No <span class=\"tool\" data-tool=\"antigravity\">antigravity</span> requests in this window, so it is not covered.";
+        assert_eq!(html.matches(missing).count(), 6);
+        assert!(html.contains("Spend by week"));
+        assert!(html.contains("<code>query agents --since 4w</code>"));
+        assert!(html.contains("<code>query projects --since 4w</code>"));
+
+        // Filtered to one tool: scope stated, other tools gone from the panels.
+        let html = render_dashboard(&store.conn, "tool=codex", NOW, None).unwrap();
+        assert!(html.contains(", <span class=\"tool\" data-tool=\"codex\">codex</span> only."));
+        assert!(!html.contains("Demo task c2"));
+        assert!(!html.contains("Subagent transcripts sit under"));
+    }
+
+    #[test]
+    fn panel_empty_states_give_direction() {
+        // Requests but no labels: point at rebuild.
+        let store = fixture();
+        let now = 1_792_400_000_000i64;
+        let html = render_dashboard(&store.conn, "window=all", now, None).unwrap();
+        assert!(html.contains("No labels yet. Run <code>usage-habit-report rebuild</code> to classify existing sessions."));
+        // Nothing in the window: widen it.
+        let html = render_dashboard(&store.conn, "", now + 100 * 86_400_000, None).unwrap();
+        for id in ["models", "agents", "projects", "sessions", "cache", "spend"] {
+            let start = html.find(&format!("<section id=\"{id}\"")).unwrap();
+            let end = start + html[start..].find("</section>").unwrap();
+            assert!(
+                html[start..end].contains("No requests in this window. Widen the window"),
+                "{id}"
+            );
+        }
+        // Empty store: point at scan in every panel.
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let html = render_dashboard(&store.conn, "", now, None).unwrap();
+        assert!(
+            html.matches("Run <code>usage-habit-report scan</code>")
+                .count()
+                >= 6
+        );
     }
 }
