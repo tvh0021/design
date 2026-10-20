@@ -19,12 +19,17 @@ use std::time::{Duration, Instant};
 ///   `<main>/.git/worktrees/<name>`), the main repository's toplevel, so every
 ///   worktree of a repo is one project. Submodules stay their own project.
 /// - Outside a repository: the directory itself.
-/// - A path that no longer exists: the string as recorded.
+/// - A path that no longer exists: the string as recorded, except that a path
+///   inside `<repo>/.claude/worktrees/<name>` or `<repo>/.git/worktrees/<name>`
+///   (a deleted worktree) is resolved as `<repo>` (see [`enclosing_repo`]).
 ///
 /// Existing paths are canonicalized first (symlinks resolved).
 pub fn resolve(cwd: &str) -> String {
     let Ok(dir) = std::fs::canonicalize(cwd) else {
-        return cwd.to_string();
+        return match enclosing_repo(cwd) {
+            Some(repo) => resolve(repo),
+            None => cwd.to_string(),
+        };
     };
     for d in dir.ancestors() {
         let dot_git = d.join(".git");
@@ -43,6 +48,18 @@ pub fn resolve(cwd: &str) -> String {
         }
     }
     dir.to_string_lossy().into_owned()
+}
+
+/// For a path that no longer exists, the repository path it was a worktree
+/// of: everything before a `/.claude/worktrees/<name>` or
+/// `/.git/worktrees/<name>` component (the `.git` itself is dropped in the
+/// second form). None when the path has neither marker, or the marker is at
+/// the very start so nothing would be left.
+fn enclosing_repo(path: &str) -> Option<&str> {
+    ["/.claude/worktrees/", "/.git/worktrees/"]
+        .iter()
+        .find_map(|marker| path.find(marker).map(|i| &path[..i]))
+        .filter(|repo| !repo.is_empty())
 }
 
 /// For a `.git` file (`gitdir: <path>`), the main worktree's toplevel when the
@@ -110,15 +127,26 @@ pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichRepor
     let tx = conn.transaction()?;
     report.t3.sessions_linked = t3::apply(&tx, &links)?;
 
-    let pending: Vec<(i64, String, String, Option<String>)> = tx
-        .prepare("SELECT id, tool, session_id, cwd FROM sessions WHERE project IS NULL")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+    // Sessions with no project yet, plus ones filed under a worktree path:
+    // those are resolved again so that a worktree deleted since the first
+    // scan folds into its repository.
+    type Pending = (i64, String, String, Option<String>, Option<String>);
+    let pending: Vec<Pending> = tx
+        .prepare(
+            "SELECT id, tool, session_id, cwd, project FROM sessions
+             WHERE project IS NULL
+                OR instr(project, '/.claude/worktrees/') > 0
+                OR instr(project, '/.git/worktrees/') > 0",
+        )?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     let mut cache: HashMap<String, String> = HashMap::new();
     {
         let mut update =
             tx.prepare("UPDATE sessions SET project = ?2, project_name = ?3 WHERE id = ?1")?;
-        for (id, tool, session_id, cwd) in pending {
+        for (id, tool, session_id, cwd, old_project) in pending {
             let (dir, from_t3) = match cwd.filter(|c| !c.is_empty()) {
                 Some(c) => (c, false),
                 None => match links
@@ -126,10 +154,13 @@ pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichRepor
                     .and_then(|l| l.workspace.clone())
                 {
                     Some(w) => (w, true),
-                    None => {
-                        report.without_cwd += 1;
-                        continue;
-                    }
+                    None => match old_project {
+                        Some(p) => (p, false),
+                        None => {
+                            report.without_cwd += 1;
+                            continue;
+                        }
+                    },
                 },
             };
             let project = cache.entry(dir).or_insert_with_key(|d| resolve(d)).clone();
@@ -408,7 +439,7 @@ fn day(ts: &Option<String>) -> &str {
 }
 
 /// Left-align the first `left` columns, right-align the rest.
-fn table(rows: &[Vec<String>], left: usize) -> String {
+pub(crate) fn table(rows: &[Vec<String>], left: usize) -> String {
     let n = rows.first().map_or(0, Vec::len);
     let widths: Vec<usize> = (0..n)
         .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
@@ -611,6 +642,55 @@ mod tests {
         assert_eq!(resolve(gone.to_str().unwrap()), gone.to_str().unwrap());
         assert_eq!(project_name("/home/demo/alpha"), "alpha");
         assert_eq!(project_name("/"), "/");
+    }
+
+    #[test]
+    fn deleted_worktree_folds_into_its_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        git_init(&repo);
+        let repo_s = canon(&repo);
+        for tail in [
+            ".claude/worktrees/explore",
+            ".claude/worktrees/explore/src/deep",
+            ".git/worktrees/explore",
+        ] {
+            let gone = repo.join(tail);
+            assert!(!gone.exists());
+            assert_eq!(resolve(gone.to_str().unwrap()), repo_s, "{tail}");
+        }
+        // The repository itself is gone too: fall back to its path as recorded.
+        let lost = "/no/such/repo/.claude/worktrees/x";
+        assert_eq!(resolve(lost), "/no/such/repo");
+        // A marker at the very start leaves nothing to fold into.
+        assert_eq!(resolve("/.claude/worktrees/x"), "/.claude/worktrees/x");
+        // Ordinary missing paths are untouched.
+        assert_eq!(resolve("/no/such/worktrees/x"), "/no/such/worktrees/x");
+        assert_eq!(enclosing_repo("/a/b/.claude/worktrees/c"), Some("/a/b"));
+    }
+
+    #[test]
+    fn enrich_refolds_sessions_filed_under_a_deleted_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        git_init(&repo);
+        let gone = format!("{}/.claude/worktrees/old", repo.display());
+        let mut store = crate::store::Store::open_in_memory().unwrap();
+        let conn = &mut store.conn;
+        conn.execute(
+            "INSERT INTO sessions (tool, session_id, cwd, project, project_name)
+             VALUES ('codex', 's1', ?1, ?1, 'old')",
+            params![gone],
+        )
+        .unwrap();
+        enrich(conn, &[]).unwrap();
+        let (p, n): (String, String) = conn
+            .query_row("SELECT project, project_name FROM sessions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(p, canon(&repo));
+        assert_eq!(n, "repo");
     }
 
     fn seed(conn: &Connection, rows: &[(&str, &str, Option<&str>)]) {

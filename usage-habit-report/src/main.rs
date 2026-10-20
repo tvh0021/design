@@ -23,28 +23,45 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     offline: bool,
+    /// Skip the catch-up that every `query` otherwise starts with (scan, enrich, price).
+    #[arg(long, global = true)]
+    no_scan: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+/// Where `scan` and `rebuild` read from; each default is the harness's usual folder.
+#[derive(clap::Args, Default)]
+struct ScanArgs {
+    /// Claude Code projects folder [default: ~/.claude/projects]
+    #[arg(long)]
+    claude_dir: Option<PathBuf>,
+    /// Codex home; reads its sessions/ and archived_sessions/ [default: $CODEX_HOME or ~/.codex]
+    #[arg(long)]
+    codex_dir: Option<PathBuf>,
+    /// Antigravity conversations folder; repeatable
+    /// [default: ~/.gemini/antigravity/conversations and the T3 bridge folders]
+    #[arg(long = "antigravity-dir")]
+    antigravity_dirs: Vec<PathBuf>,
+    /// T3 Code state database, read-only; repeatable; a missing path is skipped
+    /// [default: ~/.t3/userdata/state.sqlite and ~/.t3-personal/userdata/state.sqlite]
+    #[arg(long = "t3-state")]
+    t3_states: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Read new bytes from every harness log into the store.
     Scan {
-        /// Claude Code projects folder [default: ~/.claude/projects]
-        #[arg(long)]
-        claude_dir: Option<PathBuf>,
-        /// Codex home; reads its sessions/ and archived_sessions/ [default: $CODEX_HOME or ~/.codex]
-        #[arg(long)]
-        codex_dir: Option<PathBuf>,
-        /// Antigravity conversations folder; repeatable
-        /// [default: ~/.gemini/antigravity/conversations and the T3 bridge folders]
-        #[arg(long = "antigravity-dir")]
-        antigravity_dirs: Vec<PathBuf>,
-        /// T3 Code state database, read-only; repeatable; a missing path is skipped
-        /// [default: ~/.t3/userdata/state.sqlite and ~/.t3-personal/userdata/state.sqlite]
-        #[arg(long = "t3-state")]
-        t3_states: Vec<PathBuf>,
+        #[command(flatten)]
+        args: ScanArgs,
+    },
+    /// Drop the store's usage rows (sources, sessions, requests, Codex cursors) and
+    /// read every raw log again. Hand-set labels and rates.json are kept. Usage whose
+    /// raw logs have since been deleted is lost.
+    Rebuild {
+        #[command(flatten)]
+        args: ScanArgs,
     },
     /// Read from the store.
     Query {
@@ -94,6 +111,35 @@ enum QueryCommand {
         /// Print JSON (shape documented in README.md).
         #[arg(long)]
         json: bool,
+        /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// One session: tokens, models, cost, subagents. Key is a session id, a T3 thread id,
+    /// or a session-id prefix. Exit 1 when nothing matches, 2 when several sessions do.
+    Session {
+        /// Session id, T3 thread id, or unique prefix of a session id.
+        key: String,
+        /// Print JSON (shape documented in docs/json-shapes.md).
+        #[arg(long)]
+        json: bool,
+        /// Add one row per request (time, model, effort, tokens, cost).
+        #[arg(long)]
+        rows: bool,
+        /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Same as `query session`, but the key is matched only as a T3 thread id.
+    Thread {
+        /// T3 thread id.
+        thread_id: String,
+        /// Print JSON (shape documented in docs/json-shapes.md).
+        #[arg(long)]
+        json: bool,
+        /// Add one row per request (time, model, effort, tokens, cost).
+        #[arg(long)]
+        rows: bool,
         /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
         #[arg(long)]
         since: Option<String>,
@@ -163,6 +209,186 @@ fn print_price_stats(s: &rates::PriceStats) {
     );
 }
 
+/// What one read-and-enrich pass did.
+struct Ingest {
+    /// The per-harness lines and the enrich line, as `scan` prints them.
+    lines: Vec<String>,
+    files_read: u64,
+    rows_added: u64,
+    sessions_added: u64,
+}
+
+/// Read every harness log from its stored offset, then run the enrich step.
+fn ingest(store: &mut Store, args: ScanArgs) -> Result<Ingest> {
+    let mut lines = Vec::new();
+    let root = match args.claude_dir {
+        Some(p) => p,
+        None => paths::claude_projects()?,
+    };
+    let r = scan::scan_claude(store, &root)?;
+    let s = &r.stats;
+    let (mut files_read, mut rows_added, mut sessions_added) =
+        (s.files_read, s.rows_added, s.sessions_added);
+    lines.push(format!(
+        "claude-code: {} files seen, {} files read, {} bytes read, {} rows added, {} sessions added{}{}",
+        s.files_seen,
+        s.files_read,
+        s.bytes_read,
+        s.rows_added,
+        s.sessions_added,
+        if s.files_reset > 0 {
+            format!(", {} files re-read after shrinking", s.files_reset)
+        } else {
+            String::new()
+        },
+        if s.bad_lines > 0 {
+            format!(", {} unparseable lines skipped", s.bad_lines)
+        } else {
+            String::new()
+        },
+    ));
+    let codex_home = match args.codex_dir {
+        Some(p) => p,
+        None => codex::default_home()?,
+    };
+    let c = codex::scan_codex(store, &codex_home)?;
+    let cs = &c.report.stats;
+    files_read += cs.files_read;
+    rows_added += cs.rows_added;
+    sessions_added += cs.sessions_added;
+    lines.push(codex_summary_line(&c));
+    let ag_dirs = if args.antigravity_dirs.is_empty() {
+        antigravity::default_dirs()
+    } else {
+        args.antigravity_dirs
+    };
+    let ag = antigravity::scan_antigravity(store, &ag_dirs)?;
+    let a = &ag.stats;
+    files_read += a.scan.files_read;
+    rows_added += a.scan.rows_added;
+    sessions_added += a.scan.sessions_added;
+    lines.push(format!(
+        "antigravity: {} databases seen, {} databases read, {} bytes read, {} rows added, {} sessions added{}{}{}",
+        a.scan.files_seen,
+        a.scan.files_read,
+        a.scan.bytes_read,
+        a.scan.rows_added,
+        a.scan.sessions_added,
+        if a.scan.files_reset > 0 {
+            format!(", {} databases re-read after shrinking", a.scan.files_reset)
+        } else {
+            String::new()
+        },
+        if a.immutable_opens > 0 {
+            format!(", {} opened immutable (WAL ignored)", a.immutable_opens)
+        } else {
+            String::new()
+        },
+        if a.unreadable > 0 {
+            format!(", {} unreadable", a.unreadable)
+        } else {
+            String::new()
+        },
+    ));
+    let t3_paths = if args.t3_states.is_empty() {
+        t3::default_paths()
+    } else {
+        args.t3_states
+    };
+    let e = project::enrich(&mut store.conn, &t3_paths)?;
+    lines.push(format!(
+        "enrich: {} sessions given a project ({} from a T3 directory), {} without a directory; t3: {} databases read{}, {} sessions linked; {:.2} s",
+        e.projects_set,
+        e.projects_from_t3,
+        e.without_cwd,
+        e.t3.databases_read,
+        if e.t3.databases_unreadable > 0 {
+            format!(", {} unreadable", e.t3.databases_unreadable)
+        } else {
+            String::new()
+        },
+        e.t3.sessions_linked,
+        e.elapsed.as_secs_f64(),
+    ));
+    Ok(Ingest {
+        lines,
+        files_read,
+        rows_added,
+        sessions_added,
+    })
+}
+
+/// The scan that every `query` starts with unless `--no-scan` is given:
+/// incremental read, enrich, price. Prints one line to stderr only when it
+/// read something, so stdout stays clean JSON.
+fn catch_up(store: &mut Store, offline: bool) -> Result<()> {
+    let start = std::time::Instant::now();
+    let ing = ingest(store, ScanArgs::default())?;
+    priced(store, offline, false)?;
+    if ing.files_read > 0 {
+        eprintln!(
+            "scan: {} files read, {} rows added, {} sessions added ({:.2} s)",
+            ing.files_read,
+            ing.rows_added,
+            ing.sessions_added,
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+/// `query session` and `query thread`. Exit 1 when nothing matches, 2 when
+/// several sessions do.
+fn query_session(
+    store: &Store,
+    offline: bool,
+    key: &str,
+    by_thread: bool,
+    opts: (bool, bool, Option<String>),
+) -> Result<()> {
+    let (json, rows, since) = opts;
+    let now = scan::now_ms();
+    let since_ms = since_window(since, now)?;
+    let lookup = if by_thread {
+        query::resolve_thread(&store.conn, key)?
+    } else {
+        query::resolve_session(&store.conn, key)?
+    };
+    let what = if by_thread { "thread" } else { "session" };
+    let found = match lookup {
+        query::SessionLookup::Found(f) => f,
+        query::SessionLookup::NotFound => {
+            if json {
+                let v = serde_json::json!({"error": "not found", "key": key});
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            }
+            eprintln!("{what} not found: {key}");
+            std::process::exit(1);
+        }
+        query::SessionLookup::Ambiguous(refs) => {
+            let c = query::session_candidates(&store.conn, &refs)?;
+            if json {
+                let v = serde_json::json!({"error": "ambiguous", "key": key, "candidates": c});
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", query::render_session_candidates(key, &c));
+            }
+            eprintln!("ambiguous {what} key {key:?}: pass the full session id");
+            std::process::exit(2);
+        }
+    };
+    let mut report = query::session_report(&store.conn, &found, since_ms, rows, now)?;
+    let rates_path = paths::config_dir()?.join("rates.json");
+    let r = rates::load(&rates_path, offline, scan::now_ms(), rates::fetch_litellm);
+    report.rates_fetched_at = Some(r.file.fetched_at);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", query::render_session(&report));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     std::fs::create_dir_all(paths::config_dir()?)?;
@@ -171,97 +397,38 @@ fn main() -> Result<()> {
         None => paths::default_db()?,
     };
     let mut store = Store::open(&db)?;
+    if !cli.no_scan && matches!(cli.command, Command::Query { .. }) {
+        catch_up(&mut store, cli.offline)?;
+    }
     match cli.command {
-        Command::Scan {
-            claude_dir,
-            codex_dir,
-            antigravity_dirs,
-            t3_states,
-        } => {
+        Command::Scan { args } => {
             let scan_start = std::time::Instant::now();
-            let root = match claude_dir {
-                Some(p) => p,
-                None => paths::claude_projects()?,
-            };
-            let r = scan::scan_claude(&mut store, &root)?;
-            let s = &r.stats;
-            println!(
-                "claude-code: {} files seen, {} files read, {} bytes read, {} rows added, {} sessions added{}{}",
-                s.files_seen,
-                s.files_read,
-                s.bytes_read,
-                s.rows_added,
-                s.sessions_added,
-                if s.files_reset > 0 {
-                    format!(", {} files re-read after shrinking", s.files_reset)
-                } else {
-                    String::new()
-                },
-                if s.bad_lines > 0 {
-                    format!(", {} unparseable lines skipped", s.bad_lines)
-                } else {
-                    String::new()
-                },
-            );
-            let codex_home = match codex_dir {
-                Some(p) => p,
-                None => codex::default_home()?,
-            };
-            let c = codex::scan_codex(&mut store, &codex_home)?;
-            println!("{}", codex_summary_line(&c));
-            let ag_dirs = if antigravity_dirs.is_empty() {
-                antigravity::default_dirs()
-            } else {
-                antigravity_dirs
-            };
-            let ag = antigravity::scan_antigravity(&mut store, &ag_dirs)?;
-            let a = &ag.stats;
-            println!(
-                "antigravity: {} databases seen, {} databases read, {} bytes read, {} rows added, {} sessions added{}{}{}",
-                a.scan.files_seen,
-                a.scan.files_read,
-                a.scan.bytes_read,
-                a.scan.rows_added,
-                a.scan.sessions_added,
-                if a.scan.files_reset > 0 {
-                    format!(", {} databases re-read after shrinking", a.scan.files_reset)
-                } else {
-                    String::new()
-                },
-                if a.immutable_opens > 0 {
-                    format!(", {} opened immutable (WAL ignored)", a.immutable_opens)
-                } else {
-                    String::new()
-                },
-                if a.unreadable > 0 {
-                    format!(", {} unreadable", a.unreadable)
-                } else {
-                    String::new()
-                },
-            );
-            let t3_paths = if t3_states.is_empty() {
-                t3::default_paths()
-            } else {
-                t3_states
-            };
-            let e = project::enrich(&mut store.conn, &t3_paths)?;
-            println!(
-                "enrich: {} sessions given a project ({} from a T3 directory), {} without a directory; t3: {} databases read{}, {} sessions linked; {:.2} s",
-                e.projects_set,
-                e.projects_from_t3,
-                e.without_cwd,
-                e.t3.databases_read,
-                if e.t3.databases_unreadable > 0 {
-                    format!(", {} unreadable", e.t3.databases_unreadable)
-                } else {
-                    String::new()
-                },
-                e.t3.sessions_linked,
-                e.elapsed.as_secs_f64(),
-            );
+            let ing = ingest(&mut store, args)?;
+            for l in &ing.lines {
+                println!("{l}");
+            }
             println!("elapsed: {:.2} s", scan_start.elapsed().as_secs_f64());
             let (_, stats) = priced(&mut store, cli.offline, false)?;
             print_price_stats(&stats);
+        }
+        Command::Rebuild { args } => {
+            let start = std::time::Instant::now();
+            let tx = store.conn.transaction()?;
+            // Children first; `session_labels` is not touched.
+            for table in ["codex_cursors", "requests", "sessions", "sources"] {
+                tx.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+            tx.commit()?;
+            println!(
+                "rebuild: cleared sources, sessions, requests and codex cursors; kept session_labels"
+            );
+            let ing = ingest(&mut store, args)?;
+            for l in &ing.lines {
+                println!("{l}");
+            }
+            let (_, stats) = priced(&mut store, cli.offline, true)?;
+            print_price_stats(&stats);
+            println!("rebuild elapsed: {:.2} s", start.elapsed().as_secs_f64());
         }
         Command::Query {
             what:
@@ -298,6 +465,24 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Query {
+            what:
+                QueryCommand::Session {
+                    key,
+                    json,
+                    rows,
+                    since,
+                },
+        } => query_session(&store, cli.offline, &key, false, (json, rows, since))?,
+        Command::Query {
+            what:
+                QueryCommand::Thread {
+                    thread_id,
+                    json,
+                    rows,
+                    since,
+                },
+        } => query_session(&store, cli.offline, &thread_id, true, (json, rows, since))?,
         Command::Query {
             what: QueryCommand::Agents { json, since },
         } => {

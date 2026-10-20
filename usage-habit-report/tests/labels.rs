@@ -182,6 +182,7 @@ impl Cli {
             .args(args)
             .env("XDG_CONFIG_HOME", self.tmp.path().join("config"))
             .env("HOME", self.tmp.path()) // keep other harnesses' default folders out
+            .env_remove("CODEX_HOME")
             .env("USAGE_HABIT_REPORT_OFFLINE", "1")
             .output()
             .unwrap();

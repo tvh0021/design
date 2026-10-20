@@ -468,6 +468,112 @@ pub fn agents_report(
     })
 }
 
+/// Subagent summary of one top-level session (same figures and definitions as
+/// [`SessionAgents`], without the identity fields).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SubagentSummary {
+    pub subagent_count: usize,
+    pub subagent_models: Vec<ModelCount>,
+    pub subagent_efforts: Vec<EffortCount>,
+    /// Uncached input plus output tokens of all subagents.
+    pub subagent_tokens: i64,
+    /// The same measure over the session and its subagents.
+    pub total_tokens: i64,
+    pub subagent_token_share: Option<f64>,
+    pub max_concurrent_fanout: usize,
+}
+
+/// Subagent summary for one session: every subagent below it (nested ones
+/// included), counting requests at or after `since_ms`. With a window, a
+/// subagent counts only if it has a request in it, as in [`agents_report`].
+pub fn session_subagents(
+    conn: &Connection,
+    tool: &str,
+    session_id: &str,
+    since_ms: Option<i64>,
+) -> Result<SubagentSummary> {
+    let lo = since_ms.unwrap_or(i64::MIN);
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT parent_session_id, session_id FROM sessions
+             WHERE tool = ?1 AND is_subagent = 1 AND parent_session_id IS NOT NULL",
+        )?;
+        let mut rows = stmt.query(params![tool])?;
+        while let Some(r) = rows.next()? {
+            children.entry(r.get(0)?).or_default().push(r.get(1)?);
+        }
+    }
+    let mut descendants: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(session_id.to_string());
+    let mut queue = vec![session_id.to_string()];
+    while let Some(at) = queue.pop() {
+        for c in children.get(&at).into_iter().flatten() {
+            if seen.insert(c.clone()) {
+                descendants.push(c.clone());
+                queue.push(c.clone());
+            }
+        }
+    }
+
+    let own_tokens: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM requests
+         WHERE tool = ?1 AND session_id = ?2 AND ts_ms >= ?3",
+        params![tool, session_id, lo],
+        |r| r.get(0),
+    )?;
+    let mut span_stmt = conn.prepare(
+        "SELECT MIN(ts_ms), MAX(ts_ms), COALESCE(SUM(input_tokens + output_tokens), 0)
+         FROM requests WHERE tool = ?1 AND session_id = ?2 AND ts_ms >= ?3",
+    )?;
+    let mut mix_stmt = conn.prepare(
+        "SELECT model, effort, COUNT(*) FROM requests
+         WHERE tool = ?1 AND session_id = ?2 AND ts_ms >= ?3 GROUP BY model, effort",
+    )?;
+    let mut count = 0usize;
+    let mut intervals = Vec::new();
+    let mut sub_tokens = 0i64;
+    let mut models: BTreeMap<Option<String>, i64> = BTreeMap::new();
+    let mut efforts: BTreeMap<Option<String>, i64> = BTreeMap::new();
+    for d in &descendants {
+        let (first, last, tokens): (Option<i64>, Option<i64>, i64) = span_stmt
+            .query_row(params![tool, d, lo], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        if since_ms.is_some() && first.is_none() {
+            continue;
+        }
+        count += 1;
+        if let (Some(f), Some(l)) = (first, last) {
+            intervals.push((f, l));
+            sub_tokens += tokens;
+        }
+        let mut rows = mix_stmt.query(params![tool, d, lo])?;
+        while let Some(r) = rows.next()? {
+            let n: i64 = r.get(2)?;
+            *models.entry(r.get(0)?).or_default() += n;
+            *efforts.entry(r.get(1)?).or_default() += n;
+        }
+    }
+    let total = own_tokens + sub_tokens;
+    Ok(SubagentSummary {
+        subagent_count: count,
+        subagent_models: sorted_counts(&models)
+            .into_iter()
+            .map(|(model, requests)| ModelCount { model, requests })
+            .collect(),
+        subagent_efforts: sorted_counts(&efforts)
+            .into_iter()
+            .map(|(effort, requests)| EffortCount { effort, requests })
+            .collect(),
+        subagent_tokens: sub_tokens,
+        total_tokens: total,
+        subagent_token_share: share(sub_tokens, total),
+        max_concurrent_fanout: max_concurrent(&intervals),
+    })
+}
+
 /// Entries ordered by count descending, then name.
 fn sorted_counts(m: &BTreeMap<Option<String>, i64>) -> Vec<(Option<String>, i64)> {
     let mut v: Vec<_> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
