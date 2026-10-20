@@ -1322,12 +1322,13 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     });
   }
 
-  // Center bias for a view of the given angular radius. Full strength 2·ln(N)
-  // from a hemisphere (<= 80 deg) inward, fading to 0 at a whole-world view so
-  // the world map still shows the global top 20 instead of piling dots at its
-  // center.
+  // Center bias for a view of the given angular radius. Full strength
+  // (2/3)·ln(N) from a hemisphere (<= 80 deg) inward, fading to 0 at a
+  // whole-world view so the world map still shows the global top 20 instead
+  // of piling dots at its center. 2·ln(N) was tried first and clustered dots
+  // too tightly around the center.
   function centerBiasFor(halfAngleDeg) {
-    const full = 2 * Math.log(Math.max(2, placeList.length));
+    const full = (2 / 3) * Math.log(Math.max(2, placeList.length));
     const t = Math.min(1, Math.max(0, (180 - halfAngleDeg) / 100));
     return full * t;
   }
