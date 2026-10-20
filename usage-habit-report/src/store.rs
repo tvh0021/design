@@ -67,6 +67,15 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX requests_session ON requests (tool, session_id);
     CREATE INDEX requests_ts ON requests (ts_ms);
     "#,
+    // v2 (ticket 02): Codex parser state carried between incremental scans of
+    // one rollout file (last cumulative token totals, current model/effort,
+    // forked-history cut). JSON shape: `codex::Cursor`.
+    r#"
+    CREATE TABLE codex_cursors (
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+        state     TEXT    NOT NULL
+    );
+    "#,
 ];
 
 pub struct Store {

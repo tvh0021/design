@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use usage_habit_report::{paths, query, scan, store::Store};
+use usage_habit_report::{codex, paths, query, scan, store::Store};
 
 #[derive(Parser)]
 #[command(
@@ -24,6 +24,9 @@ enum Command {
         /// Claude Code projects folder [default: ~/.claude/projects]
         #[arg(long)]
         claude_dir: Option<PathBuf>,
+        /// Codex home; reads its sessions/ and archived_sessions/ [default: $CODEX_HOME or ~/.codex]
+        #[arg(long)]
+        codex_dir: Option<PathBuf>,
     },
     /// Read from the store.
     Query {
@@ -54,7 +57,10 @@ fn main() -> Result<()> {
     };
     let mut store = Store::open(&db)?;
     match cli.command {
-        Command::Scan { claude_dir } => {
+        Command::Scan {
+            claude_dir,
+            codex_dir,
+        } => {
             let root = match claude_dir {
                 Some(p) => p,
                 None => paths::claude_projects()?,
@@ -79,7 +85,16 @@ fn main() -> Result<()> {
                     String::new()
                 },
             );
-            println!("elapsed: {:.2} s", r.elapsed.as_secs_f64());
+            let codex_home = match codex_dir {
+                Some(p) => p,
+                None => codex::default_home()?,
+            };
+            let c = codex::scan_codex(&mut store, &codex_home)?;
+            println!("{}", codex_summary_line(&c));
+            println!(
+                "elapsed: {:.2} s",
+                (r.elapsed + c.report.elapsed).as_secs_f64()
+            );
         }
         Command::Query {
             what: QueryCommand::Summary { json, since },
@@ -98,4 +113,53 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn codex_summary_line(c: &codex::CodexScanReport) -> String {
+    let s = &c.report.stats;
+    let a = &c.anomalies;
+    let mut line = format!(
+        "codex: {} files seen, {} files read, {} bytes read, {} rows added, {} sessions added",
+        s.files_seen, s.files_read, s.bytes_read, s.rows_added, s.sessions_added
+    );
+    for (n, what) in [
+        (s.files_reset, "files re-read after shrinking"),
+        (
+            c.files_relocated,
+            "files moved or compressed since last scan",
+        ),
+        (c.duplicates_skipped, "duplicate rollout copies skipped"),
+        (c.files_unreadable, "files unreadable this time"),
+        (s.bad_lines, "unparseable lines skipped"),
+        (
+            a.cached_exceeds_input,
+            "requests with cached > input (clamped)",
+        ),
+        (
+            a.usage_mismatch,
+            "requests where last usage != cumulative delta",
+        ),
+        (a.counter_resets, "cumulative counter restarts"),
+        (
+            a.repeated_token_counts,
+            "repeated token_count events skipped",
+        ),
+        (
+            a.copied_history_skipped,
+            "usage events in copied fork history skipped",
+        ),
+        (
+            a.token_count_without_info,
+            "token_count events without usage",
+        ),
+        (
+            a.foreign_usage_records,
+            "usage records for another thread skipped",
+        ),
+    ] {
+        if n > 0 {
+            line.push_str(&format!(", {n} {what}"));
+        }
+    }
+    line
 }
