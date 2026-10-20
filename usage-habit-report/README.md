@@ -152,8 +152,8 @@ Subagent requests are included in the totals of the model that served them.
   call's `last_token_usage`. A request is recorded each time the cumulative
   total changes, and its counts are `last_token_usage`. On real data the two
   agree on 46,651 of 46,665 changes. They disagree when the counter restarts
-  (it goes down), or jumps after a fork copies history; there the cumulative
-  delta is wrong and `last_token_usage` is right. A `token_count` whose total
+  (it goes down) or jumps forward (seen after a user fork). There the
+  cumulative delta is wrong and `last_token_usage` is right. A `token_count` whose total
   did not change repeats the previous one and is skipped. The newer
   per-response records are preferred because about 0.4% of responses get a
   `token_count` whose total never moved (`last_token_usage` all zero); the
