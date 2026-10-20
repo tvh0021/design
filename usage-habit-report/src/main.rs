@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use usage_habit_report::{codex, paths, query, scan, store::Store};
+use usage_habit_report::{antigravity, codex, paths, query, scan, store::Store};
 
 #[derive(Parser)]
 #[command(
@@ -27,6 +27,10 @@ enum Command {
         /// Codex home; reads its sessions/ and archived_sessions/ [default: $CODEX_HOME or ~/.codex]
         #[arg(long)]
         codex_dir: Option<PathBuf>,
+        /// Antigravity conversations folder; repeatable
+        /// [default: ~/.gemini/antigravity/conversations and the T3 bridge folders]
+        #[arg(long = "antigravity-dir")]
+        antigravity_dirs: Vec<PathBuf>,
     },
     /// Read from the store.
     Query {
@@ -60,7 +64,9 @@ fn main() -> Result<()> {
         Command::Scan {
             claude_dir,
             codex_dir,
+            antigravity_dirs,
         } => {
+            let scan_start = std::time::Instant::now();
             let root = match claude_dir {
                 Some(p) => p,
                 None => paths::claude_projects()?,
@@ -91,10 +97,37 @@ fn main() -> Result<()> {
             };
             let c = codex::scan_codex(&mut store, &codex_home)?;
             println!("{}", codex_summary_line(&c));
+            let ag_dirs = if antigravity_dirs.is_empty() {
+                antigravity::default_dirs()
+            } else {
+                antigravity_dirs
+            };
+            let ag = antigravity::scan_antigravity(&mut store, &ag_dirs)?;
+            let a = &ag.stats;
             println!(
-                "elapsed: {:.2} s",
-                (r.elapsed + c.report.elapsed).as_secs_f64()
+                "antigravity: {} databases seen, {} databases read, {} bytes read, {} rows added, {} sessions added{}{}{}",
+                a.scan.files_seen,
+                a.scan.files_read,
+                a.scan.bytes_read,
+                a.scan.rows_added,
+                a.scan.sessions_added,
+                if a.scan.files_reset > 0 {
+                    format!(", {} databases re-read after shrinking", a.scan.files_reset)
+                } else {
+                    String::new()
+                },
+                if a.immutable_opens > 0 {
+                    format!(", {} opened immutable (WAL ignored)", a.immutable_opens)
+                } else {
+                    String::new()
+                },
+                if a.unreadable > 0 {
+                    format!(", {} unreadable", a.unreadable)
+                } else {
+                    String::new()
+                },
             );
+            println!("elapsed: {:.2} s", scan_start.elapsed().as_secs_f64());
         }
         Command::Query {
             what: QueryCommand::Summary { json, since },
