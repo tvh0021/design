@@ -1,7 +1,8 @@
 # design
 
-Small, standalone projects that I built. Both are live at
-[tvh0021.github.io/design](https://tvh0021.github.io/design/).
+Small, standalone projects that I built. The first two are live at
+[tvh0021.github.io/design](https://tvh0021.github.io/design/); the rest are
+command-line tools in `cli/`.
 
 ## Geodesic flight visualizer
 
@@ -36,3 +37,25 @@ cargo build --release
 ```
 
 See `usage-habit-report/README.md` for the full command reference.
+
+## cli/ai-usage
+
+Rust CLI that prints the remaining quota on my AI subscriptions: Claude,
+Codex, Antigravity, ChatLLM and Zed. It reads the credentials each client
+already stores locally and never refreshes an OAuth login.
+
+```sh
+cd cli/ai-usage
+cargo install --path .
+ai-usage              # all providers
+ai-usage claude       # one provider
+ai-usage --compact    # one line
+ai-usage --json
+```
+
+## cli/scix_arxiv_radar
+
+Python MCP server that triages new arXiv and ADS/SciX papers against a few
+saved research profiles and keeps a local SQLite record of what it has seen.
+Read-only; arXiv needs no credentials and ADS takes a token from the
+environment. See `cli/scix_arxiv_radar/README.md` for setup.

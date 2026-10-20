@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scix-arxiv-radar"
+version = "0.1.0"
+description = "A local, read-only MCP server for ADS/SciX and arXiv paper triage."
+requires-python = ">=3.10"
+dependencies = ["mcp[cli]>=2.0,<3"]
+
+[project.scripts]
+scix-arxiv-radar = "scix_arxiv_radar.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scix_arxiv_radar"]
