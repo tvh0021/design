@@ -322,10 +322,10 @@ fn cli_query_agents_json_on_fixtures() {
     assert_eq!(c["sessions_with_subagents"], 1);
     assert_eq!(c["subagent_sessions"], 1);
     assert_eq!(c["unlinked_subagent_sessions"], 0);
-    // Codex fixtures: a thread_spawn and a guardian subagent under one parent.
+    // Codex fixtures: thread_spawn is counted; the internal guardian is excluded.
     let x = by_tool("codex");
     assert_eq!(x["sessions_with_subagents"], 1);
-    assert_eq!(x["subagent_sessions"], 2);
+    assert_eq!(x["subagent_sessions"], 1);
 
     let hist = v["histogram"].as_array().unwrap();
     let in_hist: i64 = hist.iter().map(|b| b["sessions"].as_i64().unwrap()).sum();

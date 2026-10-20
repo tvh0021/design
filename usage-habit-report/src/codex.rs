@@ -961,11 +961,12 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
         )?;
         stats.files_reset += 1;
     }
-    let internal_only = chunk.cursor.model.as_deref() == Some("codex-auto-review")
-        && chunk
-            .requests
-            .iter()
-            .all(|r| r.row.model.as_deref() == Some("codex-auto-review"));
+    let internal_only = chunk.cursor.agent_type.as_deref() == Some("guardian")
+        || chunk.cursor.model.as_deref() == Some("codex-auto-review")
+            && chunk
+                .requests
+                .iter()
+                .all(|r| r.row.model.as_deref() == Some("codex-auto-review"));
     if consumed > 0 && !internal_only {
         let session_id = chunk.session_id().unwrap_or_else(|| stem.to_string());
         let is_new_session: bool = !tx.query_row(

@@ -268,8 +268,13 @@ JSON shape (abridged):
 | `heaviest_fanouts[].subagent_token_share` | `subagent_tokens / total_tokens` for the session; null when it has no tokens |
 
 Coverage today: Claude Code and Antigravity link every child to its parent.
-Codex links `guardian` and `thread_spawn` subagents; a few subagent sessions
-have no parent id and are counted as unlinked.
+Codex links `thread_spawn` subagents; a few subagent sessions have no parent
+id and are counted as unlinked. Internal `guardian` sessions and
+`codex-auto-review` requests are excluded by design. They contribute no sessions,
+requests, events, active time, model entries, subagent counts, or fan-out.
+Source cursors are kept so excluded rollouts are not re-read. Migration v8
+removes stored guardian sessions, requests, and events and refreshes cached
+ancestor active time. Manual labels survive.
 
 ### `label`
 
@@ -734,9 +739,9 @@ placeholder says that no snapshot has been generated yet.
   and none if that is empty.
 - Subagents: `session_meta.parent_thread_id` is the parent session id, and
   `source.subagent` the kind. `is_subagent = 1` when either is present (or
-  `thread_source` is `subagent`). `agent_type` is `guardian` for auto-review
-  subagents (`{"other": "guardian"}`), and `thread_spawn` for spawned agents
-  (their `agent_role` when Codex records one; so far always null).
+  `thread_source` is `subagent`). `agent_type` is `guardian` for internal approval
+  subagents (`{"other": "guardian"}`), which are excluded at ingest. Spawned
+  agents have `thread_spawn` or their `agent_role` when Codex records one.
   `session_meta.session_id` is the root session; it is not stored.
 - Forks (`forked_from_id` set, which includes most spawned subagents) begin
   with a copy of the parent's history, including its `token_count` records.

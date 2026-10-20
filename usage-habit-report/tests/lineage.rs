@@ -185,6 +185,73 @@ fn internal_review_never_creates_a_reportable_session_or_timeline() {
     );
 }
 
+fn guardian(dir: &Path) -> std::path::PathBuf {
+    let file = child(dir, "guardian", "gpt-6.1-sol");
+    let text = fs::read_to_string(&file).unwrap();
+    let mut lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    lines[0]["payload"]["source"] = serde_json::json!({"subagent":{"other":"guardian"}});
+    lines[0]["payload"]["parent_thread_id"] = serde_json::json!("child");
+    lines.retain(|l| l["type"] != "turn_context"); // Guardians need no model to be excluded.
+    fs::write(
+        &file,
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+    file
+}
+
+#[test]
+fn guardian_without_model_is_excluded_across_incremental_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    child(dir.path(), "child", "gpt-6.1-sol");
+    let file = guardian(dir.path());
+    let mut s = Store::open_in_memory().unwrap();
+    codex::scan_codex(&mut s, dir.path()).unwrap();
+    let unchanged = codex::scan_codex(&mut s, dir.path()).unwrap();
+    assert_eq!(unchanged.report.stats.files_read, 0);
+    fs::OpenOptions::new().append(true).open(file).unwrap().write_all(
+        b"{\"type\":\"token_usage_record\",\"timestamp\":\"2026-01-01T00:25:00Z\",\"payload\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+    ).unwrap();
+    let appended = codex::scan_codex(&mut s, dir.path()).unwrap();
+    assert_eq!(appended.report.stats.files_read, 1);
+    assert_eq!(appended.report.stats.rows_added, 0);
+    for table in ["sessions", "requests", "session_events"] {
+        let count: i64 = s
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE session_id = 'guardian'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    assert_eq!(
+        agents::session_subagents(&s.conn, "codex", "child", None)
+            .unwrap()
+            .subagent_count,
+        0
+    );
+    let count: i64 = s
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM requests WHERE model IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+    let mut rebuilt = Store::open_in_memory().unwrap();
+    codex::scan_codex(&mut rebuilt, dir.path()).unwrap();
+    assert_eq!(
+        query::summary(&s.conn, None, 0).unwrap().totals,
+        query::summary(&rebuilt.conn, None, 0).unwrap().totals
+    );
+}
+
 #[test]
 fn timing_rejects_other_projects_and_competing_delegations() {
     for conflicting_parent in [false, true] {
@@ -320,9 +387,22 @@ fn cli_incremental_scan_and_rebuild_agree_with_t3_lineage() {
     run("scan");
     assert_eq!(read(), 0);
     child(&cx, "child", "gpt-6.1-sol");
+    guardian(&cx);
     run("scan");
     let incremental = read();
     assert_eq!(incremental, 20 * 60_000);
     run("rebuild");
     assert_eq!(read(), incremental);
+    let c = Connection::open_with_flags(&store_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    for table in ["sessions", "requests", "session_events"] {
+        let count: i64 = c
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE session_id = 'guardian'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }
