@@ -293,7 +293,8 @@ pub fn store_facts(conn: &Connection) -> Result<StoreFacts> {
     })
 }
 
-/// Every task-kind column of the model matrix, in display order.
+/// Every task-kind column of the model matrix, in display order. The
+/// `unlabelled` column is dropped from a matrix when it would be all zeros.
 pub fn task_kinds() -> Vec<String> {
     crate::labels::KINDS
         .iter()
@@ -433,6 +434,16 @@ pub fn model_matrix(
     for r in &all {
         for (a, b) in col_totals.iter_mut().zip(&r.counts) {
             *a += b;
+        }
+    }
+    // The unlabelled column only earns its place when something is in it.
+    if let Some(i) = kinds.iter().position(|k| k == crate::labels::UNLABELLED)
+        && col_totals[i] == 0
+    {
+        kinds.remove(i);
+        col_totals.remove(i);
+        for r in &mut all {
+            r.counts.remove(i);
         }
     }
     let thresholds = quintiles(

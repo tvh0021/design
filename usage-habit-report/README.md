@@ -662,7 +662,8 @@ Below the map and totals, every panel follows the same window and tool
 filter, states its window, and names any tool with no requests in it:
 
 - **Model by task kind**: requests by canonical model (rows) and task label
-  (columns, `unlabelled` included), shaded with the map's stepped ramp.
+  (columns; `unlabelled` appears only when some request in the window has
+  no label), shaded with the map's stepped ramp.
   Column totals equal the per-label totals of `query summary --group-by
   label` for the window.
 - **Multi-agent habit**: the subagents-per-session histogram, main-thread
