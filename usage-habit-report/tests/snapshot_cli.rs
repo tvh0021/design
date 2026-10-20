@@ -23,20 +23,93 @@ fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
     output
 }
 
-fn assert_redacted(conn: &Connection, out: &Path) {
-    // Include raw and HTML-escaped forms, folder names derived from the path,
-    // stored project names, cwd, and T3 titles as well as the required fields.
+// The snapshot templates emit lowercase style/script tags with no attributes.
+fn body_text(document: &str) -> String {
+    let mut body = document.to_owned();
+    for tag in ["style", "script"] {
+        let opening = format!("<{tag}>");
+        let closing = format!("</{tag}>");
+        while let Some(start) = body.find(&opening) {
+            let end = body[start + opening.len()..]
+                .find(&closing)
+                .expect("inline asset has no closing tag")
+                + start
+                + opening.len()
+                + closing.len();
+            body.replace_range(start..end, "");
+        }
+    }
+    body
+}
+
+fn is_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn contains_whole_word(body: &str, candidate: &str) -> bool {
+    body.char_indices().any(|(start, _)| {
+        if !body[start..].starts_with(candidate) {
+            return false;
+        }
+        let end = start + candidate.len();
+        (start == 0 || !is_word(body.as_bytes()[start - 1]))
+            && (end == body.len() || !is_word(body.as_bytes()[end]))
+    })
+}
+
+fn page_vocabulary(out: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(out)
+        .unwrap()
+        .flat_map(|entry| {
+            body_text(&std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn word_candidate_matches(body: &str, candidate: &str, vocabulary: &BTreeSet<String>) -> bool {
+    candidate.chars().count() >= 3
+        && !vocabulary.contains(candidate)
+        && contains_whole_word(body, candidate)
+}
+
+#[test]
+fn word_privacy_rules_preserve_boundaries_case_and_escaped_forms() {
+    let vocabulary = BTreeSet::from(["project".to_owned()]);
+    let text = body_text(
+        "<style>asset-only</style><body>project secret secret_suffix prefix_secret Secret a&amp;b xy private phrase xa-a-a</body><script>script-only</script>",
+    );
+    for candidate in ["asset-only", "script-only", "project", "xy", "SECRET"] {
+        assert!(!word_candidate_matches(&text, candidate, &vocabulary));
+    }
+    for candidate in ["secret", "Secret", "a&amp;b", "private phrase", "a-a"] {
+        assert!(word_candidate_matches(&text, candidate, &vocabulary));
+    }
+    for text in ["secret_suffix", "prefix_secret", "2secret", "secret2"] {
+        assert!(!contains_whole_word(text, "secret"));
+    }
+    assert!(contains_whole_word("ésecreté", "secret"));
+    assert!(!word_candidate_matches(&text, "a&b", &vocabulary));
+}
+
+fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>) {
+    // Exact categories retain whole-file raw and escaped substring checks.
+    // Word categories use body text, a minimum length, and fixture vocabulary.
     let columns = [
-        "session_id",
-        "t3_thread_id",
-        "project",
-        "project_name",
-        "title",
-        "cwd",
-        "t3_title",
+        ("session_id", "session_id", false),
+        ("t3_thread_id", "t3_thread_id", false),
+        ("project", "project_path", false),
+        ("project", "project_folder", true),
+        ("project_name", "project_name", true),
+        ("title", "title", true),
+        ("cwd", "cwd", false),
+        ("t3_title", "t3_title", false),
     ];
     let mut categories = Vec::new();
-    for column in columns {
+    for (column, category, word_match) in columns {
         let mut stmt = conn.prepare(&format!("SELECT DISTINCT {column} FROM sessions WHERE {column} IS NOT NULL AND {column} != ''")).unwrap();
         let values: Vec<String> = stmt
             .query_map([], |r| r.get(0))
@@ -47,19 +120,18 @@ fn assert_redacted(conn: &Connection, out: &Path) {
         for value in values {
             let value = if column == "title" || column == "t3_title" {
                 value.chars().take(20).collect::<String>()
+            } else if category == "project_folder" {
+                let Some(name) = Path::new(&value).file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                name.to_owned()
             } else {
                 value
             };
             needles.insert(html::esc(&value));
-            needles.insert(value.clone());
-            if column == "project"
-                && let Some(name) = Path::new(&value).file_name().and_then(|s| s.to_str())
-            {
-                needles.insert(html::esc(name));
-                needles.insert(name.to_string());
-            }
+            needles.insert(value);
         }
-        categories.push((column, needles));
+        categories.push((category, needles, word_match));
     }
     let files: Vec<_> = std::fs::read_dir(out)
         .unwrap()
@@ -69,8 +141,18 @@ fn assert_redacted(conn: &Connection, out: &Path) {
     let mut matches = vec![0usize; categories.len()];
     for file in &files {
         let body = std::fs::read_to_string(file).unwrap();
-        for (i, (_, needles)) in categories.iter().enumerate() {
-            matches[i] += needles.iter().filter(|s| body.contains(s.as_str())).count();
+        let text = body_text(&body);
+        for (i, (_, needles, word_match)) in categories.iter().enumerate() {
+            matches[i] += needles
+                .iter()
+                .filter(|candidate| {
+                    if *word_match {
+                        word_candidate_matches(&text, candidate, vocabulary)
+                    } else {
+                        body.contains(candidate.as_str())
+                    }
+                })
+                .count();
         }
         // All resources are inline; the only navigation is to generated files.
         for forbidden in [
@@ -96,32 +178,35 @@ fn assert_redacted(conn: &Connection, out: &Path) {
         assert!(body.contains(html::CSS));
         assert!(body.contains(html::JS));
     }
-    for ((category, needles), count) in categories.iter().zip(&matches) {
+    for ((category, needles, word_match), count) in categories.iter().zip(&matches) {
+        let skipped = needles
+            .iter()
+            .filter(|s| *word_match && s.chars().count() < 3)
+            .count();
+        let page_words = needles
+            .iter()
+            .filter(|s| *word_match && s.chars().count() >= 3 && vocabulary.contains(*s))
+            .count();
         eprintln!(
-            "redaction {category}: {} candidates, {count} matches; {} candidates also occur in shared CSS, {} in shared JS",
+            "redaction {category}: {} candidates, {skipped} skipped short, {page_words} fixture vocabulary, {count} matches",
             needles.len(),
-            needles
-                .iter()
-                .filter(|s| html::CSS.contains(s.as_str()))
-                .count(),
-            needles
-                .iter()
-                .filter(|s| html::JS.contains(s.as_str()))
-                .count()
         );
     }
-    assert_eq!(
-        matches.iter().sum::<usize>(),
-        0,
-        "private values found; category counts above contain no private strings"
-    );
+    for ((category, _, word_match), count) in categories.iter().zip(&matches) {
+        let rule = if *word_match {
+            "body whole-word rule after minimum-length and fixture-vocabulary exclusions"
+        } else {
+            "whole-file exact-substring rule"
+        };
+        assert_eq!(
+            *count, 0,
+            "redaction {category} failed {rule}; counts only, no private strings"
+        );
+    }
 }
 
-#[test]
-fn fixture_snapshot_is_redacted_offline_and_linked() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("usage.db");
-    let store = Store::open(&db).unwrap();
+fn fixture_store(db: &Path) -> Store {
+    let store = Store::open(db).unwrap();
     store.conn.execute_batch(
         "INSERT INTO sessions (tool, session_id, parent_session_id, is_subagent, title, cwd, project, project_name, t3_thread_id, t3_title, started_at_ms, ended_at_ms, label) VALUES
         ('codex', 'fixture-session-private-id', NULL, 0, 'Fixture private <title> & opening prompt', '/synthetic/private-orchard/work', '/synthetic/private-orchard', 'private-orchard', 'fixture-t3-private-id', 'Fixture private T3 title', 1792380600000, 1792384200000, 'coding'),
@@ -130,9 +215,18 @@ fn fixture_snapshot_is_redacted_offline_and_linked() {
         ('codex', 'fixture-private-request-key', 'fixture-session-private-id', 0, 1792380600000, 'synthetic-model', 100, 50, 1.49),
         ('codex', 'fixture-child-request-key', 'fixture-child-private-id', 1, 1792380601000, 'synthetic-model', 50, 20, 0.49);"
     ).unwrap();
+    store
+}
+
+#[test]
+fn fixture_snapshot_is_redacted_offline_and_linked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    let store = fixture_store(&db);
     let out = tmp.path().join("out");
     export(&db, &out, None);
-    assert_redacted(&store.conn, &out);
+    // The fixture must not exempt its own private values as page vocabulary.
+    assert_redacted(&store.conn, &out, &BTreeSet::new());
     for entry in std::fs::read_dir(&out).unwrap() {
         let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
         assert!(!body.contains("fixture-private-request-key"));
@@ -223,5 +317,10 @@ fn real_store_snapshot_is_redacted() {
     for (name, bytes) in sizes {
         eprintln!("{}: {bytes} bytes", name.to_string_lossy());
     }
-    assert_redacted(&conn, tmp.path());
+    let fixture = tempfile::tempdir().unwrap();
+    let fixture_db = fixture.path().join("fixture.db");
+    let _fixture_store = fixture_store(&fixture_db);
+    let fixture_out = fixture.path().join("out");
+    export(&fixture_db, &fixture_out, None);
+    assert_redacted(&conn, tmp.path(), &page_vocabulary(&fixture_out));
 }
