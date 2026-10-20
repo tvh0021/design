@@ -537,6 +537,29 @@ as ambiguous.
   earliest and latest record timestamps.
 - Lines that fail to parse are counted and reported by `scan`, then skipped.
 
+### `serve`
+
+```sh
+usage-habit-report serve [--port 7878] [--no-open]
+```
+
+Opens the dashboard: one page rendered from the store on
+`http://127.0.0.1:<port>/`. The server only ever binds the loopback address;
+`--port 0` takes a free port, and the URL is printed first either way. The
+browser opens unless `--no-open` is given. The store is opened read-only on
+every request, so a scan in another terminal shows up on reload and the
+dashboard never prices or migrates anything.
+
+The page shows an activity map of local-time hour by weekday, shaded by
+uncached input plus output tokens, with a window of 4 weeks (default), 12
+weeks, or all time (`?window=4w|12w|all`) and an optional tool filter
+(`?tool=claude-code|codex|antigravity`). Hovering or focusing a cell shows
+its exact figures. The window totals under the map are the same figures as
+`query summary --since 4w` (or `12w`, or no `--since`) for the same window.
+Everything is embedded in the page; it makes no network requests and needs
+no Node toolchain. The visual system is written down in
+[docs/design.md](docs/design.md).
+
 ## Codex ingest
 
 - Source: every `rollout-*.jsonl` and `rollout-*.jsonl.zst` under
