@@ -20,6 +20,7 @@ fn run(tmp: &Path, args: &[&str]) -> Out {
         .args(args)
         .env("XDG_CONFIG_HOME", tmp.join("config"))
         .env("HOME", tmp) // keep the real harness and T3 folders out
+        .env_remove("CODEX_HOME")
         .env("USAGE_HABIT_REPORT_OFFLINE", "1")
         .output()
         .unwrap();

@@ -29,6 +29,16 @@ cargo build --release
 different store. `--offline` (or `USAGE_HABIT_REPORT_OFFLINE=1`) stops every
 command from fetching model rates; see [Pricing](#pricing).
 
+`--no-scan` skips the catch-up that every `query` command starts with. The
+catch-up is the incremental scan, the enrich step and the price step, so a
+query never reports stale data. It prints one `scan: N files read, ...` line
+to stderr only when it read something, so `--json` output on stdout stays
+clean. With nothing new to read it costs about 0.05 s on a store of 79,000
+requests and 1,700 sessions. With `--no-scan` a query reads the store as it is.
+
+JSON shapes of every `query` command are frozen in
+[docs/json-shapes.md](docs/json-shapes.md).
+
 ## Commands
 
 ### `scan`
@@ -275,6 +285,44 @@ cannot be labelled: they take their parent's label. The hand-set label is
 kept in its own table, so later scans and a rebuild of the raw-log rows do
 not change it.
 
+### `rebuild`
+
+```sh
+usage-habit-report rebuild [same options as scan]
+```
+
+Deletes the rows read from raw logs (`sources`, `sessions`, `requests`,
+`codex_cursors`), then scans, enriches and prices everything again. Hand-set
+labels (`session_labels`) and `rates.json` are kept. Usage whose raw logs
+have been deleted since is lost, so rebuild only to recover from a parser
+fix or a damaged store. Output is the `scan` output, then
+`rebuild elapsed: ...`.
+
+### `query session` and `query thread`
+
+```sh
+usage-habit-report query session <key> [--json] [--rows] [--since 12h|7d|2w]
+usage-habit-report query thread <t3-thread-id> [--json] [--rows] [--since 12h|7d|2w]
+```
+
+One session: tool, session id, title, project, T3 thread id and title, task
+label (hand-set preferred), models with request counts, start, end and
+elapsed time, request count, the four token kinds plus reasoning tokens,
+estimated cost (null when no request has a price; `unpriced_requests` counts
+those left out), and the subagent summary (count, models, efforts, token
+share, maximum fan-out; the same definitions as `query agents`). `--rows`
+adds one row per request (time, model, effort, tokens, cost). Prompt and
+response text never appear; the title is the first line of the opening
+prompt.
+
+`session` matches `<key>` as an exact session id, then an exact T3 thread
+id, then a session-id prefix, and the first stage with any match decides.
+`thread` matches only the T3 thread id. Several matches exit with code 2 and
+list the candidates (stdout: JSON error body with `--json`, a table
+otherwise); no match exits with 1. Both conventions are the same as for
+`query project`. Field names and types are in
+[docs/json-shapes.md](docs/json-shapes.md).
+
 ### `query models`
 
 ```sh
@@ -434,7 +482,8 @@ prefixes (`models/`, `anthropic/`, `gemini/`, …) and Vertex `@` pins are
 dropped; enum-style names are rewritten (`claude_v5_opus_thinking` ->
 `claude-opus-5`, `MODEL_CLAUDE_4_5_SONNET_THINKING` -> `claude-sonnet-4-5`);
 snapshot dates (`-20251001`, `-2025-08-07`) and effort or mode suffixes
-(`-high`, `-medium`, `-low`, `-thinking`, `-tiered`, …) are stripped. `max`
+(`-high`, `-medium`, `-low`, `-thinking`, `-tiered`, and for Gemini `-n` and
+`-trial`) are stripped. `max`
 is stripped only from Claude names, since `gpt-5.1-codex-max` is its own
 model. Opaque placeholders (`MODEL_PLACEHOLDER_M26`) get no canonical name.
 The LiteLLM key is the canonical name, except Gemini, which tries
@@ -482,8 +531,12 @@ no project (and, for T3, no thread id) yet, so a second scan does nothing.
   `commondir` (a submodule) or whose common dir is not a `.git` folder (a
   worktree of a bare repository) leaves that directory as its own project.
 - Outside a repository: the directory itself.
-- A directory that no longer exists (for example a deleted worktree): the
-  `cwd` string as recorded.
+- A directory that no longer exists: the `cwd` string as recorded, except
+  that a path containing `/.claude/worktrees/<name>` or
+  `/.git/worktrees/<name>` (a deleted worktree) resolves as the path before
+  that marker, through the rules above when that repository still exists.
+  Sessions already filed under such a path are resolved again by the next
+  enrich.
 
 Existing directories are canonicalized first (symlinks resolved, so `/tmp/x`
 becomes `/private/tmp/x` on macOS). `sessions.project` holds the path and
@@ -725,6 +778,7 @@ cargo test
 The fixtures in `tests/fixtures/` are hand-written. The Antigravity
 databases and their protobuf blobs are built inside `tests/antigravity.rs`,
 and the T3 state databases inside `src/t3.rs` and `tests/projects_cli.rs`.
-Project-resolution tests run `git init` and `git worktree add` in temporary
+`tests/query_cli.rs` covers `query session`, `query thread`, the catch-up and
+`--no-scan`, and `rebuild`. Project-resolution tests run `git init` and `git worktree add` in temporary
 folders, so `git` must be on `PATH`. Never commit real
 transcript content: this repository is public.

@@ -15,6 +15,8 @@ fn run(tmp: &std::path::Path, args: &[&str]) -> Out {
         .arg(tmp.join("usage.db"))
         .args(args)
         .env("XDG_CONFIG_HOME", tmp.join("config"))
+        .env("HOME", tmp) // the catch-up scan must not read the real harness folders
+        .env_remove("CODEX_HOME")
         .env_remove("USAGE_HABIT_REPORT_OFFLINE")
         .output()
         .unwrap();
