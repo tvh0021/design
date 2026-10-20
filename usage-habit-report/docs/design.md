@@ -96,7 +96,9 @@ The panels under the totals reuse the tokens above; nothing new is coloured.
 - **Model by task kind** uses the same six-step ramp with the same quintile
   rule, over request counts. It is always the ink, even when the page is
   filtered to one tool: hue marks a tool, and the matrix rows are models.
-  Each cell is a 10px swatch beside its figure rather than a shaded
+  The matrix is set one type step larger than the other ledgers (`--t-lead`,
+  16px) with 10px row padding, so its rows are about 20 % taller.
+  Each cell is a 12px swatch beside its figure rather than a shaded
   background, so every figure stays ink on paper at full contrast (ink on a
   48 % or 68 % step would fall under 4.5:1).
 - **Stepped bars** are a row of discrete 6 by 10px units with a 2px gap,

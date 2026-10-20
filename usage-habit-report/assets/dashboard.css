@@ -147,7 +147,10 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .ledger caption { caption-side: top; text-align: left; color: var(--muted); padding-bottom: var(--s-2); }
 .ledger .zero { color: var(--muted); }
 .untitled { color: var(--muted); }
-.matrix i.c { display: inline-block; width: 10px; height: 10px; margin-right: var(--s-2); vertical-align: -1px; }
+/* Model matrix: one type step larger than the other ledgers, rows about 20% taller */
+.matrix th, .matrix td { font-size: var(--t-lead); padding-top: 10px; padding-bottom: 10px; }
+.matrix thead th { font-size: var(--t-body); }
+.matrix i.c { display: inline-block; width: 12px; height: 12px; margin-right: var(--s-2); vertical-align: -1px; }
 .units {
   --bar: color-mix(in oklab, var(--ink) 68%, var(--paper));
   display: inline-flex; gap: 2px; vertical-align: -1px;
