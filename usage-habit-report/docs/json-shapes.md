@@ -90,7 +90,7 @@ the T3 thread id stage. Flags: `--rows`, `--since`, `--json`.
 | `t3_thread_id` | string? |
 | `t3_title` | string? |
 | `label` | string?: hand-set if present, else rule label; a subagent reports its root session's |
-| `label_source` | string?: `manual`, `rule` |
+| `label_source` | string?: `manual`, `rule`, `headline` |
 | `started_at` | string? |
 | `ended_at` | string? |
 | `elapsed_seconds` | integer? |

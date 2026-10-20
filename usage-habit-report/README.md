@@ -857,6 +857,14 @@ user prompt by deterministic keyword rules in `src/labels.rs`: `research`,
 - The ingester classifies the prompt while it holds it in memory and writes
   only the label (`sessions.label`, `sessions.label_source = 'rule'`). The
   prompt text is not stored; the title is still its first line.
+- A root session (top-level, or a subagent whose parent is unknown) whose
+  opening prompt never reached the log (no user
+  turn, or logs ingested before labels existed) is classified from its
+  headline instead, once the headline refresh has one, under
+  `label_source = 'headline'`. A hand-set label still wins.
+- Subagent sessions report under their root session's label, following
+  parent links across harnesses (an Antigravity subagent started from a
+  Claude Code thread counts under that thread's label).
 - Rules are an ordered list of (label, word-start stems, whole words). The
   rules run over the opening line first; if none matches, over the first 600
   characters. The first rule that matches wins, so specific intents

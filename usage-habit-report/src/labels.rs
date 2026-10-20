@@ -398,24 +398,26 @@ pub fn effective_label(conn: &Connection, tool: &str, session_id: &str) -> Resul
 
 /// CTE `eff(tool, session_id, is_subagent, label, manual)`: every session with
 /// the label it is reported under. A subagent takes its root session's label,
-/// following `parent_session_id` through nested subagents. Subagents whose
-/// parent is unknown get a NULL label.
+/// following `parent_session_id` through nested subagents, across tools when
+/// `parent_tool` says the parent ran in another harness (ticket 14). A subagent
+/// whose parent is unknown is its own root: it reports under its headline label
+/// when one was derived, else NULL.
 pub(crate) const EFFECTIVE_LABELS: &str = r#"
-    RECURSIVE chain(tool, session_id, root_id, depth) AS (
-        SELECT tool, session_id, session_id, 0 FROM sessions WHERE parent_session_id IS NULL
+    RECURSIVE chain(tool, session_id, root_tool, root_id, depth) AS (
+        SELECT tool, session_id, tool, session_id, 0 FROM sessions WHERE parent_session_id IS NULL
         UNION
-        SELECT s.tool, s.session_id, c.root_id, c.depth + 1
+        SELECT s.tool, s.session_id, c.root_tool, c.root_id, c.depth + 1
         FROM chain c JOIN sessions s
-          ON s.tool = c.tool AND s.parent_session_id = c.session_id
+          ON COALESCE(s.parent_tool, s.tool) = c.tool AND s.parent_session_id = c.session_id
         WHERE c.depth < 16
     ),
     eff(tool, session_id, is_subagent, label, manual) AS (
         SELECT c.tool, c.session_id, s.is_subagent,
-               COALESCE(m.label, CASE WHEN r.is_subagent = 0 THEN r.label END),
+               COALESCE(m.label, r.label),
                m.label IS NOT NULL
         FROM chain c
         JOIN sessions s ON s.tool = c.tool AND s.session_id = c.session_id
-        JOIN sessions r ON r.tool = c.tool AND r.session_id = c.root_id
+        JOIN sessions r ON r.tool = c.root_tool AND r.session_id = c.root_id
         LEFT JOIN session_labels m ON m.tool = r.tool AND m.session_id = r.session_id
     )
 "#;
@@ -796,6 +798,38 @@ mod tests {
         assert!(ok("sub-1").unwrap_err().to_string().contains("subagent"));
         assert!(ok("").is_err());
         assert!(ok("100%").is_err(), "LIKE wildcards are escaped");
+    }
+
+    #[test]
+    fn cross_tool_subagents_inherit_the_root_label() {
+        let s = seeded();
+        // An Antigravity child of the Claude Code session, and its own Codex child.
+        s.conn
+            .execute_batch(
+                "INSERT INTO sessions (tool, session_id, is_subagent, parent_session_id, parent_tool)
+                 VALUES ('antigravity', 'ag-child', 1, 'aaaa1111', 'claude-code'),
+                        ('codex', 'cx-grandchild', 1, 'ag-child', 'antigravity');
+                 INSERT INTO requests (tool, request_key, session_id, is_subagent, ts_ms, input_tokens)
+                 VALUES ('antigravity', 'r1', 'ag-child', 1, 10, 5),
+                        ('codex', 'r2', 'cx-grandchild', 1, 20, 5),
+                        ('claude-code', 'r3', 'aaaa1111', 0, 30, 5);",
+            )
+            .unwrap();
+        let r = label_report(&s.conn, 0).unwrap();
+        let coding = r.labels.iter().find(|x| x.label == "coding").unwrap();
+        assert_eq!(coding.subagent_sessions, 4);
+        let sum = summary_by_label(&s.conn, None, 0).unwrap();
+        let by_tool: Vec<_> = sum
+            .groups
+            .iter()
+            .filter(|g| g.label == "coding")
+            .map(|g| (g.tool.as_str(), g.tokens.requests))
+            .collect();
+        assert_eq!(
+            by_tool,
+            vec![("antigravity", 1), ("claude-code", 1), ("codex", 1)]
+        );
+        assert!(sum.groups.iter().all(|g| g.label != UNLABELLED));
     }
 
     #[test]

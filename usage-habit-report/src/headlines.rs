@@ -213,6 +213,40 @@ pub fn refresh(conn: &mut Connection, sources: &Sources) -> Result<usize> {
         };
         tx.execute("UPDATE sessions SET display_title = ?3, title_source = ?4 WHERE tool = ?1 AND session_id = ?2 AND (display_title IS NOT ?3 OR title_source IS NOT ?4)", params![tool, id, title, source])?;
     }
+    label_from_headlines(&tx)?;
     tx.commit()?;
     Ok(skipped)
+}
+
+/// Root sessions (top-level ones, and subagents whose parent is unknown) whose
+/// opening prompt was never seen (no user turn in the log, or logs ingested
+/// before labels existed) have no task label. When such a session has a
+/// headline, classify that instead, under `label_source =
+/// 'headline'`, so its requests leave the `unlabelled` column. A hand-set label
+/// still wins at query time, and a later rule label is never overwritten here.
+fn label_from_headlines(tx: &rusqlite::Transaction) -> Result<usize> {
+    let rows = tx
+        .prepare(
+            "SELECT tool, session_id, display_title FROM sessions
+             WHERE label IS NULL AND parent_session_id IS NULL
+               AND display_title IS NOT NULL",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut n = 0;
+    for (tool, id, title) in rows {
+        let label = crate::labels::classify(&title);
+        n += tx.execute(
+            "UPDATE sessions SET label = ?3, label_source = 'headline'
+             WHERE tool = ?1 AND session_id = ?2 AND label IS NULL",
+            params![tool, id, label],
+        )?;
+    }
+    Ok(n)
 }

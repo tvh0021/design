@@ -339,3 +339,43 @@ fn headline_reaches_cli_mcp_private_lists_and_fanout() {
     assert_eq!(value["display_title"], "Repair the demo parser");
     assert_eq!(value["title_source"], "codex-name");
 }
+
+#[test]
+fn unlabelled_top_level_sessions_take_a_label_from_their_headline() {
+    let mut s = Store::open_in_memory().unwrap();
+    seed(&s);
+    s.conn
+        .execute_batch(
+            "UPDATE sessions SET label = 'coding', label_source = 'rule' WHERE session_id = 'plain';
+             INSERT INTO sessions (tool, session_id, is_subagent, parent_session_id, title)
+             VALUES ('codex', 'child', 1, 'bbbbbbbb-0000-4000-8000-00000000000b', 'Review demo helpers');",
+        )
+        .unwrap();
+    headlines::refresh(&mut s.conn, &sources()).unwrap();
+    let labels: Vec<(String, Option<String>, Option<String>)> = s
+        .conn
+        .prepare("SELECT session_id, label, label_source FROM sessions ORDER BY session_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let get = |id: &str| labels.iter().find(|l| l.0 == id).unwrap().clone();
+    // A headline such as "Review demo helpers" classifies as review.
+    assert_eq!(
+        get(B),
+        (B.into(), Some("review".into()), Some("headline".into()))
+    );
+    // Every top-level session with a headline now has a label.
+    for id in [A, C, "demo-conversation", "t3-only"] {
+        let (_, label, source) = get(id);
+        assert!(label.is_some(), "{id}");
+        assert_eq!(source.as_deref(), Some("headline"), "{id}");
+    }
+    // An existing rule label is kept, subagents are skipped, and a session
+    // with no headline at all stays unlabelled.
+    assert_eq!(get("plain").1.as_deref(), Some("coding"));
+    assert_eq!(get("plain").2.as_deref(), Some("rule"));
+    assert_eq!(get("child").1, None);
+    assert_eq!(get("empty").1, None);
+}

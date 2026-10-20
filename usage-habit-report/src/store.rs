@@ -40,7 +40,7 @@ const MIGRATIONS: &[&str] = &[
         t3_thread_id      TEXT,                -- 05
         t3_title          TEXT,                -- 05
         label             TEXT,                -- 06: task kind
-        label_source      TEXT,                -- 06: 'rule' | 'manual'
+        label_source      TEXT,                -- 06: 'rule' | 'manual' | 'headline' (16)
         UNIQUE (tool, session_id)
     );
     CREATE INDEX sessions_parent ON sessions (tool, parent_session_id);
