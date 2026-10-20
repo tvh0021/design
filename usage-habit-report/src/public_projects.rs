@@ -1,5 +1,5 @@
 //! Explicit public-project opt-ins from the application's config file.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::BTreeMap;
 
 pub fn name(url: &str) -> &str {
@@ -18,7 +18,7 @@ fn quoted(input: &str) -> Option<(String, &str)> {
     }
 }
 
-fn setting(line: &str) -> Option<(String, String)> {
+pub(crate) fn setting(line: &str) -> Option<(String, String)> {
     let (path, tail) = quoted(line)?;
     let (url, tail) = quoted(tail.trim_start().strip_prefix('=')?)?;
     if !tail.trim().is_empty() && !tail.trim_start().starts_with('#') {
@@ -45,33 +45,8 @@ fn setting(line: &str) -> Option<(String, String)> {
     Some((path, url))
 }
 
-pub fn parse(text: &str) -> BTreeMap<String, String> {
-    let mut projects = BTreeMap::new();
-    let mut active = false;
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            active = line.split('#').next().unwrap_or("").trim() == "[public_projects]";
-        } else if active && !line.is_empty() && !line.starts_with('#') {
-            if let Some((path, url)) = setting(line) {
-                projects.insert(path, url);
-            } else {
-                eprintln!(
-                    "warning: ignoring malformed public_projects setting on line {}",
-                    index + 1
-                );
-            }
-        }
-    }
-    projects
-}
-
 pub fn load() -> Result<BTreeMap<String, String>> {
-    match std::fs::read_to_string(crate::paths::config_file()?) {
-        Ok(text) => Ok(parse(&text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(e).context("reading usage-habit-report public projects config"),
-    }
+    Ok(crate::config::load()?.public_projects)
 }
 
 #[cfg(test)]
@@ -80,7 +55,7 @@ mod tests {
 
     #[test]
     fn quoted_paths_urls_comments_and_sections() {
-        let projects = parse(
+        let projects = crate::config::parse(
             r#"
 [sources]
 codex_state_dir = '/home/demo/.codex'
@@ -88,9 +63,11 @@ codex_state_dir = '/home/demo/.codex'
 "/home/demo/a=b" = "https://github.com/demo/alpha" # comment
 '/home/demo/b' = 'https://github.com/demo/alpha/'
 [publish]
-invalid = 'ignored'
+push = false
 "#,
-        );
+        )
+        .unwrap()
+        .public_projects;
         assert_eq!(projects.len(), 2);
         assert_eq!(name(&projects["/home/demo/a=b"]), "alpha");
         assert_eq!(name(&projects["/home/demo/b"]), "alpha");
@@ -108,7 +85,12 @@ invalid = 'ignored'
             "'/home/demo/a' = 'https://github.com/demo/repo/issues'",
             "'/home/demo/a' = 'https://github.com/demo/..'",
         ] {
-            assert!(parse(&format!("[public_projects]\n{line}")).is_empty());
+            assert!(
+                crate::config::parse(&format!("[public_projects]\n{line}"))
+                    .unwrap()
+                    .public_projects
+                    .is_empty()
+            );
         }
     }
 }

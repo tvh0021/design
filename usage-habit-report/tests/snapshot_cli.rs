@@ -1,7 +1,11 @@
 //! Public export privacy checks never print private values, even on failure.
 use rusqlite::{Connection, OpenFlags};
 use std::{collections::BTreeSet, path::Path, process::Command};
-use usage_habit_report::{serve::html, store::Store};
+use usage_habit_report::{
+    privacy::{body_text, contains_whole_word, word_candidate_matches},
+    serve::html,
+    store::Store,
+};
 
 fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
     export_with_config(db, out, window, None)
@@ -20,7 +24,8 @@ fn export_with_config(
         .arg(db)
         .arg("snapshot")
         .arg("--out")
-        .arg(out);
+        .arg(out)
+        .env("XDG_CONFIG_HOME", db.parent().unwrap().join("config"));
     if let Some(w) = window {
         cmd.args(["--window", w]);
     }
@@ -35,40 +40,6 @@ fn export_with_config(
     output
 }
 
-// The snapshot templates emit lowercase style/script tags with no attributes.
-fn body_text(document: &str) -> String {
-    let mut body = document.to_owned();
-    for tag in ["style", "script"] {
-        let opening = format!("<{tag}>");
-        let closing = format!("</{tag}>");
-        while let Some(start) = body.find(&opening) {
-            let end = body[start + opening.len()..]
-                .find(&closing)
-                .expect("inline asset has no closing tag")
-                + start
-                + opening.len()
-                + closing.len();
-            body.replace_range(start..end, "");
-        }
-    }
-    body
-}
-
-fn is_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn contains_whole_word(body: &str, candidate: &str) -> bool {
-    body.char_indices().any(|(start, _)| {
-        if !body[start..].starts_with(candidate) {
-            return false;
-        }
-        let end = start + candidate.len();
-        (start == 0 || !is_word(body.as_bytes()[start - 1]))
-            && (end == body.len() || !is_word(body.as_bytes()[end]))
-    })
-}
-
 fn page_vocabulary(out: &Path) -> BTreeSet<String> {
     std::fs::read_dir(out)
         .unwrap()
@@ -80,12 +51,6 @@ fn page_vocabulary(out: &Path) -> BTreeSet<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-fn word_candidate_matches(body: &str, candidate: &str, vocabulary: &BTreeSet<String>) -> bool {
-    candidate.chars().count() >= 3
-        && !vocabulary.contains(candidate)
-        && contains_whole_word(body, candidate)
 }
 
 #[test]
@@ -117,90 +82,15 @@ fn assert_redacted_with_allowlist(
     vocabulary: &BTreeSet<String>,
     allowlist: &std::collections::BTreeMap<String, String>,
 ) {
-    // Exact categories retain whole-file raw and escaped substring checks.
-    // Word categories use body text, a minimum length, and fixture vocabulary.
-    let columns = [
-        ("session_id", "session_id", false),
-        ("t3_thread_id", "t3_thread_id", false),
-        ("project", "project_path", false),
-        ("project", "project_folder", true),
-        ("project_name", "project_name", true),
-        ("title", "title", true),
-        ("display_title", "display_title", false),
-        ("cwd", "cwd", false),
-        ("t3_title", "t3_title", false),
-    ];
-    let mut categories = Vec::new();
-    for (column, category, word_match) in columns {
-        let mut stmt = conn.prepare(&format!("SELECT DISTINCT {column} FROM sessions WHERE {column} IS NOT NULL AND {column} != ''")).unwrap();
-        let values: Vec<String> = stmt
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let mut needles = BTreeSet::new();
-        for value in values {
-            let value = if column == "title" || column == "t3_title" {
-                value.chars().take(20).collect::<String>()
-            } else if category == "project_folder" {
-                let Some(name) = Path::new(&value).file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                name.to_owned()
-            } else {
-                value
-            };
-            if word_match
-                && allowlist
-                    .values()
-                    .any(|url| usage_habit_report::public_projects::name(url) == value)
-            {
-                continue;
-            }
-            needles.insert(html::esc(&value));
-            needles.insert(value);
-        }
-        categories.push((category, needles, word_match));
-    }
+    usage_habit_report::privacy::check(conn, out, None, allowlist, vocabulary).unwrap();
     let files: Vec<_> = std::fs::read_dir(out)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
     assert_eq!(files.len(), 16);
-    let mut matches = vec![0usize; categories.len()];
     for file in &files {
         let body = std::fs::read_to_string(file).unwrap();
-        // Public URLs can contain words that also name private projects.
-        // Exclude only those exact URLs from word checks; path/id checks
-        // still inspect the complete file below.
-        let mut word_body = body.clone();
-        for url in allowlist.values() {
-            word_body = word_body.replace(&html::esc(url), "");
-        }
-        let text = body_text(&word_body);
-        for (i, (_, needles, word_match)) in categories.iter().enumerate() {
-            matches[i] += needles
-                .iter()
-                .filter(|candidate| {
-                    if *word_match {
-                        word_candidate_matches(&text, candidate, vocabulary)
-                    } else {
-                        body.contains(candidate.as_str())
-                    }
-                })
-                .count();
-        }
-        // All resources are inline; external navigation needs an exact opt-in.
-        let mut without_public_urls = body.clone();
-        for url in allowlist.values() {
-            without_public_urls = without_public_urls
-                .replace(&html::esc(url), "")
-                .replace(url, "");
-        }
-        assert!(
-            !without_public_urls.contains("https://"),
-            "unapproved external URL found"
-        );
+
         for forbidden in [
             "http://",
             "src=",
@@ -226,31 +116,6 @@ fn assert_redacted_with_allowlist(
         }
         assert!(body.contains(html::CSS));
         assert!(body.contains(html::JS));
-    }
-    for ((category, needles, word_match), count) in categories.iter().zip(&matches) {
-        let skipped = needles
-            .iter()
-            .filter(|s| *word_match && s.chars().count() < 3)
-            .count();
-        let page_words = needles
-            .iter()
-            .filter(|s| *word_match && s.chars().count() >= 3 && vocabulary.contains(*s))
-            .count();
-        eprintln!(
-            "redaction {category}: {} candidates, {skipped} skipped short, {page_words} fixture vocabulary, {count} matches",
-            needles.len(),
-        );
-    }
-    for ((category, _, word_match), count) in categories.iter().zip(&matches) {
-        let rule = if *word_match {
-            "body whole-word rule after minimum-length and fixture-vocabulary exclusions"
-        } else {
-            "whole-file exact-substring rule"
-        };
-        assert_eq!(
-            *count, 0,
-            "redaction {category} failed {rule}; counts only, no private strings"
-        );
     }
 }
 
@@ -324,6 +189,7 @@ fn invalid_window_and_missing_store_write_nothing() {
         let output = Command::new(env!("CARGO_BIN_EXE_usage-habit-report"))
             .arg("--db")
             .arg(&db)
+            .env("XDG_CONFIG_HOME", tmp.path().join("config"))
             .arg("snapshot")
             .arg("--out")
             .arg(&out)
@@ -358,7 +224,11 @@ fn real_store_snapshot_is_redacted() {
     let config = std::env::var_os("USAGE_HABIT_REPORT_CONFIG").map(std::path::PathBuf::from);
     let allowlist = config
         .as_ref()
-        .map(|p| usage_habit_report::public_projects::parse(&std::fs::read_to_string(p).unwrap()))
+        .map(|p| {
+            usage_habit_report::config::parse(&std::fs::read_to_string(p).unwrap())
+                .unwrap()
+                .public_projects
+        })
         .unwrap_or_default();
     let output = export_with_config(&db, tmp.path(), None, config.as_deref());
     // CLI stdout contains counts and duration only.
@@ -420,7 +290,9 @@ malformed setting
         String::from_utf8_lossy(&result.stderr)
             .contains("warning: ignoring malformed public_projects setting")
     );
-    let allowlist = usage_habit_report::public_projects::parse(text);
+    let allowlist = usage_habit_report::config::parse(text)
+        .unwrap()
+        .public_projects;
     assert_redacted_with_allowlist(&store.conn, &out, &BTreeSet::new(), &allowlist);
     let body = std::fs::read_to_string(out.join("index-all.html")).unwrap();
     assert_eq!(

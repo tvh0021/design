@@ -1,5 +1,5 @@
 //! Optional harness headlines, refreshed independently of transcript cursors.
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
 use std::{
     collections::HashMap,
@@ -23,53 +23,14 @@ impl Sources {
             codex_session_index: codex_home.join("session_index.jsonl"),
             antigravity_summaries: home.join(".gemini/antigravity/conversation_summaries.db"),
         };
-        let config = crate::paths::config_file()?;
-        let text = match std::fs::read_to_string(&config) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e).context("reading usage-habit-report config"),
-        };
-        // Only quoted scalar source paths are supported. Never inspect a
-        // harness's own config file, which may contain credentials.
-        let mut sources = false;
-        for line in text.lines().map(str::trim) {
-            if line.starts_with('[') {
-                sources = line == "[sources]";
-                continue;
-            }
-            if !sources || line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                bail!("invalid sources setting");
-            };
-            let slot = match key.trim() {
+        for (key, value) in crate::config::load()?.sources {
+            let slot = match key.as_str() {
                 "codex_state_dir" => &mut out.codex_state_dir,
                 "codex_session_index" => &mut out.codex_session_index,
                 "antigravity_summaries" => &mut out.antigravity_summaries,
-                _ => bail!("unknown sources setting"),
+                _ => unreachable!(),
             };
-            let value = value.trim();
-            let path: String = if let Some(value) = value.strip_prefix('\'') {
-                let (path, tail) = value.split_once('\'').context("unterminated source path")?;
-                if !tail.trim().is_empty() && !tail.trim().starts_with('#') {
-                    bail!("invalid source path");
-                }
-                path.to_owned()
-            } else {
-                let mut stream = serde_json::Deserializer::from_str(value).into_iter::<String>();
-                let path = stream.next().context("missing source path")??;
-                let tail = value[stream.byte_offset()..].trim();
-                if !tail.is_empty() && !tail.starts_with('#') {
-                    bail!("invalid source path");
-                }
-                path
-            };
-            *slot = if let Some(path) = path.strip_prefix("~/") {
-                home.join(path)
-            } else {
-                path.into()
-            };
+            *slot = value;
         }
         Ok(out)
     }

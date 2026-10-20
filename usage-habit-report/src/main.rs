@@ -24,7 +24,7 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     offline: bool,
-    /// Skip the catch-up that every `query` otherwise starts with (scan, enrich, price).
+    /// Skip catch-up before queries and publishing (scan, enrich, headlines, price).
     #[arg(long, global = true)]
     no_scan: bool,
     #[command(subcommand)]
@@ -94,6 +94,13 @@ enum Command {
         #[arg(long, value_parser = ["1w", "4w", "12w", "all"])]
         window: Option<String>,
     },
+    /// Refresh, check, and optionally commit and push the public snapshot.
+    Publish {
+        #[arg(long)]
+        no_push: bool,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Open the dashboard: a loopback-only web page rendered from the store.
     Serve {
         /// Port on 127.0.0.1; 0 picks a free one. The URL is printed.
@@ -102,6 +109,9 @@ enum Command {
         /// Do not open the browser.
         #[arg(long)]
         no_open: bool,
+        /// Skip the configured public snapshot refresh.
+        #[arg(long)]
+        no_publish: bool,
     },
 }
 
@@ -426,8 +436,54 @@ fn main() -> Result<()> {
         Some(p) => p,
         None => paths::default_db()?,
     };
-    if let Command::Serve { port, no_open } = cli.command {
-        // Read-only: the dashboard never opens the store for writing.
+    if let Command::Publish { no_push, ref out } = cli.command {
+        let config = usage_habit_report::config::load()?;
+        let out = out
+            .as_ref()
+            .or(config.publish_dir.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("publish requires --out or [publish] dir"))?;
+        if !cli.no_scan {
+            catch_up(&mut Store::open(&db)?, cli.offline)?;
+        }
+        println!(
+            "{}",
+            usage_habit_report::publish::run(
+                &db,
+                out,
+                !no_push && config.publish_push.unwrap_or(true),
+                scan::now_ms()
+            )?
+        );
+        return Ok(());
+    }
+    if let Command::Serve {
+        port,
+        no_open,
+        no_publish,
+    } = cli.command
+    {
+        if !no_publish {
+            let result = (|| -> Result<()> {
+                let config = usage_habit_report::config::load()?;
+                if let Some(out) = config.publish_dir {
+                    if !cli.no_scan {
+                        catch_up(&mut Store::open(&db)?, cli.offline)?;
+                    }
+                    let summary = usage_habit_report::publish::run(
+                        &db,
+                        &out,
+                        config.publish_push.unwrap_or(true),
+                        scan::now_ms(),
+                    )?;
+                    eprintln!("{summary}");
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("warning: publish failed: {e}");
+            }
+        }
+        // The scan connection is closed before the server opens read-only.
         return serve::run(
             &db,
             serve::Options {
@@ -685,7 +741,7 @@ fn main() -> Result<()> {
             );
             print_price_stats(&stats);
         }
-        Command::Serve { .. } | Command::Snapshot { .. } => {
+        Command::Serve { .. } | Command::Snapshot { .. } | Command::Publish { .. } => {
             unreachable!("handled before the store is opened")
         }
     }
