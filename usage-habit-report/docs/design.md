@@ -146,7 +146,7 @@ A 4px base. Tokens: `--s-1` 4px, `--s-2` 8px, `--s-3` 12px, `--s-4` 16px,
 - Within a section, title to body is `--s-3`; table cells have `--s-2`
   vertical padding; map cells have a 2px gap so the grid reads as one
   instrument, not 168 tiles.
-- Max content width 1120px, left-aligned on wider screens.
+- No maximum content width: the page spans the viewport, with `--s-6` padding on each side.
 
 ## Layout
 

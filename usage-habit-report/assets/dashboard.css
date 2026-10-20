@@ -24,7 +24,7 @@
   --s-6: 24px;
   --s-8: 32px;
   --s-12: 48px;
-  --measure: 1120px;
+  --measure: none;
 }
 @media (prefers-color-scheme: dark) {
   :root {
