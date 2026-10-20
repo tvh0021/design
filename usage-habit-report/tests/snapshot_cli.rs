@@ -318,3 +318,64 @@ malformed setting
         .is_err()
     );
 }
+
+#[test]
+fn template_words_pass_without_exempting_unusual_project_words() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    let store = fixture_store(&db);
+    store.conn.execute_batch("UPDATE sessions SET project = '/home/demo/project', project_name = 'project' WHERE is_subagent = 0; UPDATE sessions SET project = '/home/demo/sessions', project_name = 'sessions' WHERE is_subagent = 1;").unwrap();
+    let out = tmp.path().join("out");
+    export(&db, &out, None);
+    assert_redacted(&store.conn, &out, &BTreeSet::new());
+
+    store.conn.execute_batch("UPDATE sessions SET project = '/home/demo/zyqfolder', project_name = 'zyqfolder' WHERE is_subagent = 0;").unwrap();
+    export(&db, &out, None);
+    assert_redacted(&store.conn, &out, &BTreeSet::new());
+    let page = out.join("index.html");
+    let body = std::fs::read_to_string(&page).unwrap();
+    std::fs::write(&page, format!("{body}<p>zyqfolder</p>")).unwrap();
+    assert!(
+        usage_habit_report::privacy::check(
+            &store.conn,
+            &out,
+            None,
+            &Default::default(),
+            &BTreeSet::new()
+        )
+        .is_err()
+    );
+    // Caller vocabulary is unioned with the template vocabulary.
+    usage_habit_report::privacy::check(
+        &store.conn,
+        &out,
+        None,
+        &Default::default(),
+        &BTreeSet::from(["zyqfolder".into()]),
+    )
+    .unwrap();
+    // Even an exempt template word cannot exempt a full path in an asset.
+    std::fs::write(&page, "<script>/home/demo/sessions</script>").unwrap();
+    assert!(
+        usage_habit_report::privacy::check(
+            &store.conn,
+            &out,
+            None,
+            &Default::default(),
+            &BTreeSet::new()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn template_vocabulary_uses_maximal_ascii_words_and_redaction_constants() {
+    let words = usage_habit_report::privacy::template_vocabulary(1792384200000).unwrap();
+    for word in ["project", "unknown", "sessions", "models", "section"] {
+        assert!(words.contains(word));
+    }
+    assert!(words.iter().all(
+        |word| word.len() >= 3 && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    ));
+    assert!(!words.contains("zyqfolder"));
+}

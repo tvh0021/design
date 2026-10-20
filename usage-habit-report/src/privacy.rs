@@ -47,10 +47,25 @@ pub fn word_candidate_matches(body: &str, candidate: &str, vocabulary: &BTreeSet
         && contains_whole_word(body, candidate)
 }
 
+/// Derive word exclusions from every public window and tool template.
+pub fn template_vocabulary(now_ms: i64) -> Result<BTreeSet<String>> {
+    let store = crate::store::Store::open_in_memory()?;
+    let mut vocabulary = crate::serve::snapshot::pseudonym_vocabulary(&store.conn)?;
+    for (_, page) in crate::serve::snapshot::render_pages(&store.conn, None, now_ms)? {
+        vocabulary.extend(
+            body_text(&page)
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|word| word.len() >= 3)
+                .map(str::to_owned),
+        );
+    }
+    Ok(vocabulary)
+}
+
 /// Check every exported file, including inline assets, before publishing.
 /// Public repo names and exact URLs bypass word checks only. Paths and IDs
-/// remain forbidden throughout each file. Production callers use an empty
-/// vocabulary; fixture audits can exclude known template words.
+/// remain forbidden throughout each file. Template words and caller-supplied
+/// vocabulary are excluded only from word checks.
 pub fn check(
     conn: &Connection,
     out: &Path,
@@ -100,7 +115,10 @@ pub fn check(
             bail!("privacy guard failed: unapproved external URL found in export");
         }
     }
-    if audit(conn, out, vocabulary, public_projects)?
+    let mut vocabulary = vocabulary.clone();
+    vocabulary.extend(template_vocabulary(crate::scan::now_ms())?);
+    vocabulary.extend(crate::serve::snapshot::pseudonym_vocabulary(conn)?);
+    if audit(conn, out, &vocabulary, public_projects)?
         .iter()
         .any(|count| count.matches > 0)
     {
@@ -110,7 +128,7 @@ pub fn check(
 }
 
 /// Counts from the original snapshot audit, including project-word checks.
-/// Fixture vocabulary keeps common page words out of the optional word audit.
+/// The supplied vocabulary keeps common page words out of the word audit.
 pub struct AuditCount {
     pub category: &'static str,
     pub candidates: usize,
@@ -135,7 +153,7 @@ pub fn audit(
     public_projects: &BTreeMap<String, String>,
 ) -> Result<Vec<AuditCount>> {
     // Exact categories retain whole-file raw and escaped substring checks.
-    // Word categories use body text, a minimum length, and fixture vocabulary.
+    // Word categories use body text, a minimum length, and the supplied vocabulary.
     let columns = [
         ("session_id", "session_id", false),
         ("t3_thread_id", "t3_thread_id", false),

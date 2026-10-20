@@ -501,3 +501,19 @@ fn public_allowlist_exempts_words_and_urls_but_never_paths_or_ids() {
         );
     }
 }
+
+#[test]
+fn publish_accepts_project_folders_that_collide_with_template_words() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = fixture(&tmp.path().join("usage.db"));
+    store.conn.execute_batch("UPDATE sessions SET project = '/home/demo/project', project_name = 'project'; INSERT INTO sessions (tool, session_id, project, project_name) VALUES ('codex', 'second-fixture-id', '/home/demo/sessions', 'sessions');").unwrap();
+    let root = tmp.path().join("repo");
+    repo(&root);
+    let out = root.join("site");
+    let result = cli(
+        tmp.path(),
+        &["publish", "--no-push", "--out", out.to_str().unwrap()],
+    );
+    assert!(result.status.success(), "template-word publish failed");
+    assert_eq!(std::fs::read_dir(out).unwrap().count(), 16);
+}
