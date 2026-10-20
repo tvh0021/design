@@ -8,8 +8,9 @@
 //! name, most specific first.
 
 /// Raw names that the rules below cannot derive. Checked first.
-/// Keys are lowercase.
-const ALIASES: &[(&str, &str)] = &[];
+/// Keys are lowercase. `gemini-pro-default` is Antigravity's label for the
+/// default Gemini Pro of September 2026, which was Gemini 3.1 Pro.
+const ALIASES: &[(&str, &str)] = &[("gemini-pro-default", "gemini-3.1-pro")];
 
 /// Qualifiers that harnesses append to a model name to record the reasoning
 /// effort or mode. They do not change the price. `max` is not stripped from
@@ -185,13 +186,17 @@ mod tests {
         assert_eq!(c("gemini-3.8-flash-n"), "gemini-3.8-flash");
         assert_eq!(c("gemini-4-argon-trial"), "gemini-4-argon");
         // No version, so no base model to fold into.
-        assert_eq!(c("gemini-pro-default"), "gemini-pro-default");
+        assert_eq!(c("gemini-pro-default"), "gemini-3.1-pro");
         assert_eq!(c("codex-auto-review"), "codex-auto-review");
         assert_eq!(c("gemini-3.1-pro-low"), "gemini-3.1-pro");
         assert_eq!(c("gemini-3.5-flash-lite"), "gemini-3.5-flash-lite");
         assert_eq!(c("claude_v5_opus_thinking"), "claude-opus-5");
         assert_eq!(c("MODEL_CLAUDE_4_5_SONNET_THINKING"), "claude-sonnet-4-5");
         assert_eq!(c("gemini_3_8_flash_high"), "gemini-3.8-flash");
+        assert_eq!(
+            canonical("gemini-pro-default").as_deref(),
+            Some("gemini-3.1-pro")
+        );
         assert_eq!(canonical("MODEL_PLACEHOLDER_M26"), None);
         assert_eq!(canonical("  "), None);
     }
