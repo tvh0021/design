@@ -285,6 +285,7 @@ fn cli_summary_json_shape() {
         let out = std::process::Command::new(bin)
             .args(args)
             .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+            .env("USAGE_HABIT_REPORT_OFFLINE", "1")
             .output()
             .unwrap();
         assert!(

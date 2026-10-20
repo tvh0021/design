@@ -67,6 +67,23 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX requests_session ON requests (tool, session_id);
     CREATE INDEX requests_ts ON requests (ts_ms);
     "#,
+    // Ticket 04: a request priced and then changed by a later merge (streamed
+    // records grow the output count) loses its price, so the next price step
+    // recomputes it.
+    r#"
+    CREATE TRIGGER requests_unprice
+    AFTER UPDATE OF model, input_tokens, cache_read_input_tokens,
+                    cache_creation_input_tokens, output_tokens ON requests
+    WHEN (NEW.canonical_model IS NOT NULL OR NEW.cost_usd IS NOT NULL)
+     AND (OLD.model IS NOT NEW.model
+          OR OLD.input_tokens <> NEW.input_tokens
+          OR OLD.cache_read_input_tokens <> NEW.cache_read_input_tokens
+          OR OLD.cache_creation_input_tokens <> NEW.cache_creation_input_tokens
+          OR OLD.output_tokens <> NEW.output_tokens)
+    BEGIN
+        UPDATE requests SET canonical_model = NULL, cost_usd = NULL WHERE id = NEW.id;
+    END;
+    "#,
 ];
 
 pub struct Store {

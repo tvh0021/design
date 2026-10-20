@@ -4,16 +4,20 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, PartialEq)]
 pub struct Tokens {
     pub requests: i64,
     pub input_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
     pub output_tokens: i64,
+    /// Sum of per-request cost estimates; null when no request has a price.
+    pub estimated_cost_usd: Option<f64>,
+    /// Requests left out of `estimated_cost_usd` because their model has no price.
+    pub unpriced_requests: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SummaryGroup {
     pub tool: String,
     pub model: Option<String>,
@@ -27,6 +31,8 @@ pub struct Summary {
     pub generated_at: String,
     /// RFC 3339 lower bound on request time, or null for all time.
     pub since: Option<String>,
+    /// RFC 3339 time the rates behind `estimated_cost_usd` were fetched.
+    pub rates_fetched_at: Option<String>,
     pub totals: Tokens,
     pub groups: Vec<SummaryGroup>,
 }
@@ -36,7 +42,8 @@ pub fn summary(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<
     let mut stmt = conn.prepare(
         r#"SELECT tool, model, COUNT(*),
                   SUM(input_tokens), SUM(cache_read_input_tokens),
-                  SUM(cache_creation_input_tokens), SUM(output_tokens)
+                  SUM(cache_creation_input_tokens), SUM(output_tokens),
+                  SUM(cost_usd), COUNT(*) - COUNT(cost_usd)
            FROM requests
            WHERE ts_ms >= ?1
            GROUP BY tool, model
@@ -54,6 +61,8 @@ pub fn summary(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<
                     cache_read_input_tokens: r.get(4)?,
                     cache_creation_input_tokens: r.get(5)?,
                     output_tokens: r.get(6)?,
+                    estimated_cost_usd: r.get(7)?,
+                    unpriced_requests: r.get(8)?,
                 },
             })
         })?
@@ -65,10 +74,15 @@ pub fn summary(conn: &Connection, since_ms: Option<i64>, now_ms: i64) -> Result<
         totals.cache_read_input_tokens += g.tokens.cache_read_input_tokens;
         totals.cache_creation_input_tokens += g.tokens.cache_creation_input_tokens;
         totals.output_tokens += g.tokens.output_tokens;
+        totals.unpriced_requests += g.tokens.unpriced_requests;
+        if let Some(c) = g.tokens.estimated_cost_usd {
+            *totals.estimated_cost_usd.get_or_insert(0.0) += c;
+        }
     }
     Ok(Summary {
         generated_at: rfc3339(now_ms),
         since: since_ms.map(rfc3339),
+        rates_fetched_at: None,
         totals,
         groups,
     })
@@ -103,7 +117,7 @@ pub fn parse_since(s: &str) -> Result<i64> {
 
 /// Plain-text table for the default (non-JSON) output.
 pub fn render_summary_table(s: &Summary) -> String {
-    let mut rows: Vec<[String; 7]> = vec![[
+    let mut rows: Vec<[String; 8]> = vec![[
         "tool".into(),
         "model".into(),
         "requests".into(),
@@ -111,6 +125,7 @@ pub fn render_summary_table(s: &Summary) -> String {
         "cache_read".into(),
         "cache_create".into(),
         "output".into(),
+        "est. cost".into(),
     ]];
     let line = |tool: &str, model: &str, t: &Tokens| {
         [
@@ -121,6 +136,11 @@ pub fn render_summary_table(s: &Summary) -> String {
             t.cache_read_input_tokens.to_string(),
             t.cache_creation_input_tokens.to_string(),
             t.output_tokens.to_string(),
+            match t.estimated_cost_usd {
+                Some(c) if t.unpriced_requests > 0 => format!("${c:.2}*"),
+                Some(c) => format!("${c:.2}"),
+                None => "-".into(),
+            },
         ]
     };
     for g in &s.groups {
@@ -131,7 +151,7 @@ pub fn render_summary_table(s: &Summary) -> String {
         ));
     }
     rows.push(line("TOTAL", "", &s.totals));
-    let widths: Vec<usize> = (0..7)
+    let widths: Vec<usize> = (0..8)
         .map(|i| rows.iter().map(|r| r[i].len()).max().unwrap_or(0))
         .collect();
     let mut out = String::new();
@@ -150,6 +170,20 @@ pub fn render_summary_table(s: &Summary) -> String {
         out.truncate(out.trim_end().len());
         out.push('\n');
     }
+    out.push_str(&format!(
+        "est. cost: estimated USD at LiteLLM list prices{}",
+        match &s.rates_fetched_at {
+            Some(t) => format!(" (rates fetched {t})"),
+            None => String::new(),
+        }
+    ));
+    if s.totals.unpriced_requests > 0 {
+        out.push_str(&format!(
+            "; * excludes {} requests whose model has no price (see `query models`)",
+            s.totals.unpriced_requests
+        ));
+    }
+    out.push('\n');
     out
 }
 
