@@ -642,15 +642,15 @@ as ambiguous.
 ### `serve`
 
 ```sh
-usage-habit-report serve [--port 7878] [--no-open]
+usage-habit-report serve [--port 7878] [--no-open] [--no-publish]
 ```
 
 Opens the dashboard: one page rendered from the store on
 `http://127.0.0.1:<port>/`. The server only ever binds the loopback address;
-`--port 0` takes a free port, and the URL is printed first either way. The
+`--port 0` takes a free port, and the URL is printed first on stdout. The
 browser opens unless `--no-open` is given. The store is opened read-only on
 every request, so a scan in another terminal shows up on reload and the
-dashboard never prices or migrates anything.
+dashboard never prices or migrates anything after the optional startup publish step.
 
 The page shows an activity map of local-time hour by weekday, shaded by
 uncached input plus output tokens, with a window of 1 week, 4 weeks (default),
@@ -720,9 +720,51 @@ figures stay. A note states the generation date and window; the footer keeps
 the data-load time. Pseudonyms are stable within one run and may change in
 later exports as project costs change.
 
-Review the temporary output before publishing. Copy the reviewed files into
-`usage-habit-report/site/` in the repository and commit them when you want to
-publish. GitHub Pages copies that folder to `/usage/`; the flight visualizer is at `/map/`.
+### Automatic publishing
+
+```sh
+usage-habit-report publish [--no-push] [--out DIR] [--no-scan]
+```
+
+`publish` runs the same catch-up as `query`: scan, enrich, headline refresh,
+and pricing. `--no-scan` exports the existing store. It writes all 16 pages
+into a temporary sibling directory and checks every file for private store
+values, both raw and HTML-escaped. The guard checks paths, session and T3
+thread ids, titles of at least 12 characters, and the home directory. A guard
+failure leaves the previous export untouched and runs no git commands.
+After the guard passes, the new pages replace the destination, including stale files.
+
+Set the destination in `~/.config/usage-habit-report/config.toml`:
+
+```toml
+[publish]
+dir = "/home/demo/git_repos/design/usage-habit-report/site"
+push = true
+```
+
+Paths use the same quoted scalar syntax as `[sources]`, including `~/`
+expansion. `push` accepts `true` or `false` and defaults to `true`.
+`--out` overrides `dir`; without either destination, `publish` fails.
+
+When `dir` is configured, `serve` publishes before binding its port.
+`serve --no-publish` skips this step. Without a publish destination, `serve`
+behaves as before. Publish errors print a warning on stderr and the dashboard
+still starts. The server opens the store read-only after the startup step.
+
+Inside a git repository, `publish` stages only the destination and commits
+changes with `Refresh the public usage snapshot`. It refuses to commit if
+there are already staged changes. Repeating an unchanged export makes no
+commit; changes in generation time and page-load timing alone do not count. Outside a repository,
+it only writes the files.
+
+Before pushing, it checks `git log @{u}..HEAD --format=%s`. Every unpushed
+commit must have the snapshot commit message. If other commits exist, it
+keeps the snapshot commit locally and reports the count of other commits.
+`--no-push` or `push = false` always disables pushing. Git failures, including
+a missing upstream or a network error, fail the standalone command.
+The summary reports the file count, commit result, and push result or reason.
+
+GitHub Pages copies `usage-habit-report/site/` to `/usage/`; the flight visualizer is at `/map/`.
 The deploy workflow uses committed HTML and does not build Rust. The checked-in
 placeholder says that no snapshot has been generated yet.
 

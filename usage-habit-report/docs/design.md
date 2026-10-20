@@ -214,3 +214,12 @@ drops the heaviest fan-outs and the per-tool coverage and lineage notes.
 Active time appears nowhere in the export. Estimated dollar figures round independently to whole dollars,
 including exact aggregates computed before rounding. The spend note explains
 why rounded rows may not add up. All existing visual tokens stay the same.
+
+With `[publish] dir` configured, each local dashboard start regenerates the
+public export before the server binds its port. `serve --no-publish` skips
+this step. The CLI catches up the store, renders into a temporary sibling
+directory, and checks the output for private values before replacing the
+published directory. A privacy failure preserves the previous files. Other
+publish failures also leave the dashboard available. The server's connections
+remain read-only after startup. The standalone `publish` command runs the same
+step; git commits and pushes follow the rules documented in the README.

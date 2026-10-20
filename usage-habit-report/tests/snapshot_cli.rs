@@ -1,7 +1,11 @@
 //! Public export privacy checks never print private values, even on failure.
 use rusqlite::{Connection, OpenFlags};
 use std::{collections::BTreeSet, path::Path, process::Command};
-use usage_habit_report::{serve::html, store::Store};
+use usage_habit_report::{
+    privacy::{body_text, contains_whole_word, word_candidate_matches},
+    serve::html,
+    store::Store,
+};
 
 fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_usage-habit-report"));
@@ -9,7 +13,8 @@ fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
         .arg(db)
         .arg("snapshot")
         .arg("--out")
-        .arg(out);
+        .arg(out)
+        .env("XDG_CONFIG_HOME", db.parent().unwrap().join("config"));
     if let Some(w) = window {
         cmd.args(["--window", w]);
     }
@@ -23,40 +28,6 @@ fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
     output
 }
 
-// The snapshot templates emit lowercase style/script tags with no attributes.
-fn body_text(document: &str) -> String {
-    let mut body = document.to_owned();
-    for tag in ["style", "script"] {
-        let opening = format!("<{tag}>");
-        let closing = format!("</{tag}>");
-        while let Some(start) = body.find(&opening) {
-            let end = body[start + opening.len()..]
-                .find(&closing)
-                .expect("inline asset has no closing tag")
-                + start
-                + opening.len()
-                + closing.len();
-            body.replace_range(start..end, "");
-        }
-    }
-    body
-}
-
-fn is_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn contains_whole_word(body: &str, candidate: &str) -> bool {
-    body.char_indices().any(|(start, _)| {
-        if !body[start..].starts_with(candidate) {
-            return false;
-        }
-        let end = start + candidate.len();
-        (start == 0 || !is_word(body.as_bytes()[start - 1]))
-            && (end == body.len() || !is_word(body.as_bytes()[end]))
-    })
-}
-
 fn page_vocabulary(out: &Path) -> BTreeSet<String> {
     std::fs::read_dir(out)
         .unwrap()
@@ -68,12 +39,6 @@ fn page_vocabulary(out: &Path) -> BTreeSet<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-fn word_candidate_matches(body: &str, candidate: &str, vocabulary: &BTreeSet<String>) -> bool {
-    candidate.chars().count() >= 3
-        && !vocabulary.contains(candidate)
-        && contains_whole_word(body, candidate)
 }
 
 #[test]
@@ -96,65 +61,14 @@ fn word_privacy_rules_preserve_boundaries_case_and_escaped_forms() {
 }
 
 fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>) {
-    // Exact categories retain whole-file raw and escaped substring checks.
-    // Word categories use body text, a minimum length, and fixture vocabulary.
-    let columns = [
-        ("session_id", "session_id", false),
-        ("t3_thread_id", "t3_thread_id", false),
-        ("project", "project_path", false),
-        ("project", "project_folder", true),
-        ("project_name", "project_name", true),
-        ("title", "title", true),
-        ("display_title", "display_title", false),
-        ("cwd", "cwd", false),
-        ("t3_title", "t3_title", false),
-    ];
-    let mut categories = Vec::new();
-    for (column, category, word_match) in columns {
-        let mut stmt = conn.prepare(&format!("SELECT DISTINCT {column} FROM sessions WHERE {column} IS NOT NULL AND {column} != ''")).unwrap();
-        let values: Vec<String> = stmt
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let mut needles = BTreeSet::new();
-        for value in values {
-            let value = if column == "title" || column == "t3_title" {
-                value.chars().take(20).collect::<String>()
-            } else if category == "project_folder" {
-                let Some(name) = Path::new(&value).file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                name.to_owned()
-            } else {
-                value
-            };
-            needles.insert(html::esc(&value));
-            needles.insert(value);
-        }
-        categories.push((category, needles, word_match));
-    }
+    usage_habit_report::privacy::check(conn, out, None).unwrap();
     let files: Vec<_> = std::fs::read_dir(out)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
     assert_eq!(files.len(), 16);
-    let mut matches = vec![0usize; categories.len()];
     for file in &files {
         let body = std::fs::read_to_string(file).unwrap();
-        let text = body_text(&body);
-        for (i, (_, needles, word_match)) in categories.iter().enumerate() {
-            matches[i] += needles
-                .iter()
-                .filter(|candidate| {
-                    if *word_match {
-                        word_candidate_matches(&text, candidate, vocabulary)
-                    } else {
-                        body.contains(candidate.as_str())
-                    }
-                })
-                .count();
-        }
         // All resources are inline; the only navigation is to generated files.
         for forbidden in [
             "http://",
@@ -179,29 +93,19 @@ fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>)
         assert!(body.contains(html::CSS));
         assert!(body.contains(html::JS));
     }
-    for ((category, needles, word_match), count) in categories.iter().zip(&matches) {
-        let skipped = needles
-            .iter()
-            .filter(|s| *word_match && s.chars().count() < 3)
-            .count();
-        let page_words = needles
-            .iter()
-            .filter(|s| *word_match && s.chars().count() >= 3 && vocabulary.contains(*s))
-            .count();
+    for result in usage_habit_report::privacy::audit(conn, out, vocabulary).unwrap() {
         eprintln!(
-            "redaction {category}: {} candidates, {skipped} skipped short, {page_words} fixture vocabulary, {count} matches",
-            needles.len(),
+            "redaction {}: {} candidates, {} skipped short, {} fixture vocabulary, {} matches",
+            result.category,
+            result.candidates,
+            result.skipped_short,
+            result.vocabulary_words,
+            result.matches
         );
-    }
-    for ((category, _, word_match), count) in categories.iter().zip(&matches) {
-        let rule = if *word_match {
-            "body whole-word rule after minimum-length and fixture-vocabulary exclusions"
-        } else {
-            "whole-file exact-substring rule"
-        };
         assert_eq!(
-            *count, 0,
-            "redaction {category} failed {rule}; counts only, no private strings"
+            result.matches, 0,
+            "redaction {} failed; counts only, no private strings",
+            result.category
         );
     }
 }
@@ -210,8 +114,8 @@ fn fixture_store(db: &Path) -> Store {
     let store = Store::open(db).unwrap();
     store.conn.execute_batch(
         "INSERT INTO sessions (tool, session_id, parent_session_id, is_subagent, title, cwd, project, project_name, t3_thread_id, t3_title, started_at_ms, ended_at_ms, label) VALUES
-        ('codex', 'fixture-session-private-id', NULL, 0, 'Fixture private <title> & opening prompt', '/synthetic/private-orchard/work', '/synthetic/private-orchard', 'private-orchard', 'fixture-t3-private-id', 'Fixture private T3 title', 1792380600000, 1792384200000, 'coding'),
-        ('codex', 'fixture-child-private-id', 'fixture-session-private-id', 1, 'Fixture child private title', '/synthetic/private-violet', '/synthetic/private-violet', 'private-violet', 'fixture-child-t3-private-id', 'Fixture child T3 private title', 1792380601000, 1792384200000, NULL);
+        ('codex', 'fixture-session-private-id', NULL, 0, 'Fixture private <title> & opening prompt', '/home/demo/private-orchard/work', '/home/demo/private-orchard', 'private-orchard', 'fixture-t3-private-id', 'Fixture private T3 title', 1792380600000, 1792384200000, 'coding'),
+        ('codex', 'fixture-child-private-id', 'fixture-session-private-id', 1, 'Fixture child private title', '/home/demo/private-violet', '/home/demo/private-violet', 'private-violet', 'fixture-child-t3-private-id', 'Fixture child T3 private title', 1792380601000, 1792384200000, NULL);
         INSERT INTO requests (tool, request_key, session_id, is_subagent, ts_ms, canonical_model, input_tokens, output_tokens, cost_usd) VALUES
         ('codex', 'fixture-private-request-key', 'fixture-session-private-id', 0, 1792380600000, 'synthetic-model', 100, 50, 1.49),
         ('codex', 'fixture-child-request-key', 'fixture-child-private-id', 1, 1792380601000, 'synthetic-model', 50, 20, 0.49);"
@@ -276,6 +180,7 @@ fn invalid_window_and_missing_store_write_nothing() {
         let output = Command::new(env!("CARGO_BIN_EXE_usage-habit-report"))
             .arg("--db")
             .arg(&db)
+            .env("XDG_CONFIG_HOME", tmp.path().join("config"))
             .arg("snapshot")
             .arg("--out")
             .arg(&out)
