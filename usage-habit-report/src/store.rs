@@ -156,6 +156,13 @@ const MIGRATIONS: &[&str] = &[
       SELECT tool, session_id FROM sessions WHERE tool = 'codex' AND agent_type = 'guardian');
     DELETE FROM sessions WHERE tool = 'codex' AND agent_type = 'guardian';
     "#,
+    // v9: preserve the raw opening line beside the refreshed display headline.
+    r#"
+    ALTER TABLE sessions ADD COLUMN display_title TEXT;
+    ALTER TABLE sessions ADD COLUMN title_source TEXT;
+    UPDATE sessions SET display_title = COALESCE(NULLIF(t3_title, ''), title),
+      title_source = CASE WHEN NULLIF(t3_title, '') IS NOT NULL THEN 't3' ELSE 'first-line' END;
+    "#,
 ];
 
 pub struct Store {
@@ -564,7 +571,7 @@ mod active_migration_tests {
             INSERT INTO session_labels VALUES ('codex', 'parent', 'coding', 1), ('codex', 'guardian', 'review', 1);
             INSERT INTO codex_cursors VALUES (2, '{\"agent_type\":\"guardian\"}');").unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         for table in ["requests", "session_events", "sessions"] {
             let count: i64 = store.conn.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE tool = 'codex' AND session_id IN ('guardian', 'empty-guardian')"),
@@ -680,7 +687,7 @@ mod active_migration_tests {
             INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms) VALUES ('codex', 'demo', 1, 'request', 0);
             INSERT INTO codex_cursors VALUES (1, '{}');").unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         for table in ["requests", "session_labels", "sessions"] {
             assert_eq!(
                 store

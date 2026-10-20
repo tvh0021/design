@@ -599,7 +599,7 @@ fn agents_panel(p: &Page) -> String {
             let _ = write!(
                 body,
                 "<tr><td class=\"title\">{}</td><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                title_cell(f.title.as_deref()),
+                title_cell(f.display_title.as_deref().or(f.title.as_deref())),
                 tool_name(&f.tool),
                 fmt_int(f.subagent_count as i64),
                 fmt_int(f.max_concurrent_fanout as i64),

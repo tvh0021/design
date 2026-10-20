@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
-    agents, antigravity, codex, labels, mcp, paths, project, query, rates, scan, serve,
+    agents, antigravity, codex, headlines, labels, mcp, paths, project, query, rates, scan, serve,
     store::Store, t3,
 };
 
@@ -274,6 +274,7 @@ fn ingest(store: &mut Store, args: ScanArgs) -> Result<Ingest> {
         Some(p) => p,
         None => codex::default_home()?,
     };
+    let title_sources = headlines::Sources::load(&codex_home)?;
     let c = codex::scan_codex(store, &codex_home)?;
     let cs = &c.report.stats;
     files_read += cs.files_read;
@@ -333,6 +334,12 @@ fn ingest(store: &mut Store, args: ScanArgs) -> Result<Ingest> {
         e.t3.sessions_linked,
         e.elapsed.as_secs_f64(),
     ));
+    let skipped = headlines::refresh(&mut store.conn, &title_sources)?;
+    if skipped > 0 {
+        lines.push(format!(
+            "headlines: {skipped} missing or unreadable title sources skipped"
+        ));
+    }
     Ok(Ingest {
         lines,
         files_read,

@@ -16,7 +16,7 @@ Conventions:
   echoed `since` field is the resulting lower bound (`null` for all time).
 - No prompt or response text appears anywhere. The only free text is a
   session `title` (first line of the opening prompt, 120 characters at most)
-  and a T3 thread title.
+  and existing harness or T3 thread headlines.
 - Exit codes: 0 found, 1 not found, 2 ambiguous (`query project`,
   `query session`, `query thread`). With `--json` the error body is on stdout;
   a one-line message is on stderr either way.
@@ -64,6 +64,8 @@ Ambiguous (exit 2):
 | `project` | string? |
 | `t3_thread_id` | string? |
 | `started_at` | string? |
+| `display_title` | string? |
+| `title_source` | string? |
 
 ## `query session <key>` and `query thread <t3-thread-id>`
 
@@ -99,6 +101,8 @@ the T3 thread id stage. Flags: `--rows`, `--since`, `--json`.
 | `active_seconds` | integer? (whole session and linked descendants, idle gaps removed) |
 | `idle_gap_seconds` | integer (900) |
 | `parent` | object?: `{tool: string, session_id: string, lineage_source: string?}` |
+| `display_title` | string? |
+| `title_source` | string?: `codex-name`, `codex-title`, `antigravity-summary`, `t3`, `first-line` |
 
 `parent` identifies the parent across tools. `lineage_source` is `t3` or
 `timing` for imported T3 delegations, and null for harness-recorded parents.
@@ -229,7 +233,7 @@ top-level session. Token and session-count fields retain their existing meaning.
 | `by_tool[]` | `{tool, top_level_sessions, sessions_with_subagents, subagent_sessions, unlinked_subagent_sessions, subagent_tokens, total_tokens: integer-valued, subagent_token_share: number?}` (`tool` is a string); also `cross_tool_links`, `timing_matched_links`, `parents_with_imported_children` (integers) |
 | `model_mix` | `{main_thread: [ModelMixEntry], subagent: [ModelMixEntry]}`; `ModelMixEntry` is `{model: string?, requests: integer, tokens: integer, request_share: number}` |
 | `subagent_efforts[]` | `{effort: string?, requests: integer}` |
-| `heaviest_fanouts[]` | `{tool: string, session_id: string, title: string?, subagent_count: integer, subagent_models: [{model: string?, requests}], subagent_efforts: [{effort: string?, requests}], subagent_tokens: integer, total_tokens: integer, subagent_token_share: number?, max_concurrent_fanout: integer}`, at most 10 |
+| `heaviest_fanouts[]` | `{tool: string, session_id: string, title: string?, subagent_count: integer, subagent_models: [{model: string?, requests}], subagent_efforts: [{effort: string?, requests}], subagent_tokens: integer, total_tokens: integer, subagent_token_share: number?, max_concurrent_fanout: integer, display_title: string?, title_source: string?}`, at most 10 |
 
 `cross_tool_links` counts imported links whose parent and child tools differ.
 `timing_matched_links` counts imported links with `lineage_source: timing`,
@@ -253,3 +257,16 @@ contribute no subagent counts or fan-out. Source offsets and parser cursors
 remain so incremental scans skip excluded data. Migration v8 removes stored
 guardian sessions, requests, and events and refreshes cached ancestor active
 time. Manual labels survive. This exclusion adds no JSON fields.
+
+## Session display titles
+
+Session reports, ambiguous session candidates, and `heaviest_fanouts[]` add
+nullable `display_title` and `title_source`. Existing `title` stays the raw
+first line of the opening prompt. The display title uses the harness headline,
+then the T3 title, then the first line. Codex `name` or index `thread_name`
+uses `codex-name`; the weaker SQLite `title` uses `codex-title`.
+Antigravity summaries use `antigravity-summary`. Remaining sources are `t3`
+and `first-line`. Display titles collapse whitespace and keep at most 120
+characters. With no title, `display_title` is null and the source is
+`first-line` after a scan. MCP returns the same additive fields.
+Public snapshots contain none of these titles.

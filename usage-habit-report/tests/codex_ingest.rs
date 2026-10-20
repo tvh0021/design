@@ -142,7 +142,11 @@ fn first_scan_reads_live_and_archived_rollouts() {
     let total: u64 = walkdir::WalkDir::new(fixtures().join("codex"))
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path().extension().is_some_and(|x| x == "jsonl")
+                && e.file_name() != "session_index.jsonl"
+        })
         .map(|e| e.metadata().unwrap().len())
         .sum();
     assert_eq!(s.bytes_read, total);

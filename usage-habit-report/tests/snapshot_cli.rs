@@ -105,6 +105,7 @@ fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>)
         ("project", "project_folder", true),
         ("project_name", "project_name", true),
         ("title", "title", true),
+        ("display_title", "display_title", false),
         ("cwd", "cwd", false),
         ("t3_title", "t3_title", false),
     ];
@@ -215,6 +216,7 @@ fn fixture_store(db: &Path) -> Store {
         ('codex', 'fixture-private-request-key', 'fixture-session-private-id', 0, 1792380600000, 'synthetic-model', 100, 50, 1.49),
         ('codex', 'fixture-child-request-key', 'fixture-child-private-id', 1, 1792380601000, 'synthetic-model', 50, 20, 0.49);"
     ).unwrap();
+    store.conn.execute_batch("UPDATE sessions SET display_title = 'Invented private headline <demo> & example', title_source = 'codex-name'").unwrap();
     store
 }
 
@@ -296,7 +298,9 @@ fn real_store_snapshot_is_redacted() {
         eprintln!("skipped: no home directory");
         return;
     };
-    let db = Path::new(&home).join(".local/share/usage-habit-report/usage.db");
+    let db = std::env::var_os("USAGE_HABIT_REPORT_REAL_STORE_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(&home).join(".local/share/usage-habit-report/usage.db"));
     if !db.is_file() {
         eprintln!("skipped: real store is absent");
         return;

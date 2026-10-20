@@ -540,7 +540,7 @@ pub fn tool_order(tool: &str) -> (usize, String) {
 pub struct SessionLine {
     pub tool: String,
     pub session_id: String,
-    /// `sessions.title`: the first line of the opening prompt, at most 120
+    /// Refreshed display headline, falling back to the opening line, at most 120
     /// characters, stored at ingest. No other prompt text is read.
     pub title: Option<String>,
     pub project: Option<String>,
@@ -573,7 +573,7 @@ pub fn session_lists(
     let run = |order: &str| -> Result<Vec<SessionLine>> {
         let sql = format!(
             r#"WITH {WINDOW_CTE}
-            SELECT s.tool, s.session_id, s.title, s.project, s.project_name,
+            SELECT s.tool, s.session_id, COALESCE(s.display_title, s.title), s.project, s.project_name,
                    {ELAPSED_SQL} AS elapsed, w.n, w.cost, w.unpriced, COALESCE(s.active_ms / 1000, 0) AS active
             FROM w JOIN sessions s ON s.tool = w.tool AND s.session_id = w.session_id
             WHERE NOT EXISTS (SELECT 1 FROM sessions p
@@ -1430,7 +1430,7 @@ pub(crate) mod tests {
                 assert_eq!(s.requests, rep.usage.tokens.requests);
                 assert!(close(s.cost_usd, rep.usage.tokens.estimated_cost_usd));
                 assert_eq!(s.unpriced, rep.usage.tokens.unpriced_requests);
-                assert_eq!(s.title, rep.title);
+                assert_eq!(s.title, rep.display_title.or(rep.title));
             }
             for pair in l.longest.windows(2) {
                 assert!(pair[0].active_seconds >= pair[1].active_seconds);

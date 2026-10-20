@@ -187,6 +187,8 @@ pub struct SessionCandidate {
     pub t3_thread_id: Option<String>,
     /// RFC 3339 UTC time of the session's first record.
     pub started_at: Option<String>,
+    pub display_title: Option<String>,
+    pub title_source: Option<String>,
 }
 
 pub fn session_candidates(conn: &Connection, refs: &[SessionRef]) -> Result<Vec<SessionCandidate>> {
@@ -212,6 +214,16 @@ pub fn session_candidates(conn: &Connection, refs: &[SessionRef]) -> Result<Vec<
                 project,
                 t3_thread_id,
                 started_at: started.map(rfc3339),
+                display_title: conn.query_row(
+                    "SELECT display_title FROM sessions WHERE tool = ?1 AND session_id = ?2",
+                    params![r.tool, r.session_id],
+                    |r| r.get(0),
+                )?,
+                title_source: conn.query_row(
+                    "SELECT title_source FROM sessions WHERE tool = ?1 AND session_id = ?2",
+                    params![r.tool, r.session_id],
+                    |r| r.get(0),
+                )?,
             })
         })
         .collect()
@@ -291,6 +303,8 @@ pub struct SessionReport {
     pub active_seconds: Option<i64>,
     pub idle_gap_seconds: i64,
     pub parent: Option<Parent>,
+    pub display_title: Option<String>,
+    pub title_source: Option<String>,
 }
 
 /// Everything about one session. `since_ms` keeps requests at or after it in
@@ -418,6 +432,8 @@ pub fn session_report(
     let started = started_ms.or(first_ms);
     let ended = ended_ms.or(last_ms);
     Ok(SessionReport {
+        display_title: conn.query_row("SELECT display_title FROM sessions WHERE tool = ?1 AND session_id = ?2", params![tool, sid], |r| r.get(0))?,
+        title_source: conn.query_row("SELECT title_source FROM sessions WHERE tool = ?1 AND session_id = ?2", params![tool, sid], |r| r.get(0))?,
         generated_at: rfc3339(now_ms),
         since: since_ms.map(rfc3339),
         rates_fetched_at: None,
@@ -539,7 +555,11 @@ pub fn render_session(r: &SessionReport) -> String {
             if r.is_subagent { " (subagent)" } else { "" }
         ),
     );
-    line("title", dash(&r.title));
+    line(
+        "title",
+        dash(&r.display_title.as_ref().or(r.title.as_ref()).cloned()),
+    );
+    line("first line", dash(&r.title));
     line("project", dash(&r.project));
     if let Some(p) = &r.parent_session_id {
         line("parent", p.clone());
@@ -688,7 +708,11 @@ pub fn render_session_candidates(key: &str, c: &[SessionCandidate]) -> String {
             x.matched_by.as_str().to_string(),
             x.started_at.clone().unwrap_or_else(|| "-".into()),
             x.project.clone().unwrap_or_else(|| "-".into()),
-            x.title.clone().unwrap_or_else(|| "-".into()),
+            x.display_title
+                .as_ref()
+                .or(x.title.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "-".into()),
         ]);
     }
     out.push_str(&crate::project::table(&tab, 6));
