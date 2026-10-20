@@ -93,6 +93,21 @@ const MIGRATIONS: &[&str] = &[
         UPDATE requests SET canonical_model = NULL, cost_usd = NULL WHERE id = NEW.id;
     END;
     "#,
+    // v4: reserved for ticket 05 (projects, T3 enrichment). Empty here so that
+    // the migration below is v5 on this branch too; the merge replaces this
+    // entry with ticket 05's SQL.
+    "SELECT 1;",
+    // v5 (ticket 06): hand-set task labels. Kept apart from `sessions` so a
+    // rebuild that drops and re-reads the raw-log rows cannot lose them.
+    r#"
+    CREATE TABLE session_labels (
+        tool       TEXT    NOT NULL,
+        session_id TEXT    NOT NULL,
+        label      TEXT    NOT NULL,
+        set_at     INTEGER NOT NULL,           -- epoch ms
+        PRIMARY KEY (tool, session_id)
+    );
+    "#,
 ];
 
 pub struct Store {
@@ -326,6 +341,11 @@ pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET user_turns = 0, title = NULL, started_at_ms = NULL, ended_at_ms = NULL
          WHERE source_id = ?1",
+        params![source_id],
+    )?;
+    // The re-read derives the rule label again (hand-set labels live elsewhere).
+    tx.execute(
+        "UPDATE sessions SET label = NULL, label_source = NULL WHERE source_id = ?1",
         params![source_id],
     )?;
     tx.execute(

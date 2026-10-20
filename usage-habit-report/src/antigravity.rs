@@ -29,6 +29,7 @@
 //! (also 6) and the agent name in field 4.1; `parent_references` rows, when
 //! present, are checked first.
 
+use crate::labels;
 use crate::proto;
 use crate::scan::{ScanStats, now_ms};
 use crate::store::{self, RequestRow, SessionUpdate, Store};
@@ -169,6 +170,8 @@ pub struct Conversation {
     pub parent_session_id: Option<String>,
     pub agent_type: Option<String>,
     pub title: Option<String>,
+    /// Task kind of the opening prompt (see `labels`); the prompt is not kept.
+    pub label: Option<&'static str>,
     /// Workspace from the trajectory metadata (native layout).
     pub cwd: Option<String>,
     pub started_at_ms: Option<i64>,
@@ -300,19 +303,25 @@ fn fallback_model(conn: &Connection, ix: &ModelIndex) -> Result<Option<String>> 
     Ok(None)
 }
 
-/// First line of the prompt text, at most `TITLE_MAX_CHARS` characters.
-fn title_from_prompt(payload: &[u8]) -> Option<String> {
+/// Text of a user prompt step.
+fn prompt_text(payload: &[u8]) -> Option<String> {
     let body = proto::bytes(payload, 19)?;
-    let text = match proto::string(body, 2).filter(|s| !s.trim().is_empty()) {
-        Some(s) => s.to_string(),
-        None => proto::fields(body)
-            .filter(|(n, _)| *n == 3)
-            .filter_map(|(_, v)| match v {
-                proto::Value::Bytes(b) => proto::string(b, 1),
-                _ => None,
-            })
-            .collect::<String>(),
-    };
+    Some(
+        match proto::string(body, 2).filter(|s| !s.trim().is_empty()) {
+            Some(s) => s.to_string(),
+            None => proto::fields(body)
+                .filter(|(n, _)| *n == 3)
+                .filter_map(|(_, v)| match v {
+                    proto::Value::Bytes(b) => proto::string(b, 1),
+                    _ => None,
+                })
+                .collect::<String>(),
+        },
+    )
+}
+
+/// First line of the prompt text, at most `TITLE_MAX_CHARS` characters.
+fn title_from_text(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     Some(line.chars().take(TITLE_MAX_CHARS).collect())
 }
@@ -400,7 +409,11 @@ pub fn read_conversation(conn: &Connection, session_id: &str) -> Result<Conversa
                 c.user_prompt_idxs.push(idx);
                 if c.title.is_none() {
                     let payload: Option<Vec<u8>> = r.get(3)?;
-                    c.title = payload.as_deref().and_then(title_from_prompt);
+                    let text = payload.as_deref().and_then(prompt_text);
+                    c.title = text.as_deref().and_then(title_from_text);
+                    if let (Some(_), Some(text)) = (&c.title, &text) {
+                        c.label = Some(labels::classify(text));
+                    }
                 }
             }
             STEP_GENERATION => {
@@ -612,6 +625,9 @@ fn scan_db(store: &mut Store, db: &Path, st: &mut AntigravityStats) -> Result<()
                 .count() as i64,
         },
     )?;
+    if let (false, Some(label)) = (is_subagent, conv.label) {
+        labels::set_rule_label(&tx, TOOL, &session_id, label)?;
+    }
     tx.execute(
         "UPDATE sessions SET model_source = ?3 WHERE tool = ?1 AND session_id = ?2",
         params![

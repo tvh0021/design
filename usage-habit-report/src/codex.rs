@@ -32,6 +32,7 @@
 //! they set the cumulative baseline and the model but add no requests or turns.
 
 use crate::claude::{make_title, parse_ts_ms};
+use crate::labels;
 use crate::scan::{ScanReport, ScanStats, now_ms};
 use crate::store::{self, RequestRow, SessionUpdate, Store};
 use anyhow::{Context, Result};
@@ -298,6 +299,8 @@ pub struct Chunk {
     stem: String,
     pub requests: Vec<CodexRequest>,
     pub title: Option<String>,
+    /// Task kind of the opening prompt (see `labels`); the prompt is not kept.
+    pub label: Option<&'static str>,
     pub cwd: Option<String>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
@@ -314,6 +317,7 @@ impl Chunk {
             stem: stem.to_string(),
             requests: Vec::new(),
             title: None,
+            label: None,
             cwd: None,
             started_at_ms: None,
             ended_at_ms: None,
@@ -547,7 +551,13 @@ impl Chunk {
         }
         self.user_turns += 1;
         if self.title.is_none() {
-            self.title = typed.iter().find_map(|t| title_from(t));
+            for body in typed.iter().filter_map(|t| request_text(t)) {
+                if let Some(title) = make_title(&body) {
+                    self.title = Some(title);
+                    self.label = Some(labels::classify(&body));
+                    break;
+                }
+            }
         }
     }
 }
@@ -601,9 +611,9 @@ pub fn is_injected(text: &str) -> bool {
     INJECTED_TAGS.contains(&&rest[..end])
 }
 
-/// Title candidate from one typed block. IDE-wrapped prompts give the text
-/// after their `## My request` line, or nothing if that line is missing.
-pub fn title_from(text: &str) -> Option<String> {
+/// The user's own request in one typed block. IDE-wrapped prompts give the
+/// text after their `## My request` line, or nothing if that line is missing.
+fn request_text(text: &str) -> Option<String> {
     let s = text.trim_start();
     let mut lines = s.lines();
     if lines
@@ -611,12 +621,17 @@ pub fn title_from(text: &str) -> Option<String> {
         .any(|l| l.trim_start().starts_with(IDE_REQUEST_HEADER))
     {
         let rest: Vec<&str> = lines.collect();
-        return make_title(&rest.join("\n"));
+        return Some(rest.join("\n"));
     }
     if IDE_WRAPPERS.iter().any(|w| s.starts_with(w)) {
         return None;
     }
-    make_title(s)
+    Some(s.to_string())
+}
+
+/// Title candidate from one typed block (see `request_text`).
+pub fn title_from(text: &str) -> Option<String> {
+    make_title(&request_text(text)?)
 }
 
 /// Value of a string field that starts exactly at `prefix` at byte 0.
@@ -954,6 +969,9 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
                 user_turns: chunk.user_turns,
             },
         )?;
+        if let (false, Some(label)) = (c.is_subagent, chunk.label) {
+            labels::set_rule_label(&tx, TOOL, &session_id, label)?;
+        }
         for r in &chunk.requests {
             if store::upsert_request(&tx, TOOL, &session_id, c.is_subagent, source_id, &r.row)? {
                 stats.rows_added += 1;
