@@ -134,9 +134,9 @@ fn first_scan_reads_live_and_archived_rollouts() {
     let s = &r.report.stats;
     assert_eq!(s.files_seen, 5);
     assert_eq!(s.files_read, 5);
-    // A, B (two files), C (fork subagent), D (archived guardian)
-    assert_eq!(s.sessions_added, 4);
-    assert_eq!(s.rows_added, 3 + 4 + 2 + 1);
+    // A, B (two files), C (fork subagent); D is an internal guardian.
+    assert_eq!(s.sessions_added, 3);
+    assert_eq!(s.rows_added, 3 + 4 + 2);
     assert_eq!(s.bad_lines, 0);
     // bytes_read counts decompressed bytes for .zst files: the fixture sizes.
     let total: u64 = walkdir::WalkDir::new(fixtures().join("codex"))
@@ -146,7 +146,7 @@ fn first_scan_reads_live_and_archived_rollouts() {
         .map(|e| e.metadata().unwrap().len())
         .sum();
     assert_eq!(s.bytes_read, total);
-    assert_eq!(requests_of(&store, D), 1, "archived .zst rollout ingested");
+    assert_eq!(requests_of(&store, D), 0, "archived guardian excluded");
     assert_eq!(r.anomalies.repeated_token_counts, 1);
     assert_eq!(r.anomalies.token_count_without_info, 1);
     assert_eq!(r.anomalies.cached_exceeds_input, 1);
@@ -279,11 +279,22 @@ fn subagents_link_to_parent_and_forked_history_is_not_recounted() {
         (250, 50, 0, 10, Some(0))
     );
 
-    let d = session(&store, D);
-    assert_eq!(d.is_subagent, 1);
-    assert_eq!(d.parent.as_deref(), Some(A));
-    assert_eq!(d.agent_type.as_deref(), Some("guardian"));
-    assert_eq!(d.title.as_deref(), Some("Review this demo action."));
+    for table in ["sessions", "requests", "session_events"] {
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                D
+            ),
+            0
+        );
+    }
+    assert_eq!(
+        usage_habit_report::agents::session_subagents(&store.conn, "codex", A, None)
+            .unwrap()
+            .subagent_count,
+        1
+    );
 }
 
 #[test]
@@ -401,13 +412,12 @@ fn summary_shows_codex_alongside_claude() {
         Some("gpt-demo-1"),
         Some("gpt-demo-mini"),
         Some("gpt-demo-2"),
-        Some("codex-demo-review"),
         None,
     ] {
         assert!(models.contains(&m), "{m:?} in {models:?}");
     }
-    assert_eq!(codex.iter().map(|g| g.tokens.requests).sum::<i64>(), 10);
-    assert_eq!(s.totals.requests, 6 + 10);
+    assert_eq!(codex.iter().map(|g| g.tokens.requests).sum::<i64>(), 9);
+    assert_eq!(s.totals.requests, 6 + 9);
 }
 
 #[test]
@@ -441,7 +451,7 @@ fn cli_scan_reports_codex() {
     ];
     let out = run(&scan);
     assert!(out.contains("codex: 5 files seen, 5 files read"), "{out}");
-    assert!(out.contains("10 rows added, 4 sessions added"), "{out}");
+    assert!(out.contains("9 rows added, 3 sessions added"), "{out}");
     let out = run(&scan);
     assert!(
         out.contains("codex: 5 files seen, 0 files read, 0 bytes read"),

@@ -147,6 +147,15 @@ const MIGRATIONS: &[&str] = &[
       HAVING SUM(model IS NOT 'codex-auto-review') = 0);
     DELETE FROM requests WHERE model = 'codex-auto-review';
     "#,
+    // v8: guardian sessions are internal approval checks, regardless of model.
+    // Keep source offsets and parser cursors so later scans do not re-read them.
+    r#"
+    DELETE FROM requests WHERE (tool, session_id) IN (
+      SELECT tool, session_id FROM sessions WHERE tool = 'codex' AND agent_type = 'guardian');
+    DELETE FROM session_events WHERE (tool, session_id) IN (
+      SELECT tool, session_id FROM sessions WHERE tool = 'codex' AND agent_type = 'guardian');
+    DELETE FROM sessions WHERE tool = 'codex' AND agent_type = 'guardian';
+    "#,
 ];
 
 pub struct Store {
@@ -181,20 +190,39 @@ impl Store {
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = self.conn.transaction()?;
+            // Capture guardian ancestors before v8 deletes their child links.
+            // UNION terminates even if an old store contains a parent cycle.
+            let mut keys = if i == 7 {
+                tx.prepare(
+                    "WITH RECURSIVE ancestors(tool, session_id) AS (
+                        SELECT COALESCE(parent_tool, tool), parent_session_id FROM sessions
+                        WHERE tool = 'codex' AND agent_type = 'guardian' AND parent_session_id IS NOT NULL
+                        UNION
+                        SELECT COALESCE(s.parent_tool, s.tool), s.parent_session_id
+                        FROM sessions s JOIN ancestors a ON s.tool = a.tool AND s.session_id = a.session_id
+                        WHERE s.parent_session_id IS NOT NULL
+                    ) SELECT s.tool, s.session_id FROM sessions s JOIN ancestors a
+                      ON s.tool = a.tool AND s.session_id = a.session_id WHERE s.active_ms IS NOT NULL",
+                )?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             tx.execute_batch(sql)
                 .with_context(|| format!("schema migration to v{}", i + 1))?;
             if i == 6 {
-                let keys = tx
+                keys = tx
                     .prepare("SELECT tool, session_id FROM sessions WHERE active_ms IS NOT NULL")?
                     .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (tool, sid) in keys {
-                    let active = tree_active_ms(&tx, &tool, &sid)?;
-                    tx.execute(
-                        "UPDATE sessions SET active_ms = ?3 WHERE tool = ?1 AND session_id = ?2",
-                        params![tool, sid, active],
-                    )?;
-                }
+            }
+            for (tool, sid) in keys {
+                let active = tree_active_ms(&tx, &tool, &sid)?;
+                tx.execute(
+                    "UPDATE sessions SET active_ms = ?3 WHERE tool = ?1 AND session_id = ?2",
+                    params![tool, sid, active],
+                )?;
             }
             tx.pragma_update(None, "user_version", (i + 1) as i64)?;
             tx.commit()?;
@@ -509,6 +537,73 @@ mod active_migration_tests {
     use super::*;
 
     #[test]
+    fn v8_removes_guardians_keeps_cursors_and_labels_and_refreshes_ancestors() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..7] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute_batch("INSERT INTO sources(id, tool, path, offset, size) VALUES
+            (1, 'codex', '/home/demo/parent', 100, 100),
+            (2, 'codex', '/home/demo/guardian', 200, 200);
+            INSERT INTO sessions(tool, session_id, active_ms) VALUES ('claude-code', 'root', 1200000);
+            INSERT INTO sessions(tool, session_id, source_id, is_subagent, parent_session_id, parent_tool, active_ms)
+                VALUES ('codex', 'parent', 1, 1, 'root', 'claude-code', 1200000);
+            INSERT INTO sessions(tool, session_id, source_id, is_subagent, parent_session_id, agent_type, active_ms)
+                VALUES ('codex', 'guardian', 2, 1, 'parent', 'guardian', 1080000),
+                       ('codex', 'empty-guardian', 2, 1, 'parent', 'guardian', 0);
+            INSERT INTO sessions(tool, session_id, agent_type) VALUES ('claude-code', 'ordinary', 'guardian');
+            INSERT INTO session_events VALUES
+                (1, 'codex', 'parent', 0, 0), (1, 'codex', 'parent', 1200000, 1200000),
+                (2, 'codex', 'guardian', 60000, 60000),
+                (2, 'codex', 'guardian', 600000, 600000),
+                (2, 'codex', 'guardian', 1140000, 1140000),
+                (2, 'codex', 'empty-guardian', 60000, 60000);
+            INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms)
+                VALUES ('codex', 'guardian', 2, 'guardian-request', 60000);
+            INSERT INTO session_labels VALUES ('codex', 'parent', 'coding', 1), ('codex', 'guardian', 'review', 1);
+            INSERT INTO codex_cursors VALUES (2, '{\"agent_type\":\"guardian\"}');").unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 8);
+        for table in ["requests", "session_events", "sessions"] {
+            let count: i64 = store.conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE tool = 'codex' AND session_id IN ('guardian', 'empty-guardian')"),
+                [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 0);
+        }
+        for (tool, id) in [("codex", "parent"), ("claude-code", "root")] {
+            let active: i64 = store
+                .conn
+                .query_row(
+                    "SELECT active_ms FROM sessions WHERE tool = ?1 AND session_id = ?2",
+                    params![tool, id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(active, 0);
+        }
+        assert_eq!(
+            source_state(&store.conn, "/home/demo/guardian")
+                .unwrap()
+                .unwrap()
+                .offset,
+            200
+        );
+        for (table, expected) in [("session_labels", 2), ("codex_cursors", 1), ("sessions", 3)] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, expected);
+        }
+        let state: String = store
+            .conn
+            .query_row("SELECT state FROM codex_cursors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, r#"{"agent_type":"guardian"}"#);
+    }
+
+    #[test]
     fn v7_removes_internal_review_and_refreshes_cached_parent() {
         let conn = Connection::open_in_memory().unwrap();
         for migration in &MIGRATIONS[..6] {
@@ -585,7 +680,7 @@ mod active_migration_tests {
             INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms) VALUES ('codex', 'demo', 1, 'request', 0);
             INSERT INTO codex_cursors VALUES (1, '{}');").unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
         for table in ["requests", "session_labels", "sessions"] {
             assert_eq!(
                 store

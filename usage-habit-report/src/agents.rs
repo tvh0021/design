@@ -39,7 +39,7 @@ pub fn coverage() -> BTreeMap<String, Coverage> {
             "codex".to_string(),
             c(
                 true,
-                "Links guardian and thread_spawn subagents through session_meta. A few subagent sessions carry no parent id; they are counted under unlinked_subagent_sessions and left out of per-session metrics. Reasoning effort is recorded per turn.",
+                "Links thread_spawn subagents through session_meta. Internal guardian sessions are excluded by design. A few subagent sessions carry no parent id; they are counted under unlinked_subagent_sessions and left out of per-session metrics. Reasoning effort is recorded per turn.",
             ),
         ),
         (

@@ -246,3 +246,10 @@ only those requests create no sessions or event timelines. The v7 migration
 removes their existing requests and sessions and rewinds affected sources to
 correct mixed timelines on the next scan. They contribute no requests, tokens,
 cost, session count, active time, or model entries to any report.
+
+Codex sessions with `agent_type: guardian` are also excluded at ingest,
+regardless of their model. They create no sessions, requests, or events and
+contribute no subagent counts or fan-out. Source offsets and parser cursors
+remain so incremental scans skip excluded data. Migration v8 removes stored
+guardian sessions, requests, and events and refreshes cached ancestor active
+time. Manual labels survive. This exclusion adds no JSON fields.
