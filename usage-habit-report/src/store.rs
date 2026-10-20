@@ -100,6 +100,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX sessions_project ON sessions (project);
     CREATE INDEX sessions_t3_thread ON sessions (t3_thread_id);
     "#,
+    // v5 (ticket 06): hand-set task labels. Kept apart from `sessions` so a
+    // rebuild that drops and re-reads the raw-log rows cannot lose them.
+    r#"
+    CREATE TABLE session_labels (
+        tool       TEXT    NOT NULL,
+        session_id TEXT    NOT NULL,
+        label      TEXT    NOT NULL,
+        set_at     INTEGER NOT NULL,           -- epoch ms
+        PRIMARY KEY (tool, session_id)
+    );
+    "#,
 ];
 
 pub struct Store {
@@ -333,6 +344,11 @@ pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET user_turns = 0, title = NULL, started_at_ms = NULL, ended_at_ms = NULL
          WHERE source_id = ?1",
+        params![source_id],
+    )?;
+    // The re-read derives the rule label again (hand-set labels live elsewhere).
+    tx.execute(
+        "UPDATE sessions SET label = NULL, label_source = NULL WHERE source_id = ?1",
         params![source_id],
     )?;
     tx.execute(

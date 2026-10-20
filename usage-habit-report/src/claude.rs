@@ -10,6 +10,7 @@
 //! the message's `usage` (output counts grow while streaming). Requests are
 //! therefore keyed by `message.id` and merged by MAX.
 
+use crate::labels;
 use crate::store::RequestRow;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -133,6 +134,8 @@ pub struct Chunk {
     pub requests: Vec<RequestRow>,
     index: HashMap<String, usize>,
     pub title: Option<String>,
+    /// Task kind of the opening prompt (see `labels`); the prompt is not kept.
+    pub label: Option<&'static str>,
     pub cwd: Option<String>,
     /// `sessionId` field seen in the records (parent id for subagents).
     pub record_session_id: Option<String>,
@@ -230,6 +233,9 @@ impl Chunk {
         self.user_turns += 1;
         if self.title.is_none() {
             self.title = make_title(trimmed);
+            if self.title.is_some() {
+                self.label = Some(labels::classify(trimmed));
+            }
         }
     }
 }

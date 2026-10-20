@@ -5,7 +5,9 @@ harness logs into SQLite and `query` reports on them. Claude Code, Codex
 and Antigravity are supported.
 
 No prompt or response text is stored. The one exception is the session title:
-the first line (up to 120 characters) of a session's opening prompt.
+the first line (up to 120 characters) of a session's opening prompt. The
+opening prompt is also read once at ingest to pick a task label (see
+[Task labels](#task-labels)); only the label is kept.
 
 ## Build
 
@@ -62,10 +64,11 @@ After reading, `scan` runs the enrich step (see
 ### `query summary`
 
 ```sh
-usage-habit-report query summary [--json] [--since 12h|7d|2w]
+usage-habit-report query summary [--json] [--since 12h|7d|2w] [--group-by tool-model|label]
 ```
 
-Token totals grouped by tool and model. `--since` keeps requests whose
+Token totals grouped by tool and model (the default), or by task label with
+`--group-by label` (see [Grouped by label](#grouped-by-label)). `--since` keeps requests whose
 timestamp falls within the last N hours (`h`), days (`d`), or weeks (`w`).
 Without `--json` it prints a table whose `est. cost` column is the estimated
 cost in USD; a `*` marks a figure that leaves out requests with no price.
@@ -122,6 +125,155 @@ JSON shape:
 Subagent requests are included in the totals of the model that served them.
 To separate them, use `requests.is_subagent` or `sessions.parent_session_id`
 in the store (see [Antigravity ingest](#antigravity-ingest) for an example).
+
+#### Grouped by label
+
+`query summary --group-by label` returns the same JSON with a different
+`groups[]`: one entry per (label, tool), ordered by label, then total tokens
+descending, with `label` in place of `model`. The top level also carries
+`"group_by": "label"`. A subagent's requests count under its parent session's
+label. Requests from sessions with no label are grouped under `unlabelled`.
+
+```json
+{
+  "generated_at": "2026-10-20T04:10:00Z",
+  "since": null,
+  "rates_fetched_at": "2026-10-20T04:19:17Z",
+  "group_by": "label",
+  "totals": { "requests": 5000, "input_tokens": 25000, "...": 0 },
+  "groups": [
+    { "label": "coding", "tool": "claude-code", "requests": 2500, "input_tokens": 10678,
+      "cache_read_input_tokens": 235203786, "cache_creation_input_tokens": 8905200,
+      "output_tokens": 2537681, "estimated_cost_usd": 119.79, "unpriced_requests": 0 }
+  ]
+}
+```
+
+### `query labels`
+
+```sh
+usage-habit-report query labels [--json]
+```
+
+Sessions and token totals per task label, all time. JSON shape:
+
+```json
+{
+  "generated_at": "2026-10-20T04:10:00Z",
+  "totals": { "requests": 5000, "...": 0 },
+  "labels": [
+    { "label": "coding", "sessions": 100, "manual_sessions": 2, "subagent_sessions": 88,
+      "requests": 10124, "input_tokens": 51223222, "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0, "output_tokens": 5412940,
+      "estimated_cost_usd": 454.37, "unpriced_requests": 0 }
+  ]
+}
+```
+
+`sessions` counts top-level sessions with that label, `manual_sessions` the
+ones labelled by hand, and `subagent_sessions` the subagent sessions that
+inherit it. The token fields are the same as in `query summary` and cover the
+top-level sessions and their subagents. `labels[]` is ordered by `requests`
+descending. `unlabelled` appears when a session has no label.
+
+### `query agents`
+
+```sh
+usage-habit-report query agents [--json] [--since 12h|7d|2w]
+```
+
+How subagents are used: how many a session spawns, which models and efforts
+they run, how many run at once, and the share of tokens they spend. It reads
+the store only (no scan, no price step) and runs in well under a second.
+With `--since`, only requests in the window count, and a session is counted
+if it or one of its subagents has a request in it.
+
+Definitions:
+
+- A subagent belongs to its root: the nearest ancestor that is not a subagent
+  (Codex can spawn subagents from subagents). `subagent_count` counts every
+  subagent in the tree.
+- Tokens are `input_tokens + output_tokens` (uncached input plus output).
+  Cache reads and writes are left out.
+- `max_concurrent_fanout` is the largest number of a session's subagents whose
+  `[first request, last request]` intervals overlap at one instant. Intervals
+  are closed, so subagents that touch at one instant overlap there. A subagent
+  with no requests has no interval and adds to `subagent_count` only.
+
+JSON shape (abridged):
+
+```json
+{
+  "generated_at": "2026-10-20T04:10:00Z",
+  "since": null,
+  "coverage": {
+    "antigravity": { "supported": true, "note": "..." },
+    "claude-code": { "supported": true, "note": "..." },
+    "codex":       { "supported": true, "note": "..." }
+  },
+  "totals": {
+    "top_level_sessions": 672,
+    "sessions_with_subagents": 234,
+    "subagent_sessions": 820,
+    "unlinked_subagent_sessions": 8
+  },
+  "subagent_token_share": { "subagent_tokens": 43679871, "total_tokens": 375956423, "share": 0.116 },
+  "histogram": [
+    { "bucket": "0", "min": 0, "max": 0, "sessions": 438 },
+    { "bucket": "3-4", "min": 3, "max": 4, "sessions": 45 },
+    { "bucket": "20+", "min": 20, "max": null, "sessions": 4 }
+  ],
+  "by_tool": [
+    { "tool": "claude-code", "top_level_sessions": 89, "sessions_with_subagents": 27,
+      "subagent_sessions": 225, "unlinked_subagent_sessions": 0,
+      "subagent_tokens": 0, "total_tokens": 0, "subagent_token_share": 0.484 }
+  ],
+  "model_mix": {
+    "main_thread": [ { "model": "claude-example-model", "requests": 6534, "tokens": 0, "request_share": 0.122 } ],
+    "subagent":    [ { "model": "claude-example-model", "requests": 3305, "tokens": 0, "request_share": 0.297 } ]
+  },
+  "subagent_efforts": [ { "effort": "high", "requests": 120 }, { "effort": null, "requests": 900 } ],
+  "heaviest_fanouts": [
+    { "tool": "claude-code", "session_id": "...", "title": "...",
+      "subagent_count": 41, "max_concurrent_fanout": 12,
+      "subagent_models": [ { "model": "claude-example-model", "requests": 300 } ],
+      "subagent_efforts": [ { "effort": null, "requests": 300 } ],
+      "subagent_tokens": 1986107, "total_tokens": 2500000, "subagent_token_share": 0.79 }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `coverage.<tool>.supported` | Whether that tool's logs link subagents to a parent session |
+| `coverage.<tool>.note` | What is and is not linked |
+| `totals.unlinked_subagent_sessions` | Subagent sessions whose parent chain does not reach a top-level session; left out of per-session metrics |
+| `subagent_token_share` | Over all requests in the window, including unlinked subagents; `share` is null when there are no tokens |
+| `histogram[]` | Top-level sessions by number of subagents; buckets `0`, `1`, `2`, `3-4`, `5-9`, `10-19`, `20+` (`max` null for the last) |
+| `by_tool[]` | The same counts per tool, with `subagent_token_share` per tool |
+| `model_mix` | Requests and tokens by model, main-thread sessions against subagent sessions; ordered by requests |
+| `subagent_efforts[]` | Subagent requests by reasoning effort; `effort: null` means the log has none |
+| `heaviest_fanouts[]` | Up to ten sessions, by `max_concurrent_fanout`, then `subagent_count`, then `subagent_tokens` |
+| `heaviest_fanouts[].subagent_models[]` | Distinct models the session's subagents ran, with request counts |
+| `heaviest_fanouts[].subagent_token_share` | `subagent_tokens / total_tokens` for the session; null when it has no tokens |
+
+Coverage today: Claude Code and Antigravity link every child to its parent.
+Codex links `guardian` and `thread_spawn` subagents; a few subagent sessions
+have no parent id and are counted as unlinked.
+
+### `label`
+
+```sh
+usage-habit-report label <session-id-or-prefix> <kind>
+```
+
+Sets a session's task label by hand. `kind` is one of `research`, `coding`,
+`debugging`, `writing`, `review`, `data-analysis`, `ops-config`, `other`. The
+session is found by exact id or a unique id prefix across all tools;
+an ambiguous prefix is refused and lists the candidates. Subagent sessions
+cannot be labelled: they take their parent's label. The hand-set label is
+kept in its own table, so later scans and a rebuild of the raw-log rows do
+not change it.
 
 ### `query models`
 
@@ -461,7 +613,7 @@ as ambiguous.
 
 - Sources: every `*.db` in `~/.gemini/antigravity/conversations` (native
   app) and in `~/.t3/userdata/providers/antigravity/*/antigravity-acp/conversations`
-  (T3 bridge). `--antigravity-dir` (repeatable) replaces both. The session id
+  and the same path under `~/.t3-personal` (T3 bridge). `--antigravity-dir` (repeatable) replaces both. The session id
   is the file stem, which is the conversation id.
 - Each database is opened read-only (`mode=ro`). If the WAL/SHM sidecars
   block that, it is opened with `immutable=1`, which ignores the WAL, and
@@ -507,7 +659,35 @@ as ambiguous.
   only prompts at or past it add to `user_turns`. A database whose steps fall
   below `offset` is reset and re-read.
 
-## Store schema (v4)
+## Task labels
+
+Every top-level session gets one label at ingest, picked from its opening
+user prompt by deterministic keyword rules in `src/labels.rs`: `research`,
+`coding`, `debugging`, `writing`, `review`, `data-analysis`, `ops-config`, or
+`other`.
+
+- The ingester classifies the prompt while it holds it in memory and writes
+  only the label (`sessions.label`, `sessions.label_source = 'rule'`). The
+  prompt text is not stored; the title is still its first line.
+- Rules are an ordered list of (label, word-start stems, whole words). The
+  rules run over the opening line first; if none matches, over the first 600
+  characters. The first rule that matches wins, so specific intents
+  (`debugging`, `review`, `ops-config`) come before the broad `coding` rule.
+  A prompt that matches nothing is `other`.
+- A session is labelled once, from its first typed prompt. Re-reading a file
+  that shrank derives the label again.
+- A hand-set label (`label` command) is in `session_labels` and is preferred
+  over `sessions.label` by every query.
+- Subagent sessions have no label of their own. Queries give them the label
+  of their root session at read time.
+- A session with no typed prompt (for example, one that holds only injected
+  context) has no label and is reported as `unlabelled`, as are sessions
+  ingested before schema v5 until their logs are read again.
+
+The rules are keyword matches, not a model. Expect some misfiles; correct
+them with `label`.
+
+## Store schema (v5)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
 `src/store.rs`.
@@ -517,11 +697,11 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   `scanned_at`.
 - `sessions`: one row per `(tool, session_id)`, with `is_subagent`,
   `parent_session_id`, `agent_type`, `title`, `cwd`, `started_at_ms`,
-  `ended_at_ms`, `user_turns`, and `model_source` (Antigravity:
-  `measured` or `guessed`). `project`, `project_name` (v4), `t3_thread_id`,
-  and `t3_title` are filled by the enrich step (see
-  [Projects and T3](#projects-and-t3)). The nullable columns `label` and
-  `label_source` are reserved for a later ticket.
+  `ended_at_ms`, `user_turns`, `model_source` (Antigravity:
+  `measured` or `guessed`), and `label` / `label_source` (the rule result,
+  see [Task labels](#task-labels)). `project`, `project_name` (v4),
+  `t3_thread_id`, and `t3_title` are filled by the enrich step (see
+  [Projects and T3](#projects-and-t3)).
 - `requests`: one row per `(tool, request_key)`, with `session_id`,
   `is_subagent`, `source_id`, `ts_ms`, `model`, `effort`, and the four token
   counts. `reasoning_tokens` is filled where the harness reports it (Codex,
@@ -533,6 +713,8 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   `cost_usd` when a row's model or token counts change.
 - v4 (ticket 05): `sessions.project_name`, and indexes on `sessions.project`
   and `sessions.t3_thread_id`.
+- `session_labels` (v5, ticket 06): `(tool, session_id)` primary key, `label`,
+  `set_at` (epoch ms). Hand-set labels; independent of the raw-log rows.
 
 ## Tests
 

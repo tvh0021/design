@@ -2,6 +2,7 @@
 //! its last complete line, inside one transaction per file.
 
 use crate::claude::{self, Chunk, TranscriptKind};
+use crate::labels;
 use crate::store::{self, SessionUpdate, Store};
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -146,6 +147,9 @@ fn scan_file(
                 user_turns: chunk.user_turns,
             },
         )?;
+        if let (false, Some(label)) = (kind.is_subagent, chunk.label) {
+            labels::set_rule_label(&tx, claude::TOOL, &kind.session_id, label)?;
+        }
         for r in &chunk.requests {
             if store::upsert_request(
                 &tx,

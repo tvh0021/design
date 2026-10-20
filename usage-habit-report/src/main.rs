@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
-    antigravity, codex, paths, project, query, rates, scan, store::Store, t3,
+    agents, antigravity, codex, labels, paths, project, query, rates, scan, store::Store, t3,
 };
 
 #[derive(Parser)]
@@ -51,6 +51,13 @@ enum Command {
         #[command(subcommand)]
         what: QueryCommand,
     },
+    /// Set a session's task label by hand (survives rescans and rebuilds).
+    Label {
+        /// Session id or a unique prefix of it.
+        session: String,
+        /// One of: research, coding, debugging, writing, review, data-analysis, ops-config, other.
+        kind: String,
+    },
     /// Model prices (LiteLLM) and request costs.
     Rates {
         #[command(subcommand)]
@@ -69,10 +76,21 @@ enum RatesCommand {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GroupBy {
+    /// Group by tool and model (default).
+    ToolModel,
+    /// Group by task label, then tool.
+    Label,
+}
+
 #[derive(Subcommand)]
 enum QueryCommand {
-    /// Token totals grouped by tool and model.
+    /// Token totals grouped by tool and model, or by task label.
     Summary {
+        /// How to group the totals.
+        #[arg(long, value_enum, default_value = "tool-model")]
+        group_by: GroupBy,
         /// Print JSON (shape documented in README.md).
         #[arg(long)]
         json: bool,
@@ -98,6 +116,15 @@ enum QueryCommand {
         #[arg(long)]
         since: Option<String>,
     },
+    /// Subagent fan-out, model mix, and token share.
+    Agents {
+        /// Print JSON (shape documented in README.md).
+        #[arg(long)]
+        json: bool,
+        /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Every project with totals.
     Projects {
         /// Print JSON (shape documented in README.md).
@@ -106,6 +133,12 @@ enum QueryCommand {
         /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
         #[arg(long)]
         since: Option<String>,
+    },
+    /// Sessions and tokens per task label.
+    Labels {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -231,7 +264,12 @@ fn main() -> Result<()> {
             print_price_stats(&stats);
         }
         Command::Query {
-            what: QueryCommand::Summary { json, since },
+            what:
+                QueryCommand::Summary {
+                    group_by,
+                    json,
+                    since,
+                },
         } => {
             let now = scan::now_ms();
             let since_ms = since
@@ -239,13 +277,64 @@ fn main() -> Result<()> {
                 .transpose()?
                 .map(|w| now - w);
             let (r, _) = priced(&mut store, cli.offline, false)?;
-            let mut s = query::summary(&store.conn, since_ms, now)?;
-            s.rates_fetched_at = Some(r.file.fetched_at);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&s)?);
-            } else {
-                print!("{}", query::render_summary_table(&s));
+            match group_by {
+                GroupBy::ToolModel => {
+                    let mut s = query::summary(&store.conn, since_ms, now)?;
+                    s.rates_fetched_at = Some(r.file.fetched_at);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&s)?);
+                    } else {
+                        print!("{}", query::render_summary_table(&s));
+                    }
+                }
+                GroupBy::Label => {
+                    let mut s = labels::summary_by_label(&store.conn, since_ms, now)?;
+                    s.rates_fetched_at = Some(r.file.fetched_at);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&s)?);
+                    } else {
+                        print!("{}", labels::render_label_summary_table(&s));
+                    }
+                }
             }
+        }
+        Command::Query {
+            what: QueryCommand::Agents { json, since },
+        } => {
+            let now = scan::now_ms();
+            let since_ms = since
+                .map(|s| query::parse_since(&s))
+                .transpose()?
+                .map(|w| now - w);
+            let report = agents::agents_report(&store.conn, since_ms, now)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", agents::render_agents(&report));
+            }
+        }
+        Command::Query {
+            what: QueryCommand::Labels { json },
+        } => {
+            let (_, _) = priced(&mut store, cli.offline, false)?;
+            let report = labels::label_report(&store.conn, scan::now_ms())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", labels::render_label_table(&report));
+            }
+        }
+        Command::Label { session, kind } => {
+            let (tool, id) = labels::resolve_session(&store.conn, &session)?;
+            let before = labels::set_manual_label(&store.conn, &tool, &id, &kind, scan::now_ms())?;
+            println!(
+                "{tool} {id}: label set to {}{}",
+                labels::parse_kind(&kind).unwrap_or_default(),
+                match before {
+                    Some(b) => format!(" (was {b})"),
+                    None => String::new(),
+                }
+            );
         }
         Command::Query {
             what: QueryCommand::Models { json },

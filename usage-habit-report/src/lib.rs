@@ -1,8 +1,10 @@
 //! Local token-usage store for AI coding harnesses.
 
+pub mod agents;
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod labels;
 pub mod models;
 pub mod paths;
 pub mod project;
