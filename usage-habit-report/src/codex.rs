@@ -182,6 +182,8 @@ pub struct Cursor {
 /// Data-quality counts, reported by `scan`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Anomalies {
+    /// Internal review requests excluded from the usage store.
+    pub internal_review_requests_excluded: u64,
     /// `cached_input_tokens` exceeded `input_tokens`; uncached input clamped to 0.
     pub cached_exceeds_input: u64,
     /// `last_token_usage` disagreed with the change in the cumulative total.
@@ -200,6 +202,7 @@ pub struct Anomalies {
 
 impl Anomalies {
     fn add(&mut self, o: &Anomalies) {
+        self.internal_review_requests_excluded += o.internal_review_requests_excluded;
         self.cached_exceeds_input += o.cached_exceeds_input;
         self.usage_mismatch += o.usage_mismatch;
         self.counter_resets += o.counter_resets;
@@ -355,11 +358,23 @@ impl Chunk {
                 return;
             }
         };
+        // Apply the context model before deciding whether this event counts.
+        let internal = if rec.kind == "turn_context" {
+            rec.payload
+                .as_ref()
+                .and_then(|p| serde_json::from_str::<TurnContext>(p.get()).ok())
+                .and_then(|t| t.model)
+                .or_else(|| self.cursor.model.clone())
+                .as_deref()
+                == Some("codex-auto-review")
+        } else {
+            self.cursor.model.as_deref() == Some("codex-auto-review")
+        };
         let ts_ms = rec.timestamp.as_deref().and_then(parse_ts_ms);
         let ordinal = rec.ordinal.unwrap_or(line_no);
         // The first session_meta is the fork's own creation event. Subsequent
         // copied history must not bridge idle gaps in the child's timeline.
-        if let Some(t) = ts_ms {
+        if let Some(t) = ts_ms.filter(|_| !internal) {
             if !self.cursor.meta_seen || !self.is_copied(ordinal, ts_ms) {
                 self.events.push((t, t));
             }
@@ -400,7 +415,7 @@ impl Chunk {
                     if it.kind.as_deref() == Some("message")
                         && it.role.as_deref() == Some("user") =>
                 {
-                    if !self.is_copied(ordinal, ts_ms) {
+                    if !internal && !self.is_copied(ordinal, ts_ms) {
                         self.push_user(it.content.unwrap_or_default());
                     }
                 }
@@ -529,6 +544,9 @@ impl Chunk {
         if uncached < 0 {
             self.anomalies.cached_exceeds_input += 1;
             uncached = 0;
+        }
+        if self.cursor.model.as_deref() == Some("codex-auto-review") {
+            self.anomalies.internal_review_requests_excluded += 1;
         }
         self.requests.push(CodexRequest {
             row: RequestRow {
@@ -943,7 +961,12 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
         )?;
         stats.files_reset += 1;
     }
-    if consumed > 0 {
+    let internal_only = chunk.cursor.model.as_deref() == Some("codex-auto-review")
+        && chunk
+            .requests
+            .iter()
+            .all(|r| r.row.model.as_deref() == Some("codex-auto-review"));
+    if consumed > 0 && !internal_only {
         let session_id = chunk.session_id().unwrap_or_else(|| stem.to_string());
         let is_new_session: bool = !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE tool = ?1 AND session_id = ?2)",
@@ -985,11 +1008,20 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
             params![source_id, serde_json::to_string(&chunk.cursor)?],
         )?;
         store::record_events(&tx, TOOL, &session_id, source_id, &chunk.events)?;
+        stats.sessions_added += is_new_session as u64;
+    }
+    if consumed > 0 {
         stats.files_read += 1;
         stats.bytes_read += consumed;
         stats.bad_lines += chunk.bad_lines;
-        stats.sessions_added += is_new_session as u64;
-        out.anomalies.add(&chunk.anomalies);
+    }
+    out.anomalies.add(&chunk.anomalies);
+    if internal_only {
+        tx.execute(
+            "INSERT INTO codex_cursors (source_id, state) VALUES (?1, ?2)
+            ON CONFLICT(source_id) DO UPDATE SET state = excluded.state",
+            params![source_id, serde_json::to_string(&chunk.cursor)?],
+        )?;
     }
     store::update_source(&tx, source_id, offset + consumed, size, mtime_ms, now_ms())?;
     tx.commit()?;

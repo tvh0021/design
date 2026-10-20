@@ -582,6 +582,10 @@ fn agents_panel(p: &Page) -> String {
         );
     }
     for bt in &a.by_tool {
+        if bt.parents_with_imported_children > 0 {
+            body.push_str(&format!("<p>{} {} parents gained children through T3 delegation records, including {} timing-matched links.</p>",
+                bt.parents_with_imported_children, tool_name(&bt.tool), bt.timing_matched_links));
+        }
         if bt.unlinked_subagent_sessions > 0 {
             let _ = write!(
                 body,

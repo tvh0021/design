@@ -116,6 +116,9 @@ pub struct ToolAgents {
     pub subagent_sessions: usize,
     /// Subagent sessions whose parent chain does not reach a top-level session.
     pub unlinked_subagent_sessions: usize,
+    pub cross_tool_links: usize,
+    pub timing_matched_links: usize,
+    pub parents_with_imported_children: usize,
     pub subagent_tokens: i64,
     pub total_tokens: i64,
     pub subagent_token_share: Option<f64>,
@@ -149,6 +152,9 @@ pub struct Totals {
     pub sessions_with_subagents: usize,
     pub subagent_sessions: usize,
     pub unlinked_subagent_sessions: usize,
+    pub cross_tool_links: usize,
+    pub timing_matched_links: usize,
+    pub parents_with_imported_children: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +179,7 @@ struct SessionRow {
     id: String,
     is_subagent: bool,
     parent: Option<String>,
+    parent_tool: String,
     title: Option<String>,
 }
 
@@ -208,6 +215,9 @@ fn new_tool(tool: &str) -> ToolAgents {
         sessions_with_subagents: 0,
         subagent_sessions: 0,
         unlinked_subagent_sessions: 0,
+        cross_tool_links: 0,
+        timing_matched_links: 0,
+        parents_with_imported_children: 0,
         subagent_tokens: 0,
         total_tokens: 0,
         subagent_token_share: None,
@@ -228,10 +238,8 @@ pub fn agents_report(
     agents_report_for(conn, since_ms, None, now_ms)
 }
 
-/// [`agents_report`] restricted to one tool's sessions and requests (all
-/// tools when `tool` is None). Subagent trees never cross tools, so every
-/// figure equals that tool's share of the unfiltered report; `by_tool` holds
-/// the same row `agents_report` gives for it.
+/// Restrict root-tree metrics to one parent tool. Descendants may use another
+/// tool. Request-wide token shares and model mixes retain the request tool filter.
 pub fn agents_report_for(
     conn: &Connection,
     since_ms: Option<i64>,
@@ -242,15 +250,15 @@ pub fn agents_report_for(
 
     let sessions = conn
         .prepare(
-            "SELECT tool, session_id, is_subagent, parent_session_id, title FROM sessions
-             WHERE ?1 IS NULL OR tool = ?1",
+            "SELECT tool, session_id, is_subagent, parent_session_id, title, COALESCE(parent_tool, tool) FROM sessions",
         )?
-        .query_map(params![tool], |r| {
+        .query_map([], |r| {
             Ok(SessionRow {
                 tool: r.get(0)?,
                 id: r.get(1)?,
                 is_subagent: r.get::<_, i64>(2)? != 0,
                 parent: r.get(3)?,
+                parent_tool: r.get(5)?,
                 title: r.get(4)?,
             })
         })?
@@ -265,10 +273,10 @@ pub fn agents_report_for(
     let spans: HashMap<(String, String), Span> = conn
         .prepare(
             "SELECT tool, session_id, MIN(ts_ms), MAX(ts_ms), SUM(input_tokens + output_tokens)
-             FROM requests WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+             FROM requests WHERE ts_ms >= ?1
              GROUP BY tool, session_id",
         )?
-        .query_map(params![lo, tool], |r| {
+        .query_map(params![lo], |r| {
             Ok((
                 (r.get(0)?, r.get(1)?),
                 Span {
@@ -284,10 +292,10 @@ pub fn agents_report_for(
     {
         let mut stmt = conn.prepare(
             "SELECT tool, session_id, model, effort, COUNT(*) FROM requests
-             WHERE ts_ms >= ?1 AND (?2 IS NULL OR tool = ?2)
+             WHERE ts_ms >= ?1
              GROUP BY tool, session_id, model, effort",
         )?;
-        let mut rows = stmt.query(params![lo, tool])?;
+        let mut rows = stmt.query(params![lo])?;
         while let Some(r) = rows.next()? {
             mix.entry((r.get(0)?, r.get(1)?))
                 .or_default()
@@ -303,7 +311,7 @@ pub fn agents_report_for(
             if !s.is_subagent {
                 return Some(at);
             }
-            at = *index.get(&(s.tool.as_str(), s.parent.as_deref()?))?;
+            at = *index.get(&(s.parent_tool.as_str(), s.parent.as_deref()?))?;
         }
         None
     };
@@ -328,6 +336,9 @@ pub fn agents_report_for(
         // With a window, a top-level session counts only if it or one of its
         // subagents has a request in it (`live`); a subagent only if it does.
         if !s.is_subagent {
+            if tool.is_some_and(|tool| tool != s.tool) {
+                continue;
+            }
             let t = trees.entry(i).or_default();
             t.own_tokens += span.map_or(0, |x| x.tokens);
             t.live |= span.is_some();
@@ -336,12 +347,17 @@ pub fn agents_report_for(
         if since_ms.is_some() && span.is_none() {
             continue;
         }
-        *sub_total.entry(s.tool.as_str()).or_default() += 1;
-        for (_, effort, n) in mix.get(&key).into_iter().flatten() {
-            *all_efforts.entry(effort.clone()).or_default() += n;
+        let selected = tool.is_none_or(|tool| tool == s.tool);
+        if selected {
+            *sub_total.entry(s.tool.as_str()).or_default() += 1;
+            for (_, effort, n) in mix.get(&key).into_iter().flatten() {
+                *all_efforts.entry(effort.clone()).or_default() += n;
+            }
         }
         let Some(root) = root_of(i) else {
-            *unlinked.entry(s.tool.as_str()).or_default() += 1;
+            if selected {
+                *unlinked.entry(s.tool.as_str()).or_default() += 1;
+            }
             continue;
         };
         let t = trees.entry(root).or_default();
@@ -365,6 +381,9 @@ pub fn agents_report_for(
             continue;
         }
         let s = &sessions[i];
+        if tool.is_some_and(|tool| tool != s.tool) {
+            continue;
+        }
         let tool = by_tool
             .entry(s.tool.as_str())
             .or_insert_with(|| new_tool(&s.tool));
@@ -448,7 +467,27 @@ pub fn agents_report_for(
         }
     }
 
+    let link_counts = |only: Option<&str>| -> Result<(usize, usize, usize)> {
+        Ok(conn.query_row("SELECT COALESCE(SUM(COALESCE(parent_tool, tool) <> tool), 0),
+            COALESCE(SUM(lineage_source = 'timing'), 0), COUNT(DISTINCT COALESCE(parent_tool, tool) || ':' || parent_session_id)
+            FROM sessions WHERE lineage_source IN ('t3', 'timing')
+            AND (?1 IS NULL OR COALESCE(parent_tool, tool) = ?1)
+            AND (?2 IS NULL OR EXISTS (SELECT 1 FROM requests r WHERE r.tool = sessions.tool AND r.session_id = sessions.session_id AND r.ts_ms >= ?2))",
+            params![only, since_ms], |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize, r.get::<_, i64>(2)? as usize)))?)
+    };
+    for t in &mut by_tool {
+        (
+            t.cross_tool_links,
+            t.timing_matched_links,
+            t.parents_with_imported_children,
+        ) = link_counts(Some(&t.tool))?;
+    }
+    let (cross_tool_links, timing_matched_links, parents_with_imported_children) =
+        link_counts(tool)?;
     let totals = Totals {
+        cross_tool_links,
+        timing_matched_links,
+        parents_with_imported_children,
         top_level_sessions: by_tool.iter().map(|t| t.top_level_sessions).sum(),
         sessions_with_subagents: by_tool.iter().map(|t| t.sessions_with_subagents).sum(),
         subagent_sessions: sub_total.values().sum(),
@@ -512,29 +551,17 @@ pub fn session_subagents(
     since_ms: Option<i64>,
 ) -> Result<SubagentSummary> {
     let lo = since_ms.unwrap_or(i64::MIN);
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT parent_session_id, session_id FROM sessions
-             WHERE tool = ?1 AND is_subagent = 1 AND parent_session_id IS NOT NULL",
-        )?;
-        let mut rows = stmt.query(params![tool])?;
-        while let Some(r) = rows.next()? {
-            children.entry(r.get(0)?).or_default().push(r.get(1)?);
-        }
-    }
-    let mut descendants: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(session_id.to_string());
-    let mut queue = vec![session_id.to_string()];
-    while let Some(at) = queue.pop() {
-        for c in children.get(&at).into_iter().flatten() {
-            if seen.insert(c.clone()) {
-                descendants.push(c.clone());
-                queue.push(c.clone());
-            }
-        }
-    }
+    let descendants = conn
+        .prepare(
+            "WITH RECURSIVE tree(tool, sid) AS (
+            SELECT ?1, ?2 UNION SELECT s.tool, s.session_id FROM sessions s JOIN tree t
+            ON COALESCE(s.parent_tool, s.tool) = t.tool AND s.parent_session_id = t.sid
+         ) SELECT tool, sid FROM tree WHERE tool <> ?1 OR sid <> ?2",
+        )?
+        .query_map(params![tool, session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let own_tokens: i64 = conn.query_row(
         "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM requests
@@ -555,9 +582,9 @@ pub fn session_subagents(
     let mut sub_tokens = 0i64;
     let mut models: BTreeMap<Option<String>, i64> = BTreeMap::new();
     let mut efforts: BTreeMap<Option<String>, i64> = BTreeMap::new();
-    for d in &descendants {
+    for (child_tool, d) in &descendants {
         let (first, last, tokens): (Option<i64>, Option<i64>, i64) = span_stmt
-            .query_row(params![tool, d, lo], |r| {
+            .query_row(params![child_tool, d, lo], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
         if since_ms.is_some() && first.is_none() {
@@ -568,7 +595,7 @@ pub fn session_subagents(
             intervals.push((f, l));
             sub_tokens += tokens;
         }
-        let mut rows = mix_stmt.query(params![tool, d, lo])?;
+        let mut rows = mix_stmt.query(params![child_tool, d, lo])?;
         while let Some(r) = rows.next()? {
             let n: i64 = r.get(2)?;
             *models.entry(r.get(0)?).or_default() += n;
@@ -645,6 +672,10 @@ pub fn render_agents(r: &AgentsReport) -> String {
         pct(r.subagent_token_share.share),
         r.subagent_token_share.subagent_tokens,
         r.subagent_token_share.total_tokens
+    ));
+    out.push_str(&format!(
+        "cross-tool links: {}, timing-matched links: {}\n",
+        r.totals.cross_tool_links, r.totals.timing_matched_links
     ));
     out.push_str("\nsubagents per session:\n");
     for b in &r.histogram {

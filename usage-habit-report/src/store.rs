@@ -128,6 +128,25 @@ const MIGRATIONS: &[&str] = &[
     DELETE FROM codex_cursors;
     UPDATE sessions SET user_turns = 0;
     "#,
+    // v7: parents can belong to another harness. Re-read sources containing
+    // internal review requests so their timestamp-only timelines are corrected.
+    r#"
+    ALTER TABLE sessions ADD COLUMN parent_tool TEXT;
+    ALTER TABLE sessions ADD COLUMN lineage_source TEXT;
+    ALTER TABLE sessions ADD COLUMN lineage_id TEXT;
+    CREATE INDEX sessions_lineage_id ON sessions(lineage_id);
+    CREATE INDEX sessions_cross_parent ON sessions(parent_tool, parent_session_id);
+    UPDATE sources SET offset = 0, size = 0, mtime_ms = NULL
+      WHERE id IN (SELECT source_id FROM requests WHERE model = 'codex-auto-review');
+    DELETE FROM codex_cursors WHERE source_id IN (SELECT source_id FROM requests WHERE model = 'codex-auto-review');
+    DELETE FROM session_events WHERE source_id IN (SELECT source_id FROM requests WHERE model = 'codex-auto-review');
+    UPDATE sessions SET user_turns = 0, active_ms = NULL, started_at_ms = NULL, ended_at_ms = NULL
+      WHERE source_id IN (SELECT source_id FROM requests WHERE model = 'codex-auto-review');
+    DELETE FROM sessions WHERE (tool, session_id) IN (
+      SELECT tool, session_id FROM requests GROUP BY tool, session_id
+      HAVING SUM(model IS NOT 'codex-auto-review') = 0);
+    DELETE FROM requests WHERE model = 'codex-auto-review';
+    "#,
 ];
 
 pub struct Store {
@@ -164,6 +183,19 @@ impl Store {
             let tx = self.conn.transaction()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("schema migration to v{}", i + 1))?;
+            if i == 6 {
+                let keys = tx
+                    .prepare("SELECT tool, session_id FROM sessions WHERE active_ms IS NOT NULL")?
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for (tool, sid) in keys {
+                    let active = tree_active_ms(&tx, &tool, &sid)?;
+                    tx.execute(
+                        "UPDATE sessions SET active_ms = ?3 WHERE tool = ?1 AND session_id = ?2",
+                        params![tool, sid, active],
+                    )?;
+                }
+            }
             tx.pragma_update(None, "user_version", (i + 1) as i64)?;
             tx.commit()?;
         }
@@ -304,12 +336,15 @@ pub fn upsert_request(
     source_id: i64,
     r: &RequestRow,
 ) -> Result<bool> {
+    if r.model.as_deref() == Some("codex-auto-review") {
+        return Ok(false);
+    }
     let added =
         tx.prepare_cached(
             r#"INSERT INTO requests (tool, request_key, session_id, is_subagent, source_id, ts_ms,
                                      model, effort, input_tokens, cache_read_input_tokens,
                                      cache_creation_input_tokens, output_tokens)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+               VALUES (?1, ?2, ?3, MAX(?4, COALESCE((SELECT is_subagent FROM sessions WHERE tool = ?1 AND session_id = ?3), 0)), ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                ON CONFLICT(tool, request_key) DO NOTHING"#,
         )?
         .execute(params![
@@ -410,18 +445,26 @@ pub fn record_events(
     for &(start, end) in events {
         insert.execute(params![source_id, tool, session_id, start, end.max(start)])?;
     }
-    let mut stmt = tx.prepare(
-        "WITH RECURSIVE ancestors(sid) AS (
-            SELECT ?2 UNION SELECT s.parent_session_id FROM sessions s
-            JOIN ancestors a ON s.session_id = a.sid
-            WHERE s.tool = ?1 AND s.parent_session_id IS NOT NULL
-        ) SELECT sid FROM ancestors",
-    )?;
-    let ancestors = stmt
-        .query_map(params![tool, session_id], |r| r.get::<_, String>(0))?
+    refresh_ancestors(tx, tool, session_id)?;
+    Ok(())
+}
+
+/// Refresh a changed timeline or a newly imported parent edge.
+pub fn refresh_ancestors(tx: &Transaction, tool: &str, session_id: &str) -> Result<()> {
+    let ancestors = tx
+        .prepare(
+            "WITH RECURSIVE ancestors(tool, sid) AS (
+            SELECT ?1, ?2 UNION SELECT COALESCE(s.parent_tool, s.tool), s.parent_session_id
+            FROM sessions s JOIN ancestors a ON s.tool = a.tool AND s.session_id = a.sid
+            WHERE s.parent_session_id IS NOT NULL
+        ) SELECT tool, sid FROM ancestors",
+        )?
+        .query_map(params![tool, session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for sid in ancestors {
-        let active = tree_active_ms(tx, tool, &sid)?;
+    for (tool, sid) in ancestors {
+        let active = tree_active_ms(tx, &tool, &sid)?;
         tx.execute(
             "UPDATE sessions SET active_ms = ?3 WHERE tool = ?1 AND session_id = ?2",
             params![tool, sid, active],
@@ -434,11 +477,11 @@ pub fn record_events(
 /// Exposed for ingest verification; queries read the cached sessions column.
 pub fn tree_active_ms(conn: &Connection, tool: &str, session_id: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare(
-        "WITH RECURSIVE tree(sid) AS (
-            SELECT ?2 UNION SELECT s.session_id FROM sessions s JOIN tree t
-            ON s.parent_session_id = t.sid WHERE s.tool = ?1
+        "WITH RECURSIVE tree(tool, sid) AS (
+            SELECT ?1, ?2 UNION SELECT s.tool, s.session_id FROM sessions s JOIN tree t
+            ON s.parent_session_id = t.sid AND COALESCE(s.parent_tool, s.tool) = t.tool
         ) SELECT e.start_ms, e.end_ms FROM session_events e JOIN tree t
-          ON e.session_id = t.sid WHERE e.tool = ?1 ORDER BY e.start_ms, e.end_ms",
+          ON e.session_id = t.sid AND e.tool = t.tool ORDER BY e.start_ms, e.end_ms",
     )?;
     let mut rows = stmt.query(params![tool, session_id])?;
     let mut end: Option<i64> = None;
@@ -466,6 +509,70 @@ mod active_migration_tests {
     use super::*;
 
     #[test]
+    fn v7_removes_internal_review_and_refreshes_cached_parent() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..6] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute_batch("INSERT INTO sources(id, tool, path, offset, size) VALUES
+            (1, 'codex', '/home/demo/parent', 100, 100), (2, 'codex', '/home/demo/review', 100, 100);
+            INSERT INTO sessions(tool, session_id, source_id, active_ms) VALUES ('codex', 'parent', 1, 1200000);
+            INSERT INTO sessions(tool, session_id, source_id, is_subagent, parent_session_id, active_ms)
+                VALUES ('codex', 'review', 2, 1, 'parent', 1080000);
+            INSERT INTO session_events VALUES (1, 'codex', 'parent', 0, 0), (1, 'codex', 'parent', 1200000, 1200000),
+                (2, 'codex', 'review', 60000, 60000), (2, 'codex', 'review', 600000, 600000), (2, 'codex', 'review', 1140000, 1140000);
+            INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms, model)
+                VALUES ('codex', 'review', 2, 'review-request', 60000, 'codex-auto-review');
+            INSERT INTO session_labels VALUES ('codex', 'parent', 'coding', 0);
+            INSERT INTO codex_cursors VALUES (2, '{}');").unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT active_ms FROM sessions WHERE session_id = 'parent'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        for table in ["requests", "codex_cursors"] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM session_labels", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            source_state(&store.conn, "/home/demo/review")
+                .unwrap()
+                .unwrap()
+                .offset,
+            0
+        );
+    }
+
+    #[test]
     fn v5_migration_preserves_usage_and_labels_and_requests_timeline_backfill() {
         let conn = Connection::open_in_memory().unwrap();
         for migration in &MIGRATIONS[..5] {
@@ -478,7 +585,7 @@ mod active_migration_tests {
             INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms) VALUES ('codex', 'demo', 1, 'request', 0);
             INSERT INTO codex_cursors VALUES (1, '{}');").unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         for table in ["requests", "session_labels", "sessions"] {
             assert_eq!(
                 store
