@@ -161,6 +161,11 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .units[data-tool="codex"], .units i[data-tool="codex"] { --bar: var(--codex); }
 .units[data-tool="antigravity"], .units i[data-tool="antigravity"] { --bar: var(--antigravity); }
 .ledger td.bar { text-align: left; }
+.mix { color: var(--muted); font-size: var(--t-small); margin-left: var(--s-2); }
+.mix b { font-weight: 600; color: var(--muted); }
+.mix b[data-tool="claude-code"] { color: var(--claude-code); }
+.mix b[data-tool="codex"] { color: var(--codex); }
+.mix b[data-tool="antigravity"] { color: var(--antigravity); }
 .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--s-6) var(--s-8); align-items: start; }
 .stack { display: grid; gap: var(--s-6); }
 .facts, .coverage { display: grid; gap: var(--s-1); }

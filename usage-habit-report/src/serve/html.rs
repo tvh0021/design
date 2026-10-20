@@ -686,7 +686,17 @@ fn tool_mix(tools: &[(String, i64, Option<f64>)]) -> String {
             let _ = write!(s, "<i data-tool=\"{}\"></i>", esc(&t.0));
         }
     }
-    s.push_str("</span>");
+    s.push_str("</span> <span class=\"mix\">");
+    for (i, t) in tools.iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}<b data-tool=\"{}\">{:.0}</b>",
+            if i == 0 { "" } else { " / " },
+            esc(&t.0),
+            t.1 as f64 * 100.0 / total as f64
+        );
+    }
+    s.push_str(" %</span>");
     s
 }
 
@@ -743,9 +753,9 @@ fn projects_panel(p: &Page) -> String {
         );
     }
     foot.push_str(if p.audience.is_public() {
-        "Project pseudonyms are shared across this export. Hover a tool mix for its shares."
+        "Project pseudonyms are shared across this export. Tool shares are percentages of requests."
     } else {
-        "Hover a name for its full path, a tool mix for its shares."
+        "Hover a name for its full path. Tool shares are percentages of requests."
     });
     if pr.lines.iter().any(|l| l.row.tokens.unpriced_requests > 0) {
         foot.push_str(" * leaves out requests whose model has no price.");
