@@ -96,6 +96,8 @@ pub struct SessionAgents {
     /// `subagent_tokens / total_tokens`; null when the session has no tokens.
     pub subagent_token_share: Option<f64>,
     pub max_concurrent_fanout: usize,
+    pub display_title: Option<String>,
+    pub title_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -181,6 +183,8 @@ struct SessionRow {
     parent: Option<String>,
     parent_tool: String,
     title: Option<String>,
+    display_title: Option<String>,
+    title_source: Option<String>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -250,7 +254,7 @@ pub fn agents_report_for(
 
     let sessions = conn
         .prepare(
-            "SELECT tool, session_id, is_subagent, parent_session_id, title, COALESCE(parent_tool, tool) FROM sessions",
+            "SELECT tool, session_id, is_subagent, parent_session_id, title, COALESCE(parent_tool, tool), display_title, title_source FROM sessions",
         )?
         .query_map([], |r| {
             Ok(SessionRow {
@@ -260,6 +264,8 @@ pub fn agents_report_for(
                 parent: r.get(3)?,
                 parent_tool: r.get(5)?,
                 title: r.get(4)?,
+                display_title: r.get(6)?,
+                title_source: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -403,6 +409,8 @@ pub fn agents_report_for(
                 tool: s.tool.clone(),
                 session_id: s.id.clone(),
                 title: s.title.clone(),
+                display_title: s.display_title.clone(),
+                title_source: s.title_source.clone(),
                 subagent_count: t.subagents,
                 subagent_models: sorted_counts(&t.models)
                     .into_iter()
@@ -716,7 +724,10 @@ pub fn render_agents(r: &AgentsReport) -> String {
             s.subagent_tokens,
             s.tool,
             s.session_id,
-            s.title.as_deref().unwrap_or("")
+            s.display_title
+                .as_deref()
+                .or(s.title.as_deref())
+                .unwrap_or("")
         ));
     }
     out.push_str("\ncoverage:\n");

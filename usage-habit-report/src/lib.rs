@@ -4,6 +4,7 @@ pub mod agents;
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod headlines;
 pub mod labels;
 pub mod mcp;
 pub mod models;
