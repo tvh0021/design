@@ -185,6 +185,9 @@ pub struct ProjectRow {
     pub last_request_at: Option<String>,
     #[serde(flatten)]
     pub tokens: Tokens,
+    pub active_seconds: i64,
+    pub elapsed_seconds: i64,
+    pub idle_gap_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -195,6 +198,9 @@ pub struct ToolRow {
     pub last_request_at: Option<String>,
     #[serde(flatten)]
     pub tokens: Tokens,
+    pub active_seconds: i64,
+    pub elapsed_seconds: i64,
+    pub idle_gap_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +225,8 @@ pub struct ProjectList {
 #[derive(Debug, Default, Clone)]
 struct Cell {
     sessions: i64,
+    active_seconds: i64,
+    elapsed_seconds: i64,
     first_ms: Option<i64>,
     last_ms: Option<i64>,
     tokens: Tokens,
@@ -238,6 +246,8 @@ fn add_tokens(a: &mut Tokens, b: &Tokens) {
 
 fn add_cell(a: &mut Cell, b: &Cell) {
     a.sessions += b.sessions;
+    a.active_seconds += b.active_seconds;
+    a.elapsed_seconds += b.elapsed_seconds;
     a.first_ms = match (a.first_ms, b.first_ms) {
         (Some(x), Some(y)) => Some(x.min(y)),
         (x, y) => x.or(y),
@@ -258,14 +268,26 @@ fn cells(
     let since = since_ms.unwrap_or(i64::MIN);
     let mut out: BTreeMap<(Option<String>, String), Cell> = BTreeMap::new();
     let mut stmt = conn.prepare(
-        r#"SELECT project, tool, COUNT(*) FROM sessions
+        r#"SELECT project, tool, COUNT(*),
+                  COALESCE(SUM(CASE WHEN NOT EXISTS (
+                      SELECT 1 FROM sessions p WHERE p.tool = sessions.tool
+                      AND p.session_id = sessions.parent_session_id)
+                      THEN active_ms / 1000 ELSE 0 END), 0),
+                  COALESCE(SUM(CASE WHEN NOT EXISTS (
+                      SELECT 1 FROM sessions p WHERE p.tool = sessions.tool
+                      AND p.session_id = sessions.parent_session_id)
+                      THEN MAX(0, (ended_at_ms - started_at_ms) / 1000) ELSE 0 END), 0)
+           FROM sessions
            WHERE (?3 OR COALESCE(ended_at_ms, started_at_ms) >= ?1)
              AND (?2 IS NULL OR project = ?2)
            GROUP BY project, tool"#,
     )?;
     let mut rows = stmt.query(params![since, only, since_ms.is_none()])?;
     while let Some(r) = rows.next()? {
-        out.entry((r.get(0)?, r.get(1)?)).or_default().sessions = r.get(2)?;
+        let c = out.entry((r.get(0)?, r.get(1)?)).or_default();
+        c.sessions = r.get(2)?;
+        c.active_seconds = r.get(3)?;
+        c.elapsed_seconds = r.get(4)?;
     }
     // Requests are added up per session first, so the join to `sessions`
     // runs once per session rather than once per request.
@@ -314,6 +336,9 @@ fn project_row(project: Option<String>, c: Cell) -> ProjectRow {
         name: project.as_deref().map(project_name),
         project,
         sessions: c.sessions,
+        active_seconds: c.active_seconds,
+        elapsed_seconds: c.elapsed_seconds,
+        idle_gap_seconds: crate::store::IDLE_GAP_SECONDS,
         first_request_at: c.first_ms.map(rfc3339),
         last_request_at: c.last_ms.map(rfc3339),
         tokens: c.tokens,
@@ -360,6 +385,9 @@ pub fn list_with_tools(
             ToolRow {
                 tool: t,
                 sessions: c.sessions,
+                active_seconds: c.active_seconds,
+                elapsed_seconds: c.elapsed_seconds,
+                idle_gap_seconds: crate::store::IDLE_GAP_SECONDS,
                 first_request_at: c.first_ms.map(rfc3339),
                 last_request_at: c.last_ms.map(rfc3339),
                 tokens: c.tokens,
@@ -402,6 +430,9 @@ pub fn detail(
         tools.push(ToolRow {
             tool,
             sessions: c.sessions,
+            active_seconds: c.active_seconds,
+            elapsed_seconds: c.elapsed_seconds,
+            idle_gap_seconds: crate::store::IDLE_GAP_SECONDS,
             first_request_at: c.first_ms.map(rfc3339),
             last_request_at: c.last_ms.map(rfc3339),
             tokens: c.tokens,
@@ -532,7 +563,7 @@ fn token_cells(t: &Tokens) -> [String; 6] {
 
 pub fn render_list_table(l: &ProjectList) -> String {
     let mut rows = vec![
-        ["name", "sessions", "first", "last"]
+        ["name", "sessions", "active (s)", "first", "last"]
             .iter()
             .chain(TOKEN_HEADER.iter())
             .chain(["project"].iter())
@@ -543,6 +574,7 @@ pub fn render_list_table(l: &ProjectList) -> String {
         let mut r = vec![
             p.name.clone().unwrap_or_else(|| "(no directory)".into()),
             p.sessions.to_string(),
+            p.active_seconds.to_string(),
             day(&p.first_request_at).to_string(),
             day(&p.last_request_at).to_string(),
         ];
@@ -579,18 +611,26 @@ pub fn render_detail_table(d: &ProjectDetail) -> String {
         p.last_request_at.as_deref().unwrap_or("-"),
     );
     let mut rows = vec![
-        ["tool", "sessions"]
+        ["tool", "sessions", "active (s)"]
             .iter()
             .chain(TOKEN_HEADER.iter())
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
     ];
     for t in &d.tools {
-        let mut r = vec![t.tool.clone(), t.sessions.to_string()];
+        let mut r = vec![
+            t.tool.clone(),
+            t.sessions.to_string(),
+            t.active_seconds.to_string(),
+        ];
         r.extend(token_cells(&t.tokens));
         rows.push(r);
     }
-    let mut total = vec!["TOTAL".to_string(), p.sessions.to_string()];
+    let mut total = vec![
+        "TOTAL".to_string(),
+        p.sessions.to_string(),
+        p.active_seconds.to_string(),
+    ];
     total.extend(token_cells(&p.tokens));
     rows.push(total);
     out.push_str(&table(&rows, 1));

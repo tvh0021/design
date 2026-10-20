@@ -585,7 +585,7 @@ fn agents_panel(p: &Page) -> String {
         if bt.unlinked_subagent_sessions > 0 {
             let _ = write!(
                 body,
-                "<p>{} {} subagent sessions have no linked parent in this window; they count in the totals and the token share but not in the histogram or the fan-outs.</p>",
+                "<p>{} {} subagent sessions have no linked parent in this window; their active time counts as separate top-level sessions. They count in the token share but not in the histogram or the fan-outs.</p>",
                 fmt_int(bt.unlinked_subagent_sessions as i64),
                 tool_name(&bt.tool)
             );
@@ -693,7 +693,7 @@ fn projects_panel(p: &Page) -> String {
 
 fn session_table(caption: &str, rows: &[SessionLine]) -> String {
     let mut s = format!(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{caption}</caption><thead><tr><th scope=\"col\">Session</th><th scope=\"col\" class=\"l\">Tool</th><th scope=\"col\" class=\"l\">Project</th><th scope=\"col\">Elapsed</th><th scope=\"col\">Requests</th><th scope=\"col\">Est. cost</th></tr></thead><tbody>"
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{caption}</caption><thead><tr><th scope=\"col\">Session</th><th scope=\"col\" class=\"l\">Tool</th><th scope=\"col\" class=\"l\">Project</th><th scope=\"col\">Active time</th><th scope=\"col\">Requests</th><th scope=\"col\">Est. cost</th></tr></thead><tbody>"
     );
     for r in rows {
         let project = match (&r.project, &r.project_name) {
@@ -708,7 +708,7 @@ fn session_table(caption: &str, rows: &[SessionLine]) -> String {
             "<tr><td class=\"title\">{}</td><td class=\"l\">{}</td><td class=\"l\">{project}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             title_cell(r.title.as_deref()),
             tool_name(&r.tool),
-            fmt_elapsed(r.elapsed_seconds),
+            fmt_elapsed(r.active_seconds),
             fmt_int(r.requests),
             fmt_usd(r.cost_usd, r.unpriced)
         );
@@ -723,7 +723,7 @@ fn sessions_panel(p: &Page) -> String {
         return nothing_here(p);
     }
     let mut body = String::from("<div class=\"stack\">");
-    body.push_str(&session_table("Longest, by elapsed time", &sl.longest));
+    body.push_str(&session_table("Longest, by active time", &sl.longest));
     if sl.costliest.is_empty() {
         body.push_str("<p class=\"empty\">No priced requests in this window. Run <code>usage-habit-report rates update</code>, then any <code>query</code>, to price them.</p>");
     } else {
@@ -863,11 +863,12 @@ fn panels(p: &Page) -> String {
         ),
         &agents_panel(p),
     ));
+    let idle_minutes = crate::store::IDLE_GAP_SECONDS / 60;
     s.push_str(&section(
         "projects",
         "Time and cost by project",
         &format!(
-            "{scope} Sessions, tokens and cost match <code>query projects{since}</code>{}. Active time adds up each top-level session's elapsed time (first to last record, as <code>query session</code> reports it); subagents run inside it.",
+            "{scope} Sessions, tokens and cost match <code>query projects{since}</code>{}. Active time adds up top-level sessions after removing gaps longer than {idle_minutes} minutes. Linked child activity bridges their parent's gaps; unlinked children count separately.",
             match p.tool {
                 Some(t) => format!(" counting {t} only"),
                 None => String::new(),
@@ -879,7 +880,7 @@ fn panels(p: &Page) -> String {
         "sessions",
         "Longest and costliest sessions",
         &format!(
-            "{scope} Top-level sessions with a request in the window. Elapsed covers the whole session; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. Titles are the first line of the opening prompt."
+            "{scope} Top-level sessions with a request in the window. Active time covers the whole session and its linked children; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. Titles are the first line of the opening prompt."
         ),
         &sessions_panel(p),
     ));

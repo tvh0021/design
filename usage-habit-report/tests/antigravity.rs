@@ -734,3 +734,47 @@ fn falls_back_to_immutable_when_wal_blocks() {
     // immutable mode sees only the checkpointed step
     assert_eq!(r.stats.scan.rows_added, 1);
 }
+
+#[test]
+fn active_time_uses_all_steps_intervals_and_incremental_matches_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("{BARE}.db"));
+    let c = create_db(&path);
+    // Non-generation records still contribute activity. Gaps are 40 and 10 minutes.
+    for (idx, secs) in [0, 2400, 3000].into_iter().enumerate() {
+        step(&c, idx as i64, 99, &prompt_meta(secs), None);
+    }
+    let mut store = Store::open_in_memory().unwrap();
+    scan_antigravity(&mut store, &[dir.path().to_path_buf()]).unwrap();
+    let active = |s: &Store| -> i64 {
+        s.conn
+            .query_row(
+                "SELECT active_ms FROM sessions WHERE session_id = ?1",
+                [BARE],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(active(&store), 600_000);
+    // The generation interval itself counts even when longer than the idle threshold.
+    step(
+        &c,
+        3,
+        15,
+        &msg(&[ts(1, 3300), ts(6, 3301), ts(7, 4500)]),
+        None,
+    );
+    // Ensure the source fingerprint changes even on a coarse filesystem clock.
+    step(
+        &c,
+        4,
+        14,
+        &prompt_meta(4500),
+        Some(&prompt_payload(&"Demo follow-up ".repeat(700))),
+    );
+    scan_antigravity(&mut store, &[dir.path().to_path_buf()]).unwrap();
+    let mut rebuilt = Store::open_in_memory().unwrap();
+    scan_antigravity(&mut rebuilt, &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(active(&store), 2_100_000);
+    assert_eq!(active(&store), active(&rebuilt));
+}

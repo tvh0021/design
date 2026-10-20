@@ -281,6 +281,8 @@ pub struct SessionReport {
     pub subagents: Option<crate::agents::SubagentSummary>,
     /// Present only with `--rows`, oldest first.
     pub rows: Option<Vec<RequestRow>>,
+    pub active_seconds: Option<i64>,
+    pub idle_gap_seconds: i64,
 }
 
 /// Everything about one session. `since_ms` keeps requests at or after it in
@@ -426,6 +428,12 @@ pub fn session_report(
         label_source,
         started_at: started.map(rfc3339),
         ended_at: ended.map(rfc3339),
+        active_seconds: conn.query_row(
+            "SELECT active_ms / 1000 FROM sessions WHERE tool = ?1 AND session_id = ?2",
+            params![tool, sid],
+            |r| r.get(0),
+        )?,
+        idle_gap_seconds: crate::store::IDLE_GAP_SECONDS,
         elapsed_seconds: started.zip(ended).map(|(s, e)| ((e - s) / 1000).max(0)),
         models,
         usage,
@@ -535,6 +543,7 @@ pub fn render_session(r: &SessionReport) -> String {
     );
     line("started", dash(&r.started_at));
     line("ended", dash(&r.ended_at));
+    line("active", r.active_seconds.map_or("-".into(), fmt_elapsed));
     line("elapsed", r.elapsed_seconds.map_or("-".into(), fmt_elapsed));
     if let Some(s) = &r.since {
         line("since", s.clone());

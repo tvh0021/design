@@ -139,6 +139,7 @@ pub struct Chunk {
     pub cwd: Option<String>,
     /// `sessionId` field seen in the records (parent id for subagents).
     pub record_session_id: Option<String>,
+    pub events: Vec<(i64, i64)>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     pub user_turns: i64,
@@ -160,6 +161,11 @@ impl Chunk {
             }
         };
         let ts_ms = rec.timestamp.as_deref().and_then(parse_ts_ms);
+        if let Some(t) = ts_ms {
+            self.events.push((t, t));
+            self.started_at_ms = Some(self.started_at_ms.map_or(t, |s| s.min(t)));
+            self.ended_at_ms = Some(self.ended_at_ms.map_or(t, |e| e.max(t)));
+        }
         match rec.kind.as_deref() {
             Some("assistant") => self.push_assistant(rec, ts_ms),
             Some("user") => self.push_user(rec, ts_ms),

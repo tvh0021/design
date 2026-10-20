@@ -192,3 +192,9 @@ section rather than wrapping.
 - Empty store: "No usage recorded yet. Run `usage-habit-report scan` to read
   your logs."
 - Costs are "estimated" and the footer names the source and fetch time.
+
+
+Project and session time figures use cached active time with gaps longer than
+15 minutes removed. Parent time includes linked child activity; totals count
+that tree once. The longest-session list sorts by active time. Layout, tokens,
+and request/cost window semantics stay the same.

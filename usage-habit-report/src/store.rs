@@ -111,6 +111,23 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (tool, session_id)
     );
     "#,
+    // v6: timestamp-only event intervals and cached tree active time. Re-read
+    // existing sources once to collect non-request events as well.
+    r#"
+    ALTER TABLE sessions ADD COLUMN active_ms INTEGER;
+    CREATE TABLE session_events (
+        source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        tool TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        start_ms INTEGER NOT NULL,
+        end_ms INTEGER NOT NULL,
+        PRIMARY KEY (source_id, tool, session_id, start_ms, end_ms)
+    );
+    CREATE INDEX session_events_session ON session_events(tool, session_id, start_ms);
+    UPDATE sources SET offset = 0, size = 0, mtime_ms = NULL;
+    DELETE FROM codex_cursors;
+    UPDATE sessions SET user_turns = 0;
+    "#,
 ];
 
 pub struct Store {
@@ -337,6 +354,19 @@ pub fn upsert_request(
 /// Drop everything ingested from one source so it can be re-read from byte 0
 /// (used when a file shrank or was replaced).
 pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
+    let affected = tx
+        .prepare(
+            "SELECT tool, session_id FROM session_events WHERE source_id = ?1
+         UNION SELECT tool, session_id FROM sessions WHERE source_id = ?1",
+        )?
+        .query_map(params![source_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    tx.execute(
+        "DELETE FROM session_events WHERE source_id = ?1",
+        params![source_id],
+    )?;
     tx.execute(
         "DELETE FROM requests WHERE source_id = ?1",
         params![source_id],
@@ -355,5 +385,124 @@ pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
         "UPDATE sources SET offset = 0, size = 0 WHERE id = ?1",
         params![source_id],
     )?;
+    // Even an empty/truncated replacement must invalidate cached ancestors.
+    for (tool, sid) in affected {
+        record_events(tx, &tool, &sid, source_id, &[])?;
+    }
     Ok(())
+}
+
+/// Gaps strictly greater than this threshold are idle, in every ingester.
+pub const IDLE_GAP_SECONDS: i64 = 15 * 60;
+
+/// Persist only timestamps, then refresh this session and every recorded ancestor.
+/// A late child or a second source for a session therefore updates its parent
+/// in the same transaction. UNION makes malformed lineage cycles finite.
+pub fn record_events(
+    tx: &Transaction,
+    tool: &str,
+    session_id: &str,
+    source_id: i64,
+    events: &[(i64, i64)],
+) -> Result<()> {
+    let mut insert =
+        tx.prepare_cached("INSERT OR IGNORE INTO session_events VALUES (?1, ?2, ?3, ?4, ?5)")?;
+    for &(start, end) in events {
+        insert.execute(params![source_id, tool, session_id, start, end.max(start)])?;
+    }
+    let mut stmt = tx.prepare(
+        "WITH RECURSIVE ancestors(sid) AS (
+            SELECT ?2 UNION SELECT s.parent_session_id FROM sessions s
+            JOIN ancestors a ON s.session_id = a.sid
+            WHERE s.tool = ?1 AND s.parent_session_id IS NOT NULL
+        ) SELECT sid FROM ancestors",
+    )?;
+    let ancestors = stmt
+        .query_map(params![tool, session_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for sid in ancestors {
+        let active = tree_active_ms(tx, tool, &sid)?;
+        tx.execute(
+            "UPDATE sessions SET active_ms = ?3 WHERE tool = ?1 AND session_id = ?2",
+            params![tool, sid, active],
+        )?;
+    }
+    Ok(())
+}
+
+/// Merge overlapping events and retain only gaps at most the idle threshold.
+/// Exposed for ingest verification; queries read the cached sessions column.
+pub fn tree_active_ms(conn: &Connection, tool: &str, session_id: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE tree(sid) AS (
+            SELECT ?2 UNION SELECT s.session_id FROM sessions s JOIN tree t
+            ON s.parent_session_id = t.sid WHERE s.tool = ?1
+        ) SELECT e.start_ms, e.end_ms FROM session_events e JOIN tree t
+          ON e.session_id = t.sid WHERE e.tool = ?1 ORDER BY e.start_ms, e.end_ms",
+    )?;
+    let mut rows = stmt.query(params![tool, session_id])?;
+    let mut end: Option<i64> = None;
+    let mut active = 0;
+    while let Some(row) = rows.next()? {
+        let start: i64 = row.get(0)?;
+        let next: i64 = row.get(1)?;
+        if let Some(prev) = end {
+            if start - prev <= IDLE_GAP_SECONDS * 1000 {
+                active += (next - prev).max(0);
+            } else {
+                active += next - start;
+            }
+            end = Some(prev.max(next));
+        } else {
+            active += next - start;
+            end = Some(next);
+        }
+    }
+    Ok(end.map(|_| active))
+}
+
+#[cfg(test)]
+mod active_migration_tests {
+    use super::*;
+
+    #[test]
+    fn v5_migration_preserves_usage_and_labels_and_requests_timeline_backfill() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..5] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute_batch("INSERT INTO sources(id, tool, path, offset, size) VALUES (1, 'codex', '/home/demo/log', 100, 100);
+            INSERT INTO sessions(tool, session_id, source_id, user_turns) VALUES ('codex', 'demo', 1, 3);
+            INSERT INTO session_labels VALUES ('codex', 'demo', 'coding', 0);
+            INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms) VALUES ('codex', 'demo', 1, 'request', 0);
+            INSERT INTO codex_cursors VALUES (1, '{}');").unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 6);
+        for table in ["requests", "session_labels", "sessions"] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            source_state(&store.conn, "/home/demo/log")
+                .unwrap()
+                .unwrap()
+                .offset,
+            0
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM codex_cursors", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }

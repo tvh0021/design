@@ -262,7 +262,7 @@ mod tests {
         assert!(html.contains("no known directory"));
         assert!(html.contains("role=\"img\" aria-label=\"claude-code 86 %, antigravity 14 %"));
         // Sessions: titles from sessions.title, both lists.
-        assert!(html.contains("Longest, by elapsed time"));
+        assert!(html.contains("Longest, by active time"));
         assert!(html.contains("Costliest, by estimated cost"));
         assert!(html.contains("<td class=\"title\">Demo task x1</td>"));
         assert!(
