@@ -39,7 +39,14 @@ pub fn run(db: &Path, out: &Path, push: bool, now_ms: i64) -> Result<String> {
             }
         }
     }
-    crate::privacy::check(&conn, &pages, home.as_deref())?;
+    let public_projects = crate::config::load()?.public_projects;
+    crate::privacy::check(
+        &conn,
+        &pages,
+        home.as_deref(),
+        &public_projects,
+        &Default::default(),
+    )?;
     // Keep the previous tree until the guarded replacement succeeds.
     let backup = stage.path().join("previous");
     if out.exists() {

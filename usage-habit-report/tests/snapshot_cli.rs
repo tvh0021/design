@@ -8,7 +8,18 @@ use usage_habit_report::{
 };
 
 fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
+    export_with_config(db, out, window, None)
+}
+
+fn export_with_config(
+    db: &Path,
+    out: &Path,
+    window: Option<&str>,
+    config: Option<&Path>,
+) -> std::process::Output {
+    let empty = tempfile::NamedTempFile::new().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_usage-habit-report"));
+    cmd.env("USAGE_HABIT_REPORT_CONFIG", config.unwrap_or(empty.path()));
     cmd.arg("--db")
         .arg(db)
         .arg("snapshot")
@@ -18,6 +29,7 @@ fn export(db: &Path, out: &Path, window: Option<&str>) -> std::process::Output {
     if let Some(w) = window {
         cmd.args(["--window", w]);
     }
+    cmd.arg("--no-scan");
     let output = cmd.output().unwrap();
     // Error messages may contain paths. Report the exit code only.
     assert!(
@@ -61,7 +73,16 @@ fn word_privacy_rules_preserve_boundaries_case_and_escaped_forms() {
 }
 
 fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>) {
-    usage_habit_report::privacy::check(conn, out, None).unwrap();
+    assert_redacted_with_allowlist(conn, out, vocabulary, &Default::default());
+}
+
+fn assert_redacted_with_allowlist(
+    conn: &Connection,
+    out: &Path,
+    vocabulary: &BTreeSet<String>,
+    allowlist: &std::collections::BTreeMap<String, String>,
+) {
+    usage_habit_report::privacy::check(conn, out, None, allowlist, vocabulary).unwrap();
     let files: Vec<_> = std::fs::read_dir(out)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -69,10 +90,9 @@ fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>)
     assert_eq!(files.len(), 16);
     for file in &files {
         let body = std::fs::read_to_string(file).unwrap();
-        // All resources are inline; the only navigation is to generated files.
+
         for forbidden in [
             "http://",
-            "https://",
             "src=",
             "<link",
             "@import",
@@ -88,25 +108,14 @@ fn assert_redacted(conn: &Connection, out: &Path, vocabulary: &BTreeSet<String>)
         }
         for link in body.split("href=\"").skip(1) {
             let target = link.split('"').next().unwrap();
-            assert!(out.join(target).is_file(), "static link has no output file");
+            assert!(
+                allowlist.values().any(|url| html::esc(url) == target)
+                    || out.join(target).is_file(),
+                "link has no output file or allowlist entry"
+            );
         }
         assert!(body.contains(html::CSS));
         assert!(body.contains(html::JS));
-    }
-    for result in usage_habit_report::privacy::audit(conn, out, vocabulary).unwrap() {
-        eprintln!(
-            "redaction {}: {} candidates, {} skipped short, {} fixture vocabulary, {} matches",
-            result.category,
-            result.candidates,
-            result.skipped_short,
-            result.vocabulary_words,
-            result.matches
-        );
-        assert_eq!(
-            result.matches, 0,
-            "redaction {} failed; counts only, no private strings",
-            result.category
-        );
     }
 }
 
@@ -211,8 +220,17 @@ fn real_store_snapshot_is_redacted() {
         return;
     }
     let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let output = export(&db, tmp.path(), None);
+    let tmp = tempfile::tempdir_in("target").unwrap();
+    let config = std::env::var_os("USAGE_HABIT_REPORT_CONFIG").map(std::path::PathBuf::from);
+    let allowlist = config
+        .as_ref()
+        .map(|p| {
+            usage_habit_report::config::parse(&std::fs::read_to_string(p).unwrap())
+                .unwrap()
+                .public_projects
+        })
+        .unwrap_or_default();
+    let output = export_with_config(&db, tmp.path(), None, config.as_deref());
     // CLI stdout contains counts and duration only.
     eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
     let mut sizes: Vec<_> = std::fs::read_dir(tmp.path())
@@ -226,10 +244,77 @@ fn real_store_snapshot_is_redacted() {
     for (name, bytes) in sizes {
         eprintln!("{}: {bytes} bytes", name.to_string_lossy());
     }
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir_in("target").unwrap();
     let fixture_db = fixture.path().join("fixture.db");
     let _fixture_store = fixture_store(&fixture_db);
     let fixture_out = fixture.path().join("out");
     export(&fixture_db, &fixture_out, None);
-    assert_redacted(&conn, tmp.path(), &page_vocabulary(&fixture_out));
+    assert_redacted_with_allowlist(
+        &conn,
+        tmp.path(),
+        &page_vocabulary(&fixture_out),
+        &allowlist,
+    );
+    let all = std::fs::read_to_string(tmp.path().join("index-all.html")).unwrap();
+    for url in allowlist.values() {
+        assert!(
+            all.contains(&format!(
+                "href=\"{}\" rel=\"noopener\">{}",
+                html::esc(url),
+                html::esc(usage_habit_report::public_projects::name(url))
+            )),
+            "allowlisted link missing"
+        );
+    }
+}
+
+#[test]
+fn public_projects_keep_links_and_separate_rows_without_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    let store = fixture_store(&db);
+    store.conn.execute_batch("UPDATE sessions SET parent_session_id = NULL, is_subagent = 0;
+        INSERT INTO sessions (tool, session_id, project, project_name) VALUES ('codex', 'fixture-third-id', '/home/demo/private-third', 'demo');
+        INSERT INTO requests (tool, request_key, session_id, ts_ms, input_tokens, output_tokens, cost_usd) VALUES ('codex', 'fixture-third-request', 'fixture-third-id', 1792380600000, 20, 10, 0.1);
+        UPDATE sessions SET project_name = 'public-repo' WHERE project != '/home/demo/private-third';").unwrap();
+    let config = tmp.path().join("config.toml");
+    let text = r#"[public_projects]
+"/home/demo/private-orchard" = "https://github.com/demo/public-repo"
+"/home/demo/private-violet" = "https://github.com/demo/public-repo"
+malformed setting
+"#;
+    std::fs::write(&config, text).unwrap();
+    let out = tmp.path().join("out");
+    let result = export_with_config(&db, &out, None, Some(&config));
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("warning: ignoring malformed public_projects setting")
+    );
+    let allowlist = usage_habit_report::config::parse(text)
+        .unwrap()
+        .public_projects;
+    assert_redacted_with_allowlist(&store.conn, &out, &BTreeSet::new(), &allowlist);
+    let body = std::fs::read_to_string(out.join("index-all.html")).unwrap();
+    assert_eq!(
+        body.matches(
+            "<a href=\"https://github.com/demo/public-repo\" rel=\"noopener\">public-repo</a>"
+        )
+        .count(),
+        2
+    );
+    assert!(body.contains("project C"));
+    assert!(body.contains("Linked projects are public on GitHub. Other project names are pseudonyms shared across this export. Tool shares are percentages of requests."));
+    assert!(!body.contains("title=\"/"));
+    // Allowlisting a name must never exempt its private path.
+    std::fs::write(
+        out.join("index-all.html"),
+        format!("{body}/home/demo/private-orchard"),
+    )
+    .unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_redacted_with_allowlist(&store.conn, &out, &BTreeSet::new(), &allowlist);
+        }))
+        .is_err()
+    );
 }

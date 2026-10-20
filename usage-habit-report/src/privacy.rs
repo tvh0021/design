@@ -2,7 +2,10 @@
 use crate::serve::html;
 use anyhow::{Result, bail};
 use rusqlite::Connection;
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 // The snapshot templates emit lowercase style/script tags with no attributes.
 pub fn body_text(document: &str) -> String {
@@ -45,7 +48,16 @@ pub fn word_candidate_matches(body: &str, candidate: &str, vocabulary: &BTreeSet
 }
 
 /// Check every exported file, including inline assets, before publishing.
-pub fn check(conn: &Connection, out: &Path, home: Option<&Path>) -> Result<()> {
+/// Public repo names and exact URLs bypass word checks only. Paths and IDs
+/// remain forbidden throughout each file. Production callers use an empty
+/// vocabulary; fixture audits can exclude known template words.
+pub fn check(
+    conn: &Connection,
+    out: &Path,
+    home: Option<&Path>,
+    public_projects: &BTreeMap<String, String>,
+    vocabulary: &BTreeSet<String>,
+) -> Result<()> {
     let mut needles = BTreeSet::new();
     for column in [
         "cwd",
@@ -84,6 +96,15 @@ pub fn check(conn: &Connection, out: &Path, home: Option<&Path>) -> Result<()> {
         if needles.iter().any(|candidate| body.contains(candidate)) {
             bail!("privacy guard failed: private store value found in export");
         }
+        if without_public_urls(&body, public_projects).contains("https://") {
+            bail!("privacy guard failed: unapproved external URL found in export");
+        }
+    }
+    if audit(conn, out, vocabulary, public_projects)?
+        .iter()
+        .any(|count| count.matches > 0)
+    {
+        bail!("privacy guard failed: private store value found in export");
     }
     Ok(())
 }
@@ -99,10 +120,19 @@ pub struct AuditCount {
     pub word_match: bool,
 }
 
+fn without_public_urls(body: &str, public_projects: &BTreeMap<String, String>) -> String {
+    let mut text = body.to_owned();
+    for url in public_projects.values() {
+        text = text.replace(&html::esc(url), "").replace(url, "");
+    }
+    text
+}
+
 pub fn audit(
     conn: &Connection,
     out: &Path,
     vocabulary: &BTreeSet<String>,
+    public_projects: &BTreeMap<String, String>,
 ) -> Result<Vec<AuditCount>> {
     // Exact categories retain whole-file raw and escaped substring checks.
     // Word categories use body text, a minimum length, and fixture vocabulary.
@@ -127,6 +157,11 @@ pub fn audit(
             .collect::<rusqlite::Result<_>>()?;
         let mut needles = BTreeSet::new();
         for value in values {
+            if matches!(column, "title" | "t3_title" | "display_title")
+                && value.chars().count() < 12
+            {
+                continue;
+            }
             let value = if column == "title" || column == "t3_title" {
                 value.chars().take(20).collect::<String>()
             } else if category == "project_folder" {
@@ -137,15 +172,26 @@ pub fn audit(
             } else {
                 value
             };
+            if word_match
+                && public_projects
+                    .values()
+                    .any(|url| crate::public_projects::name(url) == value)
+            {
+                continue;
+            }
             needles.insert(html::esc(&value));
             needles.insert(value);
         }
         categories.push((category, needles, word_match));
     }
     let mut matches = vec![0usize; categories.len()];
-    for entry in std::fs::read_dir(out)? {
-        let body = std::fs::read_to_string(entry?.path())?;
-        let text = body_text(&body);
+    for entry in walkdir::WalkDir::new(out) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let body = std::fs::read_to_string(entry.path())?;
+        let text = body_text(&without_public_urls(&body, public_projects));
         for (i, (_, needles, word_match)) in categories.iter().enumerate() {
             matches[i] += needles
                 .iter()

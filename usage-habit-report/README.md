@@ -26,6 +26,7 @@ cargo build --release
 | Rates  | `~/.config/usage-habit-report/rates.json`     |
 
 `XDG_DATA_HOME` and `XDG_CONFIG_HOME` override the parent directories.
+`USAGE_HABIT_REPORT_CONFIG` overrides the application `config.toml` file.
 `--db <path>` (or `USAGE_HABIT_REPORT_DB`) points every command at a
 different store. `--offline` (or `USAGE_HABIT_REPORT_OFFLINE=1`) stops every
 command from fetching model rates; see [Pricing](#pricing).
@@ -712,6 +713,22 @@ T3 titles, and per-request rows are absent. Session tables retain the tool,
 project pseudonym, elapsed time, request count, and estimated cost. The
 heaviest fan-outs list becomes an omission note; its panel's aggregate
 figures remain.
+
+To keep public GitHub repository names and links, add exact stored project paths
+to `[public_projects]` in the application `config.toml`:
+
+```toml
+[public_projects]
+"/home/demo/git_repos/t3code-dev" = "https://github.com/demo/t3code"
+"/home/demo/git_repos/t3code-other" = "https://github.com/demo/t3code"
+```
+
+The public display name is the last URL segment. Paths never appear in the
+export, and paths sharing a URL remain separate rows. Other projects keep
+pseudonyms. Malformed entries warn on stderr and are ignored. Only HTTPS
+GitHub repository URLs are accepted. The local dashboard is unchanged.
+Use `USAGE_HABIT_REPORT_CONFIG=/path/to/temporary.toml` with `--db` to review
+an export using a separate config and store.
 
 Dollar figures round independently to the nearest dollar, including totals
 and activity-map readouts. Rounded rows may not add up. Real dates, local

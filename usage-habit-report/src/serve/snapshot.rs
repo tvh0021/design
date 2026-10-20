@@ -22,6 +22,7 @@ pub fn filename(window: Window, tool: Option<&str>, single_window: bool) -> Stri
 /// All-time estimated cost descending, then path for deterministic ties.
 struct Redaction {
     projects: BTreeMap<String, String>,
+    public_projects: BTreeMap<String, String>,
 }
 
 fn letters(mut index: usize) -> String {
@@ -51,6 +52,7 @@ impl Redaction {
                 .then(a.project.cmp(&b.project))
         });
         Ok(Self {
+            public_projects: crate::public_projects::load()?,
             projects: projects
                 .into_iter()
                 .filter_map(|p| p.project)
@@ -60,7 +62,16 @@ impl Redaction {
         })
     }
 
-    fn project(&self, path: &mut Option<String>, name: &mut Option<String>) {
+    fn project(
+        &self,
+        path: &mut Option<String>,
+        name: &mut Option<String>,
+        url: &mut Option<String>,
+    ) {
+        *url = path
+            .as_ref()
+            .and_then(|p| self.public_projects.get(p))
+            .cloned();
         *name = path.as_ref().map(|p| {
             // Fail closed if a future query supplies a project absent from the mapping.
             self.projects
@@ -68,6 +79,9 @@ impl Redaction {
                 .cloned()
                 .unwrap_or_else(|| "project unknown".into())
         });
+        if let Some(url) = url {
+            *name = Some(crate::public_projects::name(url).to_owned());
+        }
         *path = None;
     }
 
@@ -86,11 +100,19 @@ impl Redaction {
         {
             line.session_id.clear();
             line.title = None;
-            self.project(&mut line.project, &mut line.project_name);
+            self.project(
+                &mut line.project,
+                &mut line.project_name,
+                &mut line.project_url,
+            );
             round(&mut line.cost_usd);
         }
         for line in &mut p.projects.lines {
-            self.project(&mut line.row.project, &mut line.row.name);
+            self.project(
+                &mut line.row.project,
+                &mut line.row.name,
+                &mut line.project_url,
+            );
             round(&mut line.row.tokens.estimated_cost_usd);
             for (_, _, cost) in &mut line.tools {
                 round(cost);

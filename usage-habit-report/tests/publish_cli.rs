@@ -228,8 +228,14 @@ fn privacy_checks_raw_and_escaped_values_assets_short_titles_and_home() {
     ] {
         std::fs::write(&file, format!("<script>{value}</script>")).unwrap();
         assert!(
-            usage_habit_report::privacy::check(&store.conn, &out, Some(Path::new("/home/demo")))
-                .is_err()
+            usage_habit_report::privacy::check(
+                &store.conn,
+                &out,
+                Some(Path::new("/home/demo")),
+                &Default::default(),
+                &Default::default()
+            )
+            .is_err()
         );
     }
     store
@@ -240,7 +246,14 @@ fn privacy_checks_raw_and_escaped_values_assets_short_titles_and_home() {
         )
         .unwrap();
     std::fs::write(&file, "short title tiny small").unwrap();
-    usage_habit_report::privacy::check(&store.conn, &out, None).unwrap();
+    usage_habit_report::privacy::check(
+        &store.conn,
+        &out,
+        None,
+        &Default::default(),
+        &Default::default(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -416,4 +429,75 @@ fn unchanged_data_across_a_clock_tick_makes_no_commit() {
     let summary = publish::run(&db, &out, false, NOW + 60_000).unwrap();
     assert!(summary.contains("no commit"));
     assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn allowlisted_project_publishes_with_config_override_and_no_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = fixture(&tmp.path().join("usage.db"));
+    store
+        .conn
+        .execute("UPDATE sessions SET project_name = 'public-repo'", [])
+        .unwrap();
+    let root = tmp.path().join("repo");
+    repo(&root);
+    let out = root.join("site");
+    let config = tmp.path().join("override.toml");
+    std::fs::write(&config, format!("[sources]\ncodex_state_dir = '/home/demo/unused'\n[publish]\ndir = '{}'\npush = true\n[public_projects]\n\"/home/demo/private\" = \"https://github.com/private/public-repo\"\n", out.display())).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_usage-habit-report"))
+        .arg("--db")
+        .arg(tmp.path().join("usage.db"))
+        .args(["--no-scan", "--offline", "publish", "--no-push"])
+        .env("HOME", tmp.path().join("home"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env("USAGE_HABIT_REPORT_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "allowlisted publish failed");
+    assert!(String::from_utf8_lossy(&result.stdout).contains("committed; not pushed (disabled)"));
+    let body = std::fs::read_to_string(out.join("index-all.html")).unwrap();
+    assert!(body.contains(
+        "<a href=\"https://github.com/private/public-repo\" rel=\"noopener\">public-repo</a>"
+    ));
+    assert!(!body.contains("/home/demo/private"));
+    assert_eq!(git(&root, &["log", "-1", "--format=%s"]), publish::MESSAGE);
+}
+
+#[test]
+fn public_allowlist_exempts_words_and_urls_but_never_paths_or_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = fixture(&tmp.path().join("usage.db"));
+    store
+        .conn
+        .execute("UPDATE sessions SET project_name = 'public-repo'", [])
+        .unwrap();
+    let out = tmp.path().join("pages");
+    std::fs::create_dir(&out).unwrap();
+    let file = out.join("index.html");
+    let public = std::collections::BTreeMap::from([(
+        "/home/demo/private".to_owned(),
+        "https://github.com/private/public-repo".to_owned(),
+    )]);
+    let safe = "<a href=\"https://github.com/private/public-repo\">public-repo</a>";
+    std::fs::write(&file, safe).unwrap();
+    usage_habit_report::privacy::check(&store.conn, &out, None, &public, &Default::default())
+        .unwrap();
+    for leaked in [
+        "private",
+        "https://github.com/demo/unapproved",
+        "<style>/home/demo/private</style>",
+        "<script>private-session-id</script>",
+    ] {
+        std::fs::write(&file, format!("{safe}{leaked}")).unwrap();
+        assert!(
+            usage_habit_report::privacy::check(
+                &store.conn,
+                &out,
+                None,
+                &public,
+                &Default::default()
+            )
+            .is_err()
+        );
+    }
 }

@@ -11,6 +11,7 @@ pub mod models;
 pub mod paths;
 pub mod project;
 pub mod proto;
+pub mod public_projects;
 pub mod query;
 pub mod rates;
 pub mod scan;

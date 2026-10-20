@@ -5,12 +5,13 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[derive(Default, Debug)]
 pub struct Config {
     pub sources: BTreeMap<String, PathBuf>,
+    pub public_projects: BTreeMap<String, String>,
     pub publish_dir: Option<PathBuf>,
     pub publish_push: Option<bool>,
 }
 
 pub fn load() -> Result<Config> {
-    let text = match std::fs::read_to_string(crate::paths::config_dir()?.join("config.toml")) {
+    let text = match std::fs::read_to_string(crate::paths::config_file()?) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e).context("reading usage-habit-report config"),
@@ -21,9 +22,22 @@ pub fn load() -> Result<Config> {
 pub fn parse(text: &str) -> Result<Config> {
     let mut out = Config::default();
     let mut section = "";
-    for line in text.lines().map(str::trim) {
+    for (index, line) in text.lines().map(str::trim).enumerate() {
         if line.starts_with('[') {
             section = line.split('#').next().unwrap().trim();
+            continue;
+        }
+        if section == "[public_projects]" {
+            if !line.is_empty() && !line.starts_with('#') {
+                if let Some((path, url)) = crate::public_projects::setting(line) {
+                    out.public_projects.insert(path, url);
+                } else {
+                    eprintln!(
+                        "warning: ignoring malformed public_projects setting on line {}",
+                        index + 1
+                    );
+                }
+            }
             continue;
         }
         if !matches!(section, "[sources]" | "[publish]") || line.is_empty() || line.starts_with('#')

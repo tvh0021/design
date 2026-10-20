@@ -468,6 +468,7 @@ pub type ToolMix = Vec<(String, i64, Option<f64>)>;
 /// active time and the tool mix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectLine {
+    pub project_url: Option<String>,
     pub row: crate::project::ProjectRow,
     /// Sum of cached `active_seconds` over the
     /// project's top-level sessions in the window.
@@ -540,6 +541,7 @@ pub fn projects(
             let mut tools = mix.remove(&row.project).unwrap_or_default();
             tools.sort_by_key(|(t, _, _)| tool_order(t));
             ProjectLine {
+                project_url: None,
                 active_seconds: row.active_seconds,
                 tools,
                 row,
@@ -567,6 +569,7 @@ pub struct SessionLine {
     pub title: Option<String>,
     pub project: Option<String>,
     pub project_name: Option<String>,
+    pub project_url: Option<String>,
     /// As `query session`'s `elapsed_seconds` (the whole session, not the window).
     pub elapsed_seconds: i64,
     pub active_seconds: i64,
@@ -612,6 +615,7 @@ pub fn session_lists(
                     title: r.get(2)?,
                     project: r.get(3)?,
                     project_name: r.get(4)?,
+                    project_url: None,
                     elapsed_seconds: r.get(5)?,
                     active_seconds: r.get(9)?,
                     requests: r.get(6)?,
