@@ -740,6 +740,103 @@ user prompt by deterministic keyword rules in `src/labels.rs`: `research`,
 The rules are keyword matches, not a model. Expect some misfiles; correct
 them with `label`.
 
+## MCP server
+
+```sh
+usage-habit-report mcp
+```
+
+Runs a stdio MCP server (JSON-RPC 2.0, one message per line). Stdout carries
+protocol messages only; logs go to stderr. Each tool calls the same Rust
+function as the matching `query` command and returns its `--json` body as a
+single text content block (compact, not pretty-printed), so the shapes in
+[docs/json-shapes.md](docs/json-shapes.md) apply unchanged. Calls with the
+`2026-07-28` revision's `_meta` also get the body as `structuredContent`.
+
+| Tool | Arguments | Same as |
+|------|-----------|---------|
+| `usage_summary` | `since?`, `group_by?` (`tool-model` or `label`) | `query summary` |
+| `usage_session` | `key`, `rows?`, `since?` | `query session` |
+| `usage_project` | `key`, `since?` | `query project` |
+| `usage_projects` | `since?` | `query projects` |
+| `usage_models` | none | `query models` |
+| `usage_agents` | `since?` | `query agents` |
+| `usage_labels` | none | `query labels` |
+
+`since` is `12h`, `7d` or `2w`. `usage_session` takes a session id, a unique
+prefix, or a T3 thread id; `usage_project` takes a path or folder name. An
+ambiguous key returns an error result (`isError: true`) whose text is the CLI's
+body, `{"error": "ambiguous", "key": ..., "candidates": [...]}`; no match
+returns `{"error": "not found", "key": ...}`. Bad arguments are error results
+too; an unknown tool name is a JSON-RPC error (-32602).
+
+Every tool description says: output never contains prompt or response text
+(only session and T3 thread titles); dollar figures are estimates; the first
+call may run a catch-up scan that can take up to 30 s on a cold store.
+
+**Catch-up rule.** Nothing runs at startup, so `initialize` answers at once.
+The first tool call runs the same catch-up as `query` (scan, enrich, price).
+A later call repeats it only when more than 60 s have passed since the
+previous catch-up finished. Global `--no-scan` turns it off for the whole
+session; `--offline` and `--db` work as for the CLI. Requests are handled one
+at a time, so a call that arrives during a scan waits for it.
+
+**Protocol.** `initialize` echoes the client's version when it is one of
+`2025-11-25`, `2025-06-18`, `2025-03-26` or `2024-11-05`, and otherwise offers
+`2025-11-25`. The server also answers `server/discover` and per-request
+`_meta` version checks from the `2026-07-28` revision, which modelcontextprotocol.io
+lists as current; that path is tested here but not against a real client.
+
+### Registration
+
+Assumes the binary is on `PATH` (`cargo install --path usage-habit-report`).
+GUI apps often start with a shorter `PATH` than a shell; if a client cannot
+find it, use the absolute path (`~/.cargo/bin/usage-habit-report`).
+
+Claude Code:
+
+```sh
+claude mcp add --scope user usage-habit-report -- usage-habit-report mcp
+```
+
+which writes this under the top-level `mcpServers` key of `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "usage-habit-report": {
+      "type": "stdio",
+      "command": "usage-habit-report",
+      "args": ["mcp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.usage-habit-report]
+command = "usage-habit-report"
+args = ["mcp"]
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+```
+
+Gemini / Antigravity, in `~/.gemini/config/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "usage-habit-report": {
+      "command": "usage-habit-report",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
 ## Store schema (v5)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
@@ -779,6 +876,6 @@ The fixtures in `tests/fixtures/` are hand-written. The Antigravity
 databases and their protobuf blobs are built inside `tests/antigravity.rs`,
 and the T3 state databases inside `src/t3.rs` and `tests/projects_cli.rs`.
 `tests/query_cli.rs` covers `query session`, `query thread`, the catch-up and
-`--no-scan`, and `rebuild`. Project-resolution tests run `git init` and `git worktree add` in temporary
+`--no-scan`, and `rebuild`. `tests/mcp_cli.rs` spawns `mcp` and checks its replies against the CLI's JSON. Project-resolution tests run `git init` and `git worktree add` in temporary
 folders, so `git` must be on `PATH`. Never commit real
 transcript content: this repository is public.

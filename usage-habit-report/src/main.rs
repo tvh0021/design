@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
-    agents, antigravity, codex, labels, paths, project, query, rates, scan, store::Store, t3,
+    agents, antigravity, codex, labels, mcp, paths, project, query, rates, scan, store::Store, t3,
 };
 
 #[derive(Parser)]
@@ -63,6 +63,11 @@ enum Command {
         #[command(flatten)]
         args: ScanArgs,
     },
+    /// Run a stdio MCP server exposing the query commands as tools.
+    /// Registration snippets are in README.md. The catch-up runs on the first
+    /// tool call, and again when a call comes more than 60 s after the last;
+    /// `--no-scan` turns it off.
+    Mcp,
     /// Read from the store.
     Query {
         #[command(subcommand)]
@@ -401,6 +406,15 @@ fn main() -> Result<()> {
         catch_up(&mut store, cli.offline)?;
     }
     match cli.command {
+        Command::Mcp => {
+            let (offline, no_scan) = (cli.offline, cli.no_scan);
+            mcp::serve(
+                store,
+                offline,
+                no_scan,
+                Box::new(move |s| catch_up(s, offline)),
+            )?;
+        }
         Command::Scan { args } => {
             let scan_start = std::time::Instant::now();
             let ing = ingest(&mut store, args)?;
