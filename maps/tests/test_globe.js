@@ -649,7 +649,30 @@ test('etopo-8k.jpg exists, is an 8192x4096 JPEG and <= 8 MB', () => {
   assert.deepEqual(dims, { w: 8192, h: 4096 });
 });
 
-// 14b. Detail (50m) border asset integrity and payload budget
+// 14b. Progressive 16k terrain texture: power-of-two 16384x8192 JPEG within a 24 MB budget
+test('etopo-16k.jpg exists, is a 16384x8192 JPEG and <= 24 MB', () => {
+  const p = resolve(__dirname, '../data/etopo-16k.jpg');
+  assert.ok(existsSync(p), 'etopo-16k.jpg must exist in maps/data/');
+  const buf = readFileSync(p);
+  assert.ok(buf.length <= 24 * 1024 * 1024, `etopo-16k.jpg must stay <= 24 MB, got ${buf.length}`);
+  assert.equal(buf[0], 0xFF);
+  assert.equal(buf[1], 0xD8);
+  // Walk JPEG markers to the SOF segment and read its dimensions.
+  let i = 2, dims = null;
+  while (i < buf.length - 9) {
+    if (buf[i] !== 0xFF) { i++; continue; }
+    const marker = buf[i + 1];
+    const len = buf.readUInt16BE(i + 2);
+    if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) || (marker >= 0xC9 && marker <= 0xCB)) {
+      dims = { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
+      break;
+    }
+    i += 2 + len;
+  }
+  assert.deepEqual(dims, { w: 16384, h: 8192 });
+});
+
+// 14c. Detail (50m) border asset integrity and payload budget
 test('world-50m.json detail asset exists, is valid TopoJSON and <= 350 KB', () => {
   const assetPath = resolve(__dirname, '../data/world-50m.json');
   assert.ok(existsSync(assetPath), 'Asset maps/data/world-50m.json must exist');

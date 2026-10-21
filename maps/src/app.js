@@ -111,6 +111,9 @@ export async function initApp(options = {}) {
       ...(urlParams?.get('neighborhood') ? { placeNeighborhood: urlParams.get('neighborhood') } : {}),
       ...(urlParams?.get('reach') ? { placeDotReach: Number(urlParams.get('reach')) } : {}),
       ...(urlParams?.get('spacing') ? { placeDotSpacing: Number(urlParams.get('spacing')) } : {}),
+      // ?texture=4k|8k caps the progressive terrain upgrade (default: up to 16k).
+      ...(urlParams?.get('texture') === '4k' ? { terrainHiResUrl: null, terrainUltraUrl: null } : {}),
+      ...(urlParams?.get('texture') === '8k' ? { terrainUltraUrl: null } : {}),
       ...(options.globeOptions || {})
     });
 
@@ -120,7 +123,11 @@ export async function initApp(options = {}) {
       globe.setPlaces(directory.records.filter((r) => r && r.kind === 'city'));
     }
 
-    if (urlParams?.get('debug') === '1' && typeof window !== 'undefined') window.__globe = globe;
+    if (urlParams?.get('debug') === '1' && typeof window !== 'undefined') {
+      window.__globe = globe;
+      // Mirror the terrain tier into the DOM so headless captures can read it.
+      setInterval(() => { document.documentElement.dataset.terrainTier = globe.getTerrainTier(); }, 500);
+    }
 
     let currentOrigin = initialOrigin;
     let currentDest = initialDest;

@@ -378,7 +378,7 @@ export function getRobinsonFragmentSource() {
  * WebGL Physical Terrain Layer
  * Raymarches NOAA ETOPO1 relief on a true sphere beneath vector borders.
  */
-function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUrl, onLoaded, robinsonLut, hiResUrl) {
+function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUrl, onLoaded, robinsonLut, hiResUrl, ultraUrl) {
   if (typeof document === 'undefined') return null;
 
   const glCanvas = document.createElement('canvas');
@@ -553,12 +553,24 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
 
   let isLoaded = false;
   let hiResActive = false;
+  let ultraActive = false;
+  let lastUploadedImage = null;
 
   function uploadTexture(img) {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    // Drain stale errors so the check below reflects this upload. Bounded: a
+    // lost context reports CONTEXT_LOST_WEBGL forever.
+    for (let n = 0; n < 8 && gl.getError() !== gl.NO_ERROR; n++) { /* drain */ }
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    if (gl.getError() === gl.OUT_OF_MEMORY) {
+      // Restore the last texture that fit and stop the upgrade chain.
+      if (lastUploadedImage && lastUploadedImage !== img) {
+        uploadTexture(lastUploadedImage);
+      }
+      return false;
+    }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     // Mipmaps keep a high-resolution texture free of shimmer when the globe is
@@ -568,9 +580,15 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     if (isPot(img.width) && isPot(img.height)) {
       gl.generateMipmap(gl.TEXTURE_2D);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      // Anisotropic filtering on the 16k texture is pathological on ANGLE's
+      // Metal backend (one frame took tens of seconds on an M1 Max; the same
+      // texture with plain trilinear mipmaps drew at full speed), so it is
+      // only enabled up to 8k. Clear it explicitly in case the 8k upload set it.
       const aniso = gl.getExtension('EXT_texture_filter_anisotropic')
         || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
-      if (aniso) {
+      if (aniso && img.width > 8192) {
+        gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, 1);
+      } else if (aniso) {
         const maxAniso = gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) || 1;
         gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(4, maxAniso));
       }
@@ -578,6 +596,8 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    lastUploadedImage = img;
+    return true;
   }
 
   // Decode off the main thread where supported so the swap does not stall a frame.
@@ -604,16 +624,42 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     return true;
   }
 
+  // The 16k ultra-res texture is a progressive upgrade: only fetched once the 8k
+  // texture is uploaded, and only on desktop GPUs with ample VRAM. A 16384x8192 RGBA
+  // texture with mipmaps consumes ~680 MB of GPU memory, so gates are strict:
+  // - MAX_TEXTURE_SIZE must be at least 16384
+  // - navigator.deviceMemory must be undefined or >= 8
+  // - Must not be a touch device (window.matchMedia('(hover: none)').matches is false)
+  function canUseUltra() {
+    if (!ultraUrl) return false;
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
+    if (maxTex < 16384) return false;
+    const mem = typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined;
+    if (typeof mem === 'number' && mem < 8) return false;
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      if (window.matchMedia('(hover: none)').matches) return false;
+    }
+    return true;
+  }
+
   loadImage(textureUrl, (img) => {
-    if (hiResActive) return;
-    uploadTexture(img);
+    if (hiResActive || ultraActive) return;
+    if (!uploadTexture(img)) return;
     isLoaded = true;
     if (typeof onLoaded === 'function') onLoaded();
     if (canUseHiRes()) {
       loadImage(hiResUrl, (hi) => {
-        uploadTexture(hi);
+        if (ultraActive) return;
+        if (!uploadTexture(hi)) return;
         hiResActive = true;
         if (typeof onLoaded === 'function') onLoaded();
+        if (canUseUltra()) {
+          loadImage(ultraUrl, (ultra) => {
+            if (!uploadTexture(ultra)) return;
+            ultraActive = true;
+            if (typeof onLoaded === 'function') onLoaded();
+          });
+        }
       });
     }
   }, () => {
@@ -729,7 +775,9 @@ function initWebGLTerrain(container, parentCanvas, width, height, dpr, textureUr
     hasRobinson: () => !!rob,
     destroy,
     isLoaded: () => isLoaded,
-    isHiRes: () => hiResActive
+    isHiRes: () => hiResActive,
+    isUltra: () => ultraActive,
+    canUseUltra
   };
 }
 
@@ -981,6 +1029,8 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   const terrainUrl = options.terrainTextureUrl || 'data/etopo.jpg';
   // Progressive 8k upgrade; pass terrainHiResUrl: null to disable.
   const terrainHiResUrl = options.terrainHiResUrl === undefined ? 'data/etopo-8k.jpg' : options.terrainHiResUrl;
+  // Progressive 16k upgrade; pass terrainUltraUrl: null to disable.
+  const terrainUltraUrl = options.terrainUltraUrl === undefined ? 'data/etopo-16k.jpg' : options.terrainUltraUrl;
   let webglTerrain = null;
 
   if (terrainEnabled) {
@@ -989,7 +1039,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     try { robinsonLut = buildRobinsonLut(d3); } catch (e) { robinsonLut = null; }
     webglTerrain = initWebGLTerrain(containerElement, canvas, width, height, initDpr, terrainUrl, () => {
       render();
-    }, robinsonLut, terrainHiResUrl);
+    }, robinsonLut, terrainHiResUrl, terrainUltraUrl);
   }
 
   // Interaction/animation state (read by render() to pick the detail level)
@@ -2242,6 +2292,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     getRotation: () => getActiveProjection().rotate().slice(),
     getScale: () => getActiveProjection().scale(),
     getProjection: () => getActiveProjection(),
-    getCanvas: () => canvas
+    getCanvas: () => canvas,
+    // Terrain texture tier currently uploaded: 'none' | 'base' | 'hires' | 'ultra'.
+    getTerrainTier: () => !webglTerrain || !webglTerrain.isLoaded() ? 'none'
+      : webglTerrain.isUltra() ? 'ultra' : webglTerrain.isHiRes() ? 'hires' : 'base',
+    getTerrain: () => webglTerrain
   };
 }
