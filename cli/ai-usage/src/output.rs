@@ -1,6 +1,7 @@
-//! Terminal rendering: the summary, the per-provider detail and the one-line compact form.
+//! Terminal rendering: the summary, the per-provider detail and the compact form.
 
 use crate::report::{Report, Window, status, until};
+use chrono::{DateTime, Utc};
 
 pub struct Painter {
     pub color: bool,
@@ -21,32 +22,13 @@ impl Painter {
     }
 }
 
-/// What can be used now, what is blocked and until when, what could not be read.
+/// What can be used now, then the compact line for every provider.
 pub fn print_summary(reports: &[Report], p: &Painter) {
-    let mut usable = Vec::new();
-    let mut blocked: Vec<(String, &Window)> = Vec::new();
-    for r in reports {
-        let s = status(r);
-        usable.extend(s.usable);
-        blocked.extend(s.blocked.into_iter().map(|w| (format!("{} {}", r.provider, w.label), w)));
-    }
-    let unavailable: Vec<&Report> = reports.iter().filter(|r| r.error.is_some()).collect();
-
+    let usable: Vec<String> = reports.iter().filter_map(|r| status(r).usable).collect();
     let none = p.paint("2", "nothing");
     let usable = if usable.is_empty() { none } else { usable.join(", ") };
     println!("{} {}", p.paint("1", "Usable now:"), p.paint("32", &usable));
-    if !blocked.is_empty() {
-        println!("{}", p.paint("1", "Blocked:"));
-        let width = blocked.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0);
-        for (name, w) in &blocked {
-            let reset = w.resets_at.map(|t| format!("resets in {}", until(t))).unwrap_or_default();
-            println!("  {}  {}", p.paint("31", &format!("{name:<width$}")), p.paint("2", &reset));
-        }
-    }
-    if !unavailable.is_empty() {
-        let names: Vec<&str> = unavailable.iter().map(|r| r.provider).collect();
-        println!("{} {}", p.paint("1", "Unavailable:"), p.paint("33", &names.join(", ")));
-    }
+    print_compact(reports, p);
 }
 
 pub fn print_report(r: &Report, p: &Painter) {
@@ -87,21 +69,49 @@ pub fn print_report(r: &Report, p: &Painter) {
     }
 }
 
-/// One line for a status bar: each provider's highest usable window, or when it unblocks.
+/// One line per provider with every window's usage and time to reset, as
+/// `98% - 1h11m`. Provider-wide windows come first, then each pool with several
+/// windows as `Pool: a% - 3h2m, b% - 4d1h0m`, then single-window model caps as
+/// `Model: c% - 2d3h4m`. `Provider: ?` when it could not be read.
 pub fn print_compact(reports: &[Report], p: &Painter) {
-    let parts: Vec<String> = reports
-        .iter()
-        .map(|r| {
-            let s = status(r);
-            match (r.error.is_some(), s.worst_usable) {
-                (true, _) => p.paint("33", &format!("{} ?", r.provider)),
-                (false, Some(used)) => format!("{} {}", r.provider, p.level(used, &format!("{used:.0}%"))),
-                (false, None) => {
-                    let when = s.unblocks_at.map(|t| format!(" {}", until(t))).unwrap_or_default();
-                    p.paint("31", &format!("{} blocked{when}", r.provider))
-                }
+    for r in reports {
+        if r.error.is_some() {
+            println!("{}", p.paint("33", &format!("{}: ?", r.provider)));
+            continue;
+        }
+        let cell = |w: &Window| {
+            let pct = p.level(w.used_percent, &format!("{:.0}%", w.used_percent));
+            match w.resets_at {
+                Some(t) => format!("{pct} - {}", countdown(t)),
+                None => pct,
             }
-        })
-        .collect();
-    println!("{}", parts.join(" · "));
+        };
+        let mut parts: Vec<String> = r.windows.iter().filter(|w| w.pool.is_none()).map(cell).collect();
+        let mut pools: Vec<&str> = Vec::new();
+        for pool in r.windows.iter().filter_map(|w| w.pool.as_deref()) {
+            if !pools.contains(&pool) {
+                pools.push(pool);
+            }
+        }
+        let mut singles = Vec::new();
+        for pool in pools {
+            let cells: Vec<String> =
+                r.windows.iter().filter(|w| w.pool.as_deref() == Some(pool)).map(cell).collect();
+            let line = format!("{pool}: {}", cells.join(", "));
+            if cells.len() == 1 { singles.push(line) } else { parts.push(line) }
+        }
+        parts.extend(singles);
+        println!("{}: {}", p.paint("1", r.provider), parts.join(", "));
+    }
+}
+
+/// Time until `t` with no spaces and every unit down to minutes: "11m", "1h11m", "5d1h3m".
+fn countdown(t: DateTime<Utc>) -> String {
+    let mins = ((t - Utc::now()).num_seconds().max(0) + 59) / 60;
+    let (d, h, m) = (mins / 1440, mins % 1440 / 60, mins % 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, _) => format!("{h}h{m}m"),
+        _ => format!("{d}d{h}h{m}m"),
+    }
 }

@@ -35,7 +35,7 @@ Usage: ai-usage [options] [provider ...]
 Providers: claude, codex, antigravity, chatllm, zed (default: all)
 
 Options:
-  --compact          one line per run, for status bars
+  --compact          one line per provider with every window's usage
   --json             machine-readable output
   --watch [SECS]     refresh every SECS seconds (default 60) until Ctrl-C;
                      terminal only

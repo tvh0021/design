@@ -102,20 +102,15 @@ impl Report {
 }
 
 /// What a provider can be used for right now.
-pub struct Status<'a> {
+pub struct Status {
     /// e.g. "Claude", "Claude (not Fable)", "Antigravity (Gemini)"; `None` if nothing is usable.
     pub usable: Option<String>,
-    pub blocked: Vec<&'a Window>,
-    /// Highest usage among the windows that still allow use.
-    pub worst_usable: Option<f64>,
-    /// When something becomes usable again, if nothing is now.
-    pub unblocks_at: Option<DateTime<Utc>>,
 }
 
-pub fn status(r: &Report) -> Status<'_> {
+pub fn status(r: &Report) -> Status {
     let blocked: Vec<&Window> = r.windows.iter().filter(|w| w.blocked).collect();
     if r.error.is_some() || r.windows.is_empty() {
-        return Status { usable: None, blocked, worst_usable: None, unblocks_at: None };
+        return Status { usable: None };
     }
 
     let mut pools: Vec<&str> = Vec::new();
@@ -141,28 +136,8 @@ pub fn status(r: &Report) -> Status<'_> {
         Some(format!("{} ({})", r.provider, open_pools.join(", ")))
     };
 
-    let worst_usable = usable.as_ref().and_then(|_| {
-        r.windows
-            .iter()
-            .filter(|w| !w.blocked && w.pool.as_deref().is_none_or(|p| open_pools.contains(&p)))
-            .map(|w| w.used_percent)
-            .reduce(f64::max)
-    });
+    Status { usable }
 
-    // Every blocking window in a group has to reset before the group opens.
-    let all_reset = |ws: &mut dyn Iterator<Item = &&Window>| -> Option<DateTime<Utc>> {
-        ws.map(|w| w.resets_at).collect::<Option<Vec<_>>>()?.into_iter().max()
-    };
-    let unblocks_at = match () {
-        _ if usable.is_some() => None,
-        _ if !wide_blocked.is_empty() => all_reset(&mut wide_blocked.iter().copied()),
-        _ => blocked_pools
-            .iter()
-            .filter_map(|p| all_reset(&mut blocked.iter().filter(|w| w.pool.as_deref() == Some(*p))))
-            .min(),
-    };
-
-    Status { usable, blocked, worst_usable, unblocks_at }
 }
 
 /// Time from now until `t`: "45m", "3h 10m", "4d 18h".
@@ -230,8 +205,6 @@ mod tests {
         let r = report(vec![win("Session", 100.0, 4, 5), win("Weekly", 10.0, 24, 168)]);
         let s = status(&r);
         assert!(s.usable.is_none());
-        assert_eq!(s.blocked.len(), 1);
-        assert!(s.unblocks_at.is_some());
     }
 
     #[test]
@@ -239,7 +212,6 @@ mod tests {
         let r = report(vec![win("Weekly", 10.0, 24, 168), win("Weekly · Fable", 99.0, 24, 168).pool("Fable")]);
         let s = status(&r);
         assert_eq!(s.usable.as_deref(), Some("P (not Fable)"));
-        assert_eq!(s.worst_usable, Some(10.0));
     }
 
     #[test]
@@ -250,18 +222,5 @@ mod tests {
         ]);
         let s = status(&r);
         assert_eq!(s.usable.as_deref(), Some("P (Gemini)"));
-        assert_eq!(s.worst_usable, Some(82.0));
-    }
-
-    #[test]
-    fn all_pools_blocked_unblocks_at_earliest_pool() {
-        let r = report(vec![
-            win("A", 100.0, 3, 5).pool("A"),
-            win("B", 100.0, 24, 168).pool("B"),
-        ]);
-        let s = status(&r);
-        assert!(s.usable.is_none());
-        let hours = (s.unblocks_at.unwrap() - Utc::now()).num_minutes() as f64 / 60.0;
-        assert!((hours - 2.0).abs() < 0.05, "{hours}");
     }
 }

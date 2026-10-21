@@ -605,7 +605,7 @@ fn antigravity_summary_windows(summary: &Value) -> Vec<(String, Window)> {
                 continue;
             }
             let family = if id.starts_with("gemini-argon-") {
-                "Gemini 4 Argon"
+                "Argon"
             } else if id.starts_with("gemini-") {
                 "Gemini"
             } else if id.starts_with("3p-") {
