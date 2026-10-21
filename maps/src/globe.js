@@ -1006,10 +1006,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   // Population-ranked city dots ("places"). placeVecs caches unit vectors so
   // the orthographic view can cull the far side before projecting.
-  // Dot budget: one per ~45k px² of canvas (7 on a phone, 30 on a desktop)
-  // unless the caller fixes it.
+  // Dot budget: 20 on desktop-sized canvases, 10 on phones, unless the
+  // caller fixes it.
   const placeDotLimit = options.placeDotLimit || 0;
-  const placeDotBudget = () => placeDotLimit || Math.min(30, Math.max(6, Math.round(width * height / 45000)));
+  const placeDotBudget = () => placeDotLimit || (width >= 900 ? 20 : 10);
   // Label badges: 13 px text on desktop-sized canvases, 11 px on phones.
   const labelFontPx = () => (width >= 900 ? 13 : 11);
   const labelFont = () => `600 ${labelFontPx()}px system-ui, -apple-system, sans-serif`;
