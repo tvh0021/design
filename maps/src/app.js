@@ -108,7 +108,9 @@ export async function initApp(options = {}) {
       canvas,
       verticalCenterRatio: initialVerticalRatio,
       projectionType: resolvedProjection,
-      ...(urlParams?.get('touchlabels') === '1' ? { touchLabels: true } : {}),
+      ...(urlParams?.get('neighborhood') ? { placeNeighborhood: urlParams.get('neighborhood') } : {}),
+      ...(urlParams?.get('reach') ? { placeDotReach: Number(urlParams.get('reach')) } : {}),
+      ...(urlParams?.get('spacing') ? { placeDotSpacing: Number(urlParams.get('spacing')) } : {}),
       ...(options.globeOptions || {})
     });
 
@@ -117,6 +119,8 @@ export async function initApp(options = {}) {
     if (typeof globe.setPlaces === 'function' && Array.isArray(directory.records)) {
       globe.setPlaces(directory.records.filter((r) => r && r.kind === 'city'));
     }
+
+    if (urlParams?.get('debug') === '1' && typeof window !== 'undefined') window.__globe = globe;
 
     let currentOrigin = initialOrigin;
     let currentDest = initialDest;

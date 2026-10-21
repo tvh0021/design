@@ -71,14 +71,30 @@ function normalizeMidpoint(mid) {
  *   ln(N / (rank + 1)) - centerBias * (r / R) + (stickyBonus if previously shown)
  * where r is the pixel distance from center and R the half-diagonal of rect, so
  * a sparse region still gets dots near its middle. Candidates are then taken in
- * score order, skipping any closer than minSpacing px to a kept dot or to a
- * point in exclude (route pins), until limit dots are kept. With centerBias 0 and
- * no previous dots the score is monotonic in rank, i.e. plain top-N by population.
+ * score order, skipping any that crowd a kept dot or a point in exclude (route
+ * pins), until limit dots are kept. With centerBias 0 and no previous dots the
+ * score is monotonic in rank, i.e. plain top-N by population.
  *
- * @returns {Array<{place: object, index: number, x: number, y: number, score: number}>}
+ * The neighborhood option sets what "crowding" means. Every mode keeps a hard
+ * floor of minSpacing px between dots; prominence below is ln(N / (rank + 1)) /
+ * ln(N), 1 for the top city and 0 for the last.
+ *   'fixed'  only the minSpacing floor.
+ *   'radius' a kept dot excludes candidates within minSpacing + reach *
+ *            prominence px, so a megacity clears a wider ring than a town.
+ *   'soft'   before ranking, each candidate loses softWeight * (1 - d /
+ *            softRadius) per higher-scored candidate (or route pin) within
+ *            softRadius px, so a satellite town is outscored by free-standing
+ *            cities but still shows when nothing else is in view.
+ * When labelRect is given, a candidate is also skipped unless one of the rects
+ * from labelRect(cand) (preferred first) is free of kept dots, kept labels and
+ * excludeRects; the chosen rect is stored on the dot as labelRect so the caller
+ * draws the label where it was reserved. Every kept dot then has a label.
+ *
+ * @returns {Array<{place: object, index: number, x: number, y: number, score: number, labelRect?: object}>}
  */
 export function selectPlaceDots(places, project, rect, {
-  limit = 20, minSpacing = 16, exclude = [], center = null, centerBias = 0, previous = [], stickyBonus = 0.3
+  limit = 20, minSpacing = 16, exclude = [], center = null, centerBias = 0, previous = [], stickyBonus = 0.3,
+  neighborhood = 'fixed', reach = 0, softRadius = 0, softWeight = 0, labelRect = null, excludeRects = []
 } = {}) {
   const dots = [];
   if (!Array.isArray(places) || typeof project !== 'function' || !rect || limit <= 0) return dots;
@@ -91,6 +107,7 @@ export function selectPlaceDots(places, project, rect, {
   const prev = new Set();
   for (const d of previous || []) prev.add(d.place);
   const n = places.length;
+  const logN = Math.log(Math.max(2, n));
   const cands = [];
   for (let i = 0; i < n; i++) {
     const pt = project(places[i], i);
@@ -98,27 +115,94 @@ export function selectPlaceDots(places, project, rect, {
     const x = pt[0];
     const y = pt[1];
     if (!(x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1)) continue;
+    const prominence = Math.log(n / (i + 1)) / logN;
     let score = Math.log(n / (i + 1));
     if (centerBias) score -= centerBias * (Math.hypot(x - cx, y - cy) / halfDiag);
     if (prev.has(places[i])) score += stickyBonus;
-    cands.push({ place: places[i], index: i, x, y, score });
+    cands.push({ place: places[i], index: i, x, y, score, prominence });
   }
   cands.sort((a, b) => b.score - a.score || a.index - b.index);
+
+  if (neighborhood === 'soft' && softRadius > 0 && softWeight > 0) {
+    // Only the strongest candidates can suppress others in practice, so the
+    // top pool are the penalizers; every candidate is penalized, otherwise a
+    // weak satellite outside the pool would leapfrog its penalized neighbors.
+    // The pool is bucketed on a softRadius grid so this stays linear in C.
+    const pool = Math.min(cands.length, Math.max(300, limit * 15));
+    const rSq = softRadius * softRadius;
+    const falloff = (dx, dy) => {
+      const dSq = dx * dx + dy * dy;
+      return dSq < rSq ? softWeight * (1 - Math.sqrt(dSq) / softRadius) : 0;
+    };
+    const cells = new Map();
+    const cellKey = (x, y) => `${Math.floor(x / softRadius)},${Math.floor(y / softRadius)}`;
+    for (let j = 0; j < pool; j++) {
+      const k = cellKey(cands[j].x, cands[j].y);
+      const cell = cells.get(k);
+      if (cell) cell.push(j); else cells.set(k, [j]);
+    }
+    const penalties = new Float64Array(cands.length);
+    for (let i = 0; i < cands.length; i++) {
+      const c = cands[i];
+      let penalty = 0;
+      // Route pins outrank every candidate.
+      for (let j = 0; j < exclude.length; j++) penalty += falloff(exclude[j][0] - c.x, exclude[j][1] - c.y);
+      const cx0 = Math.floor(c.x / softRadius);
+      const cy0 = Math.floor(c.y / softRadius);
+      for (let gx = cx0 - 1; gx <= cx0 + 1; gx++) {
+        for (let gy = cy0 - 1; gy <= cy0 + 1; gy++) {
+          const cell = cells.get(`${gx},${gy}`);
+          if (!cell) continue;
+          for (const j of cell) {
+            if (j < i) penalty += falloff(cands[j].x - c.x, cands[j].y - c.y);
+          }
+        }
+      }
+      penalties[i] = penalty;
+    }
+    for (let i = 0; i < cands.length; i++) cands[i].score -= penalties[i];
+    cands.sort((a, b) => b.score - a.score || a.index - b.index);
+  }
+
   const minSq = minSpacing * minSpacing;
+  const keptRects = excludeRects.slice();
+  const dotPad = 7;
+  const dotRect = (x, y) => ({ x0: x - dotPad, y0: y - dotPad, x1: x + dotPad, y1: y + dotPad });
+  const overlaps = (a, b) => a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
   for (let c = 0; c < cands.length && dots.length < limit; c++) {
-    const { x, y } = cands[c];
+    const cand = cands[c];
+    const { x, y } = cand;
     let crowded = false;
     for (let j = 0; j < exclude.length && !crowded; j++) {
       const dx = exclude[j][0] - x;
       const dy = exclude[j][1] - y;
-      crowded = dx * dx + dy * dy < minSq;
+      // Route pins clear the full ring in 'radius' mode, like a top-ranked dot.
+      const r = neighborhood === 'radius' && reach > 0 ? minSpacing + reach : minSpacing;
+      crowded = dx * dx + dy * dy < r * r;
     }
     for (let j = 0; j < dots.length && !crowded; j++) {
       const dx = dots[j].x - x;
       const dy = dots[j].y - y;
-      crowded = dx * dx + dy * dy < minSq;
+      const dSq = dx * dx + dy * dy;
+      if (neighborhood === 'radius' && reach > 0) {
+        const r = minSpacing + reach * dots[j].prominence;
+        crowded = dSq < r * r;
+      } else {
+        crowded = dSq < minSq;
+      }
     }
-    if (!crowded) dots.push(cands[c]);
+    if (crowded) continue;
+    if (typeof labelRect === 'function') {
+      const own = dotRect(x, y);
+      if (keptRects.some((r) => overlaps(own, r))) continue;
+      const rects = labelRect(cand) || [];
+      const free = rects.find((r) => !keptRects.some((k) => overlaps(r, k))
+        && !dots.some((d) => overlaps(r, dotRect(d.x, d.y))));
+      if (!free) continue;
+      cand.labelRect = free;
+      keptRects.push(free);
+    }
+    dots.push(cand);
   }
   return dots;
 }
@@ -922,18 +1006,28 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   // Population-ranked city dots ("places"). placeVecs caches unit vectors so
   // the orthographic view can cull the far side before projecting.
-  const placeDotLimit = options.placeDotLimit || 20;
+  // Dot budget: one per ~45k px² of canvas (7 on a phone, 30 on a desktop)
+  // unless the caller fixes it.
+  const placeDotLimit = options.placeDotLimit || 0;
+  const placeDotBudget = () => placeDotLimit || Math.min(30, Math.max(6, Math.round(width * height / 45000)));
+  // Label badges: 13 px text on desktop-sized canvases, 11 px on phones.
+  const labelFontPx = () => (width >= 900 ? 13 : 11);
+  const labelFont = () => `600 ${labelFontPx()}px system-ui, -apple-system, sans-serif`;
   const placeDotSpacing = options.placeDotSpacing || 22;
   let placeList = [];
   let placeVecs = null;
   // null = zoom-dependent default, see centerBiasFor().
   const placeDotCenterBias = options.placeDotCenterBias ?? null;
-  const placeTouchLabelCount = options.placeTouchLabelCount ?? 4;
+  // How dots keep their distance from each other, see selectPlaceDots().
+  const placeNeighborhood = options.placeNeighborhood || 'soft';
+  const placeDotReach = options.placeDotReach ?? 110;
+  const placeSoftRadius = options.placeSoftRadius ?? 160;
+  const placeSoftWeight = options.placeSoftWeight ?? 4;
+  // Every dot shows its name (as many as fit without overlapping); hovering or
+  // tapping a dot adds its country. placeLabels: false restores hover-only.
+  const placeLabels = options.placeLabels ?? options.touchLabels ?? true;
+  const placeLabelCount = options.placeLabelCount ?? options.placeTouchLabelCount ?? Infinity;
   const placeTapRadius = 24;
-  // Touch devices have no hover, so the most relevant dots keep their labels.
-  const touchLabels = options.touchLabels
-    ?? (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
-      ? !!window.matchMedia('(hover: none)').matches : false);
   let placeDots = [];
   let hoveredPlace = null;
 
@@ -1196,30 +1290,53 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       }
     }
 
-    // 9. Name label for the hovered / tapped city dot
-    const dotLabel = (d) => (d.place.country ? `${d.place.name}, ${d.place.country}` : d.place.name);
-    const dotAlign = (d) => (d.x > width * 0.6 ? 'left' : 'right');
+    // 9. City dot name labels, plus the country for the hovered / tapped dot
     const taken = pinRects.filter(Boolean);
     const hoveredDot = hoveredPlace && placeDots.find((d) => d.place === hoveredPlace);
-    if (hoveredDot) {
-      taken.push(drawLabelBadge(hoveredDot.x, hoveredDot.y, dotLabel(hoveredDot), dotAlign(hoveredDot), 12));
-    }
     for (const d of placeDots) d.labeled = false;
-    if (touchLabels) {
+    if (placeLabels) {
       // placeDots is in score order, so the first fits are the most relevant.
       let shown = 0;
       for (const d of placeDots) {
-        if (shown >= placeTouchLabelCount) break;
-        if (d === hoveredDot) { d.labeled = true; shown++; continue; }
-        const text = dotLabel(d);
-        const r = labelBadgeRect(d.x, d.y, text, dotAlign(d), 12);
-        if (taken.some((t) => rectsOverlap(t, r))) continue;
-        drawLabelBadge(d.x, d.y, text, dotAlign(d), 12);
-        taken.push(r);
+        if (shown >= placeLabelCount) break;
+        if (d === hoveredDot) continue;
+        // 'label' neighborhood dots carry the rect reserved at selection time.
+        const rect = d.labelRect
+          || placeLabelRects(d).find((r) => !taken.some((t) => rectsOverlap(t, r))
+            && !placeDots.some((o) => o !== d && pointInRect(o.x, o.y, r, 7)));
+        if (!rect) continue;
+        drawLabelBadgeAt(rect, d.place.name);
+        taken.push(rect);
         d.labeled = true;
         shown++;
       }
     }
+    if (hoveredDot) {
+      const text = hoveredDot.place.country
+        ? `${hoveredDot.place.name}, ${hoveredDot.place.country}` : hoveredDot.place.name;
+      const align = hoveredDot.labelRect && hoveredDot.labelRect.x1 <= hoveredDot.x ? 'left' : dotAlign(hoveredDot);
+      drawLabelBadge(hoveredDot.x, hoveredDot.y, text, align, 12);
+      hoveredDot.labeled = true;
+    }
+  }
+
+  // Label side for a dot: away from the nearer canvas edge.
+  function dotAlign(d) {
+    return d.x > width * 0.6 ? 'left' : 'right';
+  }
+
+  // Candidate badge rects for a dot's name, preferred side first.
+  function placeLabelRects(d) {
+    const first = dotAlign(d);
+    const second = first === 'left' ? 'right' : 'left';
+    return [
+      labelBadgeRect(d.x, d.y, d.place.name, first, 12),
+      labelBadgeRect(d.x, d.y, d.place.name, second, 12)
+    ];
+  }
+
+  function pointInRect(x, y, r, pad = 0) {
+    return x > r.x0 - pad && x < r.x1 + pad && y > r.y0 - pad && y < r.y1 + pad;
   }
 
   function setPlaces(list) {
@@ -1300,11 +1417,16 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     }
 
     const exclude = [];
-    for (const city of [currentOrigin, currentDest]) {
+    const pinLabelRects = [];
+    for (const [city, align] of [[currentOrigin, 'left'], [currentDest, 'right']]) {
       const coord = city && getCityCoords(city);
       if (coord && isCoordVisible(coord, proj, projectionType, width, height)) {
         const pt = proj(coord);
-        if (pt && isFinite(pt[0]) && isFinite(pt[1])) exclude.push(pt);
+        if (pt && isFinite(pt[0]) && isFinite(pt[1])) {
+          exclude.push(pt);
+          const name = getCityName(city);
+          if (name) pinLabelRects.push(labelBadgeRect(pt[0], pt[1], name, align, 10));
+        }
       }
     }
 
@@ -1313,12 +1435,18 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       const pt = proj([p.lng, p.lat]);
       return pt && isFinite(pt[0]) && isFinite(pt[1]) ? pt : null;
     }, rect, {
-      limit: placeDotLimit,
+      limit: placeDotBudget(),
       minSpacing: placeDotSpacing,
       exclude,
       center: [(rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2],
       centerBias: placeDotCenterBias ?? centerBiasFor(viewHalfAngle),
-      previous: placeDots
+      previous: placeDots,
+      neighborhood: placeNeighborhood,
+      reach: placeDotReach,
+      softRadius: placeSoftRadius,
+      softWeight: placeSoftWeight,
+      labelRect: placeLabels ? (c) => placeLabelRects({ x: c.x, y: c.y, place: c.place }) : null,
+      excludeRects: pinLabelRects
     });
   }
 
@@ -1505,24 +1633,27 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   // Badge geometry shared by drawing and overlap checks.
   function labelBadgeRect(x, y, name, align = 'right', offset = 10) {
     ctx.save();
-    ctx.font = '600 11px system-ui, -apple-system, sans-serif';
+    ctx.font = labelFont();
     const textW = ctx.measureText(name).width;
     ctx.restore();
     const padX = 7;
     const badgeW = textW + padX * 2;
-    const badgeH = 22;
+    const badgeH = labelFontPx() * 2;
     const badgeX = align === 'left' ? x - badgeW - offset : x + offset;
     const badgeY = y - badgeH / 2;
     return { x0: badgeX, y0: badgeY, x1: badgeX + badgeW, y1: badgeY + badgeH, padX };
   }
 
   function drawLabelBadge(x, y, name, align = 'right', offset = 10) {
-    const rect = labelBadgeRect(x, y, name, align, offset);
+    return drawLabelBadgeAt(labelBadgeRect(x, y, name, align, offset), name);
+  }
+
+  function drawLabelBadgeAt(rect, name) {
     const { x0: badgeX, y0: badgeY, padX } = rect;
     const badgeW = rect.x1 - rect.x0;
     const badgeH = rect.y1 - rect.y0;
     ctx.save();
-    ctx.font = '600 11px system-ui, -apple-system, sans-serif';
+    ctx.font = labelFont();
 
     ctx.beginPath();
     if (typeof ctx.roundRect === 'function') {
@@ -2106,7 +2237,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     render,
     setDetailTopology,
     setPlaces,
-    getPlaceDots: () => placeDots.map((d) => ({ name: d.place.name, country: d.place.country, x: d.x, y: d.y, labeled: !!d.labeled })),
+    getPlaceDots: () => placeDots.map((d) => ({ name: d.place.name, country: d.place.country, x: d.x, y: d.y, index: d.index, score: d.score, labeled: !!d.labeled })),
     getHoveredPlace: () => (hoveredPlace ? { name: hoveredPlace.name, country: hoveredPlace.country } : null),
     getRotation: () => getActiveProjection().rotate().slice(),
     getScale: () => getActiveProjection().scale(),

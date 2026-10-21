@@ -948,26 +948,53 @@ test('City dots: stickyBonus keeps a previously shown dot over an equal newcomer
   assert.equal(sticky[0].place.name, 'Old');
 });
 
-test('Touch devices label at most placeTouchLabelCount dots; desktop labels none', () => {
+test('Dots carry always-on name labels; placeLabels false restores hover-only', () => {
   const places = Array.from({ length: 40 }, (_, i) => ({
     name: `City${i}`, country: 'Land', lat: 30 + (Math.floor(i / 8) - 2) * 6, lng: (i % 8) * 12 - 40
   }));
-  const run = (touchLabels) => {
+  const run = (opts) => {
     const { canvas } = createMockCanvas();
     const controller = createGlobeRenderer(createMockContainer(canvas), null, {
-      canvas, d3: createMockD3(), topojson: createMockTopojson(), width: 800, height: 600,
-      touchLabels, placeTouchLabelCount: 4
+      canvas, d3: createMockD3(), topojson: createMockTopojson(), width: 800, height: 600, ...opts
     });
     controller.setPlaces(places);
     const dots = controller.getPlaceDots();
     controller.destroy();
     return dots;
   };
-  const touch = run(true);
-  assert.ok(touch.length > 4, 'Fixture yields more dots than labels');
-  const labeled = touch.filter((d) => d.labeled).length;
-  assert.ok(labeled >= 1 && labeled <= 4, `labeled ${labeled}`);
-  assert.equal(run(false).filter((d) => d.labeled).length, 0);
+  const labeled = run({});
+  assert.ok(labeled.length > 4, 'Fixture yields several dots');
+  assert.ok(labeled.every((d) => d.labeled), 'Label-aware selection labels every dot it keeps');
+  const capped = run({ placeLabelCount: 4 }).filter((d) => d.labeled).length;
+  assert.ok(capped >= 1 && capped <= 4, `labeled ${capped}`);
+  assert.equal(run({ placeLabels: false }).filter((d) => d.labeled).length, 0);
+});
+
+test('Neighborhood modes thin satellites of a larger city', () => {
+  // Rank 0 "Metro" with a satellite 60 px to its left; a free-standing "Far" town.
+  const places = [
+    { name: 'Metro', x: 200, y: 200 }, { name: 'Far', x: 400, y: 400 }, { name: 'Satellite', x: 140, y: 200 },
+    ...Array.from({ length: 97 }, (_, i) => ({ name: `P${i}`, x: 1000, y: 1000 }))
+  ];
+  const rect = { x0: 0, x1: 500, y0: 0, y1: 500 };
+  const project = (p) => [p.x, p.y];
+  const names = (opts) => selectPlaceDots(places, project, rect, { limit: 3, minSpacing: 16, ...opts }).map((d) => d.place.name);
+  assert.deepEqual(names({}), ['Metro', 'Far', 'Satellite'], 'fixed spacing keeps the satellite');
+  assert.deepEqual(names({ neighborhood: 'radius', reach: 100 }), ['Metro', 'Far'], 'radius mode clears the ring around Metro');
+  assert.deepEqual(names({ neighborhood: 'soft', softRadius: 100, softWeight: 2 }), ['Metro', 'Far', 'Satellite'],
+    'soft mode still shows the satellite when nothing outranks it');
+  const soft = selectPlaceDots(places, project, rect, { limit: 3, neighborhood: 'soft', softRadius: 100, softWeight: 2 });
+  assert.ok(soft[2].score < Math.log(100 / 3), 'soft mode penalizes the satellite');
+  // Label fit: 60 px wide badges to the right collide between Metro and Satellite.
+  const labelRect = (c) => [{ x0: c.x + 10, x1: c.x + 70, y0: c.y - 11, y1: c.y + 11 }];
+  const labeled = selectPlaceDots(places, project, rect, { limit: 3, labelRect });
+  assert.deepEqual(labeled.map((d) => d.place.name), ['Metro', 'Far']);
+  assert.deepEqual(labeled[0].labelRect, labelRect(labeled[0])[0], 'chosen label rect is stored on the dot');
+  // A second rect to the left is used when the first collides.
+  const twoSided = (c) => [labelRect(c)[0], { x0: c.x - 70, x1: c.x - 10, y0: c.y - 11, y1: c.y + 11 }];
+  const flipped = selectPlaceDots(places, project, rect, { limit: 3, labelRect: twoSided });
+  assert.deepEqual(flipped.map((d) => d.place.name), ['Metro', 'Far', 'Satellite']);
+  assert.equal(flipped[2].labelRect.x1, 140 - 10);
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
