@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
     agents, antigravity, codex, headlines, labels, mcp, paths, project, query, rates, scan, serve,
-    store::Store, t3,
+    store::Store, t3, value,
 };
 
 #[derive(Parser)]
@@ -222,6 +222,13 @@ enum QueryCommand {
     /// Sessions and tokens per task label.
     Labels {
         /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What each subscription buys: usage per full limit window, estimated from
+    /// recorded limit readings, and monthly estimated API cost against the plan price.
+    Value {
+        /// Print JSON (shape documented in docs/json-shapes.md).
         #[arg(long)]
         json: bool,
     },
@@ -653,6 +660,19 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", labels::render_label_table(&report));
+            }
+        }
+        Command::Query {
+            what: QueryCommand::Value { json },
+        } => {
+            let (_, _) = priced(&mut store, cli.offline, false)?;
+            let subscriptions = usage_habit_report::config::load()?.subscriptions;
+            let report =
+                value::report(&store.conn, &subscriptions, scan::now_ms(), &chrono::Local)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", value::render_text(&report));
             }
         }
         Command::Label { session, kind } => {

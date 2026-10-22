@@ -163,6 +163,27 @@ const MIGRATIONS: &[&str] = &[
     UPDATE sessions SET display_title = COALESCE(NULLIF(t3_title, ''), title),
       title_source = CASE WHEN NULLIF(t3_title, '') IS NOT NULL THEN 't3' ELSE 'first-line' END;
     "#,
+    // v10: subscription limit readings. Codex writes the used share of its
+    // session and weekly windows with every token count; Claude Code records
+    // the moment a window is exhausted. Re-read both harnesses once to collect
+    // readings already on disk (request rows merge, so nothing double counts).
+    r#"
+    CREATE TABLE limit_samples (
+        source_id    INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        tool         TEXT    NOT NULL,
+        session_id   TEXT    NOT NULL,
+        ts_ms        INTEGER NOT NULL,
+        window       TEXT    NOT NULL,          -- 'session' (5 h) | 'weekly'
+        used_percent REAL    NOT NULL,          -- 0..100
+        resets_at_ms INTEGER,                   -- when the window ends, if reported
+        kind         TEXT    NOT NULL,          -- 'reading' | 'rejected'
+        PRIMARY KEY (tool, source_id, ts_ms, window)
+    );
+    CREATE INDEX limit_samples_tool_ts ON limit_samples (tool, window, ts_ms);
+    UPDATE sources SET offset = 0, size = 0, mtime_ms = NULL WHERE tool IN ('codex', 'claude-code');
+    DELETE FROM codex_cursors;
+    UPDATE sessions SET user_turns = 0 WHERE tool IN ('codex', 'claude-code');
+    "#,
 ];
 
 pub struct Store {
@@ -442,6 +463,10 @@ pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
         params![source_id],
     )?;
     tx.execute(
+        "DELETE FROM limit_samples WHERE source_id = ?1",
+        params![source_id],
+    )?;
+    tx.execute(
         "UPDATE sessions SET user_turns = 0, title = NULL, started_at_ms = NULL, ended_at_ms = NULL
          WHERE source_id = ?1",
         params![source_id],
@@ -458,6 +483,47 @@ pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
     // Even an empty/truncated replacement must invalidate cached ancestors.
     for (tool, sid) in affected {
         record_events(tx, &tool, &sid, source_id, &[])?;
+    }
+    Ok(())
+}
+
+/// One reading of a subscription window: how much of it was used at `ts_ms`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitSample {
+    pub ts_ms: i64,
+    /// `session` (the 5-hour window) or `weekly`.
+    pub window: &'static str,
+    pub used_percent: f64,
+    pub resets_at_ms: Option<i64>,
+    /// `reading` for a reported share, `rejected` when the harness was refused
+    /// because the window was exhausted (the share is then 100).
+    pub kind: &'static str,
+}
+
+pub fn record_limit_samples(
+    tx: &Transaction,
+    tool: &str,
+    session_id: &str,
+    source_id: i64,
+    samples: &[LimitSample],
+) -> Result<()> {
+    for s in samples {
+        tx.prepare_cached(
+            "INSERT INTO limit_samples (source_id, tool, session_id, ts_ms, window, used_percent, resets_at_ms, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT DO UPDATE SET used_percent = MAX(used_percent, excluded.used_percent),
+                 resets_at_ms = COALESCE(excluded.resets_at_ms, resets_at_ms)",
+        )?
+        .execute(params![
+            source_id,
+            tool,
+            session_id,
+            s.ts_ms,
+            s.window,
+            s.used_percent,
+            s.resets_at_ms,
+            s.kind
+        ])?;
     }
     Ok(())
 }
@@ -571,7 +637,7 @@ mod active_migration_tests {
             INSERT INTO session_labels VALUES ('codex', 'parent', 'coding', 1), ('codex', 'guardian', 'review', 1);
             INSERT INTO codex_cursors VALUES (2, '{\"agent_type\":\"guardian\"}');").unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() as i64);
         for table in ["requests", "session_events", "sessions"] {
             let count: i64 = store.conn.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE tool = 'codex' AND session_id IN ('guardian', 'empty-guardian')"),
@@ -589,25 +655,97 @@ mod active_migration_tests {
                 .unwrap();
             assert_eq!(active, 0);
         }
+        // v8 keeps the guardian source's offset and cursor; v10 then asks for
+        // one re-read of every Codex and Claude Code source.
         assert_eq!(
             source_state(&store.conn, "/home/demo/guardian")
                 .unwrap()
                 .unwrap()
                 .offset,
-            200
+            0
         );
-        for (table, expected) in [("session_labels", 2), ("codex_cursors", 1), ("sessions", 3)] {
+        for (table, expected) in [("session_labels", 2), ("codex_cursors", 0), ("sessions", 3)] {
             let count: i64 = store
                 .conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
             assert_eq!(count, expected);
         }
-        let state: String = store
+    }
+
+    #[test]
+    fn v10_adds_limit_samples_and_rereads_codex_and_claude_sources() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..9] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sources(id, tool, path, offset, size) VALUES
+                (1, 'codex', '/home/demo/codex', 100, 100),
+                (2, 'claude-code', '/home/demo/claude', 100, 100),
+                (3, 'antigravity', '/home/demo/antigravity', 100, 100);
+             INSERT INTO sessions(tool, session_id, source_id, user_turns) VALUES
+                ('codex', 'c', 1, 4), ('antigravity', 'a', 3, 2);
+             INSERT INTO codex_cursors VALUES (1, '{}');",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 10);
+        let offsets: Vec<(String, i64)> = store
             .conn
-            .query_row("SELECT state FROM codex_cursors", [], |r| r.get(0))
+            .prepare("SELECT tool, offset FROM sources ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(state, r#"{"agent_type":"guardian"}"#);
+        assert_eq!(
+            offsets,
+            vec![
+                ("codex".into(), 0),
+                ("claude-code".into(), 0),
+                ("antigravity".into(), 100)
+            ]
+        );
+        let cursors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM codex_cursors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cursors, 0);
+        let turns: Vec<i64> = store
+            .conn
+            .prepare("SELECT user_turns FROM sessions ORDER BY tool")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(turns, vec![2, 0]);
+        // The table accepts readings and merges a repeated key by MAX.
+        let tx = store.conn.unchecked_transaction().unwrap();
+        let sample = |pct: f64| LimitSample {
+            ts_ms: 1000,
+            window: "session",
+            used_percent: pct,
+            resets_at_ms: Some(2000),
+            kind: "reading",
+        };
+        record_limit_samples(&tx, "codex", "c", 1, &[sample(10.0), sample(12.0)]).unwrap();
+        tx.commit().unwrap();
+        let pct: f64 = store
+            .conn
+            .query_row("SELECT used_percent FROM limit_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pct, 12.0);
+        let tx = store.conn.unchecked_transaction().unwrap();
+        reset_source(&tx, 1).unwrap();
+        tx.commit().unwrap();
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM limit_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
@@ -687,7 +825,7 @@ mod active_migration_tests {
             INSERT INTO requests(tool, session_id, source_id, request_key, ts_ms) VALUES ('codex', 'demo', 1, 'request', 0);
             INSERT INTO codex_cursors VALUES (1, '{}');").unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() as i64);
         for table in ["requests", "session_labels", "sessions"] {
             assert_eq!(
                 store

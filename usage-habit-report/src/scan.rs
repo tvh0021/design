@@ -169,6 +169,13 @@ fn scan_file(
             source_id,
             &chunk.events,
         )?;
+        store::record_limit_samples(
+            &tx,
+            claude::TOOL,
+            &kind.session_id,
+            source_id,
+            &chunk.limits,
+        )?;
         stats.files_read += 1;
         stats.bytes_read += consumed;
         stats.bad_lines += chunk.bad_lines;

@@ -174,6 +174,37 @@ own transcript, not its subagents.
 | `totals` | Tokens |
 | `labels[]` | Tokens plus `label: string`, `sessions: integer`, `manual_sessions: integer`, `subagent_sessions: integer` |
 
+## `query value`
+
+| Field | Type |
+|-------|------|
+| `generated_at` | string |
+| `min_rise_percent` | number (20) |
+| `runs_averaged` | integer (10) |
+| `tools[]` | one entry per tool, in tool order |
+| `tools[].tool` | string |
+| `tools[].subscription` | `{ name: string, monthly_usd: number? }` |
+| `tools[].limit_source` | `"readings"`, `"rejections"` or `"none"` |
+| `tools[].windows[]` | `session` then `weekly` |
+| `tools[].windows[].window` | string |
+| `tools[].windows[].window_hours` | integer (5 or 168) |
+| `tools[].windows[].readings` | integer, limit samples seen for the window |
+| `tools[].windows[].qualifying_runs` | integer, runs rising at least `min_rise_percent` |
+| `tools[].windows[].runs[]` | the runs averaged, largest rise first: `start`, `end` (timestamps), `from_percent`, `to_percent`, `rise_percent` (numbers), `readings`, `sessions` (integers), Tokens, `per_window: Capacity` |
+| `tools[].windows[].per_window` | Capacity? (mean of `runs[]`; `null` with no runs) |
+| `tools[].windows[].drift[]` | `month: "YYYY-MM"`, `runs: integer`, `per_window: Capacity` (mean of every qualifying run that started that month) |
+| `tools[].windows[].lower_bound` | Capacity? (busiest sliding window; set only when `per_window` is null and requests exist) |
+| `tools[].months[]` | Tokens plus `month: "YYYY-MM"`, `complete: boolean`, `multiple: number?` (cost over the plan price) |
+| `tools[].complete_months` | integer |
+| `tools[].mean_monthly_cost_usd` | number? |
+| `tools[].mean_multiple` | number? |
+
+`Capacity` is `{ tokens, billable_tokens, requests, sessions, estimated_cost_usd }`,
+all numbers scaled to one whole window (`billable_tokens` is uncached input
+plus output). Months are local calendar months; `complete` is false for the
+current month and the first month seen. The mean fields cover complete
+months, or every month when none is complete.
+
 ## `query models`
 
 A bare array (no wrapper), unpriced rows first:

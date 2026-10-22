@@ -11,6 +11,7 @@ pub mod data;
 pub mod html;
 pub mod routes;
 pub mod snapshot;
+pub mod value_html;
 
 use crate::{paths, rates, scan};
 use anyhow::{Context, Result};
@@ -72,10 +73,11 @@ fn reply(status: u16, content_type: &'static str, body: String) -> Reply {
     }
 }
 
-/// Route one request. Only `/` (with an optional query) serves the page.
+/// Route one request: `/` (with an optional query) is the dashboard and
+/// `/value` the subscription value page.
 fn handle(db: &Path, url: &str, rates_at: Option<&str>) -> Reply {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
-    if path != "/" {
+    if path != "/" && path != "/value" {
         return reply(404, "text/plain; charset=utf-8", "not found\n".into());
     }
     let conn = match open_read_only(db) {
@@ -91,7 +93,12 @@ fn handle(db: &Path, url: &str, rates_at: Option<&str>) -> Reply {
             return reply(500, "text/plain; charset=utf-8", format!("{e:#}\n"));
         }
     };
-    match routes::render_dashboard(&conn, query, scan::now_ms(), rates_at.map(String::from)) {
+    let rendered = if path == "/value" {
+        routes::render_value(&conn, scan::now_ms(), rates_at.map(String::from))
+    } else {
+        routes::render_dashboard(&conn, query, scan::now_ms(), rates_at.map(String::from))
+    };
+    match rendered {
         Ok(page) => reply(200, "text/html; charset=utf-8", page),
         Err(e) => reply(500, "text/plain; charset=utf-8", format!("{e:#}\n")),
     }

@@ -144,17 +144,20 @@ fn v8_migration_preserves_usage_labels_and_cursors() {
     s.conn.execute_batch("INSERT INTO sources(id,tool,path,offset) VALUES (1,'codex','/home/demo/rollout.jsonl',123);
         INSERT INTO codex_cursors VALUES (1,'{}');
         INSERT INTO session_labels VALUES ('claude-code','plain','coding',0);
-        ALTER TABLE sessions DROP COLUMN display_title; ALTER TABLE sessions DROP COLUMN title_source; PRAGMA user_version=8;").unwrap();
+        ALTER TABLE sessions DROP COLUMN display_title; ALTER TABLE sessions DROP COLUMN title_source;
+        DROP TABLE limit_samples; PRAGMA user_version=8;").unwrap();
     drop(s);
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 9);
+    assert_eq!(s.schema_version().unwrap(), 10);
     assert!(titles(&s).iter().all(|(_, _, source)| !source.is_empty()));
     headlines::refresh(&mut s.conn, &sources()).unwrap();
+    // v9 keeps the Codex offset and cursor; v10 then schedules one re-read of
+    // Codex and Claude Code sources for their limit readings.
     assert_eq!(
         s.conn
             .query_row("SELECT offset FROM sources", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        123
+        0
     );
     assert_eq!(
         s.conn
@@ -168,7 +171,7 @@ fn v8_migration_preserves_usage_labels_and_cursors() {
             .query_row("SELECT COUNT(*) FROM codex_cursors", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        1
+        0
     );
 }
 fn command(tmp: &Path, args: &[&str]) -> std::process::Output {

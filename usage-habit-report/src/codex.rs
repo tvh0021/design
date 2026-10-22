@@ -34,7 +34,7 @@
 use crate::claude::{make_title, parse_ts_ms};
 use crate::labels;
 use crate::scan::{ScanReport, ScanStats, now_ms};
-use crate::store::{self, RequestRow, SessionUpdate, Store};
+use crate::store::{self, LimitSample, RequestRow, SessionUpdate, Store};
 use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -267,6 +267,23 @@ struct EventPayload {
     #[serde(rename = "type")]
     kind: Option<String>,
     info: Option<TokenInfo>,
+    rate_limits: Option<RateLimits>,
+}
+
+/// The subscription windows Codex reports with every token count.
+#[derive(Deserialize)]
+struct RateLimits {
+    limit_id: Option<String>,
+    primary: Option<LimitWindow>,
+    secondary: Option<LimitWindow>,
+}
+
+#[derive(Deserialize)]
+struct LimitWindow {
+    used_percent: Option<f64>,
+    window_minutes: Option<i64>,
+    /// Epoch seconds.
+    resets_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +323,8 @@ pub struct Chunk {
     pub label: Option<&'static str>,
     pub cwd: Option<String>,
     pub events: Vec<(i64, i64)>,
+    /// Subscription window readings, in file order.
+    pub limits: Vec<LimitSample>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     pub user_turns: i64,
@@ -324,6 +343,7 @@ impl Chunk {
             label: None,
             cwd: None,
             events: Vec::new(),
+            limits: Vec::new(),
             started_at_ms: None,
             ended_at_ms: None,
             user_turns: 0,
@@ -401,6 +421,12 @@ impl Chunk {
             },
             "event_msg" => match serde_json::from_str::<EventPayload>(payload) {
                 Ok(ev) if ev.kind.as_deref() == Some("token_count") => {
+                    if let (Some(rl), Some(t)) = (ev.rate_limits, ts_ms)
+                        && !internal
+                        && !self.is_copied(ordinal, ts_ms)
+                    {
+                        self.push_rate_limits(rl, t);
+                    }
                     self.push_token_count(ev.info, ordinal, ts_ms)
                 }
                 Ok(_) => {}
@@ -466,6 +492,33 @@ impl Chunk {
         }
         if self.cwd.is_none() && !copied {
             self.cwd = tc.cwd.filter(|s| !s.is_empty());
+        }
+    }
+
+    /// The account-wide windows only: model-scoped limits (`limit_id` other
+    /// than `codex`) do not describe the subscription as a whole.
+    fn push_rate_limits(&mut self, rl: RateLimits, ts_ms: i64) {
+        if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
+            return;
+        }
+        let windows = [("session", rl.primary), ("weekly", rl.secondary)];
+        for (fallback, w) in windows {
+            let Some(w) = w else { continue };
+            let Some(pct) = w.used_percent.filter(|p| p.is_finite()) else {
+                continue;
+            };
+            let window = match w.window_minutes {
+                Some(m) if m <= 24 * 60 => "session",
+                Some(_) => "weekly",
+                None => fallback,
+            };
+            self.limits.push(LimitSample {
+                ts_ms,
+                window,
+                used_percent: pct.clamp(0.0, 100.0),
+                resets_at_ms: w.resets_at.map(|s| s * 1000),
+                kind: "reading",
+            });
         }
     }
 
@@ -1009,6 +1062,7 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
             params![source_id, serde_json::to_string(&chunk.cursor)?],
         )?;
         store::record_events(&tx, TOOL, &session_id, source_id, &chunk.events)?;
+        store::record_limit_samples(&tx, TOOL, &session_id, source_id, &chunk.limits)?;
         stats.sessions_added += is_new_session as u64;
     }
     if consumed > 0 {
@@ -1146,6 +1200,41 @@ mod tests {
         assert_eq!(c.anomalies.foreign_usage_records, 1);
         assert_eq!(c.anomalies.repeated_token_counts, 0);
         assert_eq!(c.cursor.prev_total.unwrap().input_tokens, 150);
+    }
+
+    #[test]
+    fn token_counts_carry_subscription_window_readings() {
+        let mut c = Chunk::new("rollout-x", Cursor::default());
+        c.push_line(br#"{"timestamp":"2026-10-01T00:00:01.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":78.0,"window_minutes":300,"resets_at":1792541597},"secondary":{"used_percent":24.5,"window_minutes":10080,"resets_at":1793102633}}}}"#);
+        c.push_line(br#"{"timestamp":"2026-10-01T00:00:02.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","primary":{"used_percent":1.0,"window_minutes":300}}}}"#);
+        c.push_line(br#"{"timestamp":"2026-10-01T00:00:03.000Z","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":80.0},"secondary":null}}}"#);
+        assert_eq!(c.anomalies.token_count_without_info, 3);
+        assert_eq!(
+            c.limits,
+            vec![
+                LimitSample {
+                    ts_ms: 1_790_812_801_000,
+                    window: "session",
+                    used_percent: 78.0,
+                    resets_at_ms: Some(1_792_541_597_000),
+                    kind: "reading",
+                },
+                LimitSample {
+                    ts_ms: 1_790_812_801_000,
+                    window: "weekly",
+                    used_percent: 24.5,
+                    resets_at_ms: Some(1_793_102_633_000),
+                    kind: "reading",
+                },
+                LimitSample {
+                    ts_ms: 1_790_812_803_000,
+                    window: "session",
+                    used_percent: 80.0,
+                    resets_at_ms: None,
+                    kind: "reading",
+                },
+            ]
+        );
     }
 
     #[test]

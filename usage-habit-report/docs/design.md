@@ -177,6 +177,24 @@ Under 720px the map keeps all 24 columns and shrinks the cells; the hour
 axis then labels every third hour. Tables scroll horizontally inside their
 section rather than wrapping.
 
+### Subscription value page
+
+`/value` (public: `value.html`) reuses the header, type, colour and ledger
+styles of the main page and adds nothing new. Its controls carry one group,
+"Page", that links the two pages; the current one is underlined and carries
+`aria-current="page"`. Top to bottom:
+
+1. `section#value`: one sentence of method, then a ledger with a row per
+   tool (plan, price, estimated API cost a month, times the price, the
+   per-window figures).
+2. One `section#value-<tool>` per tool: a note on what the harness records,
+   the per-window ledger (a never-exhausted window shows `≥` lower bounds),
+   a drift table per window when two or more months qualify, the runs that
+   were averaged as a `ledger quiet` table, and the month table whose total
+   row is the mean of the complete months.
+
+No activity map, so the page carries no script.
+
 ## Keyboard and motion
 
 - Every control is a real link or button. Focus is a 2px `--focus` outline

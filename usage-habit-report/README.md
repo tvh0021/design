@@ -230,6 +230,66 @@ inherit it. The token fields are the same as in `query summary` and cover the
 top-level sessions and their subagents. `labels[]` is ordered by `requests`
 descending. `unlabelled` appears when a session has no label.
 
+### `query value`
+
+```sh
+usage-habit-report query value [--json]
+```
+
+Estimates what each subscription buys, from the rate-limit readings the
+harnesses leave in their logs and the estimated API cost of the same
+requests. One block per tool, always all three. Text output:
+
+```
+codex: ChatGPT Plus at $20.00/month; limit readings: readings
+  session window (5 h): 29.2M tokens, 1.1M uncached+output, 240 requests, 3.5 sessions, est. $14.27 per full window, from 10 of 136 runs
+    2026-09: 59 runs, 28.4M tokens, est. $13.44 per full window
+  weekly window (168 h): 170.8M tokens, ..., est. $101.68 per full window, from 10 of 19 runs
+  2026-09: est. $611.23 = 30.6x of the price
+  mean over 4 complete months: est. $451.12 = 22.6x the price
+```
+
+**Windows.** Each tool has a session window of 5 hours and a weekly window
+of 168 hours. A *run* is a stretch of rising `used_percent` readings inside
+one window: it ends at a drop of more than half a percent, a changed reset
+time, or a gap longer than the window, so mid-window resets and reset
+credits start a new run instead of inflating one. The tool's requests
+between the run's first and last reading are summed (tokens, uncached input
+plus output, requests, distinct sessions, estimated cost) and scaled by
+`100 / rise` to a whole window. Runs rising less than 20 % are ignored; the
+ten largest rises are averaged into `per_window`. `drift` repeats the mean
+for every qualifying run by the month it started, to show whether a full
+window buys more or less over time. A window that was never seen exhausted
+reports the busiest sliding window of that length as a lower bound instead.
+
+**Sources.** Codex rollouts carry `rate_limits` on every `token_count`
+event (both windows, since late May 2026), so Codex gets a real series.
+Claude Code transcripts only record a rejection (`rate_limit_info` with
+`status: rejected`) with the window's reset time, so each Claude run spans
+`resets_at - 5 h` to the first refusal and is an exact 0 to 100 % reading;
+the weekly window has never been refused and is a lower bound. Antigravity
+logs no limit data; both windows are lower bounds and only the monthly
+comparison stands.
+
+**Months.** `months[]` lists estimated API cost per local calendar month
+against the plan price (`multiple`). `complete` is false for the current
+month and the first month seen; `mean_monthly_cost_usd` and
+`mean_multiple` average the complete months, or the partial ones when no
+month is complete.
+
+Plan prices default to Claude Team at a premium seat ($150), ChatGPT Plus
+($20, the plan behind Codex) and Google AI Pro ($19.99, the plan behind
+Antigravity). Override them in `config.toml`:
+
+```toml
+[subscriptions]
+codex = 200 "ChatGPT Pro"   # price a month, optional quoted plan name
+claude-code = 150
+antigravity = none 'Free tier'   # none: no price, so no multiple
+```
+
+JSON shape: see [docs/json-shapes.md](docs/json-shapes.md#query-value).
+
 ### `query agents`
 
 ```sh
@@ -717,6 +777,11 @@ filter, states its window, and names any tool with no requests in it:
   counted back from now so they tile the window; each column adds up to the
   window total.
 
+A second page, `/value`, linked from the controls, shows what each
+subscription buys: the summary ledger of `query value`, then per tool the
+per-window capacity, the month-by-month drift tables, the runs that were
+averaged, and estimated API cost by month against the plan price.
+
 A panel with nothing to show says what to run (`scan`, `rebuild` for
 labels) instead of staying blank. On a store of about 79,000 requests a page
 renders in 110 to 260 ms. Everything is embedded in the page; it makes no
@@ -733,7 +798,8 @@ usage-habit-report snapshot --out /tmp/usage-public-12w --window 12w
 Exports the dashboard from the store read-only, without scanning, pricing,
 or network access. The default writes `index.html` for 4 weeks,
 `index-1w.html`, `index-12w.html`, and `index-all.html`, plus three
-tool-filtered versions of each. Window and tool links use relative filenames and work from
+tool-filtered versions of each, and `value.html`, the subscription value
+page. Window, tool and page links use relative filenames and work from
 `file://`. Each document embeds the same CSS, JavaScript, templates, and
 queries as `serve`. With `--window 1w|4w|12w|all`, only that window and its tool
 variants are written, with the all-tools page at `index.html`.
@@ -997,6 +1063,7 @@ single text content block (compact, not pretty-printed), so the shapes in
 | `usage_models` | none | `query models` |
 | `usage_agents` | `since?` | `query agents` |
 | `usage_labels` | none | `query labels` |
+| `usage_value` | none | `query value` |
 
 `since` is `12h`, `7d` or `2w`. `usage_session` takes a session id, a unique
 prefix, or a T3 thread id; `usage_project` takes a path or folder name. An
@@ -1096,7 +1163,7 @@ once, so the next scan can backfill non-request event timestamps. Sessions whose
 logs are no longer present keep a null active time and contribute zero to time
 totals. Run `rebuild` to discard usage whose source logs have been deleted.
 
-## Store schema (v6)
+## Store schema (v10)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
 `src/store.rs`.
@@ -1126,6 +1193,10 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   intervals keyed by source and session for incremental tree recomputation.
 - `session_labels` (v5, ticket 06): `(tool, session_id)` primary key, `label`,
   `set_at` (epoch ms). Hand-set labels; independent of the raw-log rows.
+- `limit_samples` (v10): one row per `(tool, source_id, ts_ms, window)` with
+  `used_percent`, `resets_at_ms`, and `kind` (`reading` from Codex
+  `rate_limits`, `rejected` from Claude Code refusals). Feeds `query value`.
+  The migration re-reads Codex and Claude Code sources from byte 0.
 
 ## Tests
 

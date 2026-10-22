@@ -223,7 +223,8 @@ fn tools_list_has_every_tool_with_the_required_description() {
             "usage_projects",
             "usage_models",
             "usage_agents",
-            "usage_labels"
+            "usage_labels",
+            "usage_value"
         ]
     );
     for t in tools {
@@ -243,7 +244,7 @@ fn tool_results_equal_the_cli_json() {
     let mut c = Client::spawn(p, &["--no-scan"]);
     c.initialize();
 
-    let cases: [(&str, Value, Vec<&str>); 8] = [
+    let cases: [(&str, Value, Vec<&str>); 9] = [
         (
             "usage_summary",
             json!({}),
@@ -280,6 +281,7 @@ fn tool_results_equal_the_cli_json() {
         ("usage_models", json!({}), vec!["query", "models", "--json"]),
         ("usage_agents", json!({}), vec!["query", "agents", "--json"]),
         ("usage_labels", json!({}), vec!["query", "labels", "--json"]),
+        ("usage_value", json!({}), vec!["query", "value", "--json"]),
     ];
     for (tool, args, cli) in cases {
         let mut full = vec!["--no-scan"];

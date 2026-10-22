@@ -3,7 +3,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::{collections::BTreeSet, path::Path, process::Command};
 use usage_habit_report::{
     privacy::{body_text, contains_whole_word, word_candidate_matches},
-    serve::html,
+    serve::{html, snapshot},
     store::Store,
 };
 
@@ -87,7 +87,7 @@ fn assert_redacted_with_allowlist(
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(files.len(), 16);
+    assert_eq!(files.len(), 17);
     for file in &files {
         let body = std::fs::read_to_string(file).unwrap();
 
@@ -115,7 +115,9 @@ fn assert_redacted_with_allowlist(
             );
         }
         assert!(body.contains(html::CSS));
-        assert!(body.contains(html::JS));
+        // The value page has no activity map, so it carries no script.
+        let is_value = file.file_name().unwrap() == snapshot::VALUE_FILENAME;
+        assert_eq!(body.contains(html::JS), !is_value);
     }
 }
 
@@ -143,8 +145,13 @@ fn fixture_snapshot_is_redacted_offline_and_linked() {
     // The fixture must not exempt its own private values as page vocabulary.
     assert_redacted(&store.conn, &out, &BTreeSet::new());
     for entry in std::fs::read_dir(&out).unwrap() {
-        let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        let path = entry.unwrap().path();
+        let body = std::fs::read_to_string(&path).unwrap();
         assert!(!body.contains("fixture-private-request-key"));
+        if path.file_name().unwrap() == snapshot::VALUE_FILENAME {
+            assert!(body.contains("<section id=\"value\""));
+            continue;
+        }
         for panel in [
             "activity", "totals", "models", "agents", "projects", "sessions", "cache", "spend",
         ] {
@@ -163,14 +170,14 @@ fn fixture_snapshot_is_redacted_offline_and_linked() {
 }
 
 #[test]
-fn explicit_windows_write_index_and_only_link_to_their_four_files() {
+fn explicit_windows_write_index_and_only_link_to_their_five_files() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("usage.db");
     Store::open(&db).unwrap();
     for window in ["4w", "12w", "all"] {
         let out = tmp.path().join(window);
         export(&db, &out, Some(window));
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 4);
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 5);
         let body = std::fs::read_to_string(out.join("index.html")).unwrap();
         for link in body.split("href=\"").skip(1) {
             assert!(out.join(link.split('"').next().unwrap()).is_file());

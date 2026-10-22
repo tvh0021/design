@@ -100,6 +100,53 @@ pub fn load_page(
     })
 }
 
+/// Load the subscription value page from an open store.
+pub fn load_value_page(
+    conn: &Connection,
+    now_ms: i64,
+    tz: &impl TimeZone,
+    rates_fetched_at: Option<String>,
+) -> Result<super::value_html::ValuePage> {
+    let started = std::time::Instant::now();
+    let subscriptions = crate::config::load()?.subscriptions;
+    let report = crate::value::report(conn, &subscriptions, now_ms, tz)?;
+    let run_labels = report
+        .tools
+        .iter()
+        .map(|t| {
+            t.windows
+                .iter()
+                .map(|w| {
+                    w.runs
+                        .iter()
+                        .map(|r| (clock_label(r.start_ms, tz), clock_label(r.end_ms, tz)))
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    Ok(super::value_html::ValuePage {
+        audience: html::Audience::Private,
+        now_label: clock_label(now_ms, tz),
+        tz_label: tz_label(now_ms, tz),
+        facts: data::store_facts(conn)?,
+        report,
+        run_labels,
+        rates_fetched_at,
+        load_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Render the subscription value page in the system's local zone.
+pub fn render_value(
+    conn: &Connection,
+    now_ms: i64,
+    rates_fetched_at: Option<String>,
+) -> Result<String> {
+    let page = load_value_page(conn, now_ms, &Local, rates_fetched_at)?;
+    Ok(super::value_html::render(&page))
+}
+
 /// Render the dashboard for a query string, in the system's local zone.
 pub fn render_dashboard(
     conn: &Connection,

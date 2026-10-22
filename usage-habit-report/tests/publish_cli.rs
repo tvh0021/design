@@ -61,10 +61,10 @@ fn fixture_publish_commits_once_removes_stale_files_and_preserves_unrelated_work
     assert!(first.status.success(), "publish failed");
     assert!(
         String::from_utf8_lossy(&first.stdout)
-            .contains("16 files written; committed; not pushed (disabled)")
+            .contains("17 files written; committed; not pushed (disabled)")
     );
     assert!(!out.join("stale.html").exists());
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 16);
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 17);
     assert_eq!(git(&root, &["log", "-1", "--format=%s"]), publish::MESSAGE);
     let head = git(&root, &["rev-parse", "HEAD"]);
     let second = cli(tmp.path(), &args);
@@ -336,7 +336,7 @@ fn serve_skips_publish_or_warns_and_still_starts() {
             }
             _ => {
                 assert!(out.join("index.html").exists());
-                assert!(err.starts_with("publish: 16 files"));
+                assert!(err.starts_with("publish: 17 files"));
             }
         }
         assert!(
@@ -515,5 +515,5 @@ fn publish_accepts_project_folders_that_collide_with_template_words() {
         &["publish", "--no-push", "--out", out.to_str().unwrap()],
     );
     assert!(result.status.success(), "template-word publish failed");
-    assert_eq!(std::fs::read_dir(out).unwrap().count(), 16);
+    assert_eq!(std::fs::read_dir(out).unwrap().count(), 17);
 }

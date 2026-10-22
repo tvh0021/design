@@ -11,7 +11,7 @@
 //! therefore keyed by `message.id` and merged by MAX.
 
 use crate::labels;
-use crate::store::RequestRow;
+use crate::store::{LimitSample, RequestRow};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::borrow::Cow;
@@ -101,6 +101,25 @@ struct Record<'a> {
     uuid: Option<String>,
     #[serde(borrow)]
     message: Option<Message<'a>>,
+    #[serde(rename = "apiErrorParams")]
+    api_error_params: Option<ApiErrorParams>,
+}
+
+/// Claude Code writes a synthetic assistant record when the API refuses a
+/// request; `rate_limit_info` says which subscription window was exhausted.
+#[derive(Deserialize)]
+struct ApiErrorParams {
+    rate_limit_info: Option<RateLimitInfo>,
+}
+
+#[derive(Deserialize)]
+struct RateLimitInfo {
+    status: Option<String>,
+    /// Epoch seconds.
+    #[serde(rename = "resetsAt")]
+    resets_at: Option<i64>,
+    #[serde(rename = "rateLimitType")]
+    rate_limit_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +159,8 @@ pub struct Chunk {
     /// `sessionId` field seen in the records (parent id for subagents).
     pub record_session_id: Option<String>,
     pub events: Vec<(i64, i64)>,
+    /// Moments a subscription window was found exhausted.
+    pub limits: Vec<LimitSample>,
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     pub user_turns: i64,
@@ -187,6 +208,11 @@ impl Chunk {
     }
 
     fn push_assistant(&mut self, rec: Record, ts_ms: Option<i64>) {
+        if let (Some(info), Some(ts)) =
+            (rec.api_error_params.and_then(|p| p.rate_limit_info), ts_ms)
+        {
+            self.push_rate_limit(info, ts);
+        }
         let Some(msg) = rec.message else { return };
         if msg.model.as_deref() == Some(SYNTHETIC_MODEL) {
             return;
@@ -220,6 +246,25 @@ impl Chunk {
                 self.requests.push(row);
             }
         }
+    }
+
+    /// Only a rejection says anything exact: the window was at 100 %.
+    fn push_rate_limit(&mut self, info: RateLimitInfo, ts_ms: i64) {
+        if info.status.as_deref() != Some("rejected") {
+            return;
+        }
+        let window = match info.rate_limit_type.as_deref() {
+            Some("five_hour") => "session",
+            Some("seven_day") => "weekly",
+            _ => return,
+        };
+        self.limits.push(LimitSample {
+            ts_ms,
+            window,
+            used_percent: 100.0,
+            resets_at_ms: info.resets_at.map(|s| s * 1000),
+            kind: "rejected",
+        });
     }
 
     fn push_user(&mut self, rec: Record, ts_ms: Option<i64>) {
@@ -345,6 +390,34 @@ mod tests {
         c.push_line(br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"real ask\nmore"}]}}"#);
         assert_eq!(c.user_turns, 1);
         assert_eq!(c.title.as_deref(), Some("real ask"));
+    }
+
+    #[test]
+    fn rejected_requests_record_an_exhausted_window() {
+        let mut c = Chunk::default();
+        c.push_line(br#"{"type":"assistant","timestamp":"2026-10-21T10:48:57.052Z","message":{"id":"e1","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}},"apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1792592400,"rateLimitType":"five_hour"}}}"#);
+        c.push_line(br#"{"type":"assistant","timestamp":"2026-10-21T10:49:00.000Z","message":{"id":"e2","model":"<synthetic>"},"apiErrorParams":{"rate_limit_info":{"status":"allowed_warning","resetsAt":1792592400,"rateLimitType":"seven_day"}}}"#);
+        c.push_line(br#"{"type":"assistant","timestamp":"2026-10-21T10:49:01.000Z","message":{"id":"e3","model":"<synthetic>"},"apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1793000000,"rateLimitType":"seven_day"}}}"#);
+        assert!(c.requests.is_empty(), "synthetic records are not requests");
+        assert_eq!(
+            c.limits,
+            vec![
+                LimitSample {
+                    ts_ms: 1_792_579_737_052,
+                    window: "session",
+                    used_percent: 100.0,
+                    resets_at_ms: Some(1_792_592_400_000),
+                    kind: "rejected",
+                },
+                LimitSample {
+                    ts_ms: 1_792_579_741_000,
+                    window: "weekly",
+                    used_percent: 100.0,
+                    resets_at_ms: Some(1_793_000_000_000),
+                    kind: "rejected",
+                },
+            ]
+        );
     }
 
     #[test]

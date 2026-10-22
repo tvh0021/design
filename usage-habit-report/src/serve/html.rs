@@ -183,7 +183,16 @@ fn controls(p: &Page) -> String {
             href(p, p.window, Some(t))
         );
     }
-    s.push_str("</p></nav>\n");
+    let value_href = if p.audience.is_public() {
+        super::snapshot::VALUE_FILENAME
+    } else {
+        "/value"
+    };
+    let self_href = href(p, p.window, p.tool);
+    let _ = writeln!(
+        s,
+        "</p><p class=\"group\"><span class=\"group-name\">Page</span> <a href=\"{self_href}\" aria-current=\"page\">usage habits</a> <a href=\"{value_href}\">subscription value</a></p></nav>"
+    );
     s
 }
 

@@ -300,7 +300,7 @@ impl<'a> Server<'a> {
     fn run_tool(&mut self, name: &str, args: &Value) -> Result<Outcome> {
         // Validate arguments before any scan so a typo fails fast.
         let now = scan::now_ms();
-        let since_ms = if name == "usage_models" || name == "usage_labels" {
+        let since_ms = if matches!(name, "usage_models" | "usage_labels" | "usage_value") {
             None
         } else {
             since_arg(args, now)?
@@ -393,6 +393,18 @@ impl<'a> Server<'a> {
                 let report = labels::label_report(&self.store.conn, scan::now_ms())?;
                 Ok(Outcome::ok(serde_json::to_value(&report)?))
             }
+            "usage_value" => {
+                self.ensure_fresh()?;
+                self.priced()?;
+                let subscriptions = crate::config::load()?.subscriptions;
+                let report = crate::value::report(
+                    &self.store.conn,
+                    &subscriptions,
+                    scan::now_ms(),
+                    &chrono::Local,
+                )?;
+                Ok(Outcome::ok(serde_json::to_value(&report)?))
+            }
             other => bail!("unknown tool: {other}"),
         }
     }
@@ -482,6 +494,13 @@ pub fn tool_definitions() -> Vec<Value> {
             "usage_labels",
             "Usage per task label",
             "Sessions and tokens per task label (research, coding, debugging, writing, review, data-analysis, ops-config, other). Same JSON as `usage-habit-report query labels --json`.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "usage_value",
+            "Subscription value",
+            "What each subscription buys: tokens, requests, sessions and estimated API cost per full session (5 h) and weekly limit window, extrapolated from recorded limit readings (Codex) or rejections (Claude Code), with per-month drift; plus each month's estimated API cost against the plan price. Same JSON as `usage-habit-report query value --json`.",
             json!({}),
             &[],
         ),

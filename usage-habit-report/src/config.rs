@@ -9,6 +9,44 @@ pub struct Config {
     pub public_projects: BTreeMap<String, String>,
     pub publish_dir: Option<PathBuf>,
     pub publish_push: Option<bool>,
+    /// Plan behind each tool: `codex = 20 "ChatGPT Plus"`. Tools not listed
+    /// use `value::default_subscription`.
+    pub subscriptions: BTreeMap<String, crate::value::Subscription>,
+}
+
+/// `<tool> = <monthly USD> ["plan name"] [# comment]`.
+fn subscription(line: &str) -> Option<(String, crate::value::Subscription)> {
+    let (tool, rest) = line.split_once('=')?;
+    let tool = tool.trim();
+    if tool.is_empty() || !tool.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or("").trim();
+    let (price, tail) = match rest.find(|c: char| c.is_whitespace()) {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let monthly_usd = match price {
+        "none" => None,
+        p => Some(
+            p.parse::<f64>()
+                .ok()
+                .filter(|p| p.is_finite() && *p >= 0.0)?,
+        ),
+    };
+    let name = if tail.trim().is_empty() {
+        crate::value::default_subscription(tool).name
+    } else {
+        let (name, after) = crate::public_projects::quoted(tail)?;
+        if !after.trim().is_empty() {
+            return None;
+        }
+        name
+    };
+    Some((
+        tool.to_owned(),
+        crate::value::Subscription { name, monthly_usd },
+    ))
 }
 
 pub fn load() -> Result<Config> {
@@ -49,6 +87,19 @@ pub fn parse(text: &str) -> Result<Config> {
                 bail!("project aliases require absolute non-root paths");
             }
             out.project_aliases.insert(source, target);
+            continue;
+        }
+        if section == "[subscriptions]" {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (tool, plan) = subscription(line).with_context(|| {
+                format!(
+                    "invalid subscription on line {}: expected `tool = 20 \"plan\"`",
+                    index + 1
+                )
+            })?;
+            out.subscriptions.insert(tool, plan);
             continue;
         }
         if section == "[public_projects]" {
@@ -119,6 +170,35 @@ pub fn parse(text: &str) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscriptions_take_a_price_and_an_optional_name() {
+        let c = parse(
+            "[subscriptions]\ncodex = 200 \"ChatGPT Pro\" # upgraded\nclaude-code = 150\nantigravity = none 'Free tier'\n",
+        )
+        .unwrap();
+        assert_eq!(c.subscriptions["codex"].name, "ChatGPT Pro");
+        assert_eq!(c.subscriptions["codex"].monthly_usd, Some(200.0));
+        assert_eq!(
+            c.subscriptions["claude-code"].name,
+            "Claude Team, premium seat"
+        );
+        assert_eq!(c.subscriptions["claude-code"].monthly_usd, Some(150.0));
+        assert_eq!(c.subscriptions["antigravity"].monthly_usd, None);
+        assert_eq!(c.subscriptions["antigravity"].name, "Free tier");
+        for line in [
+            "codex = twenty",
+            "codex = -1",
+            "codex = 20 unquoted",
+            "= 20",
+            "codex 20",
+        ] {
+            assert!(
+                parse(&format!("[subscriptions]\n{line}")).is_err(),
+                "{line}"
+            );
+        }
+    }
 
     #[test]
     fn project_aliases_accept_quoted_paths_and_reject_unsafe_or_malformed_rules() {
