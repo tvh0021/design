@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use chrono::{DateTime, Months, TimeZone, Utc};
+use chrono::{DateTime, Local, Months, TimeZone, Utc};
 use serde_json::{Value, json};
 
 use crate::report::{Report, Window, ago, until};
@@ -125,10 +125,20 @@ fn duration_label(secs: i64) -> &'static str {
     }
 }
 
-fn reset_credit_note(count: i64, details: &[String]) -> String {
-    let mut note = format!("Limit reset credits available: {count}");
+/// `Limit reset credits: 2 (details) · next expires in 3h 2m (Oct 22 12:00)`;
+/// says so when the provider does not report an expiry.
+fn reset_credit_note(count: i64, details: &[String], expires_at: Option<DateTime<Utc>>) -> String {
+    let mut note = format!("Limit reset credits: {count}");
     if !details.is_empty() {
         note.push_str(&format!(" ({})", details.join("; ")));
+    }
+    match expires_at {
+        Some(t) => note.push_str(&format!(
+            " · next expires in {} ({})",
+            until(t),
+            t.with_timezone(&Local).format("%b %-d %H:%M")
+        )),
+        None => note.push_str(" · expiry not reported"),
     }
     note
 }
@@ -204,8 +214,8 @@ fn claude() -> Res<Report> {
     }
     // The overage-included bucket is the first model-scoped one (T3 relies on the same).
     let scoped_model = scoped.first().map(|(m, _)| m.as_str());
-    if let Some((count, details)) = claude_reset_credits(&usage["cedar_ember"], scoped_model) {
-        report.notes.push(reset_credit_note(count, &details));
+    if let Some((count, details, expires)) = claude_reset_credits(&usage["cedar_ember"], scoped_model) {
+        report.notes.push(reset_credit_note(count, &details, expires));
     }
 
     if let Some(all_used) = weekly_all {
@@ -335,7 +345,10 @@ fn claude_cli_version() -> Option<String> {
 /// Live reset credits, using T3's rules: a grant counts when it is not
 /// paused, is usable now and has not ended, and only once the server names a
 /// next grant. Details describe that next grant: what it resets, when it expires.
-fn claude_reset_credits(block: &Value, scoped_model: Option<&str>) -> Option<(i64, Vec<String>)> {
+fn claude_reset_credits(
+    block: &Value,
+    scoped_model: Option<&str>,
+) -> Option<(i64, Vec<String>, Option<DateTime<Utc>>)> {
     if block["eligible"].as_bool() != Some(true) {
         return None;
     }
@@ -369,15 +382,12 @@ fn claude_reset_credits(block: &Value, scoped_model: Option<&str>) -> Option<(i6
         })
         .collect();
     let kind = next["type"].as_str().unwrap_or("limit");
-    let mut details = vec![if clears.is_empty() {
+    let details = vec![if clears.is_empty() {
         format!("{kind} reset")
     } else {
         format!("{kind} reset: {}", clears.join(", "))
     }];
-    if let Some(t) = parse_time(&next["ends_at"]) {
-        details.push(format!("next expires in {}", until(t)));
-    }
-    Some((count, details))
+    Some((count, details, parse_time(&next["ends_at"])))
 }
 
 // ---------- Codex (codexUsageLimits.ts) ----------
@@ -424,7 +434,7 @@ fn codex() -> Res<Report> {
     if let Some(n) = resets["available_count"].as_i64().filter(|&n| n > 0) {
         let usable = resets["applicable_available_count"].as_i64().filter(|&a| a < n);
         let details: Vec<String> = usable.map(|a| format!("{a} usable now")).into_iter().collect();
-        report.notes.push(reset_credit_note(n, &details));
+        report.notes.push(reset_credit_note(n, &details, None));
     }
     Ok(report)
 }
