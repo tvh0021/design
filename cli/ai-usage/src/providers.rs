@@ -408,7 +408,13 @@ fn codex() -> Res<Report> {
         headers.push(("ChatGPT-Account-Id", account.to_string()));
     }
     let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let usage = get_json("https://chatgpt.com/backend-api/wham/usage", &headers).map_err(|e| {
+    // The usage endpoint reports only credit counts; the expiries come from
+    // the endpoint the Codex app-server reads (backend-client rate_limit_resets.rs).
+    let (usage, reset_credits) = both(
+        || get_json("https://chatgpt.com/backend-api/wham/usage", &headers),
+        || get_json("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", &headers),
+    );
+    let usage = usage.map_err(|e| {
         if e == "HTTP 401" { "token expired; run `codex` once to refresh it".into() } else { e }
     })?;
 
@@ -433,8 +439,21 @@ fn codex() -> Res<Report> {
     let resets = &usage["rate_limit_reset_credits"];
     if let Some(n) = resets["available_count"].as_i64().filter(|&n| n > 0) {
         let usable = resets["applicable_available_count"].as_i64().filter(|&a| a < n);
-        let details: Vec<String> = usable.map(|a| format!("{a} usable now")).into_iter().collect();
-        report.notes.push(reset_credit_note(n, &details, None));
+        let mut details: Vec<String> = usable.map(|a| format!("{a} usable now")).into_iter().collect();
+        // As T3 does: the next to expire among the credits still available.
+        let available: Vec<&Value> = reset_credits
+            .as_ref()
+            .ok()
+            .and_then(|v| v["credits"].as_array())
+            .into_iter()
+            .flatten()
+            .filter(|c| c["status"].as_str() == Some("available"))
+            .collect();
+        let expires = available.iter().filter_map(|c| parse_time(&c["expires_at"])).min();
+        if let Some(title) = available.iter().find_map(|c| c["title"].as_str()) {
+            details.insert(0, title.to_string());
+        }
+        report.notes.push(reset_credit_note(n, &details, expires));
     }
     Ok(report)
 }
