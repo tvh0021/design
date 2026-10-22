@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Subscription value</title>
+<style>
+/* Tokens: docs/design.md is the source of truth. Change it first. */
+:root {
+  color-scheme: light dark;
+  --paper: #f3f2ee;
+  --ink: #1e1d1a;
+  --muted: #5f5e58;
+  --rule: #d3d1c9;
+  --claude-code: #a8402a;
+  --codex: #2a5bb8;
+  --antigravity: #4a741c;
+  --focus: #2a5bb8;
+  --ramp: var(--ink);
+
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
+  --t-small: 0.75rem;
+  --t-body: 0.875rem;
+  --t-lead: 1rem;
+  --t-title: 1.25rem;
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-12: 48px;
+  --measure: none;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #191917;
+    --ink: #e6e4dd;
+    --muted: #a3a198;
+    --rule: #3a3934;
+    --claude-code: #ee8e73;
+    --codex: #86acf2;
+    --antigravity: #a3cb65;
+    --focus: #86acf2;
+  }
+}
+
+/* Base */
+* { box-sizing: border-box; }
+html {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  background: var(--paper);
+  color: var(--ink);
+}
+body {
+  margin: 0;
+  padding: var(--s-6);
+  max-width: var(--measure);
+  font-size: var(--t-body);
+  line-height: 1.5;
+}
+h1, h2, p { margin: 0; }
+h1 { font-size: var(--t-title); line-height: 1.3; font-weight: 600; }
+h2 { font-size: var(--t-lead); line-height: 1.4; font-weight: 600; }
+code { font: inherit; }
+a { color: inherit; text-decoration: underline; text-underline-offset: 0.2em; text-decoration-thickness: 1px; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.sr {
+  position: absolute; width: 1px; height: 1px; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+/* Header */
+header { display: grid; gap: var(--s-3); }
+.provenance, .note, footer { color: var(--muted); }
+.controls { display: flex; flex-wrap: wrap; gap: var(--s-2) var(--s-8); }
+.group { display: flex; flex-wrap: wrap; gap: 0 var(--s-4); }
+.group-name { color: var(--muted); }
+.controls a { text-decoration: none; }
+.controls a:hover { text-decoration: underline; }
+.controls a[aria-current="page"] {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.3em;
+}
+
+/* One hue per tool, on the tool's name only. */
+.tool[data-tool="claude-code"] { color: var(--claude-code); }
+.tool[data-tool="codex"] { color: var(--codex); }
+.tool[data-tool="antigravity"] { color: var(--antigravity); }
+
+/* Sections */
+main { display: grid; gap: var(--s-12); margin-top: var(--s-12); }
+section { display: grid; gap: var(--s-3); padding-top: var(--s-6); border-top: 1px solid var(--rule); }
+section > h2 + .note { margin-top: calc(-1 * var(--s-2)); }
+.empty { color: var(--muted); }
+footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid var(--rule); font-size: var(--t-small); }
+
+/* Activity map */
+.activity { display: grid; gap: var(--s-3); }
+.map-wrap, .table-wrap { overflow-x: auto; }
+.map {
+  border-collapse: separate;
+  border-spacing: 2px;
+  table-layout: fixed;
+  width: 100%;
+  margin: 0 -2px;
+}
+.map th {
+  font-weight: 400;
+  font-size: var(--t-small);
+  color: var(--muted);
+  text-align: left;
+  padding: 0;
+  line-height: 1.4;
+}
+.map th.corner { width: 3.5ch; }
+.map th[scope="row"] { padding-right: var(--s-1); }
+.map thead th { vertical-align: bottom; padding-bottom: var(--s-1); border-bottom: 1px solid var(--rule); }
+.map td.c { padding: 0; height: 22px; }
+.c {
+  display: table-cell;
+  background: var(--paper);
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.c[data-level="1"] { background: color-mix(in oklab, var(--ramp) 14%, var(--paper)); box-shadow: none; }
+.c[data-level="2"] { background: color-mix(in oklab, var(--ramp) 30%, var(--paper)); box-shadow: none; }
+.c[data-level="3"] { background: color-mix(in oklab, var(--ramp) 48%, var(--paper)); box-shadow: none; }
+.c[data-level="4"] { background: color-mix(in oklab, var(--ramp) 68%, var(--paper)); box-shadow: none; }
+.c[data-level="5"] { background: color-mix(in oklab, var(--ramp) 90%, var(--paper)); box-shadow: none; }
+.map td.c:hover { box-shadow: inset 0 0 0 2px var(--ink); transition: box-shadow 80ms; }
+.map td.c:focus-visible { outline-offset: 0; }
+.map-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s-2) var(--s-6); }
+.readout { min-height: 1.5em; }
+.legend { display: flex; flex-wrap: wrap; gap: var(--s-2) var(--s-3); font-size: var(--t-small); color: var(--muted); align-items: center; }
+.legend .step { display: inline-flex; align-items: center; gap: var(--s-1); }
+.legend i.c { display: inline-block; width: 14px; height: 14px; }
+
+/* Ledger */
+.ledger { border-collapse: collapse; width: 100%; }
+.ledger th, .ledger td { padding: var(--s-2) var(--s-3) var(--s-2) 0; text-align: right; white-space: nowrap; vertical-align: baseline; }
+.ledger th[scope="row"], .ledger th:first-child { text-align: left; font-weight: 400; }
+.ledger thead th { color: var(--muted); font-weight: 400; font-size: var(--t-small); border-bottom: 1px solid var(--rule); }
+.ledger tr.total th, .ledger tr.total td { font-weight: 600; border-top: 1px solid var(--ink); }
+.ledger td:last-child, .ledger th:last-child { padding-right: 0; }
+
+/* Secondary panels (docs/design.md, "Secondary panels") */
+.ledger .l { text-align: left; }
+.ledger td.title { white-space: normal; text-align: left; min-width: 24ch; max-width: 48ch; }
+.ledger caption { caption-side: top; text-align: left; color: var(--muted); padding-bottom: var(--s-2); }
+.ledger .zero { color: var(--muted); }
+.untitled { color: var(--muted); }
+/* Model matrix: one type step larger than the other ledgers, rows about 20% taller */
+.matrix th, .matrix td { font-size: var(--t-lead); padding-top: 10px; padding-bottom: 10px; }
+.matrix thead th { font-size: var(--t-body); }
+.matrix i.c { display: inline-block; width: 12px; height: 12px; margin-right: var(--s-2); vertical-align: -1px; }
+.units {
+  --bar: color-mix(in oklab, var(--ink) 68%, var(--paper));
+  display: inline-flex; gap: 2px; vertical-align: -1px;
+}
+.units i { display: block; width: 6px; height: 10px; background: var(--bar); }
+.units i.off { background: transparent; box-shadow: inset 0 0 0 1px var(--rule); }
+.units[data-tool="claude-code"], .units i[data-tool="claude-code"] { --bar: var(--claude-code); }
+.units[data-tool="codex"], .units i[data-tool="codex"] { --bar: var(--codex); }
+.units[data-tool="antigravity"], .units i[data-tool="antigravity"] { --bar: var(--antigravity); }
+.ledger td.bar { text-align: left; }
+.mix { color: var(--muted); font-size: var(--t-small); margin-left: var(--s-2); }
+.mix b { font-weight: 600; color: var(--muted); }
+.mix b[data-tool="claude-code"] { color: var(--claude-code); }
+.mix b[data-tool="codex"] { color: var(--codex); }
+.mix b[data-tool="antigravity"] { color: var(--antigravity); }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--s-6) var(--s-8); align-items: start; }
+.stack { display: grid; gap: var(--s-6); }
+.facts, .coverage { display: grid; gap: var(--s-1); }
+.coverage { color: var(--muted); }
+.ledger.quiet { font-size: var(--t-small); }
+.ledger.quiet tbody th[scope="row"] { color: var(--muted); }
+.ledger.quiet tr.total th { color: var(--ink); }
+
+/* Narrow windows */
+@media (max-width: 720px) {
+  body { padding: var(--s-4); }
+  .map td.c { height: 14px; }
+  .map th.h:not([data-major]) { visibility: hidden; }
+  .map th.corner { width: 3ch; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+<header>
+<h1>Subscription value</h1>
+<p class="provenance">1,789 sessions and 97,905 requests. Store read Thu 22 Oct 2026, 15:06, local time UTC-04:00.</p>
+<p class="note">De-identified export. Generated Thu 22 Oct 2026, 15:06. Window: all time. Dollar figures are rounded to the nearest dollar.</p>
+<nav class="controls" aria-label="Pages"><p class="group"><span class="group-name">Page</span> <a href="index.html">usage habits</a> <a href="value.html" aria-current="page">subscription value</a></p></nav>
+</header>
+<main>
+<section id="value" aria-labelledby="value-title"><h2 id="value-title">What each plan buys</h2><p class="note">Estimated API cost is what the same requests would cost at list prices, so "times the price" is how much more the plan delivers than it costs. Per-window figures are usage scaled to one whole limit window; a session window is 5 hours and a week is 168. Figures match <code>query value</code>. The mean skips the current month and the first month seen.</p><div class="table-wrap"><table class="ledger"><thead><tr><th scope="col">Tool</th><th scope="col" class="l">Plan</th><th scope="col">Price a month</th><th scope="col">Est. API cost a month</th><th scope="col">Times the price</th><th scope="col">Est. cost per full session</th><th scope="col">Sessions per full session</th><th scope="col">Est. cost per full week</th><th scope="col">Limit readings</th></tr></thead><tbody><tr><th scope="row"><span class="tool" data-tool="claude-code">claude-code</span></th><td class="l">Claude Team, premium seat</td><td>$150</td><td>$1467</td><td>9.8x</td><td>$73</td><td>37.8</td><td>at least $1305</td><td>25 rejections</td></tr><tr><th scope="row"><span class="tool" data-tool="codex">codex</span></th><td class="l">ChatGPT Plus</td><td>$20</td><td>$451</td><td>22.6x</td><td>$14</td><td>3.5</td><td>$102</td><td>77,241</td></tr><tr><th scope="row"><span class="tool" data-tool="antigravity">antigravity</span></th><td class="l">Google AI Pro</td><td>$20</td><td>$180</td><td>9.0x</td><td>at least $39</td><td>at least 57.0</td><td>at least $132</td><td>none</td></tr></tbody></table></div></section>
+<section id="value-claude-code" aria-labelledby="value-claude-code-title"><h2 id="value-claude-code-title">claude-code on Claude Team, premium seat</h2><p class="note">Claude Team, premium seat at $150 a month. Claude Code only records the moment a window is exhausted (25 rejections). Each run spans from the window's start, its reset time minus the window length, to the first refusal: exactly 0 % to 100 %, so no scaling is needed. A window that was never exhausted shows the busiest window seen as a lower bound.</p><div class="table-wrap"><table class="ledger"><caption>Per full window, 0 % to 100 %</caption><thead><tr><th scope="col">Window</th><th scope="col">Tokens</th><th scope="col">Uncached + output</th><th scope="col">Requests</th><th scope="col">Sessions</th><th scope="col">Est. API cost</th></tr></thead><tbody><tr><th scope="row">session (5 h), 8 of 8 runs</th><td>195.2M</td><td>3.1M</td><td>1,693</td><td>37.8</td><td>$73</td></tr><tr><th scope="row">weekly (168 h), never exhausted</th><td>&ge; 3237.9M</td><td>&ge; 45.1M</td><td>&ge; 27,419</td><td>&ge; 546.0</td><td>&ge; $1305</td></tr></tbody></table></div><div class="stack"><div class="table-wrap"><table class="ledger quiet"><caption>Runs used for the session window, largest rise first</caption><thead><tr><th scope="col">Start</th><th scope="col">End</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Tokens</th><th scope="col">Requests</th><th scope="col">Sessions</th><th scope="col">Est. cost</th><th scope="col">Tokens per window</th><th scope="col">Est. cost per window</th></tr></thead><tbody><tr><th scope="row">Sat 17 Oct 2026, 10:00</th><td class="l">Sat 17 Oct 2026, 13:25</td><td>0 %</td><td>100 %</td><td>111.7M</td><td>1,135</td><td>40</td><td>$62</td><td>111.7M</td><td>$62</td></tr><tr><th scope="row">Sun 18 Oct 2026, 19:50</th><td class="l">Sun 18 Oct 2026, 23:40</td><td>0 %</td><td>100 %</td><td>111.9M</td><td>1,099</td><td>27</td><td>$66</td><td>111.9M</td><td>$66</td></tr><tr><th scope="row">Mon 19 Oct 2026, 21:40</th><td class="l">Tue 20 Oct 2026, 01:03</td><td>0 %</td><td>100 %</td><td>136.6M</td><td>1,329</td><td>34</td><td>$83</td><td>136.6M</td><td>$83</td></tr><tr><th scope="row">Tue 20 Oct 2026, 14:20</th><td class="l">Tue 20 Oct 2026, 18:10</td><td>0 %</td><td>100 %</td><td>215.4M</td><td>864</td><td>17</td><td>$77</td><td>215.4M</td><td>$77</td></tr><tr><th scope="row">Wed 21 Oct 2026, 00:20</th><td class="l">Wed 21 Oct 2026, 02:24</td><td>0 %</td><td>100 %</td><td>97.6M</td><td>1,357</td><td>76</td><td>$93</td><td>97.6M</td><td>$93</td></tr><tr><th scope="row">Wed 21 Oct 2026, 05:20</th><td class="l">Wed 21 Oct 2026, 06:48</td><td>0 %</td><td>100 %</td><td>153.5M</td><td>1,484</td><td>47</td><td>$97</td><td>153.5M</td><td>$97</td></tr><tr><th scope="row">Wed 21 Oct 2026, 15:20</th><td class="l">Wed 21 Oct 2026, 20:08</td><td>0 %</td><td>100 %</td><td>439.1M</td><td>3,712</td><td>33</td><td>$55</td><td>439.1M</td><td>$55</td></tr><tr><th scope="row">Wed 21 Oct 2026, 20:20</th><td class="l">Wed 21 Oct 2026, 22:33</td><td>0 %</td><td>100 %</td><td>296.2M</td><td>2,563</td><td>28</td><td>$52</td><td>296.2M</td><td>$52</td></tr></tbody></table></div></div><div class="table-wrap"><table class="ledger"><caption>Estimated API cost by local calendar month against the price</caption><thead><tr><th scope="col">Month</th><th scope="col">Requests</th><th scope="col">Tokens</th><th scope="col">Est. API cost</th><th scope="col">Times the price</th></tr></thead><tbody><tr><th scope="row">2026-10 (partial)</th><td>30,820</td><td>3579.4M</td><td>$1467</td><td>9.8x</td></tr><tr class="total"><th scope="row">Mean of 1 partial months</th><td></td><td></td><td>$1467</td><td>9.8x</td></tr></tbody></table></div></section>
+<section id="value-codex" aria-labelledby="value-codex-title"><h2 id="value-codex-title">codex on ChatGPT Plus</h2><p class="note">ChatGPT Plus at $20 a month. Codex reports the used share of both windows with every token count (77,241 readings). A run is a stretch of rising readings; a drop, a changed reset time, or a gap longer than the window ends it, which keeps resets and reset credits out of the figure. Each run is scaled from its rise to a whole window, and the largest 10 rises of at least 20 % are averaged.</p><div class="table-wrap"><table class="ledger"><caption>Per full window, 0 % to 100 %</caption><thead><tr><th scope="col">Window</th><th scope="col">Tokens</th><th scope="col">Uncached + output</th><th scope="col">Requests</th><th scope="col">Sessions</th><th scope="col">Est. API cost</th></tr></thead><tbody><tr><th scope="row">session (5 h), 10 of 136 runs</th><td>29.2M</td><td>1.1M</td><td>240</td><td>3.5</td><td>$14</td></tr><tr><th scope="row">weekly (168 h), 10 of 19 runs</th><td>170.8M</td><td>9.7M</td><td>1,492</td><td>23.2</td><td>$102</td></tr></tbody></table></div><div class="stack"><div class="table-wrap"><table class="ledger"><caption>Drift of the session window, every qualifying run by the month it started in</caption><thead><tr><th scope="col">Month</th><th scope="col">Runs</th><th scope="col">Tokens per window</th><th scope="col">Uncached + output per window</th><th scope="col">Requests per window</th><th scope="col">Sessions per window</th><th scope="col">Est. cost per window</th></tr></thead><tbody><tr><th scope="row">2026-05</th><td>3</td><td>27.1M</td><td>2.3M</td><td>272</td><td>5.4</td><td>$26</td></tr><tr><th scope="row">2026-06</th><td>27</td><td>23.0M</td><td>1.9M</td><td>196</td><td>5.5</td><td>$22</td></tr><tr><th scope="row">2026-07</th><td>9</td><td>18.7M</td><td>1.5M</td><td>177</td><td>5.5</td><td>$17</td></tr><tr><th scope="row">2026-09</th><td>59</td><td>28.4M</td><td>1.1M</td><td>247</td><td>8.8</td><td>$13</td></tr><tr><th scope="row">2026-10</th><td>38</td><td>49.9M</td><td>1.2M</td><td>362</td><td>11.9</td><td>$10</td></tr></tbody></table></div><div class="table-wrap"><table class="ledger quiet"><caption>Runs used for the session window, largest rise first</caption><thead><tr><th scope="col">Start</th><th scope="col">End</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Tokens</th><th scope="col">Requests</th><th scope="col">Sessions</th><th scope="col">Est. cost</th><th scope="col">Tokens per window</th><th scope="col">Est. cost per window</th></tr></thead><tbody><tr><th scope="row">Thu 17 Sep 2026, 12:28</th><td class="l">Thu 17 Sep 2026, 14:11</td><td>0 %</td><td>100 %</td><td>26.0M</td><td>216</td><td>3</td><td>$17</td><td>26.0M</td><td>$17</td></tr><tr><th scope="row">Fri 12 Jun 2026, 09:19</th><td class="l">Fri 12 Jun 2026, 11:20</td><td>1 %</td><td>100 %</td><td>21.3M</td><td>159</td><td>2</td><td>$20</td><td>21.5M</td><td>$20</td></tr><tr><th scope="row">Mon 21 Sep 2026, 10:38</th><td class="l">Mon 21 Sep 2026, 11:46</td><td>2 %</td><td>100 %</td><td>11.7M</td><td>107</td><td>2</td><td>$11</td><td>11.9M</td><td>$12</td></tr><tr><th scope="row">Sun 11 Oct 2026, 00:35</th><td class="l">Sun 11 Oct 2026, 01:14</td><td>2 %</td><td>100 %</td><td>22.7M</td><td>189</td><td>3</td><td>$4</td><td>23.2M</td><td>$4</td></tr><tr><th scope="row">Wed 23 Sep 2026, 23:49</th><td class="l">Thu 24 Sep 2026, 02:00</td><td>3 %</td><td>100 %</td><td>27.1M</td><td>229</td><td>3</td><td>$13</td><td>27.9M</td><td>$13</td></tr><tr><th scope="row">Tue 15 Sep 2026, 18:15</th><td class="l">Tue 15 Sep 2026, 23:00</td><td>0 %</td><td>95 %</td><td>22.8M</td><td>233</td><td>6</td><td>$11</td><td>24.0M</td><td>$12</td></tr><tr><th scope="row">Sun 11 Oct 2026, 21:13</th><td class="l">Mon 12 Oct 2026, 02:13</td><td>0 %</td><td>93 %</td><td>54.6M</td><td>404</td><td>4</td><td>$8</td><td>58.7M</td><td>$9</td></tr><tr><th scope="row">Wed 10 Jun 2026, 17:28</th><td class="l">Wed 10 Jun 2026, 22:16</td><td>1 %</td><td>85 %</td><td>18.5M</td><td>184</td><td>3</td><td>$20</td><td>22.0M</td><td>$24</td></tr><tr><th scope="row">Tue 22 Sep 2026, 21:52</th><td class="l">Tue 22 Sep 2026, 23:11</td><td>0 %</td><td>84 %</td><td>43.3M</td><td>347</td><td>4</td><td>$10</td><td>51.6M</td><td>$12</td></tr><tr><th scope="row">Sun 14 Jun 2026, 09:42</th><td class="l">Sun 14 Jun 2026, 12:47</td><td>1 %</td><td>84 %</td><td>21.2M</td><td>147</td><td>2</td><td>$16</td><td>25.6M</td><td>$20</td></tr></tbody></table></div><div class="table-wrap"><table class="ledger"><caption>Drift of the weekly window, every qualifying run by the month it started in</caption><thead><tr><th scope="col">Month</th><th scope="col">Runs</th><th scope="col">Tokens per window</th><th scope="col">Uncached + output per window</th><th scope="col">Requests per window</th><th scope="col">Sessions per window</th><th scope="col">Est. cost per window</th></tr></thead><tbody><tr><th scope="row">2026-05</th><td>1</td><td>164.1M</td><td>14.8M</td><td>1,614</td><td>24.3</td><td>$163</td></tr><tr><th scope="row">2026-06</th><td>4</td><td>135.6M</td><td>14.8M</td><td>1,200</td><td>26.0</td><td>$151</td></tr><tr><th scope="row">2026-07</th><td>4</td><td>116.3M</td><td>9.6M</td><td>1,037</td><td>14.2</td><td>$92</td></tr><tr><th scope="row">2026-08</th><td>2</td><td>109.9M</td><td>8.5M</td><td>1,150</td><td>33.2</td><td>$84</td></tr><tr><th scope="row">2026-09</th><td>5</td><td>248.3M</td><td>9.5M</td><td>2,207</td><td>37.5</td><td>$92</td></tr><tr><th scope="row">2026-10</th><td>3</td><td>296.0M</td><td>10.3M</td><td>2,646</td><td>68.7</td><td>$60</td></tr></tbody></table></div><div class="table-wrap"><table class="ledger quiet"><caption>Runs used for the weekly window, largest rise first</caption><thead><tr><th scope="col">Start</th><th scope="col">End</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Tokens</th><th scope="col">Requests</th><th scope="col">Sessions</th><th scope="col">Est. cost</th><th scope="col">Tokens per window</th><th scope="col">Est. cost per window</th></tr></thead><tbody><tr><th scope="row">Mon 21 Sep 2026, 10:38</th><td class="l">Tue 22 Sep 2026, 16:56</td><td>0 %</td><td>58 %</td><td>73.4M</td><td>818</td><td>17</td><td>$50</td><td>126.6M</td><td>$86</td></tr><tr><th scope="row">Sun 11 Oct 2026, 00:35</th><td class="l">Mon 12 Oct 2026, 13:05</td><td>0 %</td><td>56 %</td><td>183.0M</td><td>1,337</td><td>15</td><td>$28</td><td>326.7M</td><td>$51</td></tr><tr><th scope="row">Wed 9 Sep 2026, 15:52</th><td class="l">Fri 11 Sep 2026, 11:39</td><td>47 %</td><td>100 %</td><td>74.1M</td><td>708</td><td>18</td><td>$50</td><td>139.8M</td><td>$94</td></tr><tr><th scope="row">Mon 27 Jul 2026, 16:36</th><td class="l">Mon 27 Jul 2026, 21:32</td><td>22 %</td><td>63 %</td><td>51.7M</td><td>413</td><td>5</td><td>$34</td><td>126.2M</td><td>$83</td></tr><tr><th scope="row">Mon 20 Jul 2026, 18:35</th><td class="l">Mon 20 Jul 2026, 20:38</td><td>0 %</td><td>39 %</td><td>19.6M</td><td>190</td><td>2</td><td>$14</td><td>50.3M</td><td>$37</td></tr><tr><th scope="row">Wed 27 May 2026, 20:15</th><td class="l">Sun 31 May 2026, 11:12</td><td>0 %</td><td>37 %</td><td>60.7M</td><td>597</td><td>9</td><td>$60</td><td>164.1M</td><td>$163</td></tr><tr><th scope="row">Sun 21 Jun 2026, 21:12</th><td class="l">Wed 24 Jun 2026, 17:42</td><td>55 %</td><td>88 %</td><td>53.7M</td><td>467</td><td>9</td><td>$62</td><td>162.7M</td><td>$188</td></tr><tr><th scope="row">Thu 11 Jun 2026, 20:09</th><td class="l">Fri 12 Jun 2026, 11:20</td><td>18 %</td><td>50 %</td><td>42.2M</td><td>361</td><td>8</td><td>$44</td><td>131.9M</td><td>$138</td></tr><tr><th scope="row">Sun 12 Jul 2026, 23:43</th><td class="l">Mon 13 Jul 2026, 22:20</td><td>4 %</td><td>35 %</td><td>45.8M</td><td>438</td><td>6</td><td>$30</td><td>147.8M</td><td>$98</td></tr><tr><th scope="row">Tue 22 Sep 2026, 21:15</th><td class="l">Wed 23 Sep 2026, 23:48</td><td>69 %</td><td>100 %</td><td>102.8M</td><td>844</td><td>9</td><td>$25</td><td>331.5M</td><td>$79</td></tr></tbody></table></div></div><div class="table-wrap"><table class="ledger"><caption>Estimated API cost by local calendar month against the price</caption><thead><tr><th scope="col">Month</th><th scope="col">Requests</th><th scope="col">Tokens</th><th scope="col">Est. API cost</th><th scope="col">Times the price</th></tr></thead><tbody><tr><th scope="row">2026-05 (partial)</th><td>656</td><td>65.7M</td><td>$68</td><td>3.4x</td></tr><tr><th scope="row">2026-06</th><td>3,501</td><td>393.4M</td><td>$421</td><td>21.1x</td></tr><tr><th scope="row">2026-07</th><td>5,951</td><td>610.2M</td><td>$458</td><td>22.9x</td></tr><tr><th scope="row">2026-08</th><td>5,155</td><td>525.8M</td><td>$315</td><td>15.7x</td></tr><tr><th scope="row">2026-09</th><td>13,788</td><td>1555.1M</td><td>$611</td><td>30.6x</td></tr><tr><th scope="row">2026-10 (partial)</th><td>14,084</td><td>1773.2M</td><td>$333</td><td>16.6x</td></tr><tr class="total"><th scope="row">Mean of 4 complete months</th><td></td><td></td><td>$451</td><td>22.6x</td></tr></tbody></table></div></section>
+<section id="value-antigravity" aria-labelledby="value-antigravity-title"><h2 id="value-antigravity-title">antigravity on Google AI Pro</h2><p class="note">Google AI Pro at $20 a month. This harness records no limit readings, so the window capacity cannot be measured; the busiest window seen is shown as a lower bound and the monthly comparison stands on its own.</p><div class="table-wrap"><table class="ledger"><caption>Per full window, 0 % to 100 %</caption><thead><tr><th scope="col">Window</th><th scope="col">Tokens</th><th scope="col">Uncached + output</th><th scope="col">Requests</th><th scope="col">Sessions</th><th scope="col">Est. API cost</th></tr></thead><tbody><tr><th scope="row">session (5 h), never exhausted</th><td>&ge; 273.9M</td><td>&ge; 15.2M</td><td>&ge; 3,305</td><td>&ge; 57.0</td><td>&ge; $39</td></tr><tr><th scope="row">weekly (168 h), never exhausted</th><td>&ge; 906.1M</td><td>&ge; 50.8M</td><td>&ge; 10,722</td><td>&ge; 181.0</td><td>&ge; $132</td></tr></tbody></table></div><div class="stack"></div><div class="table-wrap"><table class="ledger"><caption>Estimated API cost by local calendar month against the price</caption><thead><tr><th scope="col">Month</th><th scope="col">Requests</th><th scope="col">Tokens</th><th scope="col">Est. API cost</th><th scope="col">Times the price</th></tr></thead><tbody><tr><th scope="row">2026-09 (partial)</th><td>11,216</td><td>1026.9M</td><td>$196</td><td>9.8x</td></tr><tr><th scope="row">2026-10 (partial)</th><td>12,734</td><td>1096.2M</td><td>$163</td><td>8.1x</td></tr><tr class="total"><th scope="row">Mean of 2 partial months</th><td></td><td></td><td>$180</td><td>9.0x</td></tr></tbody></table></div></section>
+</main>
+<footer>
+<p>Costs are estimates at LiteLLM list prices. Subscription prices come from <code>[subscriptions]</code> in config.toml, or the built-in defaults. Data loaded in 981 ms.</p>
+</footer>
+</body>
+</html>
