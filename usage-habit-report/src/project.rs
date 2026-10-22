@@ -78,6 +78,54 @@ fn main_toplevel(toplevel: &Path, dot_git: &Path) -> Option<PathBuf> {
     common.parent().map(Path::to_path_buf)
 }
 
+/// Explicit umbrella projects and T3's recorded worktree ownership. Filesystem
+/// boundaries prevent an alias for `arena` from matching `arena-other`.
+#[derive(Default)]
+struct Aliases(BTreeMap<String, String>);
+
+impl Aliases {
+    fn load(t3_paths: &[PathBuf]) -> Result<Self> {
+        let mut out = BTreeMap::new();
+        for path in t3_paths.iter().filter(|p| p.is_file()) {
+            match t3::project_aliases(path) {
+                Ok(aliases) => {
+                    for (source, target) in aliases {
+                        out.entry(source).or_insert(target);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "notice: cannot read project ownership from {}: {e:#}",
+                    path.display()
+                ),
+            }
+        }
+        // User configuration takes priority over recorded ownership.
+        out.extend(crate::config::load()?.project_aliases);
+        Ok(Self(
+            out.into_iter()
+                .map(|(source, target)| {
+                    let source =
+                        std::fs::canonicalize(&source).unwrap_or_else(|_| PathBuf::from(source));
+                    (source.to_string_lossy().into_owned(), target)
+                })
+                .collect(),
+        ))
+    }
+
+    fn resolve(&self, cwd: &str) -> String {
+        let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+        match self
+            .0
+            .iter()
+            .filter(|(source, _)| dir.starts_with(source))
+            .max_by_key(|(source, _)| Path::new(source).components().count())
+        {
+            Some((_, target)) => resolve(target),
+            None => resolve(cwd),
+        }
+    }
+}
+
 /// Last path component, or the whole string for `/` and the like.
 pub fn project_name(project: &str) -> String {
     Path::new(project)
@@ -99,8 +147,8 @@ pub struct EnrichReport {
 }
 
 /// The enrich step: attach T3 thread ids and titles, then resolve the project
-/// of every session that has none yet. T3 databases that are missing are
-/// skipped; ones that fail to open or read get one notice on stderr.
+/// of every session, refreshing historical assignments. Missing T3 databases
+/// are skipped; ones that fail to open or read get one notice on stderr.
 pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichReport> {
     let start = Instant::now();
     let mut report = EnrichReport::default();
@@ -124,20 +172,14 @@ pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichRepor
         }
     }
 
+    let aliases = Aliases::load(t3_paths)?;
     let tx = conn.transaction()?;
     report.t3.sessions_linked = t3::apply(&tx, &links)?;
 
-    // Sessions with no project yet, plus ones filed under a worktree path:
-    // those are resolved again so that a worktree deleted since the first
-    // scan folds into its repository.
+    // Revisit recorded assignments so new aliases also fix historical usage.
     type Pending = (i64, String, String, Option<String>, Option<String>);
     let pending: Vec<Pending> = tx
-        .prepare(
-            "SELECT id, tool, session_id, cwd, project FROM sessions
-             WHERE project IS NULL
-                OR instr(project, '/.claude/worktrees/') > 0
-                OR instr(project, '/.git/worktrees/') > 0",
-        )?
+        .prepare("SELECT id, tool, session_id, cwd, project FROM sessions")?
         .query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
@@ -154,7 +196,7 @@ pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichRepor
                     .and_then(|l| l.workspace.clone())
                 {
                     Some(w) => (w, true),
-                    None => match old_project {
+                    None => match old_project.clone() {
                         Some(p) => (p, false),
                         None => {
                             report.without_cwd += 1;
@@ -163,7 +205,21 @@ pub fn enrich(conn: &mut Connection, t3_paths: &[PathBuf]) -> Result<EnrichRepor
                     },
                 },
             };
-            let project = cache.entry(dir).or_insert_with_key(|d| resolve(d)).clone();
+            let mut project = cache
+                .entry(dir.clone())
+                .or_insert_with_key(|d| aliases.resolve(d))
+                .clone();
+            // Keep a previously established Git root if its deleted cwd has
+            // no current ownership evidence. Never invent a new project for it.
+            if project == dir
+                && !Path::new(&dir).exists()
+                && let Some(old) = &old_project
+            {
+                project = aliases.resolve(old);
+            }
+            if old_project.as_deref() == Some(project.as_str()) {
+                continue;
+            }
             update.execute(params![id, project, project_name(&project)])?;
             report.projects_set += 1;
             report.projects_from_t3 += from_t3 as u64;
@@ -491,8 +547,8 @@ pub fn lookup(conn: &Connection, key: &str) -> Result<Lookup> {
     if all.iter().any(|c| c.project == key) {
         return Ok(Lookup::Found(key.to_string()));
     }
-    if Path::new(key).exists() {
-        let resolved = resolve(key);
+    if Path::new(key).is_absolute() || Path::new(key).exists() {
+        let resolved = Aliases::load(&t3::default_paths())?.resolve(key);
         if all.iter().any(|c| c.project == resolved) {
             return Ok(Lookup::Found(resolved));
         }
@@ -668,6 +724,49 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn aliases_choose_the_most_specific_owner_without_matching_siblings() {
+        let aliases = Aliases(BTreeMap::from([
+            ("/missing/arena".into(), "/missing/arena".into()),
+            ("/missing/arena/independent".into(), "/missing/other".into()),
+        ]));
+        assert_eq!(
+            aliases.resolve("/missing/arena/runs/seat-02"),
+            "/missing/arena"
+        );
+        assert_eq!(
+            aliases.resolve("/missing/arena/independent/src"),
+            "/missing/other"
+        );
+        assert_eq!(
+            aliases.resolve("/missing/arena-other"),
+            "/missing/arena-other"
+        );
+    }
+
+    #[test]
+    fn reindex_preserves_known_ownership_after_cwd_disappears() {
+        let mut store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (tool, session_id, cwd, project, project_name)
+             VALUES ('codex', 'gone', '/missing/checkout/src', '/missing/main', 'main')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(enrich(&mut store.conn, &[]).unwrap().projects_set, 0);
+        let project: String = store
+            .conn
+            .query_row(
+                "SELECT project FROM sessions WHERE session_id = 'gone'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "/missing/main");
     }
 
     #[test]

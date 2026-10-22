@@ -57,6 +57,12 @@ enum Command {
         #[command(flatten)]
         args: ScanArgs,
     },
+    /// Reassign stored sessions to projects without rereading logs or changing usage.
+    Reindex {
+        /// T3 state database; repeatable. Defaults to the installed T3 profiles.
+        #[arg(long = "t3-state")]
+        t3_states: Vec<PathBuf>,
+    },
     /// Drop the store's usage rows (sources, sessions, requests, Codex cursors) and
     /// read every raw log again. Hand-set labels and rates.json are kept. Usage whose
     /// raw logs have since been deleted is lost.
@@ -531,6 +537,19 @@ fn main() -> Result<()> {
             println!("elapsed: {:.2} s", scan_start.elapsed().as_secs_f64());
             let (_, stats) = priced(&mut store, cli.offline, false)?;
             print_price_stats(&stats);
+        }
+        Command::Reindex { t3_states } => {
+            let paths = if t3_states.is_empty() {
+                t3::default_paths()
+            } else {
+                t3_states
+            };
+            let report = project::enrich(&mut store.conn, &paths)?;
+            println!(
+                "reindex: {} project assignments changed; {:.2} s",
+                report.projects_set,
+                report.elapsed.as_secs_f64()
+            );
         }
         Command::Rebuild { args } => {
             let start = std::time::Instant::now();

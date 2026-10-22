@@ -244,3 +244,107 @@ fn unreadable_t3_database_gives_one_notice() {
         o.stdout
     );
 }
+
+#[test]
+fn reindex_merges_umbrella_and_deleted_t3_worktrees_without_changing_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = canonical_root.as_path();
+    let arena = root.join("arena");
+    let seat = arena.join("runs/seat-02");
+    let sibling = root.join("arena-other");
+    std::fs::create_dir_all(&seat).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let config_dir = root.join("config/usage-habit-report");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[project_aliases]\n{} = {} # umbrella\n",
+            serde_json::to_string(arena.to_str().unwrap()).unwrap(),
+            serde_json::to_string(arena.to_str().unwrap()).unwrap(),
+        ),
+    )
+    .unwrap();
+    // Opening through the CLI creates the schema, without scanning local logs.
+    ok(root, &["--no-scan", "query", "projects", "--json"]);
+    let db = Connection::open(root.join("usage.db")).unwrap();
+    let t3 = root.join("state.sqlite");
+    t3_state(&t3);
+    db.execute_batch(
+        "INSERT INTO sessions (tool, session_id, cwd, project, project_name)
+        VALUES ('codex', 'deleted', '/deleted/worktree/subdir', '/deleted/worktree', 'worktree');
+        INSERT INTO requests (tool, request_key, session_id, ts_ms, input_tokens, output_tokens, cost_usd)
+        VALUES ('codex', 'r1', 'deleted', 1000, 123, 45, 0.25);",
+    )
+    .unwrap();
+    let metadata = Connection::open(&t3).unwrap();
+    metadata
+        .execute(
+            "UPDATE projection_threads SET worktree_path = '/deleted/worktree'",
+            [],
+        )
+        .unwrap();
+    for (sid, cwd) in [("seat", seat.as_path()), ("sibling", sibling.as_path())] {
+        db.execute(
+            "INSERT INTO sessions (tool, session_id, cwd, project, project_name)
+            VALUES ('claude-code', ?1, ?2, ?2, ?1)",
+            params![sid, cwd.to_str().unwrap()],
+        )
+        .unwrap();
+    }
+    let before: (i64, i64, i64, f64) = db
+        .query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cost_usd) FROM requests",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    let output = ok(root, &["reindex", "--t3-state", t3.to_str().unwrap()]);
+    assert!(output.contains("2 project assignments changed"), "{output}");
+    let assigned = |sid: &str| -> String {
+        db.query_row(
+            "SELECT project FROM sessions WHERE session_id = ?1",
+            [sid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        assigned("seat"),
+        std::fs::canonicalize(&arena).unwrap().to_str().unwrap()
+    );
+    assert_eq!(assigned("sibling"), sibling.to_str().unwrap());
+    assert_eq!(assigned("deleted"), "/home/demo/gamma");
+    let after = db
+        .query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cost_usd) FROM requests",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(before, after);
+    let detail: serde_json::Value = serde_json::from_str(&ok(
+        root,
+        &[
+            "--no-scan",
+            "query",
+            "project",
+            seat.to_str().unwrap(),
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(detail["project"], assigned("seat"));
+    assert!(
+        ok(root, &["reindex", "--t3-state", t3.to_str().unwrap()])
+            .contains("0 project assignments changed")
+    );
+}

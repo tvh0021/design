@@ -568,8 +568,16 @@ again with its final counts.
 
 ## Projects and T3
 
-The enrich step runs after every `scan`. It only touches sessions that have
-no project (and, for T3, no thread id) yet, so a second scan does nothing.
+The enrich step runs after every `scan` and refreshes project assignments
+for stored sessions. Unchanged assignments are not rewritten. To reindex
+projects without rereading raw logs or changing stored requests, run:
+
+```sh
+usage-habit-report reindex
+```
+
+`reindex --t3-state FILE` uses a specific T3 database and can be repeated.
+Reindexing preserves usage whose raw logs have been deleted.
 
 **Project.** A session's project is derived from its recorded `cwd`:
 
@@ -591,7 +599,30 @@ no project (and, for T3, no thread id) yet, so a second scan does nothing.
 Existing directories are canonicalized first (symlinks resolved, so `/tmp/x`
 becomes `/private/tmp/x` on macOS). `sessions.project` holds the path and
 `sessions.project_name` its last component. Each distinct `cwd` is resolved
-once per run.
+once per run. A previously established project is retained when its recorded
+working directory has disappeared and no current ownership rule applies.
+
+T3's recorded worktree paths map to their parent workspace roots, including
+worktrees that have been deleted. These mappings apply to every session
+under that path, including native subagents without a T3 session link.
+Paths with conflicting owners within a T3 database are skipped.
+
+For an umbrella project outside Git, add a path mapping to `config.toml`:
+
+```toml
+[project_aliases]
+"/work/arena" = "/work/arena"
+"/work/old-checkout" = "/work/main-repository"
+```
+
+Each source path and its descendants belong to the target project. A
+self-mapping groups nested runs, judging directories, and embedded repositories
+under one umbrella. Paths must be absolute and cannot be `/`. The most specific
+source path wins; configured mappings override T3 mappings for the same source.
+Targets resolve through the Git rules above; aliases do not chain.
+A mapping for `/work/arena` does not match `/work/arena-other`.
+The next scan or `reindex` applies changed mappings to historical sessions.
+Shared container directories such as `/work` are not inferred as projects.
 
 **T3.** T3 Code keeps a state database at `~/.t3/userdata/state.sqlite` (and
 `~/.t3-personal/userdata/state.sqlite` for a second profile).
@@ -611,6 +642,7 @@ nothing else changes.
   than one database, the first database in the list wins.
 - A session with no recorded `cwd` uses the thread's `worktree_path`, else
   its project's `projection_projects.workspace_root`, for project resolution.
+  Recorded worktree ownership then folds that path into the parent project.
   That directory is not written to `cwd`.
 
 **Session keys.** `query::resolve_session(key)` finds a session by exact

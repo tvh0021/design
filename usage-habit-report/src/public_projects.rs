@@ -6,7 +6,7 @@ pub fn name(url: &str) -> &str {
     url.trim_end_matches('/').rsplit('/').next().unwrap_or("")
 }
 
-fn quoted(input: &str) -> Option<(String, &str)> {
+pub(crate) fn quoted(input: &str) -> Option<(String, &str)> {
     let input = input.trim_start();
     if let Some(rest) = input.strip_prefix('\'') {
         let (value, tail) = rest.split_once('\'')?;

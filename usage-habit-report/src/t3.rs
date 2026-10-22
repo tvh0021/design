@@ -80,6 +80,21 @@ pub fn load(path: &Path) -> Result<Links> {
     Ok(out)
 }
 
+/// Historical worktree ownership, including deleted worktrees and native
+/// sessions that have no provider-session link. Conflicting roots are omitted.
+pub fn project_aliases(path: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let conn = Connection::open_with_flags(sqlite_uri(path, "mode=ro&immutable=1"), flags)?;
+    let mut stmt = conn.prepare(
+        "SELECT t.worktree_path, MIN(p.workspace_root)
+         FROM projection_threads t JOIN projection_projects p ON p.project_id = t.project_id
+         WHERE t.worktree_path IS NOT NULL AND t.worktree_path != '' AND p.workspace_root != ''
+         GROUP BY t.worktree_path HAVING COUNT(DISTINCT p.workspace_root) = 1",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// The harness session id in a `resume_cursor_json`: Codex rows carry
 /// `{"threadId": ...}`, Antigravity rows `{"schemaVersion": 1, "sessionId": ...}`.
 fn session_id(provider: &str, cursor: &str) -> Option<String> {
@@ -259,13 +274,13 @@ mod tests {
                 Some("/recorded/cwd".into())
             )
         );
-        // No recorded cwd: the T3 worktree path stands in (missing on disk, kept as is).
+        // A deleted T3 worktree still belongs to its recorded parent workspace.
         assert_eq!(
             row(&store.conn, "antigravity", "ag-1"),
             (
                 Some("thread-ag".into()),
                 Some("Draft a plan".into()),
-                Some("/nowhere/worktree".into())
+                Some(crate::project::resolve(ws))
             )
         );
         assert_eq!(row(&store.conn, "claude-code", "cc-1").0, None);

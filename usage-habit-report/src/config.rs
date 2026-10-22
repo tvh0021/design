@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[derive(Default, Debug)]
 pub struct Config {
     pub sources: BTreeMap<String, PathBuf>,
+    pub project_aliases: BTreeMap<String, String>,
     pub public_projects: BTreeMap<String, String>,
     pub publish_dir: Option<PathBuf>,
     pub publish_push: Option<bool>,
@@ -25,6 +26,29 @@ pub fn parse(text: &str) -> Result<Config> {
     for (index, line) in text.lines().map(str::trim).enumerate() {
         if line.starts_with('[') {
             section = line.split('#').next().unwrap().trim();
+            continue;
+        }
+        if section == "[project_aliases]" {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (source, tail) =
+                crate::public_projects::quoted(line).context("invalid project alias source")?;
+            let (target, tail) = crate::public_projects::quoted(
+                tail.trim_start()
+                    .strip_prefix('=')
+                    .context("invalid project alias")?,
+            )
+            .context("invalid project alias target")?;
+            if (!tail.trim().is_empty() && !tail.trim_start().starts_with('#'))
+                || !std::path::Path::new(&source).is_absolute()
+                || !std::path::Path::new(&target).is_absolute()
+                || source == "/"
+                || target == "/"
+            {
+                bail!("project aliases require absolute non-root paths");
+            }
+            out.project_aliases.insert(source, target);
             continue;
         }
         if section == "[public_projects]" {
@@ -90,4 +114,23 @@ pub fn parse(text: &str) -> Result<Config> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_aliases_accept_quoted_paths_and_reject_unsafe_or_malformed_rules() {
+        let c = parse("[project_aliases]\n'/work/arena' = \"/work/arena\" # umbrella\n").unwrap();
+        assert_eq!(c.project_aliases["/work/arena"], "/work/arena");
+        for line in [
+            "'relative' = '/work'",
+            "'/work' = '/'",
+            "'/' = '/work'",
+            "'/work' = '/other' junk",
+        ] {
+            assert!(parse(&format!("[project_aliases]\n{line}")).is_err());
+        }
+    }
 }
