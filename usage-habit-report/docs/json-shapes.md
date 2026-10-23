@@ -181,29 +181,47 @@ own transcript, not its subagents.
 | `generated_at` | string |
 | `min_rise_percent` | number (20) |
 | `runs_averaged` | integer (10) |
+| `pace_days` | integer (28) |
+| `combined` | `{ plans: integer, monthly_usd: number, pace_monthly_cost_usd: number?, pace_multiple: number? }` over the priced plans |
 | `tools[]` | one entry per tool, in tool order |
 | `tools[].tool` | string |
 | `tools[].subscription` | `{ name: string, monthly_usd: number? }` |
-| `tools[].limit_source` | `"readings"`, `"rejections"` or `"none"` |
-| `tools[].windows[]` | `session` then `weekly` |
+| `tools[].limit_source` | `"readings"` (logged), `"live"` (only `limits record`), `"rejections"` or `"none"` |
+| `tools[].reference_model` | string? (costliest model of the last `pace_days` days, else of all time) |
+| `tools[].first_request`, `tools[].last_request` | string? |
+| `tools[].windows[]` | `session`, `weekly`, then one per live pool and window |
 | `tools[].windows[].window` | string |
 | `tools[].windows[].window_hours` | integer (5 or 168) |
-| `tools[].windows[].readings` | integer, limit samples seen for the window |
+| `tools[].windows[].pool` | string? (`"Fable"`, `"Gemini"`; null for the plan's own window) |
+| `tools[].windows[].models` | string[] (the models a pool covers; empty for the plan's window) |
+| `tools[].windows[].readings` | integer, limit samples seen for the window, logged and live |
+| `tools[].windows[].live_readings` | integer, of `readings`, those from `limits record` |
+| `tools[].windows[].first_reading`, `last_reading` | string? |
+| `tools[].windows[].latest` | `{ at: string, used_percent: number, resets_at: string? }?`, the newest reading |
 | `tools[].windows[].qualifying_runs` | integer, runs rising at least `min_rise_percent` |
 | `tools[].windows[].runs[]` | the runs averaged, largest rise first: `start`, `end` (timestamps), `from_percent`, `to_percent`, `rise_percent` (numbers), `readings`, `sessions` (integers), Tokens, `per_window: Capacity` |
 | `tools[].windows[].per_window` | Capacity? (mean of `runs[]`; `null` with no runs) |
-| `tools[].windows[].drift[]` | `month: "YYYY-MM"`, `runs: integer`, `per_window: Capacity` (mean of every qualifying run that started that month) |
+| `tools[].windows[].spread` | `{ cost_min, cost_median, cost_max: number?, tokens_min, tokens_median, tokens_max: number }?` over `runs[]` |
+| `tools[].windows[].drift[]` | `month: "YYYY-MM"`, `runs: integer`, `per_window: Capacity` (mean of every qualifying run that started that month), `main_model: string?`, `main_model_share: number?` (share of the month's run cost) |
 | `tools[].windows[].lower_bound` | Capacity? (busiest sliding window; set only when `per_window` is null and requests exist) |
-| `tools[].months[]` | Tokens plus `month: "YYYY-MM"`, `complete: boolean`, `multiple: number?` (cost over the plan price) |
+| `tools[].windows[].utilization` | `{ windows, exhausted, cut_short, mean_peak_percent: number?, mid_window_resets, by_month: [{ month, windows, exhausted, cut_short, mean_peak_percent }] }?` over closed windows |
+| `tools[].months[]` | Tokens plus `month: "YYYY-MM"`, `complete: boolean`, `days_covered: number`, `multiple: number?` (plan-covered cost over the plan price), `projected_cost_usd: number?` (partial months at their pace), `credit_funded_cost_usd: number?` |
 | `tools[].complete_months` | integer |
 | `tools[].mean_monthly_cost_usd` | number? |
 | `tools[].mean_multiple` | number? |
+| `tools[].pace` | `{ days: number, monthly_cost_usd: number?, multiple: number? }?` |
+| `tools[].credits` | `{ first_at, last_at: string, first_balance, last_balance, spent, spent_at_limit, spent_near_resets, added: number, credit_funded: Tokens }?` (Codex) |
 
-`Capacity` is `{ tokens, billable_tokens, requests, sessions, estimated_cost_usd }`,
-all numbers scaled to one whole window (`billable_tokens` is uncached input
-plus output). Months are local calendar months; `complete` is false for the
-current month and the first month seen. The mean fields cover complete
-months, or every month when none is complete.
+`Capacity` is `{ tokens, billable_tokens, requests, sessions, output_tokens,
+estimated_cost_usd, reference_cost_usd }`, all numbers scaled to one whole
+window (`billable_tokens` is uncached input plus output;
+`reference_cost_usd` prices the same tokens at `reference_model` rates).
+Months are local calendar months; `complete` is false for the current month
+and the first month seen. The mean fields cover complete months, or every
+month when none is complete. `mean_peak_percent` covers only windows that
+ran to their reset time; `cut_short` counts those a mid-window reset ended.
+Credit-funded requests (made while a window read 100 % and the balance fell)
+are left out of `multiple` and `pace`.
 
 ## `query models`
 

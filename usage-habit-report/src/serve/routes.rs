@@ -109,7 +109,14 @@ pub fn load_value_page(
 ) -> Result<super::value_html::ValuePage> {
     let started = std::time::Instant::now();
     let subscriptions = crate::config::load()?.subscriptions;
-    let report = crate::value::report(conn, &subscriptions, now_ms, tz)?;
+    // The page never fetches: it reprices from the rates file as it stands.
+    let rates = crate::rates::load(
+        &crate::paths::config_dir()?.join("rates.json"),
+        true,
+        now_ms,
+        || anyhow::bail!("serve never fetches rates"),
+    );
+    let report = crate::value::report(conn, &subscriptions, Some(&rates.file), now_ms, tz)?;
     let run_labels = report
         .tools
         .iter()

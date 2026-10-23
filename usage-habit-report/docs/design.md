@@ -203,14 +203,29 @@ styles of the main page and adds nothing new. Its controls carry one group,
 "Page", that links the two pages; the current one is underlined and carries
 `aria-current="page"`. Top to bottom:
 
-1. `section#value`: one sentence of method, then a ledger with a row per
-   tool (plan, price, estimated API cost a month, times the price, the
-   per-window figures).
-2. One `section#value-<tool>` per tool: a note on what the harness records,
-   the per-window ledger (a never-exhausted window shows `≥` lower bounds),
-   a drift table per window when two or more months qualify, the runs that
-   were averaged as a `ledger quiet` table, and the month table whose total
-   row is the mean of the complete months.
+1. `section#value`: one sentence of method, the combined headline and any
+   pool or live-limit finding in `.facts` (a leading tool name takes the tool's
+   hue), then a ledger with a row per tool at its recent pace (plan, price,
+   estimated cost a month, times the price with a count bar, the per-window
+   costs, days of history), a total row, and one note on `≥`. Each tool's
+   own headline is left out because the ledger already says it.
+2. One `section#value-<tool>` per tool: a one-line note (price, request
+   dates, logged and live readings), the per-window ledger (`≥` lower bounds;
+   pools follow the plan's own windows), then in a `.stack`: per window a
+   drift sentence and table when two or more months qualify, with two count
+   bars per row (cost at the month's prices and at the reference model's,
+   on one scale); the closed-windows table, whose mean-peak column is a
+   20-unit share bar, and a quiet by-month table; the credits ledger
+   (`ledger quiet`) when credits moved; the month table with a count bar on
+   times the price and pace and mean rows (the mean only with two or more
+   months); and the averaged runs as `ledger quiet` tables inside one closed
+   `<details>`. Every bar in a section is that tool's hue.
+3. `section#value-coverage`, "Coverage and method": three short paragraphs
+   on runs, sources, and drift. It renders on an empty store too, so its
+   fixed words reach the snapshot's template vocabulary.
+
+The utilization and credits findings are left off the page, since their
+tables carry the same figures; the text report and MCP still print them.
 
 No activity map, so the page carries no script.
 

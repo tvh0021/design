@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
-    agents, antigravity, codex, headlines, labels, mcp, paths, project, query, rates, scan, serve,
-    store::Store, t3, value,
+    agents, antigravity, codex, headlines, labels, limits, mcp, paths, project, query, rates, scan,
+    serve, store::Store, t3, value,
 };
 
 #[derive(Parser)]
@@ -87,6 +87,11 @@ enum Command {
         /// One of: research, coding, debugging, writing, review, data-analysis, ops-config, other.
         kind: String,
     },
+    /// Subscription limit readings sampled live from `ai-usage`.
+    Limits {
+        #[command(subcommand)]
+        what: LimitsCommand,
+    },
     /// Model prices (LiteLLM) and request costs.
     Rates {
         #[command(subcommand)]
@@ -118,6 +123,22 @@ enum Command {
         /// Skip the configured public snapshot refresh.
         #[arg(long)]
         no_publish: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LimitsCommand {
+    /// Store the current used share of every Claude, Codex, and Antigravity
+    /// window from `ai-usage --json`. Claude Code and Antigravity write no
+    /// limit readings to their logs, so a schedule of these samples is what
+    /// lets `query value` measure their windows.
+    Record {
+        /// Keep sampling every SECS seconds until interrupted.
+        #[arg(long, value_name = "SECS")]
+        every: Option<u64>,
+        /// Read `ai-usage --json` output from a file instead of running it.
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
     },
 }
 
@@ -665,10 +686,15 @@ fn main() -> Result<()> {
         Command::Query {
             what: QueryCommand::Value { json },
         } => {
-            let (_, _) = priced(&mut store, cli.offline, false)?;
+            let (r, _) = priced(&mut store, cli.offline, false)?;
             let subscriptions = usage_habit_report::config::load()?.subscriptions;
-            let report =
-                value::report(&store.conn, &subscriptions, scan::now_ms(), &chrono::Local)?;
+            let report = value::report(
+                &store.conn,
+                &subscriptions,
+                Some(&r.file),
+                scan::now_ms(),
+                &chrono::Local,
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -748,6 +774,29 @@ fn main() -> Result<()> {
                 print!("{}", project::render_list_table(&l));
             }
         }
+        Command::Limits {
+            what: LimitsCommand::Record { every, from },
+        } => loop {
+            let sampled = match &from {
+                Some(path) => std::fs::read_to_string(path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| limits::record(&mut store, &json, scan::now_ms())),
+                None => limits::fetch()
+                    .and_then(|json| limits::record(&mut store, &json, scan::now_ms())),
+            };
+            match (sampled, every) {
+                (Ok(line), _) => println!("{line}"),
+                (Err(e), None) => return Err(e),
+                // A failed sample in a long-running loop is reported and retried.
+                (Err(e), Some(_)) => eprintln!("limits: {e:#}"),
+            }
+            match every {
+                Some(secs) if from.is_none() => {
+                    std::thread::sleep(std::time::Duration::from_secs(secs.max(30)))
+                }
+                _ => break,
+            }
+        },
         Command::Rates {
             what: RatesCommand::Update,
         } => {

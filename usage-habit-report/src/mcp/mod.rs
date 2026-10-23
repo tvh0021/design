@@ -395,11 +395,12 @@ impl<'a> Server<'a> {
             }
             "usage_value" => {
                 self.ensure_fresh()?;
-                self.priced()?;
+                let r = self.priced()?;
                 let subscriptions = crate::config::load()?.subscriptions;
                 let report = crate::value::report(
                     &self.store.conn,
                     &subscriptions,
+                    Some(&r.file),
                     scan::now_ms(),
                     &chrono::Local,
                 )?;

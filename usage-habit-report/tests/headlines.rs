@@ -145,14 +145,14 @@ fn v8_migration_preserves_usage_labels_and_cursors() {
         INSERT INTO codex_cursors VALUES (1,'{}');
         INSERT INTO session_labels VALUES ('claude-code','plain','coding',0);
         ALTER TABLE sessions DROP COLUMN display_title; ALTER TABLE sessions DROP COLUMN title_source;
-        DROP TABLE limit_samples; PRAGMA user_version=8;").unwrap();
+        DROP TABLE limit_samples; DROP TABLE live_limits; PRAGMA user_version=8;").unwrap();
     drop(s);
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 10);
+    assert_eq!(s.schema_version().unwrap(), 11);
     assert!(titles(&s).iter().all(|(_, _, source)| !source.is_empty()));
     headlines::refresh(&mut s.conn, &sources()).unwrap();
-    // v9 keeps the Codex offset and cursor; v10 then schedules one re-read of
-    // Codex and Claude Code sources for their limit readings.
+    // v9 keeps the Codex offset and cursor; v10 and v11 then schedule one
+    // re-read of the sources for their limit readings and credit balances.
     assert_eq!(
         s.conn
             .query_row("SELECT offset FROM sources", [], |r| r.get::<_, i64>(0))

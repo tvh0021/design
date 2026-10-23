@@ -184,6 +184,25 @@ const MIGRATIONS: &[&str] = &[
     DELETE FROM codex_cursors;
     UPDATE sessions SET user_turns = 0 WHERE tool IN ('codex', 'claude-code');
     "#,
+    // v11: the Codex credit balance beside each reading, so usage paid with
+    // credits past the limit can be told apart from usage the plan covers;
+    // and live readings sampled from `ai-usage`, which no log can rebuild.
+    // Codex sources are re-read once to fill the balance.
+    r#"
+    ALTER TABLE limit_samples ADD COLUMN credits_balance REAL;
+    CREATE TABLE live_limits (
+        tool         TEXT    NOT NULL,
+        pool         TEXT    NOT NULL DEFAULT '',  -- '' for the plan's main window
+        window       TEXT    NOT NULL,             -- 'session' | 'weekly'
+        ts_ms        INTEGER NOT NULL,
+        used_percent REAL    NOT NULL,
+        resets_at_ms INTEGER,
+        PRIMARY KEY (tool, pool, window, ts_ms)
+    );
+    UPDATE sources SET offset = 0, size = 0, mtime_ms = NULL WHERE tool = 'codex';
+    DELETE FROM codex_cursors;
+    UPDATE sessions SET user_turns = 0 WHERE tool = 'codex';
+    "#,
 ];
 
 pub struct Store {
@@ -498,6 +517,43 @@ pub struct LimitSample {
     /// `reading` for a reported share, `rejected` when the harness was refused
     /// because the window was exhausted (the share is then 100).
     pub kind: &'static str,
+    /// Codex: the account's credit balance at the reading, when reported.
+    pub credits_balance: Option<f64>,
+}
+
+/// One reading sampled live from `ai-usage`, account-wide rather than tied to
+/// a log file. `pool` names a per-model quota ("Fable", "Gemini"); empty for
+/// the plan's main window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveLimit {
+    pub tool: String,
+    pub pool: String,
+    pub window: &'static str,
+    pub ts_ms: i64,
+    pub used_percent: f64,
+    pub resets_at_ms: Option<i64>,
+}
+
+/// Insert live readings; a repeated key keeps the larger share.
+pub fn record_live_limits(tx: &Transaction, readings: &[LiveLimit]) -> Result<usize> {
+    let mut n = 0;
+    for r in readings {
+        n += tx
+            .prepare_cached(
+                "INSERT INTO live_limits (tool, pool, window, ts_ms, used_percent, resets_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT DO UPDATE SET used_percent = MAX(used_percent, excluded.used_percent)",
+            )?
+            .execute(params![
+                r.tool,
+                r.pool,
+                r.window,
+                r.ts_ms,
+                r.used_percent,
+                r.resets_at_ms
+            ])?;
+    }
+    Ok(n)
 }
 
 pub fn record_limit_samples(
@@ -509,10 +565,11 @@ pub fn record_limit_samples(
 ) -> Result<()> {
     for s in samples {
         tx.prepare_cached(
-            "INSERT INTO limit_samples (source_id, tool, session_id, ts_ms, window, used_percent, resets_at_ms, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO limit_samples (source_id, tool, session_id, ts_ms, window, used_percent, resets_at_ms, kind, credits_balance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT DO UPDATE SET used_percent = MAX(used_percent, excluded.used_percent),
-                 resets_at_ms = COALESCE(excluded.resets_at_ms, resets_at_ms)",
+                 resets_at_ms = COALESCE(excluded.resets_at_ms, resets_at_ms),
+                 credits_balance = COALESCE(excluded.credits_balance, credits_balance)",
         )?
         .execute(params![
             source_id,
@@ -522,7 +579,8 @@ pub fn record_limit_samples(
             s.window,
             s.used_percent,
             s.resets_at_ms,
-            s.kind
+            s.kind,
+            s.credits_balance
         ])?;
     }
     Ok(())
@@ -691,7 +749,7 @@ mod active_migration_tests {
         )
         .unwrap();
         let store = Store::init(conn).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() as i64);
         let offsets: Vec<(String, i64)> = store
             .conn
             .prepare("SELECT tool, offset FROM sources ORDER BY id")
@@ -730,6 +788,7 @@ mod active_migration_tests {
             used_percent: pct,
             resets_at_ms: Some(2000),
             kind: "reading",
+            credits_balance: None,
         };
         record_limit_samples(&tx, "codex", "c", 1, &[sample(10.0), sample(12.0)]).unwrap();
         tx.commit().unwrap();

@@ -276,6 +276,23 @@ struct RateLimits {
     limit_id: Option<String>,
     primary: Option<LimitWindow>,
     secondary: Option<LimitWindow>,
+    credits: Option<Credits>,
+}
+
+#[derive(Deserialize)]
+struct Credits {
+    /// A decimal string ("791.5961895000"); a number is accepted too.
+    balance: Option<serde_json::Value>,
+}
+
+impl Credits {
+    fn balance(&self) -> Option<f64> {
+        match self.balance.as_ref()? {
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            v => v.as_f64(),
+        }
+        .filter(|b: &f64| b.is_finite())
+    }
 }
 
 #[derive(Deserialize)]
@@ -501,6 +518,7 @@ impl Chunk {
         if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
             return;
         }
+        let credits_balance = rl.credits.as_ref().and_then(Credits::balance);
         let windows = [("session", rl.primary), ("weekly", rl.secondary)];
         for (fallback, w) in windows {
             let Some(w) = w else { continue };
@@ -518,6 +536,7 @@ impl Chunk {
                 used_percent: pct.clamp(0.0, 100.0),
                 resets_at_ms: w.resets_at.map(|s| s * 1000),
                 kind: "reading",
+                credits_balance,
             });
         }
     }
@@ -1205,7 +1224,7 @@ mod tests {
     #[test]
     fn token_counts_carry_subscription_window_readings() {
         let mut c = Chunk::new("rollout-x", Cursor::default());
-        c.push_line(br#"{"timestamp":"2026-10-01T00:00:01.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":78.0,"window_minutes":300,"resets_at":1792541597},"secondary":{"used_percent":24.5,"window_minutes":10080,"resets_at":1793102633}}}}"#);
+        c.push_line(br#"{"timestamp":"2026-10-01T00:00:01.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":78.0,"window_minutes":300,"resets_at":1792541597},"secondary":{"used_percent":24.5,"window_minutes":10080,"resets_at":1793102633},"credits":{"has_credits":true,"balance":"791.5"}}}}"#);
         c.push_line(br#"{"timestamp":"2026-10-01T00:00:02.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","primary":{"used_percent":1.0,"window_minutes":300}}}}"#);
         c.push_line(br#"{"timestamp":"2026-10-01T00:00:03.000Z","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":80.0},"secondary":null}}}"#);
         assert_eq!(c.anomalies.token_count_without_info, 3);
@@ -1218,6 +1237,7 @@ mod tests {
                     used_percent: 78.0,
                     resets_at_ms: Some(1_792_541_597_000),
                     kind: "reading",
+                    credits_balance: Some(791.5),
                 },
                 LimitSample {
                     ts_ms: 1_790_812_801_000,
@@ -1225,6 +1245,7 @@ mod tests {
                     used_percent: 24.5,
                     resets_at_ms: Some(1_793_102_633_000),
                     kind: "reading",
+                    credits_balance: Some(791.5),
                 },
                 LimitSample {
                     ts_ms: 1_790_812_803_000,
@@ -1232,6 +1253,7 @@ mod tests {
                     used_percent: 80.0,
                     resets_at_ms: None,
                     kind: "reading",
+                    credits_balance: None,
                 },
             ]
         );
