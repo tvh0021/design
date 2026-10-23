@@ -6,6 +6,7 @@ pub mod claude;
 pub mod codex;
 pub mod headlines;
 pub mod labels;
+pub mod limits;
 pub mod mcp;
 pub mod models;
 pub mod paths;

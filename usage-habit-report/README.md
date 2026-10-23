@@ -237,45 +237,74 @@ usage-habit-report query value [--json]
 ```
 
 Estimates what each subscription buys, from the rate-limit readings the
-harnesses leave in their logs and the estimated API cost of the same
-requests. One block per tool, always all three. Text output:
+harnesses leave in their logs, live readings taken by `limits record`, and
+the estimated API cost of the same requests. One block per tool, always all
+three. Text output opens with plain-language findings, then the figures:
 
 ```
-codex: ChatGPT Plus at $20.00/month; limit readings: readings
-  session window (5 h): 29.2M tokens, 1.1M uncached+output, 240 requests, 3.5 sessions, est. $14.27 per full window, from 10 of 136 runs
-    2026-09: 59 runs, 28.4M tokens, est. $13.44 per full window
-  weekly window (168 h): 170.8M tokens, ..., est. $101.68 per full window, from 10 of 19 runs
-  2026-09: est. $611.23 = 30.6x of the price
-  mean over 4 complete months: est. $451.12 = 22.6x the price
+- Last 28 days: the 3 plans ($190 a month) carried est. $5,097 a month at API list prices, 26.8x their price. claude-code has only 10 days of history.
+- codex drift: 5-hour window, 2026-05 to 2026-10: est. $27 to $10 (-63 %), tokens 25.2M to 52.5M (+108 %). At gpt-6.1-sol rates throughout: $8 to $10 (+25 %), so it holds more work. ...
+
+codex: ChatGPT Plus at $20.00/month; limit readings: readings; reference model gpt-6.1-sol
+  session window (5 h): 21.7M tokens, 1.2M uncached+output, 233 requests, 8.2 sessions, est. $13.42 per full window, from 10 of 143 runs
+    runs range $10.58 to $15.69, median $13.28
+    2026-10: 45 runs, 52.6M tokens, est. $9.96 per full window, $10.44 at reference rates, mostly gpt-6.1-sol (86 %)
+    windows used 229, exhausted 33, mean peak 44 %, mid-window resets 11
+  2026-10 (partial): est. $338.03 = 16.7x of the price, on pace for $478.65
+  mean over 4 complete months: est. $451.12 = 22.0x the price
+  pace over the last 28 days: est. $493.37 a month = 24.7x the price
 ```
 
 **Windows.** Each tool has a session window of 5 hours and a weekly window
-of 168 hours. A *run* is a stretch of rising `used_percent` readings inside
-one window: it ends at a drop of more than half a percent, a changed reset
-time, or a gap longer than the window, so mid-window resets and reset
-credits start a new run instead of inflating one. The tool's requests
-between the run's first and last reading are summed (tokens, uncached input
-plus output, requests, distinct sessions, estimated cost) and scaled by
-`100 / rise` to a whole window. Runs rising less than 20 % are ignored; the
-ten largest rises are averaged into `per_window`. `drift` repeats the mean
-for every qualifying run by the month it started, to show whether a full
-window buys more or less over time. A window that was never seen exhausted
-reports the busiest sliding window of that length as a lower bound instead.
+of 168 hours, plus any per-model pool the provider reports live (Claude's
+Fable weekly pool; Antigravity's Gemini, Argon, and Claude & GPT pools). A
+pool covers only the models whose names carry its word. A *run* is a stretch
+of rising `used_percent` readings inside one window. It ends at a drop, a
+changed reset time, or a gap longer than the window, so mid-window resets
+and reset credits start a new run instead of inflating one. Concurrent
+sessions interleave their readings, so a lower share against the same reset
+time, or an earlier reset time, is skipped as stale. A run stops at its first
+reading of its highest share: requests made while a window sits at 100 % are
+paid with credits or refused, not covered by the plan. The tool's requests
+inside the run are summed (tokens, uncached input plus output, requests,
+distinct sessions, estimated cost) and scaled by `100 / rise` to a whole
+window. Runs rising less than 20 % are ignored; the ten largest rises are
+averaged into `per_window`, with their `spread` (lowest, median, highest).
+A window that was never seen exhausted reports the busiest sliding window of
+that length as a lower bound instead.
+
+**Drift.** `drift` repeats the mean for every qualifying run by the month it
+started, with the month's main model by cost. Each figure is also priced at
+one reference model's rates throughout (`reference_cost_usd`; the costliest
+model of the last 28 days), which separates a change in how much work a
+window holds from a change in model prices.
+
+**Utilization.** Per window, `utilization` counts closed windows, how many
+reached 100 %, how many a reset ended early, and the mean peak of the windows
+that ran to their reset time, overall and by month. A mid-window reset is a
+fall in the share with a later reset time.
+
+**Credits.** Codex readings carry the credit balance (v11). `credits` tracks
+what was added and spent, how much went on requests made while a window read
+100 %, and how much on mid-window resets. Credit-funded requests are left out
+of each month's `multiple` and of the pace.
 
 **Sources.** Codex rollouts carry `rate_limits` on every `token_count`
 event (both windows, since late May 2026), so Codex gets a real series.
 Claude Code transcripts only record a rejection (`rate_limit_info` with
 `status: rejected`) with the window's reset time, so each Claude run spans
-`resets_at - 5 h` to the first refusal and is an exact 0 to 100 % reading;
-the weekly window has never been refused and is a lower bound. Antigravity
-logs no limit data; both windows are lower bounds and only the monthly
-comparison stands.
+`resets_at - 5 h` to the first refusal and is an exact 0 to 100 % reading.
+Antigravity logs no limit data. Live readings from `limits record` fill both
+gaps from the day sampling starts.
 
-**Months.** `months[]` lists estimated API cost per local calendar month
-against the plan price (`multiple`). `complete` is false for the current
-month and the first month seen; `mean_monthly_cost_usd` and
-`mean_multiple` average the complete months, or the partial ones when no
-month is complete.
+**Months and pace.** `months[]` lists estimated API cost per local calendar
+month against the plan price (`multiple`), the days of history in the month,
+and for a partial month its cost at that pace over a whole month. `complete`
+is false for the current month and the first month seen;
+`mean_monthly_cost_usd` and `mean_multiple` average the complete months, or
+the partial ones when no month is complete. `pace` is the monthly cost at the
+rate of the last 28 days (or of the whole history, when shorter); `combined`
+adds the plans together.
 
 Plan prices default to Claude Team at a premium seat ($150), ChatGPT Plus
 ($20, the plan behind Codex) and Google AI Pro ($19.99, the plan behind
@@ -289,6 +318,46 @@ antigravity = none 'Free tier'   # none: no price, so no multiple
 ```
 
 JSON shape: see [docs/json-shapes.md](docs/json-shapes.md#query-value).
+
+### `limits record`
+
+```sh
+usage-habit-report limits record [--every SECS] [--from FILE]
+```
+
+Runs `ai-usage --json claude codex antigravity` and stores the used share,
+reset time, and pool of every 5-hour and weekly window in `live_limits`. One
+reading prints one line, such as `limits: 10 readings at
+2026-10-23T01:25:12Z (antigravity 5, claude-code 3, codex 2)`. `--every`
+keeps sampling until interrupted (at least every 30 seconds) and reports a
+failed sample on stderr without stopping. `--from` reads saved `ai-usage`
+output instead. Set `USAGE_HABIT_REPORT_AI_USAGE` to the binary's path when
+`ai-usage` is not on `PATH`.
+
+Claude Code and Antigravity leave no usable limit series in their logs, so a
+schedule of these samples is what lets `query value` measure their windows.
+Every ten minutes is enough to catch each rise. A launchd agent on macOS,
+`~/Library/LaunchAgents/local.usage-habit-report.limits.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.usage-habit-report.limits</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/you/.cargo/bin/usage-habit-report</string>
+    <string>--no-scan</string><string>limits</string><string>record</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>USAGE_HABIT_REPORT_AI_USAGE</key><string>/usr/local/bin/ai-usage</string>
+  </dict>
+  <key>StartInterval</key><integer>600</integer>
+</dict></plist>
+```
+
+Load it with `launchctl load ~/Library/LaunchAgents/local.usage-habit-report.limits.plist`.
+With cron: `*/10 * * * * usage-habit-report --no-scan limits record`.
+`rebuild` keeps `live_limits`, since no log can recreate it.
 
 ### `query agents`
 
@@ -787,9 +856,13 @@ filter, states its window, and names any tool with no requests in it:
   window total.
 
 A second page, `/value`, linked from the controls, shows what each
-subscription buys: the summary ledger of `query value`, then per tool the
-per-window capacity, the month-by-month drift tables, the runs that were
-averaged, and estimated API cost by month against the plan price.
+subscription buys. It opens with the headline findings and a ledger of each
+plan at its recent pace, with a combined row. Each tool's section then shows
+the per-window capacity (with the range of the runs averaged and the last
+reading), the drift tables with the main model and the reference-rate cost,
+how much of each window was used, Codex credits, estimated API cost by month
+against the plan price, and the runs that were averaged. A closing section
+says what the figures rest on: each tool's history and its live readings.
 
 A panel with nothing to show says what to run (`scan`, `rebuild` for
 labels) instead of staying blank. On a store of about 79,000 requests a page
@@ -1172,7 +1245,7 @@ once, so the next scan can backfill non-request event timestamps. Sessions whose
 logs are no longer present keep a null active time and contribute zero to time
 totals. Run `rebuild` to discard usage whose source logs have been deleted.
 
-## Store schema (v10)
+## Store schema (v11)
 
 The schema version is kept in `PRAGMA user_version`; migrations live in
 `src/store.rs`.
@@ -1206,6 +1279,11 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   `used_percent`, `resets_at_ms`, and `kind` (`reading` from Codex
   `rate_limits`, `rejected` from Claude Code refusals). Feeds `query value`.
   The migration re-reads Codex and Claude Code sources from byte 0.
+- v11: `limit_samples.credits_balance` (the Codex credit balance at each
+  reading; the migration re-reads Codex sources once), and `live_limits`, one
+  row per `(tool, pool, window, ts_ms)` with `used_percent` and
+  `resets_at_ms`, written by `limits record`. `pool` is empty for the plan's
+  own windows. `rebuild` keeps this table.
 
 ## Tests
 

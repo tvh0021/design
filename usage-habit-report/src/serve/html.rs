@@ -426,7 +426,7 @@ fn fmt_pct(x: Option<f64>) -> String {
 
 /// A stepped bar: `on` filled units of `of`, unfilled ones drawn as insets
 /// when `track` is set. `tool` gives the bar that tool's hue.
-fn units(on: usize, of: usize, track: bool, tool: Option<&str>) -> String {
+pub(crate) fn units(on: usize, of: usize, track: bool, tool: Option<&str>) -> String {
     let mut s = String::from("<span class=\"units\"");
     if let Some(t) = tool {
         let _ = write!(s, " data-tool=\"{}\"", esc(t));
