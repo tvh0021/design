@@ -754,11 +754,20 @@ its exact figures. The window totals under the map are the same figures as
 Below the map and totals, every panel follows the same window and tool
 filter, states its window, and names any tool with no requests in it:
 
-- **Model by task kind**: requests by canonical model (rows) and task label
-  (columns; `unlabelled` appears only when some request in the window has
-  no label), shaded with the map's stepped ramp.
-  Column totals equal the per-label totals of `query summary --group-by
-  label` for the window.
+- **Model by task kind**: one radar chart per canonical model in a
+  three-column grid. Each axis shows the percentage of that model's requests
+  assigned to a task kind. Models are grouped by provider. Claude models use
+  Fable, Opus, Sonnet, Haiku order within the newest major generation, followed
+  by older generations. OpenAI uses Astra, Sol, Terra, Luna order, and Google
+  uses Argon, Pro, Flash order, with newer major generations first and newer
+  minor versions first within each tier. Each chart scales its largest topic to the
+  outer ring and prints that maximum percentage above the web. Axis labels
+  keep their actual request percentages. Background colors identify the model
+  provider. Small screens show two columns or one. Every model gets
+  a chart, including the table's folded long tail. Expand the request-count
+  table for the exact figures and stepped shading. `unlabelled` appears only
+  when some request in the window has no label. Column totals equal the
+  per-label totals of `query summary --group-by label` for the window.
 - **Multi-agent habit**: the subagents-per-session histogram, main-thread
   and subagent model mix, subagent token share, the ten heaviest fan-outs,
   and each tool's coverage note, all from `query agents --since <window>`

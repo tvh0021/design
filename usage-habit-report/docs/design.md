@@ -14,7 +14,10 @@ information. This note is the source of truth for the tokens in
   Antigravity each own a hue. A hue appears on a tool's name, on its row
   marker, on a stepped bar that belongs to that tool, and on the activity
   map when the map is filtered to that tool.
-  No hue is ever used for emphasis, state, or decoration.
+  Model radar backgrounds also identify the model provider: Claude uses the
+  Claude Code hue, GPT uses the Codex hue, and Gemini uses the Antigravity hue.
+  Models from other providers use neutral ink. No hue is used for emphasis,
+  state, or decoration.
 - Figures are tabular in a monospace from the system stack. No webfonts and
   no network requests of any kind; the page works offline.
 - Light and dark follow `prefers-color-scheme`. Both schemes meet WCAG AA
@@ -93,7 +96,23 @@ the token value at which each step begins.
 
 The panels under the totals reuse the tokens above; nothing new is coloured.
 
-- **Model by task kind** uses the same six-step ramp with the same quintile
+- **Model radar charts** lead the task-kind panel. Every model has its own
+  chart, including models folded into the exact-count table. Three columns
+  at desktop width become two below 1000px and one below 680px. Each chart
+  has the same task axes, with a separate linear scale that places its largest
+  topic at the outer ring. Ring labels show actual request percentages at
+  quarter-maximum intervals. Its heading includes the request count and the
+  outer ring's percentage. Models are grouped as Anthropic, OpenAI, Google,
+  then other providers. Claude models use Fable, Opus, Sonnet, Haiku order
+  within each major generation, newest generation first. OpenAI uses Astra,
+  Sol, Terra, Luna order; Google uses Argon, Pro, Flash order. Minor versions
+  sort newest first within each tier. Unknown model families follow known tiers.
+  The background mixes 12% provider hue into paper, and the plotted area mixes
+  24% hue over that background. Text stays ink for contrast. Axis labels show
+  percentages; SVG descriptions include exact counts. Unknown models use the
+  neutral background. There is no animation or external chart dependency.
+- **Model by task kind's exact-count table** sits in an expandable disclosure
+  below the charts and uses the same six-step ramp with the same quintile
   rule, over request counts. It is always the ink, even when the page is
   filtered to one tool: hue marks a tool, and the matrix rows are models.
   The matrix is set one type step larger than the other ledgers (`--t-lead`,

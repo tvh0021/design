@@ -324,6 +324,8 @@ pub struct MatrixRow {
 pub struct ModelMatrix {
     pub kinds: Vec<String>,
     pub rows: Vec<MatrixRow>,
+    /// Every model before the table's long tail is folded, on the same axes.
+    pub all_rows: Vec<MatrixRow>,
     pub col_totals: Vec<i64>,
     pub total: i64,
     /// Request count at which shade levels 1..=5 begin (quintiles of the
@@ -414,6 +416,7 @@ pub fn model_matrix(
             .cmp(&a.total)
             .then_with(|| (a.model.is_none(), &a.model).cmp(&(b.model.is_none(), &b.model)))
     });
+    let mut all_rows = all.clone();
     if all.len() > MATRIX_ROWS {
         let rest = all.split_off(MATRIX_ROWS - 1);
         let mut folded = MatrixRow {
@@ -445,6 +448,9 @@ pub fn model_matrix(
         for r in &mut all {
             r.counts.remove(i);
         }
+        for r in &mut all_rows {
+            r.counts.remove(i);
+        }
     }
     let thresholds = quintiles(
         all.iter()
@@ -456,6 +462,7 @@ pub fn model_matrix(
         total: col_totals.iter().sum(),
         kinds,
         rows: all,
+        all_rows,
         col_totals,
         thresholds,
     })
@@ -1306,6 +1313,14 @@ pub(crate) mod tests {
         }
         let m = model_matrix(&store.conn, None, None).unwrap();
         assert_eq!(m.rows.len(), MATRIX_ROWS);
+        assert_eq!(m.all_rows.len(), MATRIX_ROWS + 3);
+        assert!(m.all_rows.iter().all(|row| row.models == 1));
+        assert_eq!(m.all_rows.iter().map(|row| row.total).sum::<i64>(), m.total);
+        assert!(
+            m.all_rows
+                .iter()
+                .all(|row| row.counts.len() == m.kinds.len())
+        );
         let folded = m.rows.last().unwrap();
         assert_eq!(folded.models, 4);
         // The four smallest models have 1..=4 requests.

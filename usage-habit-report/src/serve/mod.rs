@@ -9,6 +9,7 @@
 
 pub mod data;
 pub mod html;
+mod radar;
 pub mod routes;
 pub mod snapshot;
 pub mod value_html;

@@ -185,3 +185,24 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* Model task mix: small multiples share the same axes and percentage scale. */
+.radar-note { margin: var(--s-4) 0; max-width: 85ch; color: var(--muted); }
+.model-radars { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-4); margin-block: var(--s-4) var(--s-6); }
+.model-radar { --provider: var(--muted); margin: 0; min-width: 0; padding: var(--s-4) var(--s-2) var(--s-2); background: color-mix(in oklab, var(--provider) 12%, var(--paper)); border-top: 3px solid var(--provider); }
+.model-radar[data-provider="anthropic"] { --provider: var(--claude-code); }
+.model-radar[data-provider="openai"] { --provider: var(--codex); }
+.model-radar[data-provider="google"] { --provider: var(--antigravity); }
+.model-radar figcaption { padding-inline: var(--s-2); }
+.model-radar h3 { font: inherit; font-size: var(--t-lead); font-weight: 600; margin: 0 0 var(--s-1); overflow-wrap: anywhere; }
+.model-radar figcaption p { font-size: var(--t-small); color: var(--muted); display: flex; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+.model-radar svg { display: block; width: 100%; height: auto; overflow: visible; }
+.radar-ring, .radar-axis { fill: none; stroke: var(--ink); stroke-opacity: .2; stroke-width: 1; }
+.radar-area { fill: var(--provider); fill-opacity: .24; stroke: var(--provider); stroke-width: 2; stroke-linejoin: round; }
+.radar-point { fill: var(--provider); }
+.radar-label { font: 12px var(--mono); fill: var(--ink); }
+.radar-share { font-size: 11px; fill: var(--muted); }
+.radar-tick { font: 9px var(--mono); fill: var(--muted); }
+.model-counts summary { cursor: pointer; text-decoration: underline; text-underline-offset: .2em; margin-block: var(--s-4); }
+@media (max-width: 1000px) { .model-radars { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .model-radars { grid-template-columns: minmax(0, 1fr); } }

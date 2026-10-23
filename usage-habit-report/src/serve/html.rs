@@ -457,9 +457,8 @@ fn models_panel(p: &Page) -> String {
     if m.labelled() == 0 {
         return "<p class=\"empty\">No labels yet. Run <code>usage-habit-report rebuild</code> to classify existing sessions.</p>".into();
     }
-    let mut body = String::from(
-        "<div class=\"table-wrap\"><table class=\"ledger matrix\"><thead><tr><th scope=\"col\">Model</th>",
-    );
+    let mut body = super::radar::render(m);
+    body.push_str("<details class=\"model-counts\"><summary>Exact request counts by task kind</summary><div class=\"table-wrap\"><table class=\"ledger matrix\"><thead><tr><th scope=\"col\">Model</th>");
     for k in &m.kinds {
         let _ = write!(body, "<th scope=\"col\">{}</th>", esc(k));
     }
@@ -505,7 +504,7 @@ fn models_panel(p: &Page) -> String {
             fmt_int(*t)
         );
     }
-    body.push_str("</p>");
+    body.push_str("</p></details>");
     body
 }
 
