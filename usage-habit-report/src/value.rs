@@ -671,6 +671,9 @@ fn runs_of(samples: &[Sample], window_len_ms: i64) -> Vec<(i64, i64, f64, f64, i
             Some(c) => {
                 s.used_percent < c.max - 0.5
                     || s.ts_ms - c.last_ts > window_len_ms
+                    // One window never lasts longer than its length, even
+                    // when readings carry no reset time to split on.
+                    || s.ts_ms - c.start > window_len_ms + RESET_TOLERANCE_MS
                     || !same_reset(c.reset, s.resets_at_ms)
             }
         };
@@ -2140,6 +2143,24 @@ mod tests {
                 (3 * HOUR, 4 * HOUR, 5.0, 40.0, 2),
                 (9 * HOUR, 10 * HOUR, 41.0, 70.0, 2),
                 (20 * HOUR, 21 * HOUR, 72.0, 90.0, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_never_outlast_their_window() {
+        let samples = vec![
+            s(0, 10.0, None),
+            s(2 * HOUR, 20.0, None),
+            s(4 * HOUR, 30.0, None),
+            s(6 * HOUR, 40.0, None),
+            s(7 * HOUR, 50.0, None),
+        ];
+        assert_eq!(
+            runs_of(&samples, SESSION_WINDOW_MS),
+            vec![
+                (0, 4 * HOUR, 10.0, 30.0, 3),
+                (6 * HOUR, 7 * HOUR, 40.0, 50.0, 2)
             ]
         );
     }

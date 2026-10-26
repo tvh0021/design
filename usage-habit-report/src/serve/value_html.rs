@@ -425,7 +425,7 @@ fn utilization_table(t: &ToolValue) -> String {
     if windows.is_empty() {
         return s;
     }
-    s.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Closed windows</caption><thead><tr><th scope=\"col\">Window</th><th scope=\"col\">Closed</th><th scope=\"col\">Hit 100 %</th><th scope=\"col\">Reset early</th><th scope=\"col\">Mean peak of the rest</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Mean peak, as a bar</span></th></tr></thead><tbody>");
+    s.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Closed windows</caption><thead><tr><th scope=\"col\">Window</th><th scope=\"col\">Closed</th><th scope=\"col\">Hit 100 %</th><th scope=\"col\">Reset early</th><th scope=\"col\">Mean peak, full-length windows</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Mean peak, as a bar</span></th></tr></thead><tbody>");
     for (w, u) in &windows {
         let _ = write!(
             s,
@@ -453,7 +453,7 @@ fn utilization_table(t: &ToolValue) -> String {
         let n = esc(&window_name(w));
         let _ = write!(
             s,
-            "<th scope=\"col\">{n}</th><th scope=\"col\">{n} at 100 %</th><th scope=\"col\">{n} mean peak</th>"
+            "<th scope=\"col\">{n}</th><th scope=\"col\">{n} at 100 %</th><th scope=\"col\">{n} reset early</th><th scope=\"col\">{n} mean peak</th>"
         );
     }
     s.push_str("</tr></thead><tbody>");
@@ -464,13 +464,14 @@ fn utilization_table(t: &ToolValue) -> String {
                 Some(x) => {
                     let _ = write!(
                         s,
-                        "<td>{}</td><td>{}</td><td>{}</td>",
+                        "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
                         fmt_int(x.windows),
                         fmt_int(x.exhausted),
+                        fmt_int(x.cut_short),
                         fmt_pct(x.mean_peak_percent)
                     );
                 }
-                None => s.push_str("<td class=\"zero\">0</td><td></td><td></td>"),
+                None => s.push_str("<td class=\"zero\">0</td><td></td><td></td><td></td>"),
             }
         }
         s.push_str("</tr>");
