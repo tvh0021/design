@@ -200,15 +200,10 @@ fn finding(text: &str, tools: &[ToolValue]) -> String {
 fn summary(p: &ValuePage) -> String {
     let r = &p.report;
     let mut s = String::from("<div class=\"facts\">");
-    // The combined headline, pools and live limits lead; each tool's own
-    // headline repeats the table below, and the rest sit by their tables.
+    // Pools and live limits lead; the headlines repeat the figure and the
+    // table below, and the rest sit by their tables.
     for (kind, f) in value::tagged_findings(r) {
-        let per_tool = r
-            .tools
-            .iter()
-            .any(|t| f.starts_with(&format!("{}:", t.tool)));
-        if matches!(kind, Finding::Pool | Finding::Now) || (kind == Finding::Headline && !per_tool)
-        {
+        if matches!(kind, Finding::Pool | Finding::Now) {
             s.push_str(&finding(&f, &r.tools));
         }
     }
@@ -317,63 +312,6 @@ fn lower_bound(w: &WindowEstimate) -> bool {
 
 const LOWER_BOUND_NOTE: &str = "<p class=\"note\">&ge; marks a window never seen full: the busiest window of that length, a lower bound.</p>";
 
-fn latest_cell(w: &WindowEstimate) -> String {
-    match &w.latest {
-        Some(l) => format!("{:.0} % on {}", l.used_percent, esc(value::date_of(&l.at))),
-        None => NO_DATA.into(),
-    }
-}
-
-fn windows_table(p: &ValuePage, t: &ToolValue) -> String {
-    let mut s = String::from(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Per full window</caption><thead><tr><th scope=\"col\">Window</th><th scope=\"col\">Runs</th><th scope=\"col\">Tokens</th><th scope=\"col\">Requests</th><th scope=\"col\">Sessions</th><th scope=\"col\">Est. cost</th><th scope=\"col\">Range</th><th scope=\"col\">Last reading</th></tr></thead><tbody>",
-    );
-    for w in &t.windows {
-        let row = |runs: String, c: &Capacity, prefix: &str, range: String| {
-            format!(
-                "<tr><th scope=\"row\">{}</th><td>{runs}</td><td>{prefix}{}</td><td>{prefix}{}</td><td>{prefix}{:.1}</td><td>{prefix}{}</td><td>{range}</td><td>{}</td></tr>",
-                esc(&window_name(w)),
-                fmt_tokens(c.tokens),
-                fmt_int(c.requests.round() as i64),
-                c.sessions,
-                p.usd(c.estimated_cost_usd),
-                latest_cell(w)
-            )
-        };
-        match (&w.per_window, &w.lower_bound) {
-            (Some(c), _) => {
-                let range = match w
-                    .spread
-                    .as_ref()
-                    .and_then(|s| Some((s.cost_min?, s.cost_max?)))
-                {
-                    Some((lo, hi)) if w.runs.len() > 1 => {
-                        format!("{} to {}", p.usd(Some(lo)), p.usd(Some(hi)))
-                    }
-                    _ => NO_DATA.into(),
-                };
-                s.push_str(&row(
-                    format!("{} of {}", w.runs.len(), w.qualifying_runs),
-                    c,
-                    "",
-                    range,
-                ));
-            }
-            (None, Some(b)) => s.push_str(&row("busiest".into(), b, "&ge; ", NO_DATA.into())),
-            (None, None) => {
-                let _ = write!(
-                    s,
-                    "<tr><th scope=\"row\">{}</th><td colspan=\"6\" class=\"zero\">no requests</td><td>{}</td></tr>",
-                    esc(&window_name(w)),
-                    latest_cell(w)
-                );
-            }
-        }
-    }
-    s.push_str("</tbody></table></div>");
-    s
-}
-
 fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) -> String {
     if w.runs.is_empty() {
         return String::new();
@@ -467,7 +405,6 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
         .months
         .iter()
         .filter_map(|m| m.multiple)
-        .chain(t.pace.as_ref().and_then(|p| p.multiple))
         .fold(0.0, f64::max);
     let mut s = format!(
         "<div class=\"table-wrap\"><table class=\"ledger\"><caption>By month</caption><thead><tr><th scope=\"col\">Month</th><th scope=\"col\">Days</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th>{}<th scope=\"col\">Times the price</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Times the price, as a bar</span></th><th scope=\"col\">Whole-month pace</th></tr></thead><tbody>",
@@ -526,19 +463,6 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
             fmt_x(Some(x))
         );
     }
-    if let Some(pace) = &t.pace
-        && let (Some(c), Some(x)) = (pace.monthly_cost_usd, pace.multiple)
-    {
-        let _ = write!(
-            s,
-            "<tr class=\"total\"><th scope=\"row\">Pace, last {:.0} days</th><td></td><td></td><td>{}</td>{}<td>{}</td><td class=\"bar\">{}</td><td></td></tr>",
-            pace.days,
-            p.usd(Some(c)),
-            credit_cell(None),
-            fmt_x(Some(x)),
-            bar(Some(x), max, &t.tool)
-        );
-    }
     s.push_str("</tbody></table></div>");
     if t.months.iter().any(|m| m.usage.unpriced_requests > 0) {
         s.push_str("<p class=\"note\">&dagger; leaves out models with no price.</p>");
@@ -577,7 +501,6 @@ fn source_note(p: &ValuePage, t: &ToolValue) -> String {
 
 fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     let mut body = format!("<p class=\"note\">{}</p>", source_note(p, t));
-    body.push_str(&noted(windows_table(p, t)));
     body.push_str("<div class=\"stack\">");
     body.push_str(&drift_section(t));
     body.push_str(&credits_note(p, t));

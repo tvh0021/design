@@ -863,12 +863,13 @@ filter, states its window, and names any tool with no requests in it:
   cache-read share in one sentence under this table.
 
 A second page, `/value`, linked from the controls, shows what each
-subscription buys. It opens with the headline findings and a ledger of each
-plan at its recent pace, with a combined row. Each tool's section then shows
-the per-window capacity (with the range of the runs averaged and the last
-reading), the drift tables with the main model and the reference-rate cost,
-how much of each window was used, Codex credits, estimated API cost by month
-against the plan price, and the runs that were averaged. A closing section
+subscription buys. It opens with the pool and live-limit findings, the
+block figure, and one ledger of each plan at its recent pace with what a
+full 5-hour and weekly window holds, with a combined row. Each tool's
+section then shows the drift tables with the main model and the
+reference-rate cost, how much of each window was used, Codex credits,
+estimated API cost by month against the plan price, and the runs that were
+averaged (with their range and the last live reading). A closing section
 says what the figures rest on: each tool's history and its live readings.
 
 A panel with nothing to show says what to run (`scan`, `rebuild` for
