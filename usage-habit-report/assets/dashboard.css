@@ -250,6 +250,21 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .mw-value { font: 600 12px var(--mono); fill: var(--ink); }
 .mw-note { font: 11px var(--mono); fill: var(--muted); }
 .model-windows svg text.mw-axis:last-of-type { text-anchor: end; }
+.chart-fig.limits { --tool: var(--ink); }
+.limits svg text { text-anchor: start; }
+.lb-tool { font: 600 12px var(--mono); fill: var(--tool); }
+.lb-band { fill: var(--tool); }
+.lb-0 { fill-opacity: .18; opacity: .18; }
+.lb-1 { fill-opacity: .42; opacity: .42; }
+.lb-2 { fill-opacity: .68; opacity: .68; }
+.lb-3 { fill-opacity: 1; }
+.lb-band.lb-0, .lb-band.lb-1, .lb-band.lb-2 { opacity: 1; }
+.lb-value { font: 12px var(--mono); fill: var(--ink); }
+.lb-value tspan { font-weight: 600; }
+.limits svg text.lb-note { font: 11px var(--mono); fill: var(--muted); text-anchor: end; }
+.lb-only { color: var(--ink); font-size: var(--t-small); margin: 0 0 var(--s-2); }
+.lb-legend { margin-top: var(--s-2); }
+.lb-legend i { display: inline-block; width: 12px; height: 12px; background: var(--ink); margin-right: var(--s-1); vertical-align: -1px; }
 .spend-stack { margin-bottom: var(--s-4); }
 .spend-stack figcaption p { margin-bottom: var(--s-2); }
 .spend-stack .key { color: var(--ink); display: flex; gap: var(--s-4); margin-bottom: var(--s-4); }

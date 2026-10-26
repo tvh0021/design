@@ -64,6 +64,7 @@ pub struct Page {
     pub sessions: SessionLists,
     pub spend: Spend,
     pub spend_totals: super::data::SpendTotals,
+    pub limit_bands: Vec<crate::value::LimitBands>,
     /// Shown in the footer when a rates file names its fetch time.
     pub rates_fetched_at: Option<String>,
     /// How long the data took to load, for the footer.
@@ -1057,6 +1058,125 @@ fn spend_chart(p: &Page) -> String {
     )
 }
 
+/// Fewest closed windows a tool needs for a bar.
+const BANDS_MIN_WINDOWS: i64 = 5;
+const BANDS_LABEL: f64 = 120.0;
+const BANDS_PLOT: f64 = 400.0;
+const BANDS_ROW: f64 = 34.0;
+const BAND_NAMES: [&str; 4] = ["under 25 %", "25 to 75 %", "75 to 99 %", "ran out"];
+
+/// Every closed limit window as one bar per tool, split by how full the
+/// window got before it reset. One panel per window length, with the
+/// value page's radio toggle between them.
+fn limits_panel(p: &Page) -> String {
+    let mut panels: Vec<(&str, i64, String)> = Vec::new();
+    for window in ["session", "weekly"] {
+        let rows: Vec<_> = p
+            .limit_bands
+            .iter()
+            .filter(|b| b.window == window && b.windows >= BANDS_MIN_WINDOWS)
+            .collect();
+        let Some(first) = rows.first() else {
+            continue;
+        };
+        let mut svg = String::new();
+        let mut desc = Vec::new();
+        for (i, b) in rows.iter().enumerate() {
+            let y = 8.0 + i as f64 * BANDS_ROW;
+            let out = 100.0 * b.bands[3] as f64 / b.windows as f64;
+            let _ = write!(
+                svg,
+                "<g data-tool=\"{0}\"><text class=\"lb-tool\" x=\"0\" y=\"{1:.1}\">{0}</text>",
+                esc(&b.tool),
+                y + 15.0
+            );
+            let mut x = BANDS_LABEL;
+            for (j, n) in b.bands.iter().enumerate() {
+                let w = BANDS_PLOT * *n as f64 / b.windows as f64;
+                if w > 0.0 {
+                    let _ = write!(
+                        svg,
+                        "<rect class=\"lb-band lb-{j}\" x=\"{x:.1}\" y=\"{y:.1}\" width=\"{w:.1}\" height=\"20\"><title>{}: {n} of {} windows {}</title></rect>",
+                        esc(&b.tool),
+                        b.windows,
+                        BAND_NAMES[j]
+                    );
+                }
+                x += w;
+            }
+            let _ = write!(
+                svg,
+                "<text class=\"lb-value\" x=\"{:.1}\" y=\"{:.1}\"><tspan>{out:.0} %</tspan> ran out</text><text class=\"lb-note\" x=\"720\" y=\"{:.1}\">{} windows</text></g>",
+                BANDS_LABEL + BANDS_PLOT + 16.0,
+                y + 15.0,
+                y + 15.0,
+                fmt_int(b.windows)
+            );
+            desc.push(format!(
+                "{}: {} of {} windows ran out; {}",
+                b.tool,
+                b.bands[3],
+                b.windows,
+                (0..3)
+                    .map(|j| format!("{} {}", b.bands[j], BAND_NAMES[j]))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let height = 8.0 + rows.len() as f64 * BANDS_ROW;
+        panels.push((
+            window,
+            first.window_hours,
+            format!(
+                "<svg viewBox=\"0 0 720 {height:.0}\" role=\"img\" aria-label=\"{}\">{svg}</svg>",
+                esc(&desc.join("; "))
+            ),
+        ));
+    }
+    if panels.is_empty() {
+        return format!(
+            "<p class=\"empty\">No tool has {BANDS_MIN_WINDOWS} closed limit windows in this window yet.</p>"
+        );
+    }
+    let name = |w: &str, hours: i64| {
+        if w == "weekly" {
+            "Weekly".to_owned()
+        } else {
+            format!("{hours} hr")
+        }
+    };
+    let mut inputs = String::new();
+    let mut labels = String::new();
+    let mut bodies = String::new();
+    for (i, (w, hours, body)) in panels.iter().enumerate() {
+        if panels.len() > 1 {
+            let _ = write!(
+                inputs,
+                "<input type=\"radio\" class=\"sr\" name=\"limits\" id=\"limits-{w}\"{}>",
+                if i == 0 { " checked" } else { "" }
+            );
+            let _ = write!(
+                labels,
+                "<label for=\"limits-{w}\">{}</label>",
+                name(w, *hours)
+            );
+        }
+        let _ = write!(bodies, "<div class=\"panel\">{body}</div>");
+    }
+    let toggle = match panels.as_slice() {
+        [(w, hours, _)] => format!("<p class=\"lb-only\">{}</p>", name(w, *hours)),
+        _ => format!("<div class=\"toggle\">{labels}</div>"),
+    };
+    let legend: String = BAND_NAMES
+        .iter()
+        .enumerate()
+        .map(|(j, n)| format!("<span><i class=\"lb-{j}\"></i>{n}</span>"))
+        .collect();
+    format!(
+        "<figure class=\"chart-fig toggled limits\">{inputs}<figcaption>{toggle}<p>Each bar is every closed window, by how full it got before it reset. A tool needs {BANDS_MIN_WINDOWS} closed windows for a bar.</p></figcaption>{bodies}<div class=\"legend lb-legend\">{legend}</div></figure>"
+    )
+}
+
 fn spend_panel(p: &Page) -> String {
     let sp = &p.spend;
     if p.totals.total.requests == 0 || sp.periods.is_empty() {
@@ -1183,6 +1303,12 @@ fn panels(p: &Page) -> String {
             if p.audience.is_public() { "Figures are rounded independently to the nearest dollar; displayed rows may not add up." } else { "Each column adds up to the estimated API cost." }
         ),
         &spend_panel(p),
+    ));
+    s.push_str(&section(
+        "limits",
+        "How often I exhaust a window limit",
+        &format!("{scope} Closed windows of each plan's own limits; pools are left out."),
+        &limits_panel(p),
     ));
     s
 }

@@ -205,6 +205,9 @@ pub struct Utilization {
     /// Falls of the share, with a later reset time, before the window's
     /// reset time: a reset credit or a reset granted by the provider.
     pub mid_window_resets: i64,
+    /// Closed windows by how full they got: under 25 %, 25 to 75 %, 75 % to
+    /// just under the limit, and out (100 % or a refusal).
+    pub peak_bands: [i64; 4],
     pub by_month: Vec<UtilizationMonth>,
 }
 
@@ -807,6 +810,17 @@ fn utilization(
     };
     let all: Vec<_> = by_reset.iter().collect();
     let (windows, exhausted_n, cut_short, mean_peak) = summarise(&all);
+    let mut peak_bands = [0; 4];
+    for w in &by_reset {
+        let band = match w.1 {
+            _ if exhausted(w) => 3,
+            Some(p) if p < 25.0 => 0,
+            Some(p) if p < 75.0 => 1,
+            Some(_) => 2,
+            None => continue,
+        };
+        peak_bands[band] += 1;
+    }
     let mut months: BTreeMap<String, Vec<&WindowPeak>> = BTreeMap::new();
     for w in &by_reset {
         months
@@ -820,6 +834,7 @@ fn utilization(
         cut_short,
         mean_peak_percent: mean_peak,
         mid_window_resets: resets.len() as i64,
+        peak_bands,
         by_month: months
             .into_iter()
             .map(|(month, ws)| {
@@ -834,6 +849,52 @@ fn utilization(
             })
             .collect(),
     })
+}
+
+/// How full one tool's plan-wide limit windows of one length got.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LimitBands {
+    pub tool: String,
+    /// `session` or `weekly`.
+    pub window: String,
+    pub window_hours: i64,
+    /// Closed windows counted.
+    pub windows: i64,
+    /// As [`Utilization::peak_bands`].
+    pub bands: [i64; 4],
+}
+
+/// Peak bands of each tool's plan-wide windows, from readings taken since
+/// `since_ms` (all of them when `None`). Pools are left out: their
+/// windows sit inside the plan's.
+pub fn limit_bands(
+    conn: &Connection,
+    tools: &[&str],
+    since_ms: Option<i64>,
+    now_ms: i64,
+    tz: &impl TimeZone,
+) -> Result<Vec<LimitBands>> {
+    let mut out = Vec::new();
+    for window in ["session", "weekly"] {
+        let len = window_ms(window);
+        for tool in tools {
+            let (mut samples, _) = samples(conn, tool, window, "")?;
+            if let Some(since) = since_ms {
+                samples.retain(|s| s.ts_ms >= since);
+            }
+            let resets = mid_window_resets(&samples);
+            if let Some(u) = utilization(&samples, len, &resets, now_ms, tz) {
+                out.push(LimitBands {
+                    tool: (*tool).to_owned(),
+                    window: window.to_owned(),
+                    window_hours: len / 3_600_000,
+                    windows: u.peak_bands.iter().sum(),
+                    bands: u.peak_bands,
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Credit balance changes from the logged Codex readings, and the time spans
@@ -2302,6 +2363,8 @@ mod tests {
         // The first window was reset early, so only the second counts.
         assert_eq!(u.cut_short, 1);
         assert_eq!(u.mean_peak_percent, Some(25.0));
+        // Both windows peaked between 25 and 75 %, early reset or not.
+        assert_eq!(u.peak_bands, [0, 2, 0, 0]);
         let sp = session.spread.as_ref().unwrap();
         assert_eq!(
             (sp.tokens_min, sp.tokens_median, sp.tokens_max),

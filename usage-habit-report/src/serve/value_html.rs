@@ -6,7 +6,7 @@
 use super::data::StoreFacts;
 use super::html::{Audience, CSS, esc, fmt_int, section, units};
 use crate::value::{
-    self, Capacity, Finding, MonthValue, Run, ToolValue, Utilization, ValueReport, WindowEstimate,
+    self, Capacity, Finding, MonthValue, Run, ToolValue, ValueReport, WindowEstimate,
 };
 use std::fmt::Write;
 
@@ -119,10 +119,6 @@ fn fmt_x(x: Option<f64>) -> String {
     x.map_or(NO_DATA.into(), |x| format!("{x:.1}x"))
 }
 
-fn fmt_pct(x: Option<f64>) -> String {
-    x.map_or(NO_DATA.into(), |x| format!("{x:.0} %"))
-}
-
 fn tool_name(tool: &str) -> String {
     format!(
         "<span class=\"tool\" data-tool=\"{0}\">{0}</span>",
@@ -138,17 +134,6 @@ fn bar(v: Option<f64>, max: f64, tool: &str) -> String {
             units(n, 20, false, Some(tool))
         }
         _ => String::new(),
-    }
-}
-
-/// A share bar: a percentage as 20 units of 5 %, with the unfilled track.
-fn share_bar(pct: Option<f64>, tool: &str) -> String {
-    match pct {
-        Some(p) => {
-            let n = (p / 5.0).round().clamp(0.0, 20.0) as usize;
-            units(n.max(usize::from(p > 0.0)), 20, true, Some(tool))
-        }
-        None => String::new(),
     }
 }
 
@@ -433,74 +418,6 @@ fn drift_section(t: &ToolValue) -> String {
     super::value_svg::drift_chart(t, &panels) + &super::value_svg::model_chart(t, &panels)
 }
 
-fn utilization_table(t: &ToolValue) -> String {
-    let windows: Vec<(&WindowEstimate, &Utilization)> = t
-        .windows
-        .iter()
-        .filter(|w| w.pool.is_none())
-        .filter_map(|w| Some((w, w.utilization.as_ref()?)))
-        .filter(|(_, u)| u.mean_peak_percent.is_some() || u.cut_short > 0)
-        .collect();
-    let mut s = String::new();
-    if windows.is_empty() {
-        return s;
-    }
-    s.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Closed windows</caption><thead><tr><th scope=\"col\">Window</th><th scope=\"col\">Closed</th><th scope=\"col\">Hit 100 %</th><th scope=\"col\">Reset early</th><th scope=\"col\">Mean peak, full-length windows</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Mean peak, as a bar</span></th></tr></thead><tbody>");
-    for (w, u) in &windows {
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"bar\">{}</td></tr>",
-            esc(&window_name(w)),
-            fmt_int(u.windows),
-            fmt_int(u.exhausted),
-            fmt_int(u.cut_short),
-            fmt_pct(u.mean_peak_percent),
-            share_bar(u.mean_peak_percent, &t.tool)
-        );
-    }
-    s.push_str("</tbody></table></div>");
-    let mut months: Vec<&str> = windows
-        .iter()
-        .flat_map(|(_, u)| u.by_month.iter().map(|m| m.month.as_str()))
-        .collect();
-    months.sort_unstable();
-    months.dedup();
-    if months.len() < 2 {
-        return s;
-    }
-    s.push_str("<div class=\"table-wrap\"><table class=\"ledger quiet\"><caption>Closed windows by month</caption><thead><tr><th scope=\"col\">Month</th>");
-    for (w, _) in &windows {
-        let n = esc(&window_name(w));
-        let _ = write!(
-            s,
-            "<th scope=\"col\">{n}</th><th scope=\"col\">{n} at 100 %</th><th scope=\"col\">{n} reset early</th><th scope=\"col\">{n} mean peak</th>"
-        );
-    }
-    s.push_str("</tr></thead><tbody>");
-    for m in months {
-        let _ = write!(s, "<tr><th scope=\"row\">{}</th>", esc(m));
-        for (_, u) in &windows {
-            match u.by_month.iter().find(|x| x.month == m) {
-                Some(x) => {
-                    let _ = write!(
-                        s,
-                        "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
-                        fmt_int(x.windows),
-                        fmt_int(x.exhausted),
-                        fmt_int(x.cut_short),
-                        fmt_pct(x.mean_peak_percent)
-                    );
-                }
-                None => s.push_str("<td class=\"zero\">0</td><td></td><td></td><td></td>"),
-            }
-        }
-        s.push_str("</tr>");
-    }
-    s.push_str("</tbody></table></div>");
-    s
-}
-
-/// Where the credits went, in one sentence, on the private page only.
 fn credits_note(p: &ValuePage, t: &ToolValue) -> String {
     if !matches!(p.audience, Audience::Private) {
         return String::new();
@@ -663,7 +580,6 @@ fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     body.push_str(&noted(windows_table(p, t)));
     body.push_str("<div class=\"stack\">");
     body.push_str(&drift_section(t));
-    body.push_str(&noted(utilization_table(t)));
     body.push_str(&credits_note(p, t));
     body.push_str(&noted(months_table(p, t)));
     let runs: String = t
