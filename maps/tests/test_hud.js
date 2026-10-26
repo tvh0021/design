@@ -746,7 +746,7 @@ test('updateTelemetry renders distance, flight times, wind effect, and coordinat
   assert.ok(el.durationEffective.textContent.includes('h '));
   assert.ok(el.durationNominal.textContent.includes('Nominal '));
 
-  assert.ok(el.durationNominal.textContent.endsWith(' · 870 km/h'));
+  assert.ok(el.durationNominal.textContent.endsWith(' · 910 km/h'));
   assert.ok(readFileSync(resolve(__dirname, '../src/hud.js'), 'utf-8').includes('<div class="metric-label">FLIGHT TIME</div>'));
 
   // Jet stream westbound headwind penalty
@@ -762,7 +762,7 @@ test('updateTelemetry renders distance, flight times, wind effect, and coordinat
   assert.equal(el.antipodalBadge.style.display, 'none');
 
   hud.updateTelemetry(computeGeodesic(origin, origin), origin, origin);
-  assert.equal(el.durationNominal.textContent, 'Cruise 870 km/h');
+  assert.equal(el.durationNominal.textContent, 'Cruise 910 km/h');
   hud.destroy();
 });
 
