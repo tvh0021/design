@@ -15,6 +15,8 @@
  * - Minimizable mobile bottom drawer / desktop floating trigger
  */
 
+import { CRUISE_SPEED_KMH } from './geodesic.js';
+
 /**
  * Converts decimal degrees latitude/longitude to formatted string with cardinal symbols.
  * Example: 48.8566, 2.3522 -> "48.86° N, 2.35° E"
@@ -285,14 +287,9 @@ export class FlightHUD {
 
     const title = doc.createElement('h1');
     title.className = 'hud-title';
-    title.textContent = 'GEODESIC FLIGHT';
-
-    const subtitle = doc.createElement('p');
-    subtitle.className = 'hud-subtitle';
-    subtitle.textContent = 'Spherical Great-Circle Telemetry';
+    title.textContent = 'Flight path visualizer';
 
     titleGroup.appendChild(title);
-    titleGroup.appendChild(subtitle);
     headerLeft.appendChild(titleBadge);
     headerLeft.appendChild(titleGroup);
     header.appendChild(headerLeft);
@@ -948,7 +945,7 @@ export class FlightHUD {
       if (this.distanceKmEl) this.distanceKmEl.textContent = '— km';
       if (this.distanceMilesEl) this.distanceMilesEl.textContent = '— mi';
       if (this.durationEffectiveEl) this.durationEffectiveEl.textContent = '0h 00m';
-      if (this.durationNominalEl) this.durationNominalEl.textContent = 'Cruise 870 km/h';
+      if (this.durationNominalEl) this.durationNominalEl.textContent = `Cruise ${CRUISE_SPEED_KMH} km/h`;
       if (this.windBadgeEl) {
         this.windBadgeEl.className = 'wind-badge wind-badge-neutral';
         this.windBadgeEl.textContent = 'Neutral';
@@ -990,16 +987,16 @@ export class FlightHUD {
       : nominalFlightTimeHours + (prevailingWindAdjustmentHours || 0);
     const nomHours = typeof nominalFlightTimeHours === 'number'
       ? nominalFlightTimeHours
-      : (distanceKm / 870);
+      : (distanceKm / CRUISE_SPEED_KMH);
 
     if (this.durationEffectiveEl) {
       this.durationEffectiveEl.textContent = formatDuration(effHours);
     }
     if (this.durationNominalEl) {
       if (Math.abs(prevailingWindAdjustmentHours) > 0.05) {
-        this.durationNominalEl.textContent = `Nominal ${formatDuration(nomHours)} · 870 km/h`;
+        this.durationNominalEl.textContent = `Nominal ${formatDuration(nomHours)} · ${CRUISE_SPEED_KMH} km/h`;
       } else {
-        this.durationNominalEl.textContent = 'Cruise 870 km/h';
+        this.durationNominalEl.textContent = `Cruise ${CRUISE_SPEED_KMH} km/h`;
       }
     }
 

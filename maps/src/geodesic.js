@@ -8,7 +8,7 @@
  * - Antipodal detection with polar fallback routing over the North Pole
  * - Slerp (spherical linear interpolation) sampled waypoints formatted for GeoJSON/D3
  * - Forward initial bearing and reverse-arrival final bearing in degrees [0, 360)
- * - Physical jet stream model calibrated against empirical Flightradar24 airborne flight times
+ * - Physical jet stream model calibrated against ADS-B airborne (takeoff-to-touchdown) flight times
  *   incorporating latitude-dependent zonal westerlies, along-track vector projection, and
  *   North-South crosswind neutrality.
  */
@@ -16,12 +16,12 @@
 export const EARTH_RADIUS_KM = 6371.0088;
 export const KM_TO_MILES = 0.621371;
 
-// Calibrated empirical flight parameters based on Flightradar24 airborne benchmarks:
-export const CRUISE_SPEED_KMH = 870; // True airspeed at cruise (~Mach 0.82)
-export const CLIMB_ALLOWANCE_HOURS = 0.35; // Climb & descent maneuver buffer (~21m)
+// Calibrated against 221 long-haul ADS-B airborne times (20 routes, Nov 2025 - Oct 2026):
+export const CRUISE_SPEED_KMH = 910; // True airspeed at cruise (~Mach 0.84)
+export const CLIMB_ALLOWANCE_HOURS = 0.5; // Climb & descent maneuver buffer (30m)
 export const JET_MAX_SPEED_KMH = 100; // Peak mid-latitude westerly jet stream speed
-export const JET_CORE_LAT_DEG = 44; // Core latitude of mid-latitude jet stream
-export const JET_LAT_WIDTH_DEG = 14; // Gaussian standard deviation width
+export const JET_CORE_LAT_DEG = 40; // Core latitude of mid-latitude jet stream
+export const JET_LAT_WIDTH_DEG = 16; // Gaussian standard deviation width
 export const WESTWARD_WIND_PENALTY_FACTOR = 0.14; // Backward-compatibility reference
 export const DEFAULT_ANTIPODAL_THRESHOLD_DEG = 178.5;
 
