@@ -77,7 +77,7 @@ impl ValuePage {
     /// "$1,305" in the public export, "$1,305.27" locally.
     pub(super) fn usd(&self, cost: Option<f64>) -> String {
         let Some(c) = cost else {
-            return "-".into();
+            return NO_DATA.into();
         };
         if self.audience.is_public() {
             return value::dollars(c);
@@ -103,12 +103,24 @@ fn fmt_tokens(n: f64) -> String {
     }
 }
 
+/// The mark for a cell with too little data to fill, explained by
+/// [`noted`] under its table.
+const NO_DATA: &str = "*";
+
+/// `tables` with a "not enough data" note when any cell holds [`NO_DATA`].
+fn noted(mut tables: String) -> String {
+    if tables.contains("*</td>") {
+        tables.push_str("<p class=\"note\">* Not enough data.</p>");
+    }
+    tables
+}
+
 fn fmt_x(x: Option<f64>) -> String {
-    x.map_or("-".into(), |x| format!("{x:.1}x"))
+    x.map_or(NO_DATA.into(), |x| format!("{x:.1}x"))
 }
 
 fn fmt_pct(x: Option<f64>) -> String {
-    x.map_or("-".into(), |x| format!("{x:.0} %"))
+    x.map_or(NO_DATA.into(), |x| format!("{x:.0} %"))
 }
 
 fn tool_name(tool: &str) -> String {
@@ -217,8 +229,9 @@ fn summary(p: &ValuePage) -> String {
     }
     s.push_str("</div>");
     s.push_str(&super::value_svg::value_squares(p));
+    let mut table = String::new();
     let _ = write!(
-        s,
+        table,
         "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 hr</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
         r.pace_days
     );
@@ -227,14 +240,14 @@ fn summary(p: &ValuePage) -> String {
             Some(w) => match (&w.per_window, &w.lower_bound) {
                 (Some(c), _) => p.usd(c.estimated_cost_usd),
                 (None, Some(b)) => format!("&ge; {}", p.usd(b.estimated_cost_usd)),
-                (None, None) => "-".into(),
+                (None, None) => NO_DATA.into(),
             },
-            None => "-".into(),
+            None => NO_DATA.into(),
         };
         let pace = t.pace.as_ref();
         let multiple = pace.and_then(|p| p.multiple);
         let _ = write!(
-            s,
+            table,
             "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             tool_name(&t.tool),
             esc(&t.subscription.name),
@@ -243,19 +256,20 @@ fn summary(p: &ValuePage) -> String {
             fmt_x(multiple),
             cell(value::main_window(t, "session")),
             cell(value::main_window(t, "weekly")),
-            pace.map_or("-".into(), |p| format!("{:.0}", p.days)),
+            pace.map_or(NO_DATA.into(), |p| format!("{:.0}", p.days)),
         );
     }
     let c = &r.combined;
     let _ = write!(
-        s,
+        table,
         "<tr class=\"total\"><th scope=\"row\">All plans</th><td class=\"l\">{} plans</td><td>{}</td><td>{}</td><td>{}</td><td></td><td></td><td></td></tr>",
         c.plans,
         p.usd(Some(c.monthly_usd)),
         p.usd(c.pace_monthly_cost_usd),
         fmt_x(c.pace_multiple)
     );
-    s.push_str("</tbody></table></div>");
+    table.push_str("</tbody></table></div>");
+    s.push_str(&noted(table));
     if r.tools.iter().flat_map(|t| &t.windows).any(lower_bound) {
         s.push_str(LOWER_BOUND_NOTE);
     }
@@ -287,7 +301,7 @@ fn session_shares(tools: &[value::ToolValue]) -> String {
         };
         let (ratio, share) = match sh.weekly_percent.filter(|v| *v > 0.0) {
             Some(v) => (format!("{:.1}", 100.0 / v), format!("{v:.0} % of the week")),
-            None => ("-".into(), "-".into()),
+            None => (NO_DATA.into(), NO_DATA.into()),
         };
         let _ = write!(
             s,
@@ -298,11 +312,11 @@ fn session_shares(tools: &[value::ToolValue]) -> String {
         );
     }
     s.push_str("</tbody></table></div>");
+    let mut s = noted(s);
     let _ = write!(
         s,
-        "<p class=\"note\">Measured from session and weekly readings taken together, over 5-hour sessions that used at least {:.0} % of their limit. - marks a limit with fewer than {} such sessions.{}</p>",
+        "<p class=\"note\">Measured from session and weekly readings taken together, over 5-hour sessions that used at least {:.0} % of their limit. {}</p>",
         value::MIN_RISE_PERCENT,
-        value::SHARE_MIN_WINDOWS,
         if pool_only {
             " A pool with only a weekly limit shares the plan's session limit with other models, so each session counts only the pool's share of its cost."
         } else {
@@ -321,7 +335,7 @@ const LOWER_BOUND_NOTE: &str = "<p class=\"note\">&ge; marks a window never seen
 fn latest_cell(w: &WindowEstimate) -> String {
     match &w.latest {
         Some(l) => format!("{:.0} % on {}", l.used_percent, esc(value::date_of(&l.at))),
-        None => "-".into(),
+        None => NO_DATA.into(),
     }
 }
 
@@ -351,7 +365,7 @@ fn windows_table(p: &ValuePage, t: &ToolValue) -> String {
                     Some((lo, hi)) if w.runs.len() > 1 => {
                         format!("{} to {}", p.usd(Some(lo)), p.usd(Some(hi)))
                     }
-                    _ => "-".into(),
+                    _ => NO_DATA.into(),
                 };
                 s.push_str(&row(
                     format!("{} of {}", w.runs.len(), w.qualifying_runs),
@@ -360,7 +374,7 @@ fn windows_table(p: &ValuePage, t: &ToolValue) -> String {
                     range,
                 ));
             }
-            (None, Some(b)) => s.push_str(&row("busiest".into(), b, "&ge; ", "-".into())),
+            (None, Some(b)) => s.push_str(&row("busiest".into(), b, "&ge; ", NO_DATA.into())),
             (None, None) => {
                 let _ = write!(
                     s,
@@ -562,7 +576,11 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
             m.days_covered,
             fmt_tokens(token_total(u)),
             p.usd(u.estimated_cost_usd),
-            if u.unpriced_requests > 0 { "*" } else { "" },
+            if u.unpriced_requests > 0 {
+                "&dagger;"
+            } else {
+                ""
+            },
             credit_cell(Some(m)),
             fmt_x(m.multiple),
             bar(m.multiple, max, &t.tool),
@@ -600,7 +618,7 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
     }
     s.push_str("</tbody></table></div>");
     if t.months.iter().any(|m| m.usage.unpriced_requests > 0) {
-        s.push_str("<p class=\"note\">* leaves out models with no price.</p>");
+        s.push_str("<p class=\"note\">&dagger; leaves out models with no price.</p>");
     }
     s
 }
@@ -636,14 +654,14 @@ fn source_note(p: &ValuePage, t: &ToolValue) -> String {
 
 fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     let mut body = format!("<p class=\"note\">{}</p>", source_note(p, t));
-    body.push_str(&windows_table(p, t));
+    body.push_str(&noted(windows_table(p, t)));
     body.push_str("<div class=\"stack\">");
     for w in t.windows.iter().filter(|w| w.pool.is_none()) {
         body.push_str(&drift_table(t, w));
     }
-    body.push_str(&utilization_table(t));
+    body.push_str(&noted(utilization_table(t)));
     body.push_str(&credits_note(p, t));
-    body.push_str(&months_table(p, t));
+    body.push_str(&noted(months_table(p, t)));
     let runs: String = t
         .windows
         .iter()
@@ -662,7 +680,8 @@ fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     if !runs.is_empty() {
         let _ = write!(
             body,
-            "<details><summary>Runs averaged, largest rise first</summary>{runs}</details>"
+            "<details><summary>Runs averaged, largest rise first</summary>{}</details>",
+            noted(runs)
         );
     }
     body.push_str("</div>");

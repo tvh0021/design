@@ -16,10 +16,11 @@ const ALIASES: &[(&str, &str)] = &[("gemini-pro-default", "gemini-3.1-pro")];
 /// effort or mode. They do not change the price. `max` is not stripped from
 /// GPT names because `gpt-5.1-codex-max` is a distinct model.
 const CLAUDE_QUALIFIERS: &[&str] = &["low", "medium", "high", "xhigh", "max", "thinking"];
-/// `n` and `trial` appear on Antigravity's `gemini-3.8-flash-n` and
-/// `gemini-4-argon-trial`; both are the base model under another label.
+/// `n`, `trial` and `c` appear on Antigravity's `gemini-3.8-flash-n`,
+/// `gemini-4-argon-trial` and `gemini-4-argon-c`; each is the base model
+/// under another label.
 const GEMINI_QUALIFIERS: &[&str] = &[
-    "low", "medium", "high", "minimal", "thinking", "tiered", "none", "n", "trial",
+    "low", "medium", "high", "minimal", "thinking", "tiered", "none", "n", "trial", "c",
 ];
 const GPT_QUALIFIERS: &[&str] = &["low", "medium", "high", "xhigh", "minimal", "none"];
 
@@ -185,6 +186,7 @@ mod tests {
         assert_eq!(c("gemini-4-argon-medium"), "gemini-4-argon");
         assert_eq!(c("gemini-3.8-flash-n"), "gemini-3.8-flash");
         assert_eq!(c("gemini-4-argon-trial"), "gemini-4-argon");
+        assert_eq!(c("gemini-4-argon-c"), "gemini-4-argon");
         // No version, so no base model to fold into.
         assert_eq!(c("gemini-pro-default"), "gemini-3.1-pro");
         assert_eq!(c("codex-auto-review"), "codex-auto-review");
