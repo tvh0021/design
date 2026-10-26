@@ -259,6 +259,56 @@ fn summary(p: &ValuePage) -> String {
     if r.tools.iter().flat_map(|t| &t.windows).any(lower_bound) {
         s.push_str(LOWER_BOUND_NOTE);
     }
+    s.push_str(&session_shares(&r.tools));
+    s
+}
+
+/// Weekly limit over session limit: how many full sessions one week holds.
+fn session_shares(tools: &[value::ToolValue]) -> String {
+    let rows: Vec<_> = tools
+        .iter()
+        .flat_map(|t| t.session_shares.iter().map(move |s| (t, s)))
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Weekly limit / session limit</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Limit</th><th scope=\"col\">Sessions a week</th><th scope=\"col\">One session uses</th><th scope=\"col\">Sessions measured</th></tr></thead><tbody>",
+    );
+    let mut pool_only = false;
+    for (t, sh) in rows {
+        let limit = match (&sh.session_pool, &sh.weekly_pool) {
+            (Some(p), _) => format!("{p} pool"),
+            (None, Some(w)) => {
+                pool_only = true;
+                format!("{w} weekly, {w} use only")
+            }
+            (None, None) => "Plan".to_owned(),
+        };
+        let (ratio, share) = match sh.weekly_percent.filter(|v| *v > 0.0) {
+            Some(v) => (format!("{:.1}", 100.0 / v), format!("{v:.0} % of the week")),
+            None => ("-".into(), "-".into()),
+        };
+        let _ = write!(
+            s,
+            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{ratio}</td><td>{share}</td><td>{}</td></tr>",
+            tool_name(&t.tool),
+            esc(&limit),
+            sh.windows
+        );
+    }
+    s.push_str("</tbody></table></div>");
+    let _ = write!(
+        s,
+        "<p class=\"note\">Measured from session and weekly readings taken together, over 5-hour sessions that used at least {:.0} % of their limit. - marks a limit with fewer than {} such sessions.{}</p>",
+        value::MIN_RISE_PERCENT,
+        value::SHARE_MIN_WINDOWS,
+        if pool_only {
+            " A pool with only a weekly limit shares the plan's session limit with other models, so each session counts only the pool's share of its cost."
+        } else {
+            ""
+        }
+    );
     s
 }
 
