@@ -4,7 +4,9 @@
  * Self-contained map overlay drawing the path of totality, the central line,
  * the point of greatest eclipse, and markers every 1000 km along the central
  * line giving the duration of totality and the local clock time of
- * mid-totality. Data comes from maps/data/eclipse-2027-08-02.json (built by
+ * mid-totality. The markers and their badges only appear once the view is
+ * zoomed in (see dotsAt / labelsAt), so the default view shows just the band.
+ * Data comes from maps/data/eclipse-2027-08-02.json (built by
  * maps/scripts/build_eclipse.py).
  *
  * The overlay is deliberately isolated so it can be removed in one sweep:
@@ -134,14 +136,50 @@ export function createEclipseOverlay(options = {}) {
     return !!pt && isFinite(pt[0]) && isFinite(pt[1]);
   }
 
+  // Zoom gating, in screen pixels per degree of longitude at the view centre.
+  // Below `dotsAt` only the band, the central line and the greatest-eclipse dot
+  // are drawn; from `dotsAt` the 1000 km dots appear; from `labelsAt` the
+  // duration / local-time badges appear. The default globe sits near 4 px/deg.
+  const dotsAt = Number.isFinite(options.dotsAt) ? options.dotsAt : 7;
+  const labelsAt = Number.isFinite(options.labelsAt) ? options.labelsAt : 12;
+
+  function pixelsPerDegree(proj) {
+    if (!proj || typeof proj.scale !== 'function') return Infinity; // unknown: show everything
+    let center = null;
+    if (typeof proj.invert === 'function' && typeof proj.translate === 'function') {
+      center = proj.invert(proj.translate());
+    }
+    if (!center || !isFinite(center[0]) || !isFinite(center[1])) {
+      if (typeof proj.rotate === 'function') {
+        const rot = proj.rotate();
+        center = [-rot[0], -rot[1]];
+      } else {
+        return proj.scale() * Math.PI / 180;
+      }
+    }
+    const a = proj(center);
+    const b = proj([center[0] + 1, center[1]]);
+    if (!a || !b || !isFinite(a[0]) || !isFinite(b[0])) return proj.scale() * Math.PI / 180;
+    return Math.hypot(b[0] - a[0], b[1] - a[1]);
+  }
+
+  /** 'none' | 'dots' | 'labels' for the current zoom. */
+  function detailLevel(proj) {
+    const ppd = pixelsPerDegree(proj);
+    return ppd >= labelsAt ? 'labels' : ppd >= dotsAt ? 'dots' : 'none';
+  }
+
   /**
    * @param {CanvasRenderingContext2D} ctx
    * @param {Function} path   d3.geoPath bound to ctx and the active projection
    * @param {object} proj     the active d3 projection
-   * @param {object} [opts]   { labels: boolean } — draw the marker badges
+   * @param {object} [opts]   { labels: boolean } — allow the marker badges (still zoom-gated)
    */
   function draw(ctx, path, proj, opts = {}) {
     if (!visible || !layers || !ctx || typeof path !== 'function') return;
+    const detail = detailLevel(proj);
+    const showDots = detail !== 'none';
+    const showLabels = detail === 'labels' && opts.labels !== false;
 
     ctx.save();
     ctx.lineJoin = 'round';
@@ -175,10 +213,12 @@ export function createEclipseOverlay(options = {}) {
     const placed = [];
     const ordered = [];
     if (layers.greatest) ordered.push({ feature: layers.greatest, greatest: true });
-    layers.markers
-      .slice()
-      .sort((a, b) => Math.abs(a.properties.distanceKm) - Math.abs(b.properties.distanceKm))
-      .forEach((feature) => ordered.push({ feature, greatest: false }));
+    if (showDots) {
+      layers.markers
+        .slice()
+        .sort((a, b) => Math.abs(a.properties.distanceKm) - Math.abs(b.properties.distanceKm))
+        .forEach((feature) => ordered.push({ feature, greatest: false }));
+    }
 
     for (const { feature, greatest } of ordered) {
       const coord = feature.geometry && feature.geometry.coordinates;
@@ -193,7 +233,7 @@ export function createEclipseOverlay(options = {}) {
       ctx.lineWidth = greatest ? 1.5 : 1.2;
       ctx.strokeStyle = palette.markerOutline;
       ctx.stroke();
-      if (opts.labels !== false) {
+      if (showLabels) {
         const p = feature.properties || {};
         const text = `${formatTotality(p.durationSeconds)} · ${p.localTime || ''}`.trim();
         const rect = badgeRect(ctx, x, y, text, greatest ? 'above' : (p.distanceKm > 0 ? 'below' : 'above'));
@@ -275,6 +315,7 @@ export function createEclipseOverlay(options = {}) {
     },
     isVisible: () => visible,
     isLoaded: () => !!layers,
+    detailLevel,
     getLayers: () => layers,
     getSummary,
     getError: () => loadError,

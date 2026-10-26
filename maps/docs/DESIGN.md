@@ -107,7 +107,7 @@ function createGlobeRenderer(container: HTMLElement, worldTopoJson: any): GlobeC
 
 ### 3b. `EclipseOverlay` (Removable Layer) — `[eclipse-overlay]`
 
-**Depth**: Shallow by design. Draws the 2 August 2027 total solar eclipse ground track (path of totality, central line, greatest-eclipse marker, and duration/local-time markers every 1000 km) from `data/eclipse-2027-08-02.json`, which `scripts/build_eclipse.py` derives from NASA's Besselian elements. The renderer only knows a `draw(ctx, path, projection, opts)` hook (`setEclipseOverlay`); the HUD only knows an optional `eclipseToggle` option (`visible`, `onToggle`, `getDescription` for the card shown when the switch is clicked on). Every touch point outside `src/eclipse.js` carries the `[eclipse-overlay]` tag so the feature can be deleted in one sweep (see ADR 0006).
+**Depth**: Shallow by design. Draws the 2 August 2027 total solar eclipse ground track (path of totality, central line, greatest-eclipse marker, and duration/local-time markers every 1000 km, shown only when zoomed in) from `data/eclipse-2027-08-02.json`, which `scripts/build_eclipse.py` derives from NASA's Besselian elements. The renderer only knows a `draw(ctx, path, projection, opts)` hook (`setEclipseOverlay`); the HUD only knows an optional `eclipseToggle` option (`visible`, `onToggle`, `getDescription` for the card shown when the switch is clicked on). Every touch point outside `src/eclipse.js` carries the `[eclipse-overlay]` tag so the feature can be deleted in one sweep (see ADR 0006).
 
 ```typescript
 interface EclipseOverlay {

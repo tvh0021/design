@@ -9,6 +9,7 @@
  * 4. Markers sit on the central line, 1000 km apart, with durations that fall off away from greatest eclipse.
  * 5. parseEclipseData reverses rings d3 would treat as "larger than a hemisphere".
  * 6. createEclipseOverlay draws only when visible, skips overlapping labels, and setVisible notifies the owner.
+ * 6b. Marker dots and badges are zoom-gated: hidden at the default globe scale, shown once zoomed in.
  * 7. The HUD builds the eclipse switch only when asked, toggles it, and shows a description card (see test_hud.js).
  */
 
@@ -230,6 +231,42 @@ test('overlay draws totality, central line and markers only while visible; overl
   hidden.draw(ctx, path, proj, { labels: false });
   assert.deepEqual(drawn, ['total', 'central']);
   assert.ok(!calls.includes('fillText'), 'label suppressed while interacting');
+});
+
+test('marker dots and badges are hidden at the default zoom and appear when zoomed in', () => {
+  const d3 = { geoArea: () => 0.1, geoDistance: () => 0 };
+  const overlay = createEclipseOverlay({ data, d3, visible: true });
+  const markerCount = data.features.filter((f) => f.properties.kind === 'marker').length;
+  // Orthographic-like mock: 1 degree of longitude at the centre spans scale * pi / 180 px.
+  const makeProj = (scale) => {
+    const proj = (c) => [100 + c[0] * scale * Math.PI / 180, 100 - c[1] * scale * Math.PI / 180];
+    return Object.assign(proj, {
+      scale: () => scale, rotate: () => [0, 0, 0], clipAngle: () => 90,
+      translate: () => [400, 300], invert: () => [0, 0]
+    });
+  };
+  const { ctx, calls } = recordingContext();
+
+  // Default globe on a 600 px viewport: 252 px scale, about 4.4 px/deg.
+  assert.equal(overlay.detailLevel(makeProj(252)), 'none');
+  overlay.draw(ctx, () => {}, makeProj(252));
+  assert.equal(calls.filter((c) => c === 'arc').length, 1, 'only the greatest-eclipse dot');
+  assert.equal(calls.filter((c) => c === 'fillText').length, 0, 'no badges at default zoom');
+
+  calls.length = 0;
+  assert.equal(overlay.detailLevel(makeProj(500)), 'dots');
+  overlay.draw(ctx, () => {}, makeProj(500));
+  assert.equal(calls.filter((c) => c === 'arc').length, 1 + markerCount, 'dots once zoomed a little');
+  assert.equal(calls.filter((c) => c === 'fillText').length, 0, 'still no badges');
+
+  calls.length = 0;
+  assert.equal(overlay.detailLevel(makeProj(900)), 'labels');
+  overlay.draw(ctx, () => {}, makeProj(900));
+  assert.equal(calls.filter((c) => c === 'arc').length, 1 + markerCount);
+  assert.ok(calls.filter((c) => c === 'fillText').length >= 3, 'badges once zoomed in');
+
+  // A projection with no scale() is treated as zoomed in (tests and unknown projections).
+  assert.equal(overlay.detailLevel({}), 'labels');
 });
 
 test('overlay reports fetch failures instead of throwing', async () => {

@@ -155,7 +155,7 @@ export async function initApp(options = {}) {
     let isSwapping = false;
 
     // [eclipse-overlay] 2 August 2027 total solar eclipse ground track.
-    // Starts visible; ?eclipse=0 hides it on load. Pass eclipseUrl: null to
+    // Starts hidden; ?eclipse=1 shows it on load. Pass eclipseUrl: null to
     // leave the overlay out entirely (e.g. in tests).
     const eclipseUrl = options.eclipseUrl === undefined ? 'data/eclipse-2027-08-02.json' : options.eclipseUrl;
     const eclipseOverlay = (eclipseUrl || options.eclipseData)
@@ -164,7 +164,7 @@ export async function initApp(options = {}) {
           data: options.eclipseData,
           url: eclipseUrl,
           fetch: fetchFn,
-          visible: options.eclipseVisible !== undefined ? !!options.eclipseVisible : urlParams?.get('eclipse') !== '0',
+          visible: options.eclipseVisible !== undefined ? !!options.eclipseVisible : urlParams?.get('eclipse') === '1',
           onChange: () => globe.render()
         })
       : null;
