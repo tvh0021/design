@@ -856,7 +856,11 @@ filter, states its window, and names any tool with no requests in it:
   read, cache write), from the window totals.
 - **Spend by week** (by month for all time): estimated cost per tool, weeks
   counted back from now so they tile the window; each column adds up to the
-  window total.
+  window total. The public page titles it "What my use would cost at API
+  prices" and leaves out the estimated API cost table, the sessions section
+  and the cache-read table: the totals sit in this table's total row, the
+  session counts in the subagent rows and the project footnote, and the
+  cache-read share in one sentence under this table.
 
 A second page, `/value`, linked from the controls, shows what each
 subscription buys. It opens with the headline findings and a ledger of each

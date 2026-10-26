@@ -837,14 +837,6 @@ fn sessions_panel(p: &Page) -> String {
     if sl.longest.is_empty() {
         return nothing_here(p);
     }
-    if p.audience.is_public() {
-        return format!(
-            "<p>{} top-level sessions across {} projects had activity in this window; {} of them spawned subagents. Per-session figures are left out of this export.</p>",
-            fmt_int(p.agents.totals.top_level_sessions as i64),
-            fmt_int(p.projects.count as i64),
-            fmt_int(p.agents.totals.sessions_with_subagents as i64)
-        );
-    }
     let mut body = String::from("<div class=\"stack\">");
     body.push_str(&session_table(p, "Longest, by active time", &sl.longest));
     if sl.costliest.is_empty() {
@@ -1233,7 +1225,31 @@ fn spend_panel(p: &Page) -> String {
             fmt_int(all.1)
         );
     }
+    if p.audience.is_public() {
+        body.push_str(&cache_sentence(p));
+    }
     body
+}
+
+/// One line on prompt caching for the public spend section, which stands in
+/// for the private cache-read table: the all-tools share, then each tool's.
+fn cache_sentence(p: &Page) -> String {
+    let t = &p.totals;
+    let pct = |k: &Tokens| whole_pct(super::data::cache_read_ratio(k));
+    let per_tool: Vec<String> = t
+        .by_tool
+        .iter()
+        .map(|r| format!("{} {}", tool_name(&r.tool), pct(&r.tokens)))
+        .collect();
+    let per_tool = if t.by_tool.len() > 1 {
+        format!(" ({})", and_list(&per_tool))
+    } else {
+        String::new()
+    };
+    format!(
+        "<p class=\"note\">{} of input tokens were cache reads{per_tool}, priced at the cheaper cache rate.</p>",
+        pct(&t.total)
+    )
 }
 
 /// The ticket 10 panels, in the order docs/design.md gives.
@@ -1277,39 +1293,49 @@ fn panels(p: &Page) -> String {
         ),
         &projects_panel(p),
     ));
-    s.push_str(&section(
-        "sessions",
-        if p.audience.is_public() { "Sessions" } else { "Longest and costliest sessions" },
-        &if p.audience.is_public() {
-            format!("{scope} Counts match <code>query agents{since}</code> and <code>query projects{since}</code>.")
-        } else {
-            format!(
+    // Public pages leave these out: the session counts sit in the subagent
+    // rows and the project footnote, and the cache share is one sentence
+    // under spend.
+    if !p.audience.is_public() {
+        s.push_str(&section(
+            "sessions",
+            "Longest and costliest sessions",
+            &format!(
                 "{scope} Top-level sessions with a request in the window. Active time covers the whole session and its linked children; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. Titles are the first line of the opening prompt."
-            )
-        },
-        &sessions_panel(p),
-    ));
-    s.push_str(&section(
-        "cache",
-        "Cache-read ratio",
-        &format!(
-            "{scope} Cache-read tokens as a share of all input: uncached, cache read and cache write. Same figures as the estimated API cost section."
-        ),
-        &cache_panel(p),
-    ));
+            ),
+            &sessions_panel(p),
+        ));
+        s.push_str(&section(
+            "cache",
+            "Cache-read ratio",
+            &format!(
+                "{scope} Cache-read tokens as a share of all input: uncached, cache read and cache write. Same figures as the estimated API cost section."
+            ),
+            &cache_panel(p),
+        ));
+    }
     s.push_str(&section(
         "spend",
-        if p.spend.by_month {
-            "Spend by month"
-        } else {
-            "Spend by week"
+        match (p.audience.is_public(), p.spend.by_month) {
+            (true, true) => "What my use would cost at API prices, by month",
+            (true, false) => "What my use would cost at API prices, by week",
+            (false, true) => "Spend by month",
+            (false, false) => "Spend by week",
         },
         &format!(
-            "{scope} Estimated cost {}. {}",
+            "{scope} Estimated cost {}{}. {}",
             if p.spend.by_month {
                 "by local calendar month"
             } else {
                 "by week, counted back from now"
+            },
+            if p.audience.is_public() {
+                format!(", at API list prices; the total row matches <code>{}</code>", match p.window.since_arg() {
+                    Some(a) => format!("query summary --since {a}"),
+                    None => "query summary".to_string(),
+                })
+            } else {
+                String::new()
             },
             if p.audience.is_public() { "Figures are rounded independently to the nearest dollar; displayed rows may not add up." } else { "Each column adds up to the estimated API cost." }
         ),
@@ -1383,7 +1409,10 @@ pub fn render(p: &Page) -> String {
         }
         None => format!("Same window. The total row matches <code>{cmd}</code>."),
     };
-    s.push_str(&section("totals", "Estimated API cost", &note, &totals(p)));
+    // The public page folds these figures into spend by week.
+    if !p.audience.is_public() {
+        s.push_str(&section("totals", "Estimated API cost", &note, &totals(p)));
+    }
     s.push_str(&panels(p));
     s.push_str("</main>\n<footer>\n<p>");
     let _ = write!(

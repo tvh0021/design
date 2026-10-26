@@ -153,9 +153,13 @@ fn fixture_snapshot_is_redacted_offline_and_linked() {
             continue;
         }
         for panel in [
-            "activity", "totals", "models", "agents", "projects", "sessions", "cache", "spend",
+            "activity", "models", "agents", "projects", "spend", "limits",
         ] {
             assert!(body.contains(&format!("<section id=\"{panel}\"")));
+        }
+        // Public pages fold these three into the spend section.
+        for panel in ["totals", "sessions", "cache"] {
+            assert!(!body.contains(&format!("<section id=\"{panel}\"")));
         }
     }
     // Snapshot opens the store read-only and performs no scan, pricing, or migration.

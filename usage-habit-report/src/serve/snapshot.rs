@@ -312,7 +312,8 @@ mod tests {
         assert!(!html.contains("Heaviest fan-outs"));
         assert!(!html.contains("Active time"));
         assert!(!html.contains("delegation records"));
-        assert!(html.contains("Per-session figures are left out of this export."));
+        assert!(!html.contains("<section id=\"sessions\""));
+        assert!(!html.contains("<section id=\"cache\""));
         assert!(!html.contains("Demo task"));
         assert!(!html.contains("untitled session"));
     }
@@ -380,7 +381,9 @@ mod tests {
             assert!(!amount.contains('.'));
         }
         assert!(html.contains("Costs are estimates"));
-        assert!(html.contains("Estimated API cost"));
+        assert!(!html.contains("<section id=\"totals\""));
+        assert!(html.contains("What my use would cost at API prices"));
+        assert!(html.contains("of input tokens were cache reads"));
     }
 
     #[test]
