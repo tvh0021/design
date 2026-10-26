@@ -748,7 +748,7 @@ pub fn render(p: &ValuePage) -> String {
     s.push_str("</main>\n<footer>\n<p>");
     let _ = write!(
         s,
-        "Estimates at LiteLLM list prices{}. Plan prices from <code>[subscriptions]</code> in config.toml or the defaults. Loaded in {:.0} ms.",
+        "Estimates at LiteLLM list prices{}. Plan prices from <code>[subscriptions]</code> in config.toml or the defaults. Data loaded in {:.0} ms.",
         match &p.rates_fetched_at {
             Some(t) => format!(", rates fetched {}", esc(t)),
             None => String::new(),

@@ -85,7 +85,7 @@ pub(super) fn value_squares(p: &ValuePage) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     let mut out = format!(
-        "<figure class=\"value-fig value-squares\"><figcaption><h3>What each subscription buys</h3><p>Each block is one month's price. The solid block is what you pay. The outlined blocks are what the rest of a month's use would cost at API list prices, at the pace of the last {} days. Block areas are to scale.</p></figcaption><svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-labelledby=\"squares-title squares-desc\"><title id=\"squares-title\">Plan price against est. cost at API prices</title><desc id=\"squares-desc\">{}. All {} plans: {} a month buys est. {}.</desc>",
+        "<figure class=\"chart-fig value-squares\"><figcaption><h3>What each subscription buys</h3><p>Each block is one month's price. The solid block is what you pay. The outlined blocks are what the rest of a month's use would cost at API list prices, at the pace of the last {} days. Block areas are to scale.</p></figcaption><svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-labelledby=\"squares-title squares-desc\"><title id=\"squares-title\">Plan price against est. cost at API prices</title><desc id=\"squares-desc\">{}. All {} plans: {} a month buys est. {}.</desc>",
         r.pace_days,
         esc(&desc),
         c.plans,

@@ -896,13 +896,176 @@ fn cache_panel(p: &Page) -> String {
     body
 }
 
+/// Height of the tallest month column, its width, and the space between.
+const STACK_PLOT: f64 = 160.0;
+/// Width the month slots share; the columns fill it whatever their count.
+const STACK_WIDTH: f64 = 720.0;
+/// Months shown; older ones stay in the table below.
+const STACK_MONTHS: usize = 6;
+
+/// Spend by month as stacked columns on one dollar scale, one segment per
+/// tool. The current month adds a dashed outline up to its projection: each
+/// tool's cost so far over its own days of history in the month, scaled to
+/// the whole month.
+fn spend_chart(p: &Page) -> String {
+    let sp = &p.spend;
+    if !sp.by_month {
+        return String::new();
+    }
+    let last = sp.periods.len().saturating_sub(1);
+    let first = sp.periods.len().saturating_sub(STACK_MONTHS);
+    // (label, per-tool costs, projected total for the current month)
+    let months: Vec<_> = sp
+        .periods
+        .iter()
+        .enumerate()
+        .skip(first)
+        .map(|(i, per)| {
+            let costs: Vec<f64> = per.cells.iter().map(|c| c.0.unwrap_or(0.0)).collect();
+            let projected = sp.current.as_ref().filter(|_| i == last).map(|cur| {
+                costs
+                    .iter()
+                    .zip(&cur.covered)
+                    // Under a day of history says little about a month.
+                    .map(|(c, d)| {
+                        if *d >= 1.0 {
+                            c * cur.days / d.min(cur.days)
+                        } else {
+                            *c
+                        }
+                    })
+                    .sum::<f64>()
+            });
+            (per, costs, projected)
+        })
+        .collect();
+    let peak = months
+        .iter()
+        .map(|(_, c, proj)| c.iter().sum::<f64>().max(proj.unwrap_or(0.0)))
+        .fold(0.0, f64::max);
+    if peak <= 0.0 {
+        return String::new();
+    }
+    let h = |usd: f64| STACK_PLOT * usd.max(0.0) / peak;
+    let top = 18.0;
+    let base = top + STACK_PLOT;
+    let slot = STACK_WIDTH / months.len() as f64;
+    let col = (slot * 0.6).min(120.0);
+    let height = base + 40.0;
+    // Whole dollars for both audiences; the table below keeps the detail.
+    let usd = |v: f64| format!("${}", fmt_int(v.round() as i64));
+    let mut desc = Vec::new();
+    let mut body = String::new();
+    for (i, (per, costs, projected)) in months.iter().enumerate() {
+        let mid = (i as f64 + 0.5) * slot;
+        let x = mid - col / 2.0;
+        let total: f64 = costs.iter().sum();
+        let parts = sp
+            .tools
+            .iter()
+            .zip(costs)
+            .filter(|(_, c)| **c > 0.0)
+            .map(|(t, c)| format!("{t} {}", usd(*c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut text = format!("{}: est. {} ({parts})", per.label, usd(total));
+        if let Some(v) = projected {
+            text.push_str(&format!(", on pace for {}", usd(*v)));
+        }
+        let _ = write!(body, "<g><title>{}</title>", esc(&text));
+        desc.push(text);
+        if let Some(v) = projected.filter(|v| *v > total) {
+            let _ = write!(
+                body,
+                "<rect class=\"st-pace\" x=\"{x:.1}\" y=\"{:.1}\" width=\"{col:.1}\" height=\"{:.1}\"/>",
+                base - h(v),
+                h(v) - h(total)
+            );
+        }
+        let mut y = base;
+        for (t, c) in sp.tools.iter().zip(costs) {
+            if *c <= 0.0 {
+                continue;
+            }
+            y -= h(*c);
+            let _ = write!(
+                body,
+                "<rect class=\"st-seg\" data-tool=\"{}\" x=\"{x:.1}\" y=\"{y:.1}\" width=\"{col:.1}\" height=\"{:.1}\"/>",
+                esc(t),
+                h(*c)
+            );
+        }
+        let (label, at) = match projected {
+            Some(v) => (format!("{} pace", usd(*v)), v.max(total)),
+            None => (usd(total), total),
+        };
+        let month = per.label.split(' ').next().unwrap_or(&per.label);
+        let _ = write!(
+            body,
+            "<text class=\"st-value\" x=\"{mid:.1}\" y=\"{:.1}\">{}</text><text class=\"st-month\" x=\"{mid:.1}\" y=\"{:.1}\">{}</text>",
+            base - h(at) - 5.0,
+            esc(&label),
+            base + 16.0,
+            esc(month),
+        );
+        if projected.is_some_and(|v| h(v) - h(total) > 20.0) {
+            let _ = write!(
+                body,
+                "<text class=\"st-value\" x=\"{mid:.1}\" y=\"{:.1}\">{}</text>",
+                base - h(total) - 5.0,
+                usd(total)
+            );
+        }
+        if let Some(cur) = sp.current.as_ref().filter(|_| projected.is_some()) {
+            let so_far = cur.covered.iter().copied().fold(0.0, f64::max);
+            let _ = write!(
+                body,
+                "<text class=\"st-note\" x=\"{mid:.1}\" y=\"{:.1}\">{:.0} of {:.0} days</text>",
+                base + 32.0,
+                so_far,
+                cur.days
+            );
+        }
+        body.push_str("</g>");
+    }
+    let _ = write!(
+        body,
+        "<line class=\"st-base\" x1=\"-4\" x2=\"{:.1}\" y1=\"{base:.1}\" y2=\"{base:.1}\"/>",
+        STACK_WIDTH + 4.0
+    );
+    let key = if sp.tools.len() > 1 {
+        format!(
+            "<p class=\"key\">{}</p>",
+            sp.tools
+                .iter()
+                .map(|t| tool_name(t))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    } else {
+        String::new()
+    };
+    let width = STACK_WIDTH + 8.0;
+    format!(
+        "<figure class=\"chart-fig spend-stack\"><figcaption><p>Each column is a month's use at API list prices, split by tool.{}</p>{key}</figcaption><svg viewBox=\"-4 0 {width:.0} {height:.0}\" role=\"img\" aria-labelledby=\"spend-title spend-desc\"><title id=\"spend-title\">Est. cost by month and tool</title><desc id=\"spend-desc\">{}</desc>{body}</svg></figure>",
+        if sp.current.is_some() {
+            " The dashed outline is where this month ends at each tool's pace so far."
+        } else {
+            ""
+        },
+        esc(&desc.join("; "))
+    )
+}
+
 fn spend_panel(p: &Page) -> String {
     let sp = &p.spend;
     if p.totals.total.requests == 0 || sp.periods.is_empty() {
         return nothing_here(p);
     }
     let period = if sp.by_month { "Month" } else { "Week" };
-    let mut body = format!(
+    let mut body = spend_chart(p);
+    let _ = write!(
+        body,
         "<div class=\"table-wrap\"><table class=\"ledger quiet\"><thead><tr><th scope=\"col\">{period}</th>"
     );
     for t in &sp.tools {
