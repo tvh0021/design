@@ -830,17 +830,19 @@ filter, states its window, and names any tool with no requests in it:
   by older generations. OpenAI uses Astra, Sol, Terra, Luna order, and Google
   uses Argon, Pro, Flash order, with newer major generations first and newer
   minor versions first within each tier. Each chart scales its largest topic to the
-  outer ring and prints that maximum percentage above the web. Axis labels
-  keep their actual request percentages. Background colors identify the model
-  provider. Small screens show two columns or one. Every model gets
+  outer ring; the ring ticks and axis labels keep their actual request
+  percentages. Small screens show two columns or one. Every model gets
   a chart, including the table's folded long tail. Expand the request-count
   table for the exact figures and stepped shading. `unlabelled` appears only
   when some request in the window has no label. Column totals equal the
   per-label totals of `query summary --group-by label` for the window.
-- **Multi-agent habit**: the subagents-per-session histogram, main-thread
-  and subagent model mix, subagent token share, the ten heaviest fan-outs,
-  and each tool's coverage note, all from `query agents --since <window>`
-  (with a tool filter, that tool's `by_tool` row).
+- **How much of my work I hand to subagents**: rows of 20 squares, each
+  5 % of tokens, filled by the subagent share. "By tool" has one row per
+  tool plus all tools, with sessions that spawned subagents out of all
+  top-level sessions, from `query agents --since <window>` (with a tool
+  filter, that tool's `by_tool` row). "By month" covers all history from
+  `requests.is_subagent`, the last twelve local calendar months. The private
+  dashboard adds the ten heaviest fan-outs and each tool's coverage note.
 - **Time and cost by project**: the ten costliest projects with sessions,
   tokens and cost from `query projects`, active time (the sum of each
   top-level session's `active_seconds` as `query session` reports it), and
@@ -853,15 +855,20 @@ filter, states its window, and names any tool with no requests in it:
   read, cache write), from the window totals.
 - **Spend by week** (by month for all time): estimated cost per tool, weeks
   counted back from now so they tile the window; each column adds up to the
-  window total.
+  window total. The public page titles it "What my use would cost at API
+  prices" and leaves out the estimated API cost table, the sessions section
+  and the cache-read table: the totals sit in this table's total row, the
+  session counts in the subagent rows and the project footnote, and the
+  cache-read share in one sentence under this table.
 
 A second page, `/value`, linked from the controls, shows what each
-subscription buys. It opens with the headline findings and a ledger of each
-plan at its recent pace, with a combined row. Each tool's section then shows
-the per-window capacity (with the range of the runs averaged and the last
-reading), the drift tables with the main model and the reference-rate cost,
-how much of each window was used, Codex credits, estimated API cost by month
-against the plan price, and the runs that were averaged. A closing section
+subscription buys. It opens with the pool and live-limit findings, the
+block figure, and one ledger of each plan at its recent pace with what a
+full 5-hour and weekly window holds, with a combined row. Each tool's
+section then shows the drift tables with the main model and the
+reference-rate cost, how much of each window was used, Codex credits,
+estimated API cost by month against the plan price, and the runs that were
+averaged (with their range and the last live reading). A closing section
 says what the figures rest on: each tool's history and its live readings.
 
 A panel with nothing to show says what to run (`scan`, `rebuild` for

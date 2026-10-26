@@ -76,9 +76,12 @@ pub fn load_page(
     let totals = data::totals(conn, since, params.tool)?;
     let models = data::model_matrix(conn, since, params.tool)?;
     let agents = crate::agents::agents_report_for(conn, since, params.tool, now_ms)?;
+    let agent_months = crate::agents::month_shares(conn, params.tool, now_ms, tz)?;
     let projects = data::projects(conn, since, params.tool, now_ms)?;
     let sessions = data::session_lists(conn, since, params.tool)?;
     let spend = data::spend(conn, window, now_ms, params.tool, tz)?;
+    let tools = params.tool.map_or(data::TOOLS.to_vec(), |t| vec![t]);
+    let limit_bands = crate::value::limit_bands(conn, &tools, since, now_ms, tz)?;
     Ok(Page {
         audience: html::Audience::Private,
         window,
@@ -91,10 +94,12 @@ pub fn load_page(
         totals,
         models,
         agents,
+        agent_months,
         projects,
         sessions,
         spend_totals: spend.totals(),
         spend,
+        limit_bands,
         rates_fetched_at,
         load_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
@@ -336,7 +341,7 @@ mod tests {
         // Four weeks: Antigravity has no requests, and every panel says so.
         let html = render_dashboard(&store.conn, "", NOW, None).unwrap();
         let missing = "No <span class=\"tool\" data-tool=\"antigravity\">antigravity</span> requests in this window, so it is not covered.";
-        assert_eq!(html.matches(missing).count(), 6);
+        assert_eq!(html.matches(missing).count(), 7);
         assert!(html.contains("Spend by week"));
         assert!(html.contains("<code>query agents --since 4w</code>"));
         assert!(html.contains("<code>query projects --since 4w</code>"));

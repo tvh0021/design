@@ -29,7 +29,7 @@ fn repo(dir: &Path) {
 }
 fn fixture(db: &Path) -> Store {
     let store = Store::open(db).unwrap();
-    store.conn.execute_batch("INSERT INTO sessions (tool, session_id, cwd, project, title, display_title, t3_title) VALUES ('codex', 'private-session-id', '/home/demo/private/work', '/home/demo/private', 'Private <opening> title', 'Private display headline', 'Private T3 headline'); INSERT INTO requests (tool, request_key, session_id, ts_ms, canonical_model, input_tokens) VALUES ('codex', 'request', 'private-session-id', 1792380600000, 'demo-model', 42);").unwrap();
+    store.conn.execute_batch("INSERT INTO sessions (tool, session_id, cwd, project, title, display_title, t3_title, label) VALUES ('codex', 'private-session-id', '/home/demo/private/work', '/home/demo/private', 'Private <opening> title', 'Private display headline', 'Private T3 headline', 'coding'); INSERT INTO requests (tool, request_key, session_id, ts_ms, canonical_model, input_tokens) VALUES ('codex', 'request', 'private-session-id', 1792380600000, 'demo-model', 42);").unwrap();
     store
 }
 fn cli(tmp: &Path, args: &[&str]) -> Output {
@@ -84,7 +84,8 @@ fn privacy_failure_preserves_directory_and_index_for_paths_and_titles() {
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let store = fixture(&tmp.path().join("usage.db"));
-        // Model names survive redaction, so this deliberately plants a private value.
+        // Model names survive redaction and reach the public page through the
+        // model matrix, so this deliberately plants a private value there.
         store
             .conn
             .execute("UPDATE requests SET canonical_model = ?1", [value])

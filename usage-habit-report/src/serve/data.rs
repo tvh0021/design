@@ -661,6 +661,19 @@ pub struct Spend {
     pub tools: Vec<String>,
     /// Oldest first.
     pub periods: Vec<SpendPeriod>,
+    /// How far the last month has run, when it is the current month.
+    pub current: Option<MonthSoFar>,
+}
+
+/// The current month so far, for projecting it to its end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonthSoFar {
+    /// Days in the whole month.
+    pub days: f64,
+    /// Days of history in the month so far per tool, in `Spend::tools`
+    /// order: from the later of the month's start and the tool's first
+    /// request, to now.
+    pub covered: Vec<f64>,
 }
 
 /// Exact aggregates are computed before any public rounding.
@@ -752,6 +765,7 @@ pub fn spend(
             by_month: false,
             tools,
             periods,
+            current: None,
         });
     }
     // All time: local months, from 15-minute UTC buckets as in `heatmap`.
@@ -773,6 +787,7 @@ pub fn spend(
             .or_insert_with(|| vec![(None, 0); tools.len()]);
         add_cost(&mut cells[c], r.get(2)?, r.get(3)?);
     }
+    let months_last = months.keys().next_back().copied();
     // Fill the gaps so the months read as a continuous ledger.
     let mut periods = Vec::new();
     if let (Some(first), Some(last)) = (
@@ -791,11 +806,56 @@ pub fn spend(
             (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
         }
     }
+    let current = month_so_far(conn, now_ms, &tools, tz, months_last)?;
     Ok(Spend {
         by_month: true,
         tools,
         periods,
+        current,
     })
+}
+
+/// `MonthSoFar` for the local month holding `now_ms`, when `last` (the
+/// latest month with requests) is that month.
+fn month_so_far(
+    conn: &Connection,
+    now_ms: i64,
+    tools: &[String],
+    tz: &impl TimeZone,
+    last: Option<(i32, u32)>,
+) -> Result<Option<MonthSoFar>> {
+    let Some(now) = tz.timestamp_millis_opt(now_ms).single() else {
+        return Ok(None);
+    };
+    let (y, m) = (now.year(), now.month());
+    if last != Some((y, m)) {
+        return Ok(None);
+    }
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    let start_of = |y, m| {
+        tz.with_ymd_and_hms(y, m, 1, 0, 0, 0)
+            .earliest()
+            .map(|t| t.timestamp_millis())
+    };
+    let (Some(start), Some(end)) = (start_of(y, m), start_of(ny, nm)) else {
+        return Ok(None);
+    };
+    let day = 86_400_000.0;
+    let mut first: std::collections::HashMap<String, i64> = conn
+        .prepare("SELECT tool, MIN(ts_ms) FROM requests GROUP BY tool")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let covered = tools
+        .iter()
+        .map(|t| {
+            let from = first.remove(t).map_or(start, |f| f.max(start));
+            (now_ms - from).max(0) as f64 / day
+        })
+        .collect();
+    Ok(Some(MonthSoFar {
+        days: (end - start) as f64 / day,
+        covered,
+    }))
 }
 
 /// Cache reads as a share of all input (uncached + cache read + cache write);
@@ -1558,6 +1618,11 @@ pub(crate) mod tests {
             vec!["Aug 2026", "Sep 2026", "Oct 2026"]
         );
         assert_eq!(sp.tools, vec!["claude-code", "codex", "antigravity"]);
+        // October is the current month: each tool's days so far fit in it.
+        let cur = sp.current.as_ref().expect("current month");
+        assert_eq!(cur.days, 31.0);
+        assert_eq!(cur.covered.len(), 3);
+        assert!(cur.covered.iter().all(|d| *d > 0.0 && *d <= cur.days));
         // The latest week holds the requests of the last seven days.
         let sp = spend(&store.conn, Window::FourWeeks, NOW, Some("codex"), &tz).unwrap();
         assert!(close(sp.periods[3].cells[0].0, Some(1.5 + 0.2 + 0.01)));

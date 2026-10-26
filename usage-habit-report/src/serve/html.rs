@@ -60,10 +60,13 @@ pub struct Page {
     pub totals: Totals,
     pub models: ModelMatrix,
     pub agents: AgentsReport,
+    /// Subagent share of tokens per month, over all history.
+    pub agent_months: Vec<crate::agents::MonthShare>,
     pub projects: Projects,
     pub sessions: SessionLists,
     pub spend: Spend,
     pub spend_totals: super::data::SpendTotals,
+    pub limit_bands: Vec<crate::value::LimitBands>,
     /// Shown in the footer when a rates file names its fetch time.
     pub rates_fetched_at: Option<String>,
     /// How long the data took to load, for the footer.
@@ -508,93 +511,96 @@ fn models_panel(p: &Page) -> String {
     body
 }
 
-fn mix_table(caption: &str, entries: &[crate::agents::ModelMixEntry]) -> String {
-    const ROWS: usize = 6;
-    let mut s = format!(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{caption}</caption><thead><tr><th scope=\"col\">Model</th><th scope=\"col\">Requests</th><th scope=\"col\">Share</th></tr></thead><tbody>"
-    );
-    if entries.is_empty() {
-        s.push_str("<tr><td class=\"l zero\" colspan=\"3\">No requests.</td></tr>");
+/// Whole percent of a share, "<1 %" for a non-zero share that rounds to 0.
+fn whole_pct(x: Option<f64>) -> String {
+    match x {
+        None => "-".into(),
+        Some(v) if v > 0.0 && v < 0.005 => "&lt;1 %".into(),
+        Some(v) => format!("{:.0} %", v * 100.0),
     }
-    for e in entries.iter().take(ROWS) {
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td></tr>",
-            e.model
-                .as_deref()
-                .map_or("<span class=\"untitled\">no model</span>".into(), esc),
-            fmt_int(e.requests),
-            fmt_pct(Some(e.request_share))
-        );
-    }
-    if entries.len() > ROWS {
-        let rest: i64 = entries[ROWS..].iter().map(|e| e.requests).sum();
-        let share: f64 = entries[ROWS..].iter().map(|e| e.request_share).sum();
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{} more</th><td>{}</td><td>{}</td></tr>",
-            entries.len() - ROWS,
-            fmt_int(rest),
-            fmt_pct(Some(share))
-        );
-    }
-    s.push_str("</tbody></table></div>");
-    s
 }
 
+/// How much of the work went to subagent threads: one row of 20 squares per
+/// tool for the window, or per month over all history, behind the radio
+/// toggle. Squares are the subagent share of tokens.
 fn agents_panel(p: &Page) -> String {
     let a = &p.agents;
-    if a.totals.top_level_sessions == 0 && a.totals.subagent_sessions == 0 {
-        return nothing_here(p);
-    }
-    let t = &a.totals;
-    let mut body = String::from("<div class=\"facts\">");
-    let _ = write!(
-        body,
-        "<p>{} top-level sessions; {} of them spawned subagents, {} subagent sessions in all.</p>",
-        fmt_int(t.top_level_sessions as i64),
-        fmt_int(t.sessions_with_subagents as i64),
-        fmt_int(t.subagent_sessions as i64)
-    );
-    let ts = &a.subagent_token_share;
-    let _ = write!(
-        body,
-        "<p>Subagents spent {} of tokens: {} of {} uncached input plus output tokens.</p>",
-        fmt_pct(ts.share),
-        fmt_int(ts.subagent_tokens),
-        fmt_int(ts.total_tokens)
-    );
-    body.push_str("</div><div class=\"pair\">");
+    let row = |label: String, share: Option<f64>, tool: Option<&str>, sessions: Option<String>| {
+        let on = share.map_or(0, share_units);
+        format!(
+            "<tr><th scope=\"row\">{label}</th><td>{}</td><td class=\"n\">{}</td>{}</tr>",
+            units(on, 20, true, tool),
+            whole_pct(share),
+            sessions.map_or(String::new(), |s| format!("<td class=\"s\">{s}</td>"))
+        )
+    };
+    let of = |part: usize, whole: usize| {
+        format!("{} of {}", fmt_int(part as i64), fmt_int(whole as i64))
+    };
 
-    // Histogram: sessions by number of subagents, count bars scaled to the
-    // largest bucket.
-    let most = a.histogram.iter().map(|b| b.sessions).max().unwrap_or(0);
-    body.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Subagents per session</caption><thead><tr><th scope=\"col\">Subagents</th><th scope=\"col\">Sessions</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Bar</span></th></tr></thead><tbody>");
-    for b in &a.histogram {
-        let on = if most == 0 || b.sessions == 0 {
-            0
-        } else {
-            (b.sessions * 20).div_ceil(most).clamp(1, 20)
-        };
-        let _ = write!(
-            body,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td class=\"bar\">{}</td></tr>",
-            esc(&b.bucket),
-            fmt_int(b.sessions as i64),
-            units(on, 20, false, None)
-        );
+    // By tool, in the page's tool order, then all tools together.
+    let tools: Vec<_> = super::data::TOOLS
+        .iter()
+        .filter_map(|t| a.by_tool.iter().find(|b| b.tool == *t))
+        .filter(|b| b.top_level_sessions > 0)
+        .collect();
+    let mut by_tool = String::new();
+    for b in &tools {
+        by_tool.push_str(&row(
+            tool_name(&b.tool),
+            b.subagent_token_share,
+            Some(&b.tool),
+            Some(of(b.sessions_with_subagents, b.top_level_sessions)),
+        ));
     }
-    body.push_str("</tbody></table></div>");
-    body.push_str("<div class=\"stack\">");
-    body.push_str(&mix_table(
-        "Main-thread requests by model",
-        &a.model_mix.main_thread,
-    ));
-    body.push_str(&mix_table(
-        "Subagent requests by model",
-        &a.model_mix.subagent,
-    ));
-    body.push_str("</div></div>");
+    if tools.len() > 1 {
+        let (sub, total) = tools.iter().fold((0, 0), |(s, t), b| {
+            (s + b.subagent_tokens, t + b.total_tokens)
+        });
+        by_tool.push_str(&row(
+            "All tools".into(),
+            (total > 0).then(|| sub as f64 / total as f64),
+            None,
+            Some(of(
+                a.totals.sessions_with_subagents,
+                a.totals.top_level_sessions,
+            )),
+        ));
+    }
+
+    // By month: the last twelve, so no month name repeats.
+    let months = &p.agent_months[p.agent_months.len().saturating_sub(12)..];
+    let mut by_month = String::new();
+    for m in months {
+        let mut label = super::value_svg::month_abbr(&m.month);
+        if m.partial {
+            label.push_str(", so far");
+        }
+        by_month.push_str(&row(
+            label,
+            (m.total_tokens > 0).then(|| m.subagent_tokens as f64 / m.total_tokens as f64),
+            None,
+            None,
+        ));
+    }
+
+    // Captions, headers and the legend render with no data too, so their
+    // words reach the privacy guard's template vocabulary.
+    let empty = nothing_here(p);
+    let table = |head: &str, rows: &str| {
+        format!(
+            "<div class=\"panel\"><table><thead><tr><th scope=\"col\"><span class=\"sr\">Row</span></th><th scope=\"col\"><span class=\"sr\">Squares</span></th><th scope=\"col\" class=\"n\">tokens</th>{head}</tr></thead><tbody>{rows}</tbody></table>{}</div>",
+            if rows.is_empty() { empty.as_str() } else { "" }
+        )
+    };
+    let mut body = format!(
+        "<figure class=\"chart-fig toggled handoff\"><input type=\"radio\" class=\"sr\" name=\"handoff\" id=\"handoff-tool\" checked><input type=\"radio\" class=\"sr\" name=\"handoff\" id=\"handoff-month\"><figcaption><div class=\"toggle\"><label for=\"handoff-tool\">By tool</label><label for=\"handoff-month\">By month</label></div><p>Share of tokens spent in subagent threads vs main threads. Each square is 5 %. By month covers all history.</p></figcaption>{}{}<p class=\"legend\"><span><i class=\"on\"></i>subagent threads</span><span><i class=\"off\"></i>main threads</span></p></figure>",
+        table(
+            "<th scope=\"col\" class=\"s\">sessions with subagents</th>",
+            &by_tool
+        ),
+        table("", &by_month),
+    );
 
     if p.audience.is_public() {
         // Per-session fan-outs and per-tool coverage notes stay private.
@@ -640,7 +646,7 @@ fn agents_panel(p: &Page) -> String {
         if bt.unlinked_subagent_sessions > 0 {
             let _ = write!(
                 body,
-                "<p>{} {} subagent sessions have no linked parent in this window; their active time counts as separate top-level sessions. They count in the token share but not in the histogram or the fan-outs.</p>",
+                "<p>{} {} subagent sessions have no linked parent in this window; their active time counts as separate top-level sessions. They count in the monthly token share but not in the per-tool rows or the fan-outs.</p>",
                 fmt_int(bt.unlinked_subagent_sessions as i64),
                 tool_name(&bt.tool)
             );
@@ -831,14 +837,6 @@ fn sessions_panel(p: &Page) -> String {
     if sl.longest.is_empty() {
         return nothing_here(p);
     }
-    if p.audience.is_public() {
-        return format!(
-            "<p>{} top-level sessions across {} projects had activity in this window; {} of them spawned subagents. Per-session figures are left out of this export.</p>",
-            fmt_int(p.agents.totals.top_level_sessions as i64),
-            fmt_int(p.projects.count as i64),
-            fmt_int(p.agents.totals.sessions_with_subagents as i64)
-        );
-    }
     let mut body = String::from("<div class=\"stack\">");
     body.push_str(&session_table(p, "Longest, by active time", &sl.longest));
     if sl.costliest.is_empty() {
@@ -896,13 +894,301 @@ fn cache_panel(p: &Page) -> String {
     body
 }
 
+/// Height of the tallest month column, its width, and the space between.
+const STACK_PLOT: f64 = 160.0;
+/// Width the month slots share; the columns fill it whatever their count.
+const STACK_WIDTH: f64 = 720.0;
+/// Months shown; older ones stay in the table below.
+const STACK_MONTHS: usize = 6;
+
+/// Spend by month as stacked columns on one dollar scale, one segment per
+/// tool. The current month adds a dashed outline up to its projection: each
+/// tool's cost so far over its own days of history in the month, scaled to
+/// the whole month.
+fn spend_chart(p: &Page) -> String {
+    let sp = &p.spend;
+    if !sp.by_month {
+        return String::new();
+    }
+    let last = sp.periods.len().saturating_sub(1);
+    let first = sp.periods.len().saturating_sub(STACK_MONTHS);
+    // (label, per-tool costs, projected total for the current month)
+    let months: Vec<_> = sp
+        .periods
+        .iter()
+        .enumerate()
+        .skip(first)
+        .map(|(i, per)| {
+            let costs: Vec<f64> = per.cells.iter().map(|c| c.0.unwrap_or(0.0)).collect();
+            let projected = sp.current.as_ref().filter(|_| i == last).map(|cur| {
+                costs
+                    .iter()
+                    .zip(&cur.covered)
+                    // Under a day of history says little about a month.
+                    .map(|(c, d)| {
+                        if *d >= 1.0 {
+                            c * cur.days / d.min(cur.days)
+                        } else {
+                            *c
+                        }
+                    })
+                    .sum::<f64>()
+            });
+            (per, costs, projected)
+        })
+        .collect();
+    let peak = months
+        .iter()
+        .map(|(_, c, proj)| c.iter().sum::<f64>().max(proj.unwrap_or(0.0)))
+        .fold(0.0, f64::max);
+    if peak <= 0.0 {
+        return String::new();
+    }
+    let h = |usd: f64| STACK_PLOT * usd.max(0.0) / peak;
+    let top = 18.0;
+    let base = top + STACK_PLOT;
+    let slot = STACK_WIDTH / months.len() as f64;
+    let col = (slot * 0.6).min(120.0);
+    let height = base + 40.0;
+    // Whole dollars for both audiences; the table below keeps the detail.
+    let usd = |v: f64| format!("${}", fmt_int(v.round() as i64));
+    let mut desc = Vec::new();
+    let mut body = String::new();
+    for (i, (per, costs, projected)) in months.iter().enumerate() {
+        let mid = (i as f64 + 0.5) * slot;
+        let x = mid - col / 2.0;
+        let total: f64 = costs.iter().sum();
+        let parts = sp
+            .tools
+            .iter()
+            .zip(costs)
+            .filter(|(_, c)| **c > 0.0)
+            .map(|(t, c)| format!("{t} {}", usd(*c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut text = format!("{}: est. {} ({parts})", per.label, usd(total));
+        if let Some(v) = projected {
+            text.push_str(&format!(", on pace for {}", usd(*v)));
+        }
+        let _ = write!(body, "<g><title>{}</title>", esc(&text));
+        desc.push(text);
+        if let Some(v) = projected.filter(|v| *v > total) {
+            let _ = write!(
+                body,
+                "<rect class=\"st-pace\" x=\"{x:.1}\" y=\"{:.1}\" width=\"{col:.1}\" height=\"{:.1}\"/>",
+                base - h(v),
+                h(v) - h(total)
+            );
+        }
+        let mut y = base;
+        for (t, c) in sp.tools.iter().zip(costs) {
+            if *c <= 0.0 {
+                continue;
+            }
+            y -= h(*c);
+            let _ = write!(
+                body,
+                "<rect class=\"st-seg\" data-tool=\"{}\" x=\"{x:.1}\" y=\"{y:.1}\" width=\"{col:.1}\" height=\"{:.1}\"/>",
+                esc(t),
+                h(*c)
+            );
+        }
+        let (label, at) = match projected {
+            Some(v) => (format!("{} pace", usd(*v)), v.max(total)),
+            None => (usd(total), total),
+        };
+        let month = per.label.split(' ').next().unwrap_or(&per.label);
+        let _ = write!(
+            body,
+            "<text class=\"st-value\" x=\"{mid:.1}\" y=\"{:.1}\">{}</text><text class=\"st-month\" x=\"{mid:.1}\" y=\"{:.1}\">{}</text>",
+            base - h(at) - 5.0,
+            esc(&label),
+            base + 16.0,
+            esc(month),
+        );
+        if projected.is_some_and(|v| h(v) - h(total) > 20.0) {
+            let _ = write!(
+                body,
+                "<text class=\"st-value\" x=\"{mid:.1}\" y=\"{:.1}\">{}</text>",
+                base - h(total) - 5.0,
+                usd(total)
+            );
+        }
+        if let Some(cur) = sp.current.as_ref().filter(|_| projected.is_some()) {
+            let so_far = cur.covered.iter().copied().fold(0.0, f64::max);
+            let _ = write!(
+                body,
+                "<text class=\"st-note\" x=\"{mid:.1}\" y=\"{:.1}\">{:.0} of {:.0} days</text>",
+                base + 32.0,
+                so_far,
+                cur.days
+            );
+        }
+        body.push_str("</g>");
+    }
+    let _ = write!(
+        body,
+        "<line class=\"st-base\" x1=\"-4\" x2=\"{:.1}\" y1=\"{base:.1}\" y2=\"{base:.1}\"/>",
+        STACK_WIDTH + 4.0
+    );
+    let key = if sp.tools.len() > 1 {
+        format!(
+            "<p class=\"key\">{}</p>",
+            sp.tools
+                .iter()
+                .map(|t| tool_name(t))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    } else {
+        String::new()
+    };
+    let width = STACK_WIDTH + 8.0;
+    format!(
+        "<figure class=\"chart-fig spend-stack\"><figcaption><p>Each column is a month's use at API list prices, split by tool.{}</p>{key}</figcaption><svg viewBox=\"-4 0 {width:.0} {height:.0}\" role=\"img\" aria-labelledby=\"spend-title spend-desc\"><title id=\"spend-title\">Est. cost by month and tool</title><desc id=\"spend-desc\">{}</desc>{body}</svg></figure>",
+        if sp.current.is_some() {
+            " The dashed outline is where this month ends at each tool's pace so far."
+        } else {
+            ""
+        },
+        esc(&desc.join("; "))
+    )
+}
+
+/// Fewest closed windows a tool needs for a bar.
+const BANDS_MIN_WINDOWS: i64 = 5;
+const BANDS_LABEL: f64 = 120.0;
+const BANDS_PLOT: f64 = 400.0;
+const BANDS_ROW: f64 = 34.0;
+const BAND_NAMES: [&str; 4] = ["under 25 %", "25 to 75 %", "75 to 99 %", "ran out"];
+
+/// Every closed limit window as one bar per tool, split by how full the
+/// window got before it reset. One panel per window length, with the
+/// value page's radio toggle between them.
+fn limits_panel(p: &Page) -> String {
+    let mut panels: Vec<(&str, i64, String)> = Vec::new();
+    for window in ["session", "weekly"] {
+        let rows: Vec<_> = p
+            .limit_bands
+            .iter()
+            .filter(|b| b.window == window && b.windows >= BANDS_MIN_WINDOWS)
+            .collect();
+        let Some(first) = rows.first() else {
+            continue;
+        };
+        let mut svg = String::new();
+        let mut desc = Vec::new();
+        for (i, b) in rows.iter().enumerate() {
+            let y = 8.0 + i as f64 * BANDS_ROW;
+            let out = 100.0 * b.bands[3] as f64 / b.windows as f64;
+            let _ = write!(
+                svg,
+                "<g data-tool=\"{0}\"><text class=\"lb-tool\" x=\"0\" y=\"{1:.1}\">{0}</text>",
+                esc(&b.tool),
+                y + 15.0
+            );
+            let mut x = BANDS_LABEL;
+            for (j, n) in b.bands.iter().enumerate() {
+                let w = BANDS_PLOT * *n as f64 / b.windows as f64;
+                if w > 0.0 {
+                    let _ = write!(
+                        svg,
+                        "<rect class=\"lb-band lb-{j}\" x=\"{x:.1}\" y=\"{y:.1}\" width=\"{w:.1}\" height=\"20\"><title>{}: {n} of {} windows {}</title></rect>",
+                        esc(&b.tool),
+                        b.windows,
+                        BAND_NAMES[j]
+                    );
+                }
+                x += w;
+            }
+            let _ = write!(
+                svg,
+                "<text class=\"lb-value\" x=\"{:.1}\" y=\"{:.1}\"><tspan>{out:.0} %</tspan> ran out</text><text class=\"lb-note\" x=\"720\" y=\"{:.1}\">{} windows</text></g>",
+                BANDS_LABEL + BANDS_PLOT + 16.0,
+                y + 15.0,
+                y + 15.0,
+                fmt_int(b.windows)
+            );
+            desc.push(format!(
+                "{}: {} of {} windows ran out; {}",
+                b.tool,
+                b.bands[3],
+                b.windows,
+                (0..3)
+                    .map(|j| format!("{} {}", b.bands[j], BAND_NAMES[j]))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let height = 8.0 + rows.len() as f64 * BANDS_ROW;
+        panels.push((
+            window,
+            first.window_hours,
+            format!(
+                "<svg viewBox=\"0 0 720 {height:.0}\" role=\"img\" aria-label=\"{}\">{svg}</svg>",
+                esc(&desc.join("; "))
+            ),
+        ));
+    }
+    // The caption and legend render even with no bars, so their words
+    // reach the privacy guard's template vocabulary.
+    let caption = format!(
+        "<p>Each bar is every closed window, by how full it got before it reset. A tool needs {BANDS_MIN_WINDOWS} closed windows for a bar.</p>"
+    );
+    let legend: String = BAND_NAMES
+        .iter()
+        .enumerate()
+        .map(|(j, n)| format!("<span><i class=\"lb-{j}\"></i>{n}</span>"))
+        .collect();
+    let legend = format!("<div class=\"legend lb-legend\">{legend}</div>");
+    if panels.is_empty() {
+        return format!(
+            "<figure class=\"chart-fig limits\"><figcaption>{caption}</figcaption><p class=\"empty\">No tool has {BANDS_MIN_WINDOWS} closed limit windows in this window yet, so none ran out.</p>{legend}</figure>"
+        );
+    }
+    let name = |w: &str, hours: i64| {
+        if w == "weekly" {
+            "Weekly".to_owned()
+        } else {
+            format!("{hours} hr")
+        }
+    };
+    let mut inputs = String::new();
+    let mut labels = String::new();
+    let mut bodies = String::new();
+    for (i, (w, hours, body)) in panels.iter().enumerate() {
+        if panels.len() > 1 {
+            let _ = write!(
+                inputs,
+                "<input type=\"radio\" class=\"sr\" name=\"limits\" id=\"limits-{w}\"{}>",
+                if i == 0 { " checked" } else { "" }
+            );
+            let _ = write!(
+                labels,
+                "<label for=\"limits-{w}\">{}</label>",
+                name(w, *hours)
+            );
+        }
+        let _ = write!(bodies, "<div class=\"panel\">{body}</div>");
+    }
+    let toggle = match panels.as_slice() {
+        [(w, hours, _)] => format!("<p class=\"lb-only\">{}</p>", name(w, *hours)),
+        _ => format!("<div class=\"toggle\">{labels}</div>"),
+    };
+    format!(
+        "<figure class=\"chart-fig toggled limits\">{inputs}<figcaption>{toggle}{caption}</figcaption>{bodies}{legend}</figure>"
+    )
+}
+
 fn spend_panel(p: &Page) -> String {
     let sp = &p.spend;
     if p.totals.total.requests == 0 || sp.periods.is_empty() {
         return nothing_here(p);
     }
     let period = if sp.by_month { "Month" } else { "Week" };
-    let mut body = format!(
+    let mut body = spend_chart(p);
+    let _ = write!(
+        body,
         "<div class=\"table-wrap\"><table class=\"ledger quiet\"><thead><tr><th scope=\"col\">{period}</th>"
     );
     for t in &sp.tools {
@@ -939,7 +1225,31 @@ fn spend_panel(p: &Page) -> String {
             fmt_int(all.1)
         );
     }
+    if p.audience.is_public() {
+        body.push_str(&cache_sentence(p));
+    }
     body
+}
+
+/// One line on prompt caching for the public spend section, which stands in
+/// for the private cache-read table: the all-tools share, then each tool's.
+fn cache_sentence(p: &Page) -> String {
+    let t = &p.totals;
+    let pct = |k: &Tokens| whole_pct(super::data::cache_read_ratio(k));
+    let per_tool: Vec<String> = t
+        .by_tool
+        .iter()
+        .map(|r| format!("{} {}", tool_name(&r.tool), pct(&r.tokens)))
+        .collect();
+    let per_tool = if t.by_tool.len() > 1 {
+        format!(" ({})", and_list(&per_tool))
+    } else {
+        String::new()
+    };
+    format!(
+        "<p class=\"note\">{} of input tokens were cache reads{per_tool}, priced at the cheaper cache rate.</p>",
+        pct(&t.total)
+    )
 }
 
 /// The ticket 10 panels, in the order docs/design.md gives.
@@ -962,7 +1272,7 @@ fn panels(p: &Page) -> String {
     ));
     s.push_str(&section(
         "agents",
-        "Multi-agent habit",
+        "How much of my work I hand to subagents",
         &format!(
             "{scope} Tokens are uncached input plus output. Figures match <code>query agents{since}</code>{}.",
             tool_rows("row of by_tool")
@@ -983,43 +1293,59 @@ fn panels(p: &Page) -> String {
         ),
         &projects_panel(p),
     ));
-    s.push_str(&section(
-        "sessions",
-        if p.audience.is_public() { "Sessions" } else { "Longest and costliest sessions" },
-        &if p.audience.is_public() {
-            format!("{scope} Counts match <code>query agents{since}</code> and <code>query projects{since}</code>.")
-        } else {
-            format!(
+    // Public pages leave these out: the session counts sit in the subagent
+    // rows and the project footnote, and the cache share is one sentence
+    // under spend.
+    if !p.audience.is_public() {
+        s.push_str(&section(
+            "sessions",
+            "Longest and costliest sessions",
+            &format!(
                 "{scope} Top-level sessions with a request in the window. Active time covers the whole session and its linked children; requests and cost count its own requests in the window, as <code>query session &lt;id&gt;{since}</code> does. Titles are the first line of the opening prompt."
-            )
-        },
-        &sessions_panel(p),
-    ));
-    s.push_str(&section(
-        "cache",
-        "Cache-read ratio",
-        &format!(
-            "{scope} Cache-read tokens as a share of all input: uncached, cache read and cache write. Same figures as the estimated API cost section."
-        ),
-        &cache_panel(p),
-    ));
+            ),
+            &sessions_panel(p),
+        ));
+        s.push_str(&section(
+            "cache",
+            "Cache-read ratio",
+            &format!(
+                "{scope} Cache-read tokens as a share of all input: uncached, cache read and cache write. Same figures as the estimated API cost section."
+            ),
+            &cache_panel(p),
+        ));
+    }
     s.push_str(&section(
         "spend",
-        if p.spend.by_month {
-            "Spend by month"
-        } else {
-            "Spend by week"
+        match (p.audience.is_public(), p.spend.by_month) {
+            (true, true) => "What my use would cost at API prices, by month",
+            (true, false) => "What my use would cost at API prices, by week",
+            (false, true) => "Spend by month",
+            (false, false) => "Spend by week",
         },
         &format!(
-            "{scope} Estimated cost {}. {}",
+            "{scope} Estimated cost {}{}. {}",
             if p.spend.by_month {
                 "by local calendar month"
             } else {
                 "by week, counted back from now"
             },
+            if p.audience.is_public() {
+                format!(", at API list prices; the total row matches <code>{}</code>", match p.window.since_arg() {
+                    Some(a) => format!("query summary --since {a}"),
+                    None => "query summary".to_string(),
+                })
+            } else {
+                String::new()
+            },
             if p.audience.is_public() { "Figures are rounded independently to the nearest dollar; displayed rows may not add up." } else { "Each column adds up to the estimated API cost." }
         ),
         &spend_panel(p),
+    ));
+    s.push_str(&section(
+        "limits",
+        "How often I exhaust a window limit",
+        &format!("{scope} Closed windows of each plan's own limits; pools are left out."),
+        &limits_panel(p),
     ));
     s
 }
@@ -1083,7 +1409,10 @@ pub fn render(p: &Page) -> String {
         }
         None => format!("Same window. The total row matches <code>{cmd}</code>."),
     };
-    s.push_str(&section("totals", "Estimated API cost", &note, &totals(p)));
+    // The public page folds these figures into spend by week.
+    if !p.audience.is_public() {
+        s.push_str(&section("totals", "Estimated API cost", &note, &totals(p)));
+    }
     s.push_str(&panels(p));
     s.push_str("</main>\n<footer>\n<p>");
     let _ = write!(

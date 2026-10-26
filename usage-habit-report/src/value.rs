@@ -55,7 +55,11 @@ const RESET_CREDIT_SLACK_MS: i64 = 15 * 60 * 1000;
 /// concurrent session's reading.
 const STALE_BALANCE_MS: i64 = 60 * 60 * 1000;
 /// Drift endpoints need at least this many runs in their month.
-const DRIFT_MIN_RUNS: i64 = 3;
+pub const DRIFT_MIN_RUNS: i64 = 3;
+/// A session-to-week share needs at least this many session windows.
+pub const SHARE_MIN_WINDOWS: i64 = 3;
+/// A window counts toward a model when the model has this share of its cost.
+pub const MODEL_WINDOW_SHARE: f64 = 0.8;
 
 /// Monthly price and name of the plan behind each tool.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -116,6 +120,19 @@ impl Capacity {
             reference_cost_usd: mean_of(items.iter().map(|c| c.reference_cost_usd)),
         })
     }
+}
+
+/// What a full window held at list prices when one model did most of the
+/// work in it: the limit read model by model.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelWindow {
+    pub model: String,
+    /// Full windows where this model had at least `MODEL_WINDOW_SHARE` of
+    /// the estimated cost, and every request was priced.
+    pub windows: i64,
+    pub median_cost_usd: f64,
+    pub min_cost_usd: f64,
+    pub max_cost_usd: f64,
 }
 
 /// One rise of a window's used share, with the requests that caused it.
@@ -188,6 +205,9 @@ pub struct Utilization {
     /// Falls of the share, with a later reset time, before the window's
     /// reset time: a reset credit or a reset granted by the provider.
     pub mid_window_resets: i64,
+    /// Closed windows by how full they got: under 25 %, 25 to 75 %, 75 % to
+    /// just under the limit, and out (100 % or a refusal).
+    pub peak_bands: [i64; 4],
     pub by_month: Vec<UtilizationMonth>,
 }
 
@@ -206,6 +226,8 @@ pub struct WindowEstimate {
     pub per_window: Option<Capacity>,
     /// Every qualifying run, by the month it started in.
     pub drift: Vec<DriftPoint>,
+    /// Every qualifying run, by the model that did most of its work.
+    pub by_model: Vec<ModelWindow>,
     /// When no run exists: the busiest whole window seen, which did not
     /// exhaust the limit, so the true capacity is at least this much.
     pub lower_bound: Option<Capacity>,
@@ -259,6 +281,22 @@ pub struct Pace {
     pub multiple: Option<f64>,
 }
 
+/// How much of a weekly window one full session window uses, read from
+/// paired readings of the two: within each session window, the weekly
+/// share's rise over the session share's rise.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionShare {
+    /// The session window's pool; null for the plan's window.
+    pub session_pool: Option<String>,
+    /// The weekly window's pool; null for the plan's window.
+    pub weekly_pool: Option<String>,
+    /// Session windows that rose at least `MIN_RISE_PERCENT`.
+    pub windows: i64,
+    /// Weekly percent per 100 % of session, pooled over `windows`; null
+    /// below `SHARE_MIN_WINDOWS`.
+    pub weekly_percent: Option<f64>,
+}
+
 /// The Codex credit balance over time.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CreditUse {
@@ -298,6 +336,8 @@ pub struct ToolValue {
     pub last_request: Option<String>,
     pub pace: Option<Pace>,
     pub credits: Option<CreditUse>,
+    /// One per session window paired with a weekly window it counts toward.
+    pub session_shares: Vec<SessionShare>,
 }
 
 /// All plans together, at their recent pace.
@@ -634,6 +674,9 @@ fn runs_of(samples: &[Sample], window_len_ms: i64) -> Vec<(i64, i64, f64, f64, i
             Some(c) => {
                 s.used_percent < c.max - 0.5
                     || s.ts_ms - c.last_ts > window_len_ms
+                    // One window never lasts longer than its length, even
+                    // when readings carry no reset time to split on.
+                    || s.ts_ms - c.start > window_len_ms + RESET_TOLERANCE_MS
                     || !same_reset(c.reset, s.resets_at_ms)
             }
         };
@@ -767,6 +810,17 @@ fn utilization(
     };
     let all: Vec<_> = by_reset.iter().collect();
     let (windows, exhausted_n, cut_short, mean_peak) = summarise(&all);
+    let mut peak_bands = [0; 4];
+    for w in &by_reset {
+        let band = match w.1 {
+            _ if exhausted(w) => 3,
+            Some(p) if p < 25.0 => 0,
+            Some(p) if p < 75.0 => 1,
+            Some(_) => 2,
+            None => continue,
+        };
+        peak_bands[band] += 1;
+    }
     let mut months: BTreeMap<String, Vec<&WindowPeak>> = BTreeMap::new();
     for w in &by_reset {
         months
@@ -780,6 +834,7 @@ fn utilization(
         cut_short,
         mean_peak_percent: mean_peak,
         mid_window_resets: resets.len() as i64,
+        peak_bands,
         by_month: months
             .into_iter()
             .map(|(month, ws)| {
@@ -794,6 +849,52 @@ fn utilization(
             })
             .collect(),
     })
+}
+
+/// How full one tool's plan-wide limit windows of one length got.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LimitBands {
+    pub tool: String,
+    /// `session` or `weekly`.
+    pub window: String,
+    pub window_hours: i64,
+    /// Closed windows counted.
+    pub windows: i64,
+    /// As [`Utilization::peak_bands`].
+    pub bands: [i64; 4],
+}
+
+/// Peak bands of each tool's plan-wide windows, from readings taken since
+/// `since_ms` (all of them when `None`). Pools are left out: their
+/// windows sit inside the plan's.
+pub fn limit_bands(
+    conn: &Connection,
+    tools: &[&str],
+    since_ms: Option<i64>,
+    now_ms: i64,
+    tz: &impl TimeZone,
+) -> Result<Vec<LimitBands>> {
+    let mut out = Vec::new();
+    for window in ["session", "weekly"] {
+        let len = window_ms(window);
+        for tool in tools {
+            let (mut samples, _) = samples(conn, tool, window, "")?;
+            if let Some(since) = since_ms {
+                samples.retain(|s| s.ts_ms >= since);
+            }
+            let resets = mid_window_resets(&samples);
+            if let Some(u) = utilization(&samples, len, &resets, now_ms, tz) {
+                out.push(LimitBands {
+                    tool: (*tool).to_owned(),
+                    window: window.to_owned(),
+                    window_hours: len / 3_600_000,
+                    windows: u.peak_bands.iter().sum(),
+                    bands: u.peak_bands,
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Credit balance changes from the logged Codex readings, and the time spans
@@ -959,6 +1060,7 @@ fn window_estimate(
     let (samples, live) = samples(conn, tool, spec.window, spec.pool.unwrap_or(""))?;
     let mut runs = Vec::new();
     let mut by_month: BTreeMap<String, (Vec<Capacity>, Acc)> = BTreeMap::new();
+    let mut model_costs: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
     for (start, end, from, to, readings) in runs_of(&samples, len) {
         let rise = to - from;
         if rise < MIN_RISE_PERCENT {
@@ -972,6 +1074,17 @@ fn window_estimate(
             continue;
         }
         let per_window = acc.capacity(100.0 / rise);
+        let total: f64 = acc.by_model.values().map(|m| m.1).sum();
+        if acc.t.unpriced_requests == 0
+            && total > 0.0
+            && let Some(cost) = per_window.estimated_cost_usd
+            && let Some((&m, _)) = acc
+                .by_model
+                .iter()
+                .find(|(_, v)| v.1 / total >= MODEL_WINDOW_SHARE)
+        {
+            model_costs.entry(m).or_default().push(cost);
+        }
         let month = by_month.entry(month_key(start, tz)).or_default();
         month.0.push(per_window.clone());
         for r in reqs.iter().filter(|r| spec.scope.covers(r)) {
@@ -1010,6 +1123,20 @@ fn window_estimate(
             })
         })
         .collect();
+    let mut by_model: Vec<ModelWindow> = model_costs
+        .into_iter()
+        .map(|(m, mut costs)| {
+            costs.sort_by(f64::total_cmp);
+            ModelWindow {
+                model: data.models[m as usize].clone(),
+                windows: costs.len() as i64,
+                median_cost_usd: median(&costs),
+                min_cost_usd: costs[0],
+                max_cost_usd: costs[costs.len() - 1],
+            }
+        })
+        .collect();
+    by_model.sort_by(|a, b| b.windows.cmp(&a.windows).then(a.model.cmp(&b.model)));
     runs.sort_by(|a, b| {
         b.rise_percent
             .total_cmp(&a.rise_percent)
@@ -1033,6 +1160,7 @@ fn window_estimate(
             runs,
             per_window,
             drift,
+            by_model,
             lower_bound,
             pool: spec.pool.map(str::to_owned),
             models: spec.models.clone(),
@@ -1284,6 +1412,7 @@ fn tool_value(
         windows.push(w);
     }
     resets.sort_unstable();
+    let session_shares = session_shares(conn, tool, &pools, &pool_names, &data)?;
     let (credits, funded) = match credits(conn, tool, &resets, &data)? {
         Some((c, spans)) => (Some(c), spans),
         None => (None, Vec::new()),
@@ -1314,9 +1443,171 @@ fn tool_value(
         last_request: data.reqs.last().map(|r| rfc3339(r.ts)),
         pace: pace(&data, subscription.monthly_usd, &funded, now_ms),
         credits,
+        session_shares,
         months,
         subscription,
     })
+}
+
+/// Pair each session window with the weekly window it counts toward: the
+/// weekly window of its own pool, or the plan's. A weekly pool with no
+/// session window of its own (Claude's Fable) pairs with the plan's session,
+/// which also fills with other models, so each window's session rise is cut
+/// to the pool's share of that window's estimated cost: the figure is for a
+/// session spent on the pool's models alone.
+fn session_shares(
+    conn: &Connection,
+    tool: &str,
+    pools: &[(String, String)],
+    pool_names: &[String],
+    data: &Data,
+) -> Result<Vec<SessionShare>> {
+    let has = |pool: &str, window: &str| pools.iter().any(|p| p.0 == pool && p.1 == window);
+    let mut pairs = vec![(String::new(), String::new())];
+    for (pool, window) in pools {
+        if window == "session" {
+            let weekly = if has(pool, "weekly") {
+                pool.clone()
+            } else {
+                String::new()
+            };
+            pairs.push((pool.clone(), weekly));
+        } else if !has(pool, "session") {
+            pairs.push((String::new(), pool.clone()));
+        }
+    }
+    let mut out = Vec::new();
+    for (sp, wp) in pairs {
+        let mut stmt = conn.prepare_cached(
+            "SELECT s.ts_ms, s.used_percent, s.resets_at_ms, w.used_percent, w.resets_at_ms
+                 FROM limit_samples s JOIN limit_samples w
+                 ON w.tool = s.tool AND w.source_id = s.source_id AND w.ts_ms = s.ts_ms
+                    AND w.window = 'weekly' AND w.kind = 'reading'
+                 WHERE s.tool = ?1 AND s.window = 'session' AND s.kind = 'reading'
+                    AND ?2 = '' AND ?3 = ''
+             UNION ALL
+             SELECT s.ts_ms, s.used_percent, s.resets_at_ms, w.used_percent, w.resets_at_ms
+                 FROM live_limits s JOIN live_limits w
+                 ON w.tool = s.tool AND w.ts_ms = s.ts_ms AND w.window = 'weekly' AND w.pool = ?3
+                 WHERE s.tool = ?1 AND s.window = 'session' AND s.pool = ?2
+             ORDER BY 1",
+        )?;
+        let rows: Vec<PairedReading> = stmt
+            .query_map(params![tool, sp, wp], |r| {
+                Ok(PairedReading {
+                    ts: r.get(0)?,
+                    session: r.get(1)?,
+                    session_reset: r.get(2)?,
+                    weekly: r.get(3)?,
+                    weekly_reset: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if rows.is_empty() {
+            continue;
+        }
+        let (windows, weekly_percent) = if sp.is_empty() && !wp.is_empty() {
+            let scope = Scope {
+                models: Some(pool_models(&wp, pool_names, &data.models)),
+            };
+            share_of(&rows, |start, end| {
+                pool_cost_share(data, &scope, start, end)
+            })
+        } else {
+            share_of(&rows, |_, _| Some(1.0))
+        };
+        out.push(SessionShare {
+            session_pool: (!sp.is_empty()).then_some(sp),
+            weekly_pool: (!wp.is_empty()).then_some(wp),
+            windows,
+            weekly_percent: weekly_percent.filter(|_| windows >= SHARE_MIN_WINDOWS),
+        });
+    }
+    Ok(out)
+}
+
+/// The pool's share of the estimated cost of requests from `start` to
+/// `end`; null when none of them is priced.
+fn pool_cost_share(data: &Data, scope: &Scope, start: i64, end: i64) -> Option<f64> {
+    let from = data.reqs.partition_point(|r| r.ts < start);
+    let to = data.reqs.partition_point(|r| r.ts <= end);
+    let (mut pool, mut all) = (0.0, 0.0);
+    for r in &data.reqs[from..to] {
+        let c = r.cost.unwrap_or(0.0);
+        all += c;
+        if scope.covers(r) {
+            pool += c;
+        }
+    }
+    (all > 0.0).then(|| pool / all)
+}
+
+/// A session reading and the weekly reading taken with it.
+struct PairedReading {
+    ts: i64,
+    session: f64,
+    session_reset: Option<i64>,
+    weekly: f64,
+    weekly_reset: Option<i64>,
+}
+
+/// (windows, weekly percent per full session) from time-ordered paired
+/// readings. Readings are grouped by their two reset times, so a reset
+/// bought mid-window starts a new group; the rise of each share is its
+/// highest reading less its lowest, which also absorbs stale readings from
+/// concurrent sessions. `weight(start, end)` scales a window's session rise
+/// to the part spent on the weekly window's models; a null weight drops it.
+fn share_of(
+    rows: &[PairedReading],
+    weight: impl Fn(i64, i64) -> Option<f64>,
+) -> (i64, Option<f64>) {
+    struct Group {
+        session_reset: i64,
+        weekly_reset: i64,
+        session: (f64, f64),
+        weekly: (f64, f64),
+        first: i64,
+        last: i64,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for r in rows {
+        let (Some(sr), Some(wr)) = (r.session_reset, r.weekly_reset) else {
+            continue;
+        };
+        // Concurrent sessions interleave, so look back over recent groups.
+        let found = groups.iter_mut().rev().take(8).find(|g| {
+            (g.session_reset - sr).abs() <= RESET_TOLERANCE_MS
+                && (g.weekly_reset - wr).abs() <= RESET_TOLERANCE_MS
+        });
+        match found {
+            Some(g) => {
+                g.session = (g.session.0.min(r.session), g.session.1.max(r.session));
+                g.weekly = (g.weekly.0.min(r.weekly), g.weekly.1.max(r.weekly));
+                g.first = g.first.min(r.ts);
+                g.last = g.last.max(r.ts);
+            }
+            None => groups.push(Group {
+                session_reset: sr,
+                weekly_reset: wr,
+                session: (r.session, r.session),
+                weekly: (r.weekly, r.weekly),
+                first: r.ts,
+                last: r.ts,
+            }),
+        }
+    }
+    let rises: Vec<(f64, f64)> = groups
+        .iter()
+        .map(|g| (g, g.session.1 - g.session.0))
+        .filter(|(_, rise)| *rise >= MIN_RISE_PERCENT)
+        .filter_map(|(g, rise)| Some((rise * weight(g.first, g.last)?, g.weekly.1 - g.weekly.0)))
+        .collect();
+    let session: f64 = rises.iter().map(|r| r.0).sum();
+    let weekly: f64 = rises.iter().map(|r| r.1).sum();
+    (
+        rises.len() as i64,
+        (session > 0.0).then(|| 100.0 * weekly / session),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1918,6 +2209,24 @@ mod tests {
     }
 
     #[test]
+    fn runs_never_outlast_their_window() {
+        let samples = vec![
+            s(0, 10.0, None),
+            s(2 * HOUR, 20.0, None),
+            s(4 * HOUR, 30.0, None),
+            s(6 * HOUR, 40.0, None),
+            s(7 * HOUR, 50.0, None),
+        ];
+        assert_eq!(
+            runs_of(&samples, SESSION_WINDOW_MS),
+            vec![
+                (0, 4 * HOUR, 10.0, 30.0, 3),
+                (6 * HOUR, 7 * HOUR, 40.0, 50.0, 2)
+            ]
+        );
+    }
+
+    #[test]
     fn rejections_span_a_whole_window_once() {
         let reject = |ts_ms, reset| Sample {
             ts_ms,
@@ -2054,6 +2363,8 @@ mod tests {
         // The first window was reset early, so only the second counts.
         assert_eq!(u.cut_short, 1);
         assert_eq!(u.mean_peak_percent, Some(25.0));
+        // Both windows peaked between 25 and 75 %, early reset or not.
+        assert_eq!(u.peak_bands, [0, 2, 0, 0]);
         let sp = session.spread.as_ref().unwrap();
         assert_eq!(
             (sp.tokens_min, sp.tokens_median, sp.tokens_max),
@@ -2346,6 +2657,7 @@ mod tests {
             qualifying_runs: 10,
             runs: vec![],
             per_window: None,
+            by_model: vec![],
             drift: vec![
                 point("2026-05", cap(26.0, 20.0, 27e6), "gpt-5.5"),
                 DriftPoint {
@@ -2378,6 +2690,7 @@ mod tests {
             last_request: None,
             pace: None,
             credits: None,
+            session_shares: vec![],
         };
         let s = drift_sentence(&t, &w).unwrap();
         assert!(
@@ -2399,6 +2712,39 @@ mod tests {
             drift_sentence(&t, &w).is_none(),
             "one solid month is not a trend"
         );
+    }
+
+    #[test]
+    fn session_share_pools_the_weekly_rise_of_each_session_window() {
+        let r = |session, sr, weekly, wr| PairedReading {
+            ts: sr,
+            session,
+            session_reset: Some(sr),
+            weekly,
+            weekly_reset: Some(wr),
+        };
+        let week = 900_000_000;
+        let rows = [
+            // One window: 0 to 50 % of session, 10 to 18 % of week.
+            r(0.0, 1_000, 10.0, week),
+            r(20.0, 1_000, 13.0, week),
+            // A stale reading from a concurrent session changes nothing.
+            r(10.0, 1_000, 11.0, week),
+            r(50.0, 1_000, 18.0, week),
+            // The next window: 0 to 100 %, 18 to 34 %.
+            r(0.0, 20_000_000, 18.0, week),
+            r(100.0, 20_000_000, 34.0, week),
+            // Too small a rise to count.
+            r(0.0, 40_000_000, 34.0, week),
+            r(5.0, 40_000_000, 35.0, week),
+        ];
+        let (windows, share) = share_of(&rows, |_, _| Some(1.0));
+        assert_eq!(windows, 2);
+        assert!((share.unwrap() - 100.0 * 24.0 / 150.0).abs() < 1e-9);
+        // A pool that took half of every window's cost fills twice as fast
+        // when a session is spent on it alone.
+        let (_, half) = share_of(&rows, |_, _| Some(0.5));
+        assert!((half.unwrap() - 2.0 * share.unwrap()).abs() < 1e-9);
     }
 
     #[test]

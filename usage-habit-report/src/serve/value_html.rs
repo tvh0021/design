@@ -6,7 +6,7 @@
 use super::data::StoreFacts;
 use super::html::{Audience, CSS, esc, fmt_int, section, units};
 use crate::value::{
-    self, Capacity, Finding, MonthValue, Run, ToolValue, Utilization, ValueReport, WindowEstimate,
+    self, Capacity, Finding, MonthValue, Run, ToolValue, ValueReport, WindowEstimate,
 };
 use std::fmt::Write;
 
@@ -77,7 +77,7 @@ impl ValuePage {
     /// "$1,305" in the public export, "$1,305.27" locally.
     pub(super) fn usd(&self, cost: Option<f64>) -> String {
         let Some(c) = cost else {
-            return "-".into();
+            return NO_DATA.into();
         };
         if self.audience.is_public() {
             return value::dollars(c);
@@ -103,12 +103,20 @@ fn fmt_tokens(n: f64) -> String {
     }
 }
 
-fn fmt_x(x: Option<f64>) -> String {
-    x.map_or("-".into(), |x| format!("{x:.1}x"))
+/// The mark for a cell with too little data to fill, explained by
+/// [`noted`] under its table.
+const NO_DATA: &str = "*";
+
+/// `tables` with a "not enough data" note when any cell holds [`NO_DATA`].
+fn noted(mut tables: String) -> String {
+    if tables.contains("*</td>") {
+        tables.push_str("<p class=\"note\">* Not enough data.</p>");
+    }
+    tables
 }
 
-fn fmt_pct(x: Option<f64>) -> String {
-    x.map_or("-".into(), |x| format!("{x:.0} %"))
+fn fmt_x(x: Option<f64>) -> String {
+    x.map_or(NO_DATA.into(), |x| format!("{x:.1}x"))
 }
 
 fn tool_name(tool: &str) -> String {
@@ -129,17 +137,6 @@ fn bar(v: Option<f64>, max: f64, tool: &str) -> String {
     }
 }
 
-/// A share bar: a percentage as 20 units of 5 %, with the unfilled track.
-fn share_bar(pct: Option<f64>, tool: &str) -> String {
-    match pct {
-        Some(p) => {
-            let n = (p / 5.0).round().clamp(0.0, 20.0) as usize;
-            units(n.max(usize::from(p > 0.0)), 20, true, Some(tool))
-        }
-        None => String::new(),
-    }
-}
-
 fn token_total(u: &crate::query::Tokens) -> f64 {
     (u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens)
         as f64
@@ -152,12 +149,12 @@ fn price(t: &ToolValue, p: &ValuePage) -> String {
     }
 }
 
-/// "5 h", "weekly", "Fable pool, weekly".
+/// "5 hr", "weekly", "Fable pool, weekly".
 fn window_name(w: &WindowEstimate) -> String {
     let base = if w.window == "weekly" {
         "weekly".to_string()
     } else {
-        format!("{} h", w.window_hours)
+        format!("{} hr", w.window_hours)
     };
     match &w.pool {
         Some(pool) => format!("{pool} pool, {base}"),
@@ -166,7 +163,7 @@ fn window_name(w: &WindowEstimate) -> String {
 }
 
 /// "Weekly" for a caption that opens with the window's name.
-fn capitalised(s: &str) -> String {
+pub(super) fn capitalised(s: &str) -> String {
     let mut c = s.chars();
     c.next()
         .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
@@ -203,23 +200,19 @@ fn finding(text: &str, tools: &[ToolValue]) -> String {
 fn summary(p: &ValuePage) -> String {
     let r = &p.report;
     let mut s = String::from("<div class=\"facts\">");
-    // The combined headline, pools and live limits lead; each tool's own
-    // headline repeats the table below, and the rest sit by their tables.
+    // Pools and live limits lead; the headlines repeat the figure and the
+    // table below, and the rest sit by their tables.
     for (kind, f) in value::tagged_findings(r) {
-        let per_tool = r
-            .tools
-            .iter()
-            .any(|t| f.starts_with(&format!("{}:", t.tool)));
-        if matches!(kind, Finding::Pool | Finding::Now) || (kind == Finding::Headline && !per_tool)
-        {
+        if matches!(kind, Finding::Pool | Finding::Now) {
             s.push_str(&finding(&f, &r.tools));
         }
     }
     s.push_str("</div>");
     s.push_str(&super::value_svg::value_squares(p));
+    let mut table = String::new();
     let _ = write!(
-        s,
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 h</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
+        table,
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 hr</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
         r.pace_days
     );
     for t in &r.tools {
@@ -227,14 +220,14 @@ fn summary(p: &ValuePage) -> String {
             Some(w) => match (&w.per_window, &w.lower_bound) {
                 (Some(c), _) => p.usd(c.estimated_cost_usd),
                 (None, Some(b)) => format!("&ge; {}", p.usd(b.estimated_cost_usd)),
-                (None, None) => "-".into(),
+                (None, None) => NO_DATA.into(),
             },
-            None => "-".into(),
+            None => NO_DATA.into(),
         };
         let pace = t.pace.as_ref();
         let multiple = pace.and_then(|p| p.multiple);
         let _ = write!(
-            s,
+            table,
             "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             tool_name(&t.tool),
             esc(&t.subscription.name),
@@ -243,22 +236,73 @@ fn summary(p: &ValuePage) -> String {
             fmt_x(multiple),
             cell(value::main_window(t, "session")),
             cell(value::main_window(t, "weekly")),
-            pace.map_or("-".into(), |p| format!("{:.0}", p.days)),
+            pace.map_or(NO_DATA.into(), |p| format!("{:.0}", p.days)),
         );
     }
     let c = &r.combined;
     let _ = write!(
-        s,
+        table,
         "<tr class=\"total\"><th scope=\"row\">All plans</th><td class=\"l\">{} plans</td><td>{}</td><td>{}</td><td>{}</td><td></td><td></td><td></td></tr>",
         c.plans,
         p.usd(Some(c.monthly_usd)),
         p.usd(c.pace_monthly_cost_usd),
         fmt_x(c.pace_multiple)
     );
-    s.push_str("</tbody></table></div>");
+    table.push_str("</tbody></table></div>");
+    s.push_str(&noted(table));
     if r.tools.iter().flat_map(|t| &t.windows).any(lower_bound) {
         s.push_str(LOWER_BOUND_NOTE);
     }
+    s.push_str(&session_shares(&r.tools));
+    s
+}
+
+/// Weekly limit over session limit: how many full sessions one week holds.
+fn session_shares(tools: &[value::ToolValue]) -> String {
+    let rows: Vec<_> = tools
+        .iter()
+        .flat_map(|t| t.session_shares.iter().map(move |s| (t, s)))
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Weekly limit / session limit</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Limit</th><th scope=\"col\">Sessions a week</th><th scope=\"col\">One session uses</th><th scope=\"col\">Sessions measured</th></tr></thead><tbody>",
+    );
+    let mut pool_only = false;
+    for (t, sh) in rows {
+        let limit = match (&sh.session_pool, &sh.weekly_pool) {
+            (Some(p), _) => format!("{p} pool"),
+            (None, Some(w)) => {
+                pool_only = true;
+                format!("{w} weekly, {w} use only")
+            }
+            (None, None) => "Plan".to_owned(),
+        };
+        let (ratio, share) = match sh.weekly_percent.filter(|v| *v > 0.0) {
+            Some(v) => (format!("{:.1}", 100.0 / v), format!("{v:.0} % of the week")),
+            None => (NO_DATA.into(), NO_DATA.into()),
+        };
+        let _ = write!(
+            s,
+            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{ratio}</td><td>{share}</td><td>{}</td></tr>",
+            tool_name(&t.tool),
+            esc(&limit),
+            sh.windows
+        );
+    }
+    s.push_str("</tbody></table></div>");
+    let mut s = noted(s);
+    let _ = write!(
+        s,
+        "<p class=\"note\">Measured from session and weekly readings taken together, over 5-hour sessions that used at least {:.0} % of their limit. {}</p>",
+        value::MIN_RISE_PERCENT,
+        if pool_only {
+            " A pool with only a weekly limit shares the plan's session limit with other models, so each session counts only the pool's share of its cost."
+        } else {
+            ""
+        }
+    );
     s
 }
 
@@ -267,63 +311,6 @@ fn lower_bound(w: &WindowEstimate) -> bool {
 }
 
 const LOWER_BOUND_NOTE: &str = "<p class=\"note\">&ge; marks a window never seen full: the busiest window of that length, a lower bound.</p>";
-
-fn latest_cell(w: &WindowEstimate) -> String {
-    match &w.latest {
-        Some(l) => format!("{:.0} % on {}", l.used_percent, esc(value::date_of(&l.at))),
-        None => "-".into(),
-    }
-}
-
-fn windows_table(p: &ValuePage, t: &ToolValue) -> String {
-    let mut s = String::from(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Per full window</caption><thead><tr><th scope=\"col\">Window</th><th scope=\"col\">Runs</th><th scope=\"col\">Tokens</th><th scope=\"col\">Requests</th><th scope=\"col\">Sessions</th><th scope=\"col\">Est. cost</th><th scope=\"col\">Range</th><th scope=\"col\">Last reading</th></tr></thead><tbody>",
-    );
-    for w in &t.windows {
-        let row = |runs: String, c: &Capacity, prefix: &str, range: String| {
-            format!(
-                "<tr><th scope=\"row\">{}</th><td>{runs}</td><td>{prefix}{}</td><td>{prefix}{}</td><td>{prefix}{:.1}</td><td>{prefix}{}</td><td>{range}</td><td>{}</td></tr>",
-                esc(&window_name(w)),
-                fmt_tokens(c.tokens),
-                fmt_int(c.requests.round() as i64),
-                c.sessions,
-                p.usd(c.estimated_cost_usd),
-                latest_cell(w)
-            )
-        };
-        match (&w.per_window, &w.lower_bound) {
-            (Some(c), _) => {
-                let range = match w
-                    .spread
-                    .as_ref()
-                    .and_then(|s| Some((s.cost_min?, s.cost_max?)))
-                {
-                    Some((lo, hi)) if w.runs.len() > 1 => {
-                        format!("{} to {}", p.usd(Some(lo)), p.usd(Some(hi)))
-                    }
-                    _ => "-".into(),
-                };
-                s.push_str(&row(
-                    format!("{} of {}", w.runs.len(), w.qualifying_runs),
-                    c,
-                    "",
-                    range,
-                ));
-            }
-            (None, Some(b)) => s.push_str(&row("busiest".into(), b, "&ge; ", "-".into())),
-            (None, None) => {
-                let _ = write!(
-                    s,
-                    "<tr><th scope=\"row\">{}</th><td colspan=\"6\" class=\"zero\">no requests</td><td>{}</td></tr>",
-                    esc(&window_name(w)),
-                    latest_cell(w)
-                );
-            }
-        }
-    }
-    s.push_str("</tbody></table></div>");
-    s
-}
 
 fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) -> String {
     if w.runs.is_empty() {
@@ -353,156 +340,43 @@ fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) ->
     s
 }
 
-fn drift_table(p: &ValuePage, t: &ToolValue, w: &WindowEstimate) -> String {
-    if w.drift.len() < 2 {
-        return String::new();
-    }
-    let mut s = String::new();
-    if let Some(d) = value::drift_sentence(t, w) {
-        let _ = write!(s, "<p>{}</p>", esc(&d));
-    }
-    let reference = esc(t.reference_model.as_deref().unwrap_or("one model's"));
-    let max = w
-        .drift
-        .iter()
-        .flat_map(|d| {
-            [
-                d.per_window.estimated_cost_usd,
-                d.per_window.reference_cost_usd,
-            ]
-        })
-        .flatten()
-        .fold(0.0, f64::max);
-    let _ = write!(
-        s,
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{} window by month</caption><thead><tr><th scope=\"col\">Month</th><th scope=\"col\">Runs</th><th scope=\"col\" class=\"l\">Main model</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Est. cost, as a bar</span></th><th scope=\"col\">At {reference} rates</th><th scope=\"col\" class=\"l\"><span class=\"sr\">At {reference} rates, as a bar</span></th></tr></thead><tbody>",
-        esc(&capitalised(&window_name(w))),
-    );
-    for d in &w.drift {
-        let c = &d.per_window;
-        let model = match (&d.main_model, d.main_model_share) {
-            (Some(m), Some(share)) => format!("{} ({:.0} %)", esc(m), share * 100.0),
-            (Some(m), None) => esc(m),
-            _ => "-".into(),
-        };
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td class=\"l\">{}</td><td>{}</td><td>{}</td><td class=\"bar\">{}</td><td>{}</td><td class=\"bar\">{}</td></tr>",
-            esc(&d.month),
-            fmt_int(d.runs),
-            model,
-            fmt_tokens(c.tokens),
-            p.usd(c.estimated_cost_usd),
-            bar(c.estimated_cost_usd, max, &t.tool),
-            p.usd(c.reference_cost_usd),
-            bar(c.reference_cost_usd, max, &t.tool)
-        );
-    }
-    s.push_str("</tbody></table></div>");
-    s
-}
-
-fn utilization_table(t: &ToolValue) -> String {
-    let windows: Vec<(&WindowEstimate, &Utilization)> = t
+/// The drift of every plan window in one figure, then their value by
+/// model in another.
+fn drift_section(t: &ToolValue) -> String {
+    let panels: Vec<_> = t
         .windows
         .iter()
         .filter(|w| w.pool.is_none())
-        .filter_map(|w| Some((w, w.utilization.as_ref()?)))
-        .filter(|(_, u)| u.mean_peak_percent.is_some() || u.cut_short > 0)
+        .map(|w| super::value_svg::WindowPanel {
+            window: w,
+            name: window_name(w),
+            sentence: value::drift_sentence(t, w),
+        })
         .collect();
-    let mut s = String::new();
-    if windows.is_empty() {
-        return s;
-    }
-    s.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Closed windows</caption><thead><tr><th scope=\"col\">Window</th><th scope=\"col\">Closed</th><th scope=\"col\">Hit 100 %</th><th scope=\"col\">Reset early</th><th scope=\"col\">Mean peak of the rest</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Mean peak, as a bar</span></th></tr></thead><tbody>");
-    for (w, u) in &windows {
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"bar\">{}</td></tr>",
-            esc(&window_name(w)),
-            fmt_int(u.windows),
-            fmt_int(u.exhausted),
-            fmt_int(u.cut_short),
-            fmt_pct(u.mean_peak_percent),
-            share_bar(u.mean_peak_percent, &t.tool)
-        );
-    }
-    s.push_str("</tbody></table></div>");
-    let mut months: Vec<&str> = windows
-        .iter()
-        .flat_map(|(_, u)| u.by_month.iter().map(|m| m.month.as_str()))
-        .collect();
-    months.sort_unstable();
-    months.dedup();
-    if months.len() < 2 {
-        return s;
-    }
-    s.push_str("<div class=\"table-wrap\"><table class=\"ledger quiet\"><caption>Closed windows by month</caption><thead><tr><th scope=\"col\">Month</th>");
-    for (w, _) in &windows {
-        let n = esc(&window_name(w));
-        let _ = write!(
-            s,
-            "<th scope=\"col\">{n}</th><th scope=\"col\">{n} at 100 %</th><th scope=\"col\">{n} mean peak</th>"
-        );
-    }
-    s.push_str("</tr></thead><tbody>");
-    for m in months {
-        let _ = write!(s, "<tr><th scope=\"row\">{}</th>", esc(m));
-        for (_, u) in &windows {
-            match u.by_month.iter().find(|x| x.month == m) {
-                Some(x) => {
-                    let _ = write!(
-                        s,
-                        "<td>{}</td><td>{}</td><td>{}</td>",
-                        fmt_int(x.windows),
-                        fmt_int(x.exhausted),
-                        fmt_pct(x.mean_peak_percent)
-                    );
-                }
-                None => s.push_str("<td class=\"zero\">0</td><td></td><td></td>"),
-            }
-        }
-        s.push_str("</tr>");
-    }
-    s.push_str("</tbody></table></div>");
-    s
+    super::value_svg::drift_chart(t, &panels) + &super::value_svg::model_chart(t, &panels)
 }
 
-fn credits_table(p: &ValuePage, t: &ToolValue) -> String {
-    let Some(c) = t
-        .credits
-        .as_ref()
-        .filter(|c| c.spent > 0.5 || c.added > 0.5)
-    else {
+fn credits_note(p: &ValuePage, t: &ToolValue) -> String {
+    if !matches!(p.audience, Audience::Private) {
+        return String::new();
+    }
+    let Some(c) = t.credits.as_ref().filter(|c| c.spent > 0.5) else {
         return String::new();
     };
-    let rows = [
-        ("Added", value::grouped(c.added)),
-        ("Spent", value::grouped(c.spent)),
-        ("at a full window", value::grouped(c.spent_at_limit)),
-        ("on mid-window resets", value::grouped(c.spent_near_resets)),
-        ("Left", value::grouped(c.last_balance)),
-        (
-            "Requests paid with credits",
-            fmt_int(c.credit_funded.requests),
-        ),
-        (
-            "Their est. cost, left out of the plan's value",
-            p.usd(c.credit_funded.estimated_cost_usd),
-        ),
-    ];
-    let mut s = String::new();
-    let _ = write!(
-        s,
-        "<div class=\"table-wrap\"><table class=\"ledger quiet\"><caption>Credits from {} to {}</caption><thead><tr><th scope=\"col\">Credits</th><th scope=\"col\">Amount</th></tr></thead><tbody>",
-        esc(value::date_of(&c.first_at)),
-        esc(value::date_of(&c.last_at))
-    );
-    for (label, v) in rows {
-        let _ = write!(s, "<tr><th scope=\"row\">{label}</th><td>{v}</td></tr>");
-    }
-    s.push_str("</tbody></table></div>");
-    s
+    let value = c.credit_funded.estimated_cost_usd.filter(|v| *v > 0.0);
+    format!(
+        "<p>Credits: {} of {} spent, {} at a full window and {} on early resets, {} left.{}</p>",
+        value::grouped(c.spent),
+        value::grouped(c.added.max(c.spent)),
+        value::grouped(c.spent_at_limit),
+        value::grouped(c.spent_near_resets),
+        value::grouped(c.last_balance),
+        value.map_or(String::new(), |v| format!(
+            " The use they paid for is worth est. {} at list prices, {:.1}¢ a credit.",
+            p.usd(Some(v)),
+            100.0 * v / c.spent
+        )),
+    )
 }
 
 /// "Mean of 4 complete months", or the partial ones when none is complete.
@@ -531,7 +405,6 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
         .months
         .iter()
         .filter_map(|m| m.multiple)
-        .chain(t.pace.as_ref().and_then(|p| p.multiple))
         .fold(0.0, f64::max);
     let mut s = format!(
         "<div class=\"table-wrap\"><table class=\"ledger\"><caption>By month</caption><thead><tr><th scope=\"col\">Month</th><th scope=\"col\">Days</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th>{}<th scope=\"col\">Times the price</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Times the price, as a bar</span></th><th scope=\"col\">Whole-month pace</th></tr></thead><tbody>",
@@ -563,7 +436,11 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
             m.days_covered,
             fmt_tokens(token_total(u)),
             p.usd(u.estimated_cost_usd),
-            if u.unpriced_requests > 0 { "*" } else { "" },
+            if u.unpriced_requests > 0 {
+                "&dagger;"
+            } else {
+                ""
+            },
             credit_cell(Some(m)),
             fmt_x(m.multiple),
             bar(m.multiple, max, &t.tool),
@@ -586,22 +463,9 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
             fmt_x(Some(x))
         );
     }
-    if let Some(pace) = &t.pace
-        && let (Some(c), Some(x)) = (pace.monthly_cost_usd, pace.multiple)
-    {
-        let _ = write!(
-            s,
-            "<tr class=\"total\"><th scope=\"row\">Pace, last {:.0} days</th><td></td><td></td><td>{}</td>{}<td>{}</td><td class=\"bar\">{}</td><td></td></tr>",
-            pace.days,
-            p.usd(Some(c)),
-            credit_cell(None),
-            fmt_x(Some(x)),
-            bar(Some(x), max, &t.tool)
-        );
-    }
     s.push_str("</tbody></table></div>");
     if t.months.iter().any(|m| m.usage.unpriced_requests > 0) {
-        s.push_str("<p class=\"note\">* leaves out models with no price.</p>");
+        s.push_str("<p class=\"note\">&dagger; leaves out models with no price.</p>");
     }
     s
 }
@@ -637,14 +501,10 @@ fn source_note(p: &ValuePage, t: &ToolValue) -> String {
 
 fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     let mut body = format!("<p class=\"note\">{}</p>", source_note(p, t));
-    body.push_str(&windows_table(p, t));
     body.push_str("<div class=\"stack\">");
-    for w in t.windows.iter().filter(|w| w.pool.is_none()) {
-        body.push_str(&drift_table(p, t, w));
-    }
-    body.push_str(&utilization_table(t));
-    body.push_str(&credits_table(p, t));
-    body.push_str(&months_table(p, t));
+    body.push_str(&drift_section(t));
+    body.push_str(&credits_note(p, t));
+    body.push_str(&noted(months_table(p, t)));
     let runs: String = t
         .windows
         .iter()
@@ -663,7 +523,8 @@ fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     if !runs.is_empty() {
         let _ = write!(
             body,
-            "<details><summary>Runs averaged, largest rise first</summary>{runs}</details>"
+            "<details><summary>Runs averaged, largest rise first</summary>{}</details>",
+            noted(runs)
         );
     }
     body.push_str("</div>");
@@ -748,7 +609,7 @@ pub fn render(p: &ValuePage) -> String {
     s.push_str("</main>\n<footer>\n<p>");
     let _ = write!(
         s,
-        "Estimates at LiteLLM list prices{}. Plan prices from <code>[subscriptions]</code> in config.toml or the defaults. Loaded in {:.0} ms.",
+        "Estimates at LiteLLM list prices{}. Plan prices from <code>[subscriptions]</code> in config.toml or the defaults. Data loaded in {:.0} ms.",
         match &p.rates_fetched_at {
             Some(t) => format!(", rates fetched {}", esc(t)),
             None => String::new(),
