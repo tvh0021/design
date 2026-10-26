@@ -75,7 +75,7 @@ impl ValuePage {
     }
 
     /// "$1,305" in the public export, "$1,305.27" locally.
-    fn usd(&self, cost: Option<f64>) -> String {
+    pub(super) fn usd(&self, cost: Option<f64>) -> String {
         let Some(c) = cost else {
             return "-".into();
         };
@@ -216,16 +216,12 @@ fn summary(p: &ValuePage) -> String {
         }
     }
     s.push_str("</div>");
+    s.push_str(&super::value_svg::value_squares(p));
     let _ = write!(
         s,
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Times the price, as a bar</span></th><th scope=\"col\">Full 5 h</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 h</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
         r.pace_days
     );
-    let max = r
-        .tools
-        .iter()
-        .filter_map(|t| t.pace.as_ref()?.multiple)
-        .fold(0.0, f64::max);
     for t in &r.tools {
         let cell = |w: Option<&WindowEstimate>| match w {
             Some(w) => match (&w.per_window, &w.lower_bound) {
@@ -239,13 +235,12 @@ fn summary(p: &ValuePage) -> String {
         let multiple = pace.and_then(|p| p.multiple);
         let _ = write!(
             s,
-            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"bar\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             tool_name(&t.tool),
             esc(&t.subscription.name),
             p.usd(t.subscription.monthly_usd),
             p.usd(pace.and_then(|p| p.monthly_cost_usd)),
             fmt_x(multiple),
-            bar(multiple, max, &t.tool),
             cell(value::main_window(t, "session")),
             cell(value::main_window(t, "weekly")),
             pace.map_or("-".into(), |p| format!("{:.0}", p.days)),
@@ -254,7 +249,7 @@ fn summary(p: &ValuePage) -> String {
     let c = &r.combined;
     let _ = write!(
         s,
-        "<tr class=\"total\"><th scope=\"row\">All plans</th><td class=\"l\">{} plans</td><td>{}</td><td>{}</td><td>{}</td><td></td><td></td><td></td><td></td></tr>",
+        "<tr class=\"total\"><th scope=\"row\">All plans</th><td class=\"l\">{} plans</td><td>{}</td><td>{}</td><td>{}</td><td></td><td></td><td></td></tr>",
         c.plans,
         p.usd(Some(c.monthly_usd)),
         p.usd(c.pace_monthly_cost_usd),

@@ -13,6 +13,7 @@ mod radar;
 pub mod routes;
 pub mod snapshot;
 pub mod value_html;
+mod value_svg;
 
 use crate::{paths, rates, scan};
 use anyhow::{Context, Result};

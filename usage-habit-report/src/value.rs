@@ -1478,11 +1478,11 @@ pub fn tagged_findings(r: &ValueReport) -> Vec<(Finding, String)> {
     let c = &r.combined;
     if let (Some(cost), Some(x)) = (c.pace_monthly_cost_usd, c.pace_multiple) {
         let mut s = format!(
-            "Last {} days: the {} plans ({} a month) carried est. {} a month at API list prices, {:.1}x their price.",
+            "Over the last {} days, the same use at API list prices would cost est. {} a month. The {} plans cost {} a month, so that is {:.1}x their price.",
             r.pace_days,
+            dollars(cost),
             c.plans,
             dollars(c.monthly_usd),
-            dollars(cost),
             x
         );
         for t in &r.tools {
@@ -1623,10 +1623,10 @@ pub fn tagged_findings(r: &ValueReport) -> Vec<(Finding, String)> {
                 out.push((
                     Finding::Pool,
                     format!(
-                        "{} {pool} pool: a full {} window holds est. {} ({} tokens).",
+                        "{} {pool} pool holds est. {} of use in a full {} window, {} tokens.",
                         t.tool,
-                        window_words(w),
                         c.estimated_cost_usd.map_or("-".into(), dollars),
+                        window_words(w),
                         short_tokens(c.tokens)
                     ),
                 ));
