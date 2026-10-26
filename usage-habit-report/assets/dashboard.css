@@ -224,18 +224,18 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .drift .dr-dot { fill: var(--tool); }
 .drift .dr-dot.hollow { fill: var(--paper); stroke: var(--tool); stroke-width: 1.5; }
 .drift .dr-ring { fill: var(--paper); stroke: var(--ink); stroke-width: 1.2; }
-.drift .dr-panel { display: none; }
-.drift .dr-panel:first-of-type,
-.drift > input:nth-of-type(2):checked ~ .dr-panel:nth-of-type(2) { display: block; }
-.drift > input:nth-of-type(2):checked ~ .dr-panel:first-of-type { display: none; }
+.toggled .panel { display: none; }
+.toggled .panel:first-of-type,
+.toggled > input:nth-of-type(2):checked ~ .panel:nth-of-type(2) { display: block; }
+.toggled > input:nth-of-type(2):checked ~ .panel:first-of-type { display: none; }
 .dr-sentence { margin: 0 0 var(--s-3); }
 .toggle { display: inline-flex; margin: var(--s-2) 0 var(--s-3); border: 1px solid var(--rule); }
 .toggle label { padding: 2px var(--s-3); cursor: pointer; font-size: var(--t-small); color: var(--muted); }
 .toggle label + label { border-left: 1px solid var(--rule); }
-.drift > input:nth-of-type(1):checked ~ figcaption .toggle label:nth-of-type(1),
-.drift > input:nth-of-type(2):checked ~ figcaption .toggle label:nth-of-type(2) { background: var(--tool); color: var(--paper); }
-.drift > input:nth-of-type(1):focus-visible ~ figcaption .toggle label:nth-of-type(1),
-.drift > input:nth-of-type(2):focus-visible ~ figcaption .toggle label:nth-of-type(2) { outline: 2px solid var(--focus); outline-offset: 2px; }
+.toggled > input:nth-of-type(1):checked ~ figcaption .toggle label:nth-of-type(1),
+.toggled > input:nth-of-type(2):checked ~ figcaption .toggle label:nth-of-type(2) { background: var(--tool); color: var(--paper); }
+.toggled > input:nth-of-type(1):focus-visible ~ figcaption .toggle label:nth-of-type(1),
+.toggled > input:nth-of-type(2):focus-visible ~ figcaption .toggle label:nth-of-type(2) { outline: 2px solid var(--focus); outline-offset: 2px; }
 .dr-value { font: 12px var(--mono); fill: var(--ink); }
 .dr-ref-value { font: 11px var(--mono); fill: var(--muted); }
 .dr-month { font: 600 12px var(--mono); fill: var(--ink); }

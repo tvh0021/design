@@ -417,23 +417,20 @@ fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) ->
     s
 }
 
-/// The drift of every plan window in one figure, then each window's
-/// value by model.
+/// The drift of every plan window in one figure, then their value by
+/// model in another.
 fn drift_section(t: &ToolValue) -> String {
-    let windows: Vec<_> = t.windows.iter().filter(|w| w.pool.is_none()).collect();
-    let panels: Vec<_> = windows
+    let panels: Vec<_> = t
+        .windows
         .iter()
-        .map(|w| super::value_svg::DriftPanel {
+        .filter(|w| w.pool.is_none())
+        .map(|w| super::value_svg::WindowPanel {
             window: w,
             name: window_name(w),
             sentence: value::drift_sentence(t, w),
         })
         .collect();
-    let mut s = super::value_svg::drift_chart(t, &panels);
-    for w in windows {
-        s.push_str(&super::value_svg::model_chart(t, w, &window_name(w)));
-    }
-    s
+    super::value_svg::drift_chart(t, &panels) + &super::value_svg::model_chart(t, &panels)
 }
 
 fn utilization_table(t: &ToolValue) -> String {

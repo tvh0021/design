@@ -143,9 +143,9 @@ pub(super) fn value_squares(p: &ValuePage) -> String {
 const DRIFT_W: f64 = 720.0;
 const DRIFT_PLOT: f64 = 150.0;
 
-/// One panel of [`drift_chart`]: a window's name, the sentence that reads
-/// its drift, and the window itself.
-pub(super) struct DriftPanel<'a> {
+/// One window of a toggled figure: the window, its name, and for
+/// [`drift_chart`] the sentence that reads its drift.
+pub(super) struct WindowPanel<'a> {
     pub window: &'a WindowEstimate,
     pub name: String,
     pub sentence: Option<String>,
@@ -157,7 +157,7 @@ pub(super) struct DriftPanel<'a> {
 /// Months resting on fewer than `DRIFT_MIN_RUNS` runs are drawn hollow.
 /// Several windows share one figure, with a radio toggle between them that
 /// needs no script.
-pub(super) fn drift_chart(t: &ToolValue, panels: &[DriftPanel]) -> String {
+pub(super) fn drift_chart(t: &ToolValue, panels: &[WindowPanel]) -> String {
     let drawn: Vec<_> = panels
         .iter()
         .filter_map(|p| Some((p, drift_svg(t, p.window, &p.name)?)))
@@ -165,7 +165,6 @@ pub(super) fn drift_chart(t: &ToolValue, panels: &[DriftPanel]) -> String {
     if drawn.is_empty() {
         return String::new();
     }
-    let tool = esc(&t.tool);
     let key = match t.reference_model.as_deref() {
         Some(m) => format!(
             "Solid: what a full window held at each month's own prices. Dashed: the same use at {} prices, so a change in prices reads apart from a change in the limit.",
@@ -173,15 +172,46 @@ pub(super) fn drift_chart(t: &ToolValue, panels: &[DriftPanel]) -> String {
         ),
         None => "What a full window held at each month's own prices.".to_owned(),
     };
+    let drawn = drawn
+        .into_iter()
+        .map(|(p, svg)| {
+            let sentence = p
+                .sentence
+                .as_ref()
+                .map(|s| format!("<p class=\"dr-sentence\">{}</p>", esc(s)))
+                .unwrap_or_default();
+            (p, format!("{sentence}{svg}"))
+        })
+        .collect::<Vec<_>>();
+    toggled_figure(
+        "drift",
+        t,
+        |w| format!("What a full {w}window holds, month by month"),
+        &format!("{key} A hollow dot rests on fewer than {DRIFT_MIN_RUNS} full windows."),
+        &drawn,
+    )
+}
+
+/// A figure of one chart per window. With more than one, a radio toggle
+/// picks the window shown, in CSS alone. `heading` gets the window's name
+/// and a space when there is only one, an empty string otherwise.
+fn toggled_figure(
+    class: &str,
+    t: &ToolValue,
+    heading: impl Fn(&str) -> String,
+    caption: &str,
+    panels: &[(&WindowPanel, String)],
+) -> String {
+    let tool = esc(&t.tool);
     let mut inputs = String::new();
     let mut labels = String::new();
     let mut bodies = String::new();
-    for (i, (p, svg)) in drawn.iter().enumerate() {
-        let id = format!("drift-{tool}-{}", p.window.window);
-        if drawn.len() > 1 {
+    for (i, (p, body)) in panels.iter().enumerate() {
+        let id = format!("{class}-{tool}-{}", p.window.window);
+        if panels.len() > 1 {
             let _ = write!(
                 inputs,
-                "<input type=\"radio\" class=\"sr\" name=\"drift-{tool}\" id=\"{id}\"{}>",
+                "<input type=\"radio\" class=\"sr\" name=\"{class}-{tool}\" id=\"{id}\"{}>",
                 if i == 0 { " checked" } else { "" }
             );
             let _ = write!(
@@ -190,24 +220,19 @@ pub(super) fn drift_chart(t: &ToolValue, panels: &[DriftPanel]) -> String {
                 esc(&super::value_html::capitalised(&p.name))
             );
         }
-        let sentence = p
-            .sentence
-            .as_ref()
-            .map(|s| format!("<p class=\"dr-sentence\">{}</p>", esc(s)))
-            .unwrap_or_default();
-        let _ = write!(bodies, "<div class=\"dr-panel\">{sentence}{svg}</div>");
+        let _ = write!(bodies, "<div class=\"panel\">{body}</div>");
     }
     let toggle = if labels.is_empty() {
         String::new()
     } else {
         format!("<div class=\"toggle\">{labels}</div>")
     };
-    let heading = match drawn.as_slice() {
-        [(p, _)] => format!("What a full {} window holds, month by month", esc(&p.name)),
-        _ => "What a full window holds, month by month".to_owned(),
+    let heading = match panels {
+        [(p, _)] => heading(&format!("{} ", esc(&p.name))),
+        _ => heading(""),
     };
     format!(
-        "<figure class=\"chart-fig drift\" data-tool=\"{tool}\">{inputs}<figcaption><h3>{heading}</h3>{toggle}<p>{key} A hollow dot rests on fewer than {DRIFT_MIN_RUNS} full windows.</p></figcaption>{bodies}</figure>"
+        "<figure class=\"chart-fig toggled {class}\" data-tool=\"{tool}\">{inputs}<figcaption><h3>{heading}</h3>{toggle}<p>{caption}</p></figcaption>{bodies}</figure>"
     )
 }
 
@@ -340,20 +365,39 @@ const MODEL_ROW: f64 = 30.0;
 /// windows, a dot at the median and a line across the range. Equal dots
 /// would mean the limit is a dollar budget; spread dots show which models
 /// get more out of it.
-pub(super) fn model_chart(t: &ToolValue, w: &WindowEstimate, window: &str) -> String {
+pub(super) fn model_chart(t: &ToolValue, panels: &[WindowPanel]) -> String {
+    let drawn: Vec<_> = panels
+        .iter()
+        .filter_map(|p| Some((p, model_svg(t, p.window, &p.name)?)))
+        .collect();
+    if drawn.is_empty() {
+        return String::new();
+    }
+    toggled_figure(
+        "model-windows",
+        t,
+        |w| format!("What a full {w}window is worth, by model"),
+        "Dot: the typical window. Line: lowest to highest.",
+        &drawn,
+    )
+}
+
+/// The chart of one window for [`model_chart`], or `None` with fewer than
+/// two models of `DRIFT_MIN_RUNS` full windows.
+fn model_svg(t: &ToolValue, w: &WindowEstimate, window: &str) -> Option<String> {
     let rows: Vec<_> = w
         .by_model
         .iter()
         .filter(|m| m.windows >= DRIFT_MIN_RUNS)
         .collect();
     if rows.len() < 2 {
-        return String::new();
+        return None;
     }
     let mut rows = rows;
     rows.sort_by(|a, b| b.median_cost_usd.total_cmp(&a.median_cost_usd));
     let peak = rows.iter().map(|m| m.max_cost_usd).fold(0.0, f64::max);
     if peak <= 0.0 {
-        return String::new();
+        return None;
     }
     let x = |v: f64| MODEL_LABEL + MODEL_PLOT * v / peak;
     let mut body = String::new();
@@ -397,10 +441,10 @@ pub(super) fn model_chart(t: &ToolValue, w: &WindowEstimate, window: &str) -> St
         dollars(peak)
     );
     let height = base + 20.0;
-    format!(
-        "<figure class=\"chart-fig model-windows\" data-tool=\"{tool}\"><figcaption><h3>What a full {window} window is worth, by model</h3><p>Dot: the typical window. Line: lowest to highest.</p></figcaption><svg viewBox=\"0 0 720 {height:.0}\" role=\"img\" aria-labelledby=\"mw-{id}-title mw-{id}-desc\"><title id=\"mw-{id}-title\">{tool}: est. cost of a full {window} window by main model</title><desc id=\"mw-{id}-desc\">{}</desc>{body}</svg></figure>",
+    Some(format!(
+        "<svg viewBox=\"0 0 720 {height:.0}\" role=\"img\" aria-labelledby=\"mw-{id}-title mw-{id}-desc\"><title id=\"mw-{id}-title\">{tool}: est. cost of a full {window} window by main model</title><desc id=\"mw-{id}-desc\">{}</desc>{body}</svg>",
         esc(&desc.join("; ")),
         tool = esc(&t.tool),
         id = format!("{}-{}", esc(&t.tool), w.window),
-    )
+    ))
 }
