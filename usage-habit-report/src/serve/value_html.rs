@@ -152,12 +152,12 @@ fn price(t: &ToolValue, p: &ValuePage) -> String {
     }
 }
 
-/// "5 h", "weekly", "Fable pool, weekly".
+/// "5 hr", "weekly", "Fable pool, weekly".
 fn window_name(w: &WindowEstimate) -> String {
     let base = if w.window == "weekly" {
         "weekly".to_string()
     } else {
-        format!("{} h", w.window_hours)
+        format!("{} hr", w.window_hours)
     };
     match &w.pool {
         Some(pool) => format!("{pool} pool, {base}"),
@@ -219,7 +219,7 @@ fn summary(p: &ValuePage) -> String {
     s.push_str(&super::value_svg::value_squares(p));
     let _ = write!(
         s,
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 h</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 hr</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
         r.pace_days
     );
     for t in &r.tools {
@@ -409,6 +409,7 @@ fn drift_table(t: &ToolValue, w: &WindowEstimate) -> String {
         let _ = write!(s, "<p>{}</p>", esc(&d));
     }
     s.push_str(&super::value_svg::drift_chart(t, w, &window_name(w)));
+    s.push_str(&super::value_svg::model_chart(t, w, &window_name(w)));
     s
 }
 

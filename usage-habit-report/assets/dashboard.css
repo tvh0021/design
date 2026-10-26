@@ -231,6 +231,13 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .chart-fig[data-tool="claude-code"] { --tool: var(--claude-code); }
 .chart-fig[data-tool="codex"] { --tool: var(--codex); }
 .chart-fig[data-tool="antigravity"] { --tool: var(--antigravity); }
+.model-windows svg text { text-anchor: start; }
+.mw-model { font: 12px var(--mono); fill: var(--ink); }
+.mw-range { stroke: var(--tool); stroke-width: 2; stroke-opacity: .45; stroke-linecap: round; }
+.mw-dot { fill: var(--tool); }
+.mw-value { font: 600 12px var(--mono); fill: var(--ink); }
+.mw-note { font: 11px var(--mono); fill: var(--muted); }
+.model-windows svg text.mw-axis:last-of-type { text-anchor: end; }
 .spend-stack { margin-bottom: var(--s-4); }
 .spend-stack figcaption p { margin-bottom: var(--s-2); }
 .spend-stack .key { color: var(--ink); display: flex; gap: var(--s-4); margin-bottom: var(--s-4); }

@@ -58,6 +58,8 @@ const STALE_BALANCE_MS: i64 = 60 * 60 * 1000;
 pub const DRIFT_MIN_RUNS: i64 = 3;
 /// A session-to-week share needs at least this many session windows.
 pub const SHARE_MIN_WINDOWS: i64 = 3;
+/// A window counts toward a model when the model has this share of its cost.
+pub const MODEL_WINDOW_SHARE: f64 = 0.8;
 
 /// Monthly price and name of the plan behind each tool.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -118,6 +120,19 @@ impl Capacity {
             reference_cost_usd: mean_of(items.iter().map(|c| c.reference_cost_usd)),
         })
     }
+}
+
+/// What a full window held at list prices when one model did most of the
+/// work in it: the limit read model by model.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelWindow {
+    pub model: String,
+    /// Full windows where this model had at least `MODEL_WINDOW_SHARE` of
+    /// the estimated cost, and every request was priced.
+    pub windows: i64,
+    pub median_cost_usd: f64,
+    pub min_cost_usd: f64,
+    pub max_cost_usd: f64,
 }
 
 /// One rise of a window's used share, with the requests that caused it.
@@ -208,6 +223,8 @@ pub struct WindowEstimate {
     pub per_window: Option<Capacity>,
     /// Every qualifying run, by the month it started in.
     pub drift: Vec<DriftPoint>,
+    /// Every qualifying run, by the model that did most of its work.
+    pub by_model: Vec<ModelWindow>,
     /// When no run exists: the busiest whole window seen, which did not
     /// exhaust the limit, so the true capacity is at least this much.
     pub lower_bound: Option<Capacity>,
@@ -979,6 +996,7 @@ fn window_estimate(
     let (samples, live) = samples(conn, tool, spec.window, spec.pool.unwrap_or(""))?;
     let mut runs = Vec::new();
     let mut by_month: BTreeMap<String, (Vec<Capacity>, Acc)> = BTreeMap::new();
+    let mut model_costs: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
     for (start, end, from, to, readings) in runs_of(&samples, len) {
         let rise = to - from;
         if rise < MIN_RISE_PERCENT {
@@ -992,6 +1010,17 @@ fn window_estimate(
             continue;
         }
         let per_window = acc.capacity(100.0 / rise);
+        let total: f64 = acc.by_model.values().map(|m| m.1).sum();
+        if acc.t.unpriced_requests == 0
+            && total > 0.0
+            && let Some(cost) = per_window.estimated_cost_usd
+            && let Some((&m, _)) = acc
+                .by_model
+                .iter()
+                .find(|(_, v)| v.1 / total >= MODEL_WINDOW_SHARE)
+        {
+            model_costs.entry(m).or_default().push(cost);
+        }
         let month = by_month.entry(month_key(start, tz)).or_default();
         month.0.push(per_window.clone());
         for r in reqs.iter().filter(|r| spec.scope.covers(r)) {
@@ -1030,6 +1059,20 @@ fn window_estimate(
             })
         })
         .collect();
+    let mut by_model: Vec<ModelWindow> = model_costs
+        .into_iter()
+        .map(|(m, mut costs)| {
+            costs.sort_by(f64::total_cmp);
+            ModelWindow {
+                model: data.models[m as usize].clone(),
+                windows: costs.len() as i64,
+                median_cost_usd: median(&costs),
+                min_cost_usd: costs[0],
+                max_cost_usd: costs[costs.len() - 1],
+            }
+        })
+        .collect();
+    by_model.sort_by(|a, b| b.windows.cmp(&a.windows).then(a.model.cmp(&b.model)));
     runs.sort_by(|a, b| {
         b.rise_percent
             .total_cmp(&a.rise_percent)
@@ -1053,6 +1096,7 @@ fn window_estimate(
             runs,
             per_window,
             drift,
+            by_model,
             lower_bound,
             pool: spec.pool.map(str::to_owned),
             models: spec.models.clone(),
@@ -2529,6 +2573,7 @@ mod tests {
             qualifying_runs: 10,
             runs: vec![],
             per_window: None,
+            by_model: vec![],
             drift: vec![
                 point("2026-05", cap(26.0, 20.0, 27e6), "gpt-5.5"),
                 DriftPoint {

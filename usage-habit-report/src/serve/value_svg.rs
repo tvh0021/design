@@ -271,3 +271,77 @@ fn month_abbr(key: &str) -> String {
         .and_then(|m| NAMES.get(m.checked_sub(1)?))
         .map_or_else(|| key.to_owned(), |n| (*n).to_owned())
 }
+
+const MODEL_LABEL: f64 = 150.0;
+const MODEL_PLOT: f64 = 400.0;
+const MODEL_ROW: f64 = 30.0;
+
+/// What a full window was worth at list prices, model by model: one row per
+/// model that did most of the work in at least `DRIFT_MIN_RUNS` full
+/// windows, a dot at the median and a line across the range. Equal dots
+/// would mean the limit is a dollar budget; spread dots show which models
+/// get more out of it.
+pub(super) fn model_chart(t: &ToolValue, w: &WindowEstimate, window: &str) -> String {
+    let rows: Vec<_> = w
+        .by_model
+        .iter()
+        .filter(|m| m.windows >= DRIFT_MIN_RUNS)
+        .collect();
+    if rows.len() < 2 {
+        return String::new();
+    }
+    let mut rows = rows;
+    rows.sort_by(|a, b| b.median_cost_usd.total_cmp(&a.median_cost_usd));
+    let peak = rows.iter().map(|m| m.max_cost_usd).fold(0.0, f64::max);
+    if peak <= 0.0 {
+        return String::new();
+    }
+    let x = |v: f64| MODEL_LABEL + MODEL_PLOT * v / peak;
+    let mut body = String::new();
+    let mut desc = Vec::new();
+    for (i, m) in rows.iter().enumerate() {
+        let mid = 14.0 + i as f64 * MODEL_ROW;
+        let tip = format!(
+            "{}: {} a full {window} window (median of {}), {} to {}",
+            m.model,
+            dollars(m.median_cost_usd),
+            m.windows,
+            dollars(m.min_cost_usd),
+            dollars(m.max_cost_usd)
+        );
+        let _ = write!(
+            body,
+            "<g><title>{}</title><text class=\"mw-model\" x=\"0\" y=\"{:.1}\">{}</text><line class=\"mw-range\" x1=\"{:.1}\" x2=\"{:.1}\" y1=\"{mid:.1}\" y2=\"{mid:.1}\"/><circle class=\"mw-dot\" cx=\"{:.1}\" cy=\"{mid:.1}\" r=\"6\"/><text class=\"mw-value\" x=\"{:.1}\" y=\"{:.1}\">{}</text><text class=\"mw-note\" x=\"{:.1}\" y=\"{:.1}\">{} windows</text></g>",
+            esc(&tip),
+            mid + 4.0,
+            esc(&m.model),
+            x(m.min_cost_usd),
+            x(m.max_cost_usd).max(x(m.min_cost_usd) + 1.0),
+            x(m.median_cost_usd),
+            MODEL_LABEL + MODEL_PLOT + 20.0,
+            mid + 4.0,
+            dollars(m.median_cost_usd),
+            MODEL_LABEL + MODEL_PLOT + 70.0,
+            mid + 4.0,
+            m.windows
+        );
+        desc.push(tip);
+    }
+    let base = 14.0 + rows.len() as f64 * MODEL_ROW - 8.0;
+    let _ = write!(
+        body,
+        "<line class=\"dr-base\" x1=\"{MODEL_LABEL}\" x2=\"{:.1}\" y1=\"{base:.1}\" y2=\"{base:.1}\"/><text class=\"mw-note mw-axis\" x=\"{MODEL_LABEL}\" y=\"{:.1}\">$0</text><text class=\"mw-note mw-axis\" x=\"{:.1}\" y=\"{:.1}\">{}</text>",
+        MODEL_LABEL + MODEL_PLOT,
+        base + 14.0,
+        MODEL_LABEL + MODEL_PLOT,
+        base + 14.0,
+        dollars(peak)
+    );
+    let height = base + 20.0;
+    format!(
+        "<figure class=\"chart-fig model-windows\" data-tool=\"{tool}\"><figcaption><h3>What a full {window} window is worth, by model</h3><p>Dot: the typical window. Line: lowest to highest.</p></figcaption><svg viewBox=\"0 0 720 {height:.0}\" role=\"img\" aria-labelledby=\"mw-{id}-title mw-{id}-desc\"><title id=\"mw-{id}-title\">{tool}: est. cost of a full {window} window by main model</title><desc id=\"mw-{id}-desc\">{}</desc>{body}</svg></figure>",
+        esc(&desc.join("; ")),
+        tool = esc(&t.tool),
+        id = format!("{}-{}", esc(&t.tool), w.window),
+    )
+}
