@@ -76,6 +76,7 @@ pub fn load_page(
     let totals = data::totals(conn, since, params.tool)?;
     let models = data::model_matrix(conn, since, params.tool)?;
     let agents = crate::agents::agents_report_for(conn, since, params.tool, now_ms)?;
+    let agent_months = crate::agents::month_shares(conn, params.tool, now_ms, tz)?;
     let projects = data::projects(conn, since, params.tool, now_ms)?;
     let sessions = data::session_lists(conn, since, params.tool)?;
     let spend = data::spend(conn, window, now_ms, params.tool, tz)?;
@@ -93,6 +94,7 @@ pub fn load_page(
         totals,
         models,
         agents,
+        agent_months,
         projects,
         sessions,
         spend_totals: spend.totals(),

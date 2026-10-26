@@ -265,6 +265,21 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .lb-only { color: var(--ink); font-size: var(--t-small); margin: 0 0 var(--s-2); }
 .lb-legend { margin-top: var(--s-2); }
 .lb-legend i { display: inline-block; width: 12px; height: 12px; background: var(--ink); margin-right: var(--s-1); vertical-align: -1px; }
+
+/* Subagent share: rows of 20 squares, by tool or by month */
+.chart-fig.handoff { --tool: var(--ink); }
+.handoff table { border-collapse: collapse; }
+.handoff th, .handoff td { padding: 3px var(--s-4) 3px 0; text-align: left; font-weight: 400; white-space: nowrap; }
+.handoff thead th { font-size: var(--t-small); color: var(--muted); }
+.handoff .n, .handoff .s { text-align: right; }
+.handoff td.s { color: var(--muted); }
+.handoff .units { gap: 3px; vertical-align: -3px; }
+.handoff .units:not([data-tool]) { --bar: var(--ink); }
+.handoff .units i { width: 11px; height: 15px; }
+.handoff .legend { margin-top: var(--s-3); }
+.handoff .legend i { display: inline-block; width: 11px; height: 15px; margin-right: var(--s-1); vertical-align: -3px; }
+.handoff .legend i.on { background: var(--ink); }
+.handoff .legend i.off { box-shadow: inset 0 0 0 1px var(--rule); }
 .spend-stack { margin-bottom: var(--s-4); }
 .spend-stack figcaption p { margin-bottom: var(--s-2); }
 .spend-stack .key { color: var(--ink); display: flex; gap: var(--s-4); margin-bottom: var(--s-4); }

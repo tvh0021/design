@@ -346,7 +346,7 @@ fn drift_svg(t: &ToolValue, w: &WindowEstimate, window: &str) -> Option<String> 
 }
 
 /// "Jun" from "2026-06"; the key itself when it does not parse.
-fn month_abbr(key: &str) -> String {
+pub(super) fn month_abbr(key: &str) -> String {
     const NAMES: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];

@@ -837,10 +837,13 @@ filter, states its window, and names any tool with no requests in it:
   table for the exact figures and stepped shading. `unlabelled` appears only
   when some request in the window has no label. Column totals equal the
   per-label totals of `query summary --group-by label` for the window.
-- **Multi-agent habit**: the subagents-per-session histogram, main-thread
-  and subagent model mix, subagent token share, the ten heaviest fan-outs,
-  and each tool's coverage note, all from `query agents --since <window>`
-  (with a tool filter, that tool's `by_tool` row).
+- **How much of my work I hand to subagents**: rows of 20 squares, each
+  5 % of tokens, filled by the subagent share. "By tool" has one row per
+  tool plus all tools, with sessions that spawned subagents out of all
+  top-level sessions, from `query agents --since <window>` (with a tool
+  filter, that tool's `by_tool` row). "By month" covers all history from
+  `requests.is_subagent`, the last twelve local calendar months. The private
+  dashboard adds the ten heaviest fan-outs and each tool's coverage note.
 - **Time and cost by project**: the ten costliest projects with sessions,
   tokens and cost from `query projects`, active time (the sum of each
   top-level session's `active_seconds` as `query session` reports it), and

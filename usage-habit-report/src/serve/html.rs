@@ -60,6 +60,8 @@ pub struct Page {
     pub totals: Totals,
     pub models: ModelMatrix,
     pub agents: AgentsReport,
+    /// Subagent share of tokens per month, over all history.
+    pub agent_months: Vec<crate::agents::MonthShare>,
     pub projects: Projects,
     pub sessions: SessionLists,
     pub spend: Spend,
@@ -509,93 +511,96 @@ fn models_panel(p: &Page) -> String {
     body
 }
 
-fn mix_table(caption: &str, entries: &[crate::agents::ModelMixEntry]) -> String {
-    const ROWS: usize = 6;
-    let mut s = format!(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{caption}</caption><thead><tr><th scope=\"col\">Model</th><th scope=\"col\">Requests</th><th scope=\"col\">Share</th></tr></thead><tbody>"
-    );
-    if entries.is_empty() {
-        s.push_str("<tr><td class=\"l zero\" colspan=\"3\">No requests.</td></tr>");
+/// Whole percent of a share, "<1 %" for a non-zero share that rounds to 0.
+fn whole_pct(x: Option<f64>) -> String {
+    match x {
+        None => "-".into(),
+        Some(v) if v > 0.0 && v < 0.005 => "&lt;1 %".into(),
+        Some(v) => format!("{:.0} %", v * 100.0),
     }
-    for e in entries.iter().take(ROWS) {
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td></tr>",
-            e.model
-                .as_deref()
-                .map_or("<span class=\"untitled\">no model</span>".into(), esc),
-            fmt_int(e.requests),
-            fmt_pct(Some(e.request_share))
-        );
-    }
-    if entries.len() > ROWS {
-        let rest: i64 = entries[ROWS..].iter().map(|e| e.requests).sum();
-        let share: f64 = entries[ROWS..].iter().map(|e| e.request_share).sum();
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{} more</th><td>{}</td><td>{}</td></tr>",
-            entries.len() - ROWS,
-            fmt_int(rest),
-            fmt_pct(Some(share))
-        );
-    }
-    s.push_str("</tbody></table></div>");
-    s
 }
 
+/// How much of the work went to subagent threads: one row of 20 squares per
+/// tool for the window, or per month over all history, behind the radio
+/// toggle. Squares are the subagent share of tokens.
 fn agents_panel(p: &Page) -> String {
     let a = &p.agents;
-    if a.totals.top_level_sessions == 0 && a.totals.subagent_sessions == 0 {
-        return nothing_here(p);
-    }
-    let t = &a.totals;
-    let mut body = String::from("<div class=\"facts\">");
-    let _ = write!(
-        body,
-        "<p>{} top-level sessions; {} of them spawned subagents, {} subagent sessions in all.</p>",
-        fmt_int(t.top_level_sessions as i64),
-        fmt_int(t.sessions_with_subagents as i64),
-        fmt_int(t.subagent_sessions as i64)
-    );
-    let ts = &a.subagent_token_share;
-    let _ = write!(
-        body,
-        "<p>Subagents spent {} of tokens: {} of {} uncached input plus output tokens.</p>",
-        fmt_pct(ts.share),
-        fmt_int(ts.subagent_tokens),
-        fmt_int(ts.total_tokens)
-    );
-    body.push_str("</div><div class=\"pair\">");
+    let row = |label: String, share: Option<f64>, tool: Option<&str>, sessions: Option<String>| {
+        let on = share.map_or(0, share_units);
+        format!(
+            "<tr><th scope=\"row\">{label}</th><td>{}</td><td class=\"n\">{}</td>{}</tr>",
+            units(on, 20, true, tool),
+            whole_pct(share),
+            sessions.map_or(String::new(), |s| format!("<td class=\"s\">{s}</td>"))
+        )
+    };
+    let of = |part: usize, whole: usize| {
+        format!("{} of {}", fmt_int(part as i64), fmt_int(whole as i64))
+    };
 
-    // Histogram: sessions by number of subagents, count bars scaled to the
-    // largest bucket.
-    let most = a.histogram.iter().map(|b| b.sessions).max().unwrap_or(0);
-    body.push_str("<div class=\"table-wrap\"><table class=\"ledger\"><caption>Subagents per session</caption><thead><tr><th scope=\"col\">Subagents</th><th scope=\"col\">Sessions</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Bar</span></th></tr></thead><tbody>");
-    for b in &a.histogram {
-        let on = if most == 0 || b.sessions == 0 {
-            0
-        } else {
-            (b.sessions * 20).div_ceil(most).clamp(1, 20)
-        };
-        let _ = write!(
-            body,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td class=\"bar\">{}</td></tr>",
-            esc(&b.bucket),
-            fmt_int(b.sessions as i64),
-            units(on, 20, false, None)
-        );
+    // By tool, in the page's tool order, then all tools together.
+    let tools: Vec<_> = super::data::TOOLS
+        .iter()
+        .filter_map(|t| a.by_tool.iter().find(|b| b.tool == *t))
+        .filter(|b| b.top_level_sessions > 0)
+        .collect();
+    let mut by_tool = String::new();
+    for b in &tools {
+        by_tool.push_str(&row(
+            tool_name(&b.tool),
+            b.subagent_token_share,
+            Some(&b.tool),
+            Some(of(b.sessions_with_subagents, b.top_level_sessions)),
+        ));
     }
-    body.push_str("</tbody></table></div>");
-    body.push_str("<div class=\"stack\">");
-    body.push_str(&mix_table(
-        "Main-thread requests by model",
-        &a.model_mix.main_thread,
-    ));
-    body.push_str(&mix_table(
-        "Subagent requests by model",
-        &a.model_mix.subagent,
-    ));
-    body.push_str("</div></div>");
+    if tools.len() > 1 {
+        let (sub, total) = tools.iter().fold((0, 0), |(s, t), b| {
+            (s + b.subagent_tokens, t + b.total_tokens)
+        });
+        by_tool.push_str(&row(
+            "All tools".into(),
+            (total > 0).then(|| sub as f64 / total as f64),
+            None,
+            Some(of(
+                a.totals.sessions_with_subagents,
+                a.totals.top_level_sessions,
+            )),
+        ));
+    }
+
+    // By month: the last twelve, so no month name repeats.
+    let months = &p.agent_months[p.agent_months.len().saturating_sub(12)..];
+    let mut by_month = String::new();
+    for m in months {
+        let mut label = super::value_svg::month_abbr(&m.month);
+        if m.partial {
+            label.push_str(", so far");
+        }
+        by_month.push_str(&row(
+            label,
+            (m.total_tokens > 0).then(|| m.subagent_tokens as f64 / m.total_tokens as f64),
+            None,
+            None,
+        ));
+    }
+
+    // Captions, headers and the legend render with no data too, so their
+    // words reach the privacy guard's template vocabulary.
+    let empty = nothing_here(p);
+    let table = |head: &str, rows: &str| {
+        format!(
+            "<div class=\"panel\"><table><thead><tr><th scope=\"col\"><span class=\"sr\">Row</span></th><th scope=\"col\"><span class=\"sr\">Squares</span></th><th scope=\"col\" class=\"n\">tokens</th>{head}</tr></thead><tbody>{rows}</tbody></table>{}</div>",
+            if rows.is_empty() { empty.as_str() } else { "" }
+        )
+    };
+    let mut body = format!(
+        "<figure class=\"chart-fig toggled handoff\"><input type=\"radio\" class=\"sr\" name=\"handoff\" id=\"handoff-tool\" checked><input type=\"radio\" class=\"sr\" name=\"handoff\" id=\"handoff-month\"><figcaption><div class=\"toggle\"><label for=\"handoff-tool\">By tool</label><label for=\"handoff-month\">By month</label></div><p>Share of tokens spent in subagent threads vs main threads. Each square is 5 %. By month covers all history.</p></figcaption>{}{}<p class=\"legend\"><span><i class=\"on\"></i>subagent threads</span><span><i class=\"off\"></i>main threads</span></p></figure>",
+        table(
+            "<th scope=\"col\" class=\"s\">sessions with subagents</th>",
+            &by_tool
+        ),
+        table("", &by_month),
+    );
 
     if p.audience.is_public() {
         // Per-session fan-outs and per-tool coverage notes stay private.
@@ -641,7 +646,7 @@ fn agents_panel(p: &Page) -> String {
         if bt.unlinked_subagent_sessions > 0 {
             let _ = write!(
                 body,
-                "<p>{} {} subagent sessions have no linked parent in this window; their active time counts as separate top-level sessions. They count in the token share but not in the histogram or the fan-outs.</p>",
+                "<p>{} {} subagent sessions have no linked parent in this window; their active time counts as separate top-level sessions. They count in the monthly token share but not in the per-tool rows or the fan-outs.</p>",
                 fmt_int(bt.unlinked_subagent_sessions as i64),
                 tool_name(&bt.tool)
             );
@@ -1251,7 +1256,7 @@ fn panels(p: &Page) -> String {
     ));
     s.push_str(&section(
         "agents",
-        "Multi-agent habit",
+        "How much of my work I hand to subagents",
         &format!(
             "{scope} Tokens are uncached input plus output. Figures match <code>query agents{since}</code>{}.",
             tool_rows("row of by_tool")

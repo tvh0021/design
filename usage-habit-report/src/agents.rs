@@ -536,6 +536,66 @@ pub fn agents_report_for(
     })
 }
 
+/// Tokens of one local calendar month, split by thread.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MonthShare {
+    /// "YYYY-MM".
+    pub month: String,
+    pub subagent_tokens: i64,
+    pub total_tokens: i64,
+    /// The month `now_ms` falls in.
+    pub partial: bool,
+}
+
+/// Subagent share of tokens per local calendar month over all history, from
+/// `requests.is_subagent` as the report's [`TokenShare`]. With a `tool`, only
+/// that tool's requests count. Months with no tokens are left out.
+pub fn month_shares(
+    conn: &Connection,
+    tool: Option<&str>,
+    now_ms: i64,
+    tz: &impl chrono::TimeZone,
+) -> Result<Vec<MonthShare>> {
+    // Quarter-hour sums keep the row count small. Every zone offset in use is
+    // a whole number of quarter hours, so none straddles a month boundary.
+    const QUARTER_MS: i64 = 900_000;
+    let mut months: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT ts_ms / ?2, is_subagent, SUM(input_tokens + output_tokens)
+         FROM requests WHERE (?1 IS NULL OR tool = ?1) GROUP BY 1, 2",
+    )?;
+    let mut rows = stmt.query(params![tool, QUARTER_MS])?;
+    while let Some(r) = rows.next()? {
+        let (quarter, sub, tokens): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+        let e = months
+            .entry(month_key(quarter * QUARTER_MS, tz))
+            .or_default();
+        e.1 += tokens;
+        if sub != 0 {
+            e.0 += tokens;
+        }
+    }
+    let now = month_key(now_ms, tz);
+    Ok(months
+        .into_iter()
+        .filter(|(_, (_, total))| *total > 0)
+        .map(|(month, (subagent_tokens, total_tokens))| MonthShare {
+            partial: month == now,
+            month,
+            subagent_tokens,
+            total_tokens,
+        })
+        .collect())
+}
+
+fn month_key(ms: i64, tz: &impl chrono::TimeZone) -> String {
+    use chrono::Datelike;
+    tz.timestamp_millis_opt(ms)
+        .single()
+        .map(|t| format!("{:04}-{:02}", t.year(), t.month()))
+        .unwrap_or_default()
+}
+
 /// Subagent summary of one top-level session (same figures and definitions as
 /// [`SessionAgents`], without the identity fields).
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -798,6 +858,43 @@ mod tests {
                 params![key, sid, ts, model, effort],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn month_shares_split_tokens_by_thread() {
+        let s = Store::open_in_memory().unwrap();
+        put_session(&s, "root", false, None);
+        put_session(&s, "a", true, Some("root"));
+        // 2026-05-31T23:00Z and 2026-06-01T01:00Z, both read in UTC.
+        let may = 1_780_268_400_000;
+        let june = may + 2 * 3_600_000;
+        put_req(&s, "root", "r1", may, "big", None);
+        put_req(&s, "root", "r2", june, "big", None);
+        put_req(&s, "a", "a1", june, "small", None);
+        put_req(&s, "a", "a2", june + 1, "small", None);
+        let m = month_shares(&s.conn, None, june, &chrono::Utc).unwrap();
+        assert_eq!(
+            m,
+            vec![
+                MonthShare {
+                    month: "2026-05".into(),
+                    subagent_tokens: 0,
+                    total_tokens: 15,
+                    partial: false
+                },
+                MonthShare {
+                    month: "2026-06".into(),
+                    subagent_tokens: 30,
+                    total_tokens: 45,
+                    partial: true
+                },
+            ]
+        );
+        assert!(
+            month_shares(&s.conn, Some("claude-code"), june, &chrono::Utc)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
