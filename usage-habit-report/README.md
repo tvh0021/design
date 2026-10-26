@@ -830,9 +830,8 @@ filter, states its window, and names any tool with no requests in it:
   by older generations. OpenAI uses Astra, Sol, Terra, Luna order, and Google
   uses Argon, Pro, Flash order, with newer major generations first and newer
   minor versions first within each tier. Each chart scales its largest topic to the
-  outer ring and prints that maximum percentage above the web. Axis labels
-  keep their actual request percentages. Background colors identify the model
-  provider. Small screens show two columns or one. Every model gets
+  outer ring; the ring ticks and axis labels keep their actual request
+  percentages. Small screens show two columns or one. Every model gets
   a chart, including the table's folded long tail. Expand the request-count
   table for the exact figures and stepped shading. `unlabelled` appears only
   when some request in the window has no label. Column totals equal the

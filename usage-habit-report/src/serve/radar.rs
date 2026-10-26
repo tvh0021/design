@@ -103,10 +103,9 @@ fn chart(row: &MatrixRow, kinds: &[String], index: usize) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     let mut out = format!(
-        "<figure class=\"model-radar\" data-provider=\"{provider}\"><figcaption><h3>{}</h3><p>{} requests <span>{provider_name}</span></p><p class=\"radar-scale\">Outer ring: {:.1}%</p></figcaption><svg viewBox=\"0 0 400 330\" role=\"img\" aria-labelledby=\"radar-{index}-title radar-{index}-desc\"><title id=\"radar-{index}-title\">{} task mix</title><desc id=\"radar-{index}-desc\">Share of this model's requests. The outer ring is the largest topic, {:.1}%. {}.</desc>",
+        "<figure class=\"model-radar\" data-provider=\"{provider}\"><figcaption><h3>{}</h3><p>{} requests <span>{provider_name}</span></p></figcaption><svg viewBox=\"0 0 400 330\" role=\"img\" aria-labelledby=\"radar-{index}-title radar-{index}-desc\"><title id=\"radar-{index}-title\">{} task mix</title><desc id=\"radar-{index}-desc\">Share of this model's requests. The outer ring is the largest topic, {:.1}%. {}.</desc>",
         esc(model),
         fmt_int(row.total),
-        share(peak) * 100.0,
         esc(model),
         share(peak) * 100.0,
         esc(&description)
@@ -159,7 +158,7 @@ fn chart(row: &MatrixRow, kinds: &[String], index: usize) -> String {
 
 pub(super) fn render(matrix: &ModelMatrix) -> String {
     let mut out = String::from(
-        "<p class=\"radar-note\">Models are grouped by provider. Each web scales its largest topic to the outer ring; its maximum percentage is shown above the chart. Axis labels show the actual share of requests. Backgrounds identify the model provider.</p><div class=\"model-radars\">",
+        "<p class=\"radar-note\">Each web scales its largest topic to the outer ring. Ring ticks and axis labels give the share of that model's requests.</p><div class=\"model-radars\">",
     );
     let mut rows = matrix.all_rows.iter().collect::<Vec<_>>();
     rows.sort_by_key(|row| model_order(row.model.as_deref()));
@@ -195,7 +194,8 @@ mod tests {
         assert!(html.contains("radar-7-title radar-7-desc"));
         // The largest topic reaches the full radius; other topics retain their ratios.
         assert!(html.contains("radar-area\" points=\"200.00,74.00 221.21,142.79"));
-        assert!(html.contains("Outer ring: 75.0%"));
+        assert!(!html.contains("Outer ring"));
+        assert!(html.contains("largest topic, 75.0%"));
         assert!(html.contains(">18.8%</text>"));
         let empty = chart(
             &MatrixRow {
