@@ -219,6 +219,18 @@ footer { margin-top: var(--s-12); padding-top: var(--s-6); border-top: 1px solid
 .sq-label { font: 12px var(--mono); fill: var(--ink); }
 .sq-mult { font: 12px var(--mono); fill: var(--muted); }
 .sq-note { font: 11px var(--mono); fill: var(--muted); font-style: italic; }
+.drift .dr-own { fill: none; stroke: var(--tool); stroke-width: 2; }
+.drift .dr-ref { fill: none; stroke: var(--ink); stroke-width: 1.2; stroke-dasharray: 4 3; }
+.drift .dr-dot { fill: var(--tool); }
+.drift .dr-dot.hollow { fill: var(--paper); stroke: var(--tool); stroke-width: 1.5; }
+.drift .dr-ring { fill: var(--paper); stroke: var(--ink); stroke-width: 1.2; }
+.dr-value { font: 12px var(--mono); fill: var(--ink); }
+.dr-ref-value { font: 11px var(--mono); fill: var(--muted); }
+.dr-month { font: 600 12px var(--mono); fill: var(--ink); }
+.dr-base { stroke: var(--rule); stroke-width: 1; }
+.chart-fig[data-tool="claude-code"] { --tool: var(--claude-code); }
+.chart-fig[data-tool="codex"] { --tool: var(--codex); }
+.chart-fig[data-tool="antigravity"] { --tool: var(--antigravity); }
 .spend-stack { margin-bottom: var(--s-4); }
 .spend-stack figcaption p { margin-bottom: var(--s-2); }
 .spend-stack .key { color: var(--ink); display: flex; gap: var(--s-4); margin-bottom: var(--s-4); }

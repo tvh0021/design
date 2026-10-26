@@ -403,52 +403,12 @@ fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) ->
     s
 }
 
-fn drift_table(p: &ValuePage, t: &ToolValue, w: &WindowEstimate) -> String {
-    if w.drift.len() < 2 {
-        return String::new();
-    }
+fn drift_table(t: &ToolValue, w: &WindowEstimate) -> String {
     let mut s = String::new();
     if let Some(d) = value::drift_sentence(t, w) {
         let _ = write!(s, "<p>{}</p>", esc(&d));
     }
-    let reference = esc(t.reference_model.as_deref().unwrap_or("one model's"));
-    let max = w
-        .drift
-        .iter()
-        .flat_map(|d| {
-            [
-                d.per_window.estimated_cost_usd,
-                d.per_window.reference_cost_usd,
-            ]
-        })
-        .flatten()
-        .fold(0.0, f64::max);
-    let _ = write!(
-        s,
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>{} window by month</caption><thead><tr><th scope=\"col\">Month</th><th scope=\"col\">Runs</th><th scope=\"col\" class=\"l\">Main model</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Est. cost, as a bar</span></th><th scope=\"col\">At {reference} rates</th><th scope=\"col\" class=\"l\"><span class=\"sr\">At {reference} rates, as a bar</span></th></tr></thead><tbody>",
-        esc(&capitalised(&window_name(w))),
-    );
-    for d in &w.drift {
-        let c = &d.per_window;
-        let model = match (&d.main_model, d.main_model_share) {
-            (Some(m), Some(share)) => format!("{} ({:.0} %)", esc(m), share * 100.0),
-            (Some(m), None) => esc(m),
-            _ => "-".into(),
-        };
-        let _ = write!(
-            s,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td class=\"l\">{}</td><td>{}</td><td>{}</td><td class=\"bar\">{}</td><td>{}</td><td class=\"bar\">{}</td></tr>",
-            esc(&d.month),
-            fmt_int(d.runs),
-            model,
-            fmt_tokens(c.tokens),
-            p.usd(c.estimated_cost_usd),
-            bar(c.estimated_cost_usd, max, &t.tool),
-            p.usd(c.reference_cost_usd),
-            bar(c.reference_cost_usd, max, &t.tool)
-        );
-    }
-    s.push_str("</tbody></table></div>");
+    s.push_str(&super::value_svg::drift_chart(t, w, &window_name(w)));
     s
 }
 
@@ -518,41 +478,28 @@ fn utilization_table(t: &ToolValue) -> String {
     s
 }
 
-fn credits_table(p: &ValuePage, t: &ToolValue) -> String {
-    let Some(c) = t
-        .credits
-        .as_ref()
-        .filter(|c| c.spent > 0.5 || c.added > 0.5)
-    else {
+/// Where the credits went, in one sentence, on the private page only.
+fn credits_note(p: &ValuePage, t: &ToolValue) -> String {
+    if !matches!(p.audience, Audience::Private) {
+        return String::new();
+    }
+    let Some(c) = t.credits.as_ref().filter(|c| c.spent > 0.5) else {
         return String::new();
     };
-    let rows = [
-        ("Added", value::grouped(c.added)),
-        ("Spent", value::grouped(c.spent)),
-        ("at a full window", value::grouped(c.spent_at_limit)),
-        ("on mid-window resets", value::grouped(c.spent_near_resets)),
-        ("Left", value::grouped(c.last_balance)),
-        (
-            "Requests paid with credits",
-            fmt_int(c.credit_funded.requests),
-        ),
-        (
-            "Their est. cost, left out of the plan's value",
-            p.usd(c.credit_funded.estimated_cost_usd),
-        ),
-    ];
-    let mut s = String::new();
-    let _ = write!(
-        s,
-        "<div class=\"table-wrap\"><table class=\"ledger quiet\"><caption>Credits from {} to {}</caption><thead><tr><th scope=\"col\">Credits</th><th scope=\"col\">Amount</th></tr></thead><tbody>",
-        esc(value::date_of(&c.first_at)),
-        esc(value::date_of(&c.last_at))
-    );
-    for (label, v) in rows {
-        let _ = write!(s, "<tr><th scope=\"row\">{label}</th><td>{v}</td></tr>");
-    }
-    s.push_str("</tbody></table></div>");
-    s
+    let value = c.credit_funded.estimated_cost_usd.filter(|v| *v > 0.0);
+    format!(
+        "<p>Credits: {} of {} spent, {} at a full window and {} on early resets, {} left.{}</p>",
+        value::grouped(c.spent),
+        value::grouped(c.added.max(c.spent)),
+        value::grouped(c.spent_at_limit),
+        value::grouped(c.spent_near_resets),
+        value::grouped(c.last_balance),
+        value.map_or(String::new(), |v| format!(
+            " The use they paid for is worth est. {} at list prices, {:.1}¢ a credit.",
+            p.usd(Some(v)),
+            100.0 * v / c.spent
+        )),
+    )
 }
 
 /// "Mean of 4 complete months", or the partial ones when none is complete.
@@ -690,10 +637,10 @@ fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     body.push_str(&windows_table(p, t));
     body.push_str("<div class=\"stack\">");
     for w in t.windows.iter().filter(|w| w.pool.is_none()) {
-        body.push_str(&drift_table(p, t, w));
+        body.push_str(&drift_table(t, w));
     }
     body.push_str(&utilization_table(t));
-    body.push_str(&credits_table(p, t));
+    body.push_str(&credits_note(p, t));
     body.push_str(&months_table(p, t));
     let runs: String = t
         .windows

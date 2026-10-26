@@ -55,7 +55,7 @@ const RESET_CREDIT_SLACK_MS: i64 = 15 * 60 * 1000;
 /// concurrent session's reading.
 const STALE_BALANCE_MS: i64 = 60 * 60 * 1000;
 /// Drift endpoints need at least this many runs in their month.
-const DRIFT_MIN_RUNS: i64 = 3;
+pub const DRIFT_MIN_RUNS: i64 = 3;
 /// A session-to-week share needs at least this many session windows.
 pub const SHARE_MIN_WINDOWS: i64 = 3;
 
