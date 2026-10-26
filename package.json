@@ -5,7 +5,9 @@
   "description": "Geodesic flight path visualizer and great-circle calculation engine",
   "scripts": {
     "start": "node maps/scripts/serve.js",
-    "test": "node maps/tests/test_directory.js && node maps/tests/test_geodesic.js && node maps/tests/test_globe.js && node maps/tests/test_hud.js && node maps/tests/test_integration.js",
+    "test": "node maps/tests/test_directory.js && node maps/tests/test_geodesic.js && node maps/tests/test_globe.js && node maps/tests/test_hud.js && node maps/tests/test_eclipse.js && node maps/tests/test_integration.js",
+    "test:eclipse": "node maps/tests/test_eclipse.js",
+    "build:eclipse": "python3 maps/scripts/build_eclipse.py",
     "test:directory": "node maps/tests/test_directory.js",
     "test:geodesic": "node maps/tests/test_geodesic.js",
     "test:globe": "node maps/tests/test_globe.js",

@@ -945,6 +945,14 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let landFeature = baseFeatures.land;
   let countryBordersFeature = baseFeatures.borders;
 
+  // [eclipse-overlay] Pluggable overlay drawn once per frame (see src/eclipse.js).
+  // Anything with a draw(ctx, path, projection, opts) method can be plugged in.
+  let eclipseOverlay = options.eclipseOverlay || null;
+  function setEclipseOverlay(overlay) {
+    eclipseOverlay = overlay || null;
+    render();
+  }
+
   function setDetailTopology(topology) {
     const extracted = topology ? extractFeatures(topology) : { land: null, borders: null };
     detailFeatures = extracted.land || extracted.borders ? extracted : null;
@@ -1265,6 +1273,11 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
         ctx.stroke();
       }
       ctx.restore();
+    }
+
+    // 5a. [eclipse-overlay] Optional eclipse overlay, under the city dots and route.
+    if (eclipseOverlay && typeof eclipseOverlay.draw === 'function') {
+      eclipseOverlay.draw(ctx, path, activeProj, { labels: !(isDragging || isPinching) });
     }
 
     // 5b. Population-ranked city dots for the current view
@@ -2286,6 +2299,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
     destroy,
     render,
     setDetailTopology,
+    setEclipseOverlay, // [eclipse-overlay]
     setPlaces,
     getPlaceDots: () => placeDots.map((d) => ({ name: d.place.name, country: d.place.country, x: d.x, y: d.y, index: d.index, score: d.score, labeled: !!d.labeled })),
     getHoveredPlace: () => (hoveredPlace ? { name: hoveredPlace.name, country: hoveredPlace.country } : null),

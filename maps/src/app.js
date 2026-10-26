@@ -9,6 +9,26 @@ import { CityDirectory } from './directory.js';
 import { computeGeodesic } from './geodesic.js';
 import { createGlobeRenderer } from './globe.js';
 import { FlightHUD } from './hud.js';
+import { createEclipseOverlay } from './eclipse.js'; // [eclipse-overlay]
+
+/**
+ * [eclipse-overlay] Short description for the HUD card. Numbers come from the
+ * dataset when it has loaded; the prose is fixed.
+ */
+export function describeEclipse(summary) {
+  const g = (summary && summary.greatest) || {};
+  const duration = g.duration || '6m 23s';
+  const local = g.localTime ? `${g.localTime} local time` : 'early afternoon local time';
+  const width = g.pathWidthKm ? `${g.pathWidthKm} km` : 'about 258 km';
+  return {
+    title: 'Total solar eclipse · 2 August 2027',
+    lines: [
+      `The Moon's shadow crosses the Atlantic, southern Spain, Morocco, Algeria, Tunisia, Libya, Egypt, Saudi Arabia, Yemen and Somalia before ending in the Indian Ocean. The path is ${width} wide.`,
+      `Greatest eclipse is near Luxor, Egypt: ${duration} of totality at ${local}, the longest totality on land this century.`,
+      'Markers every 1000 km along the central line give the duration of totality and the local clock time of mid-totality there.'
+    ]
+  };
+}
 
 /**
  * Initializes the complete Geodesic Flight application.
@@ -134,6 +154,24 @@ export async function initApp(options = {}) {
     let currentGeodesic = null;
     let isSwapping = false;
 
+    // [eclipse-overlay] 2 August 2027 total solar eclipse ground track.
+    // Starts visible; ?eclipse=0 hides it on load. Pass eclipseUrl: null to
+    // leave the overlay out entirely (e.g. in tests).
+    const eclipseUrl = options.eclipseUrl === undefined ? 'data/eclipse-2027-08-02.json' : options.eclipseUrl;
+    const eclipseOverlay = (eclipseUrl || options.eclipseData)
+      ? createEclipseOverlay({
+          d3: options.d3 || (typeof window !== 'undefined' ? window.d3 : undefined),
+          data: options.eclipseData,
+          url: eclipseUrl,
+          fetch: fetchFn,
+          visible: options.eclipseVisible !== undefined ? !!options.eclipseVisible : urlParams?.get('eclipse') !== '0',
+          onChange: () => globe.render()
+        })
+      : null;
+    if (eclipseOverlay && typeof globe.setEclipseOverlay === 'function') {
+      globe.setEclipseOverlay(eclipseOverlay);
+    }
+
     if (detailWorldUrl && typeof globe.setDetailTopology === 'function') {
       Promise.resolve()
         .then(() => fetchFn(detailWorldUrl))
@@ -190,7 +228,15 @@ export async function initApp(options = {}) {
       },
       onProjectionChange: (projectionType) => {
         globe.setProjectionType(projectionType);
-      }
+      },
+      // [eclipse-overlay]
+      ...(eclipseOverlay ? {
+        eclipseToggle: {
+          visible: eclipseOverlay.isVisible(),
+          onToggle: (visible) => eclipseOverlay.setVisible(visible),
+          getDescription: () => describeEclipse(eclipseOverlay.getSummary())
+        }
+      } : {})
     });
 
     function updateViewportInsets() {
@@ -259,6 +305,8 @@ export async function initApp(options = {}) {
       recenter: () => globe.recenter(),
       setProjection: (type) => hud.setProjection(type),
       getProjection: () => globe.getProjectionType(),
+      eclipse: eclipseOverlay, // [eclipse-overlay]
+      setEclipseVisible: (v) => hud.setEclipseVisible(v), // [eclipse-overlay]
       resize: (w, h) => globe.resize(w, h),
       destroy: () => {
         if (typeof window !== 'undefined') {

@@ -105,6 +105,20 @@ interface GlobeController {
 function createGlobeRenderer(container: HTMLElement, worldTopoJson: any): GlobeController;
 ```
 
+### 3b. `EclipseOverlay` (Removable Layer) — `[eclipse-overlay]`
+
+**Depth**: Shallow by design. Draws the 2 August 2027 total solar eclipse ground track (path of totality, central line, greatest-eclipse marker, and duration/local-time markers every 1000 km) from `data/eclipse-2027-08-02.json`, which `scripts/build_eclipse.py` derives from NASA's Besselian elements. The renderer only knows a `draw(ctx, path, projection, opts)` hook (`setEclipseOverlay`); the HUD only knows an optional `eclipseToggle` option (`visible`, `onToggle`, `getDescription` for the card shown when the switch is clicked on). Every touch point outside `src/eclipse.js` carries the `[eclipse-overlay]` tag so the feature can be deleted in one sweep (see ADR 0006).
+
+```typescript
+interface EclipseOverlay {
+  draw(ctx: CanvasRenderingContext2D, path: GeoPath, projection: GeoProjection, opts?: { labels?: boolean }): void;
+  setVisible(visible: boolean): void;
+  isVisible(): boolean;
+  isLoaded(): boolean;
+  getSummary(): { greatest: { duration, localTime, utc, pathWidthKm }, markerCount } | null;
+}
+```
+
 ### 4. `HUD & Controls` (Interface Surface)
 
 Custom lightweight combobox dropdowns for Origin and Destination selection, a 1-click swap button, recenter button, and a telemetry metrics card showing distance, flight time, and wind effects.

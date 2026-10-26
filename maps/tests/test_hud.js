@@ -914,6 +914,82 @@ test('Projection toggle switches between Globe and Robinson and triggers callbac
   assert.equal(container.children.length, 0, 'Destroy must remove the independent projection switch');
 });
 
+// [eclipse-overlay]
+test('Eclipse switch is only built on request, toggles, and is torn down', () => {
+  const { doc, container } = createTestEnvironment();
+  const plain = createFlightHUD(container, { document: doc });
+  assert.equal(plain.getElements().eclipseToggle, null, 'No eclipse switch unless eclipseToggle option is given');
+  assert.equal(plain.getEclipseVisible(), false);
+  plain.setEclipseVisible(true);
+  assert.equal(plain.getEclipseVisible(), false, 'Without the option the switch is inert');
+  plain.destroy();
+
+  const seen = [];
+  const hud = createFlightHUD(container, {
+    document: doc,
+    eclipseToggle: { visible: true, onToggle: (v) => seen.push(v) }
+  });
+  const elements = hud.getElements();
+  assert.ok(elements.eclipseToggle, 'Eclipse switch group must exist');
+  assert.ok(elements.eclipseToggle.parentElement === container, 'Eclipse switch lives beside the projection switch');
+  assert.ok(elements.eclipseBtn.classList.contains('is-active'));
+  assert.equal(elements.eclipseBtn.getAttribute('aria-pressed'), 'true');
+  assert.equal(hud.getEclipseVisible(), true);
+
+  elements.eclipseBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getEclipseVisible(), false);
+  assert.ok(!elements.eclipseBtn.classList.contains('is-active'));
+  assert.equal(elements.eclipseBtn.getAttribute('aria-pressed'), 'false');
+  assert.deepEqual(seen, [false]);
+
+  hud.setEclipseVisible(true);
+  hud.setEclipseVisible(true);
+  assert.deepEqual(seen, [false, true], 'Repeated same-state calls do not re-notify');
+
+  hud.destroy();
+  assert.equal(container.children.length, 0, 'Destroy must remove the eclipse switch');
+});
+
+// [eclipse-overlay]
+test('Clicking the eclipse switch on shows a description card; off or dismiss hides it', () => {
+  const { doc, container } = createTestEnvironment();
+  let calls = 0;
+  const hud = createFlightHUD(container, {
+    document: doc,
+    eclipseToggle: {
+      visible: false,
+      onToggle: () => {},
+      getDescription: () => { calls++; return { title: 'Total solar eclipse · 2 August 2027', lines: ['Line one.', 'Line two.'] }; }
+    }
+  });
+  const { eclipseBtn, eclipseCard } = hud.getElements();
+  assert.ok(eclipseCard, 'card element exists');
+  assert.equal(hud.isEclipseCardVisible(), false, 'card hidden until the switch is clicked on');
+
+  eclipseBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getEclipseVisible(), true);
+  assert.equal(hud.isEclipseCardVisible(), true, 'switching on shows the card');
+  assert.equal(calls, 1, 'description is fetched when shown');
+  const title = eclipseCard.querySelector('.hud-eclipse-card-title');
+  assert.equal(title.textContent, 'Total solar eclipse · 2 August 2027');
+  assert.equal(eclipseCard.querySelectorAll('.hud-eclipse-card-line').length, 2);
+
+  eclipseCard.querySelector('.hud-eclipse-card-close').dispatchEvent({ type: 'click' });
+  assert.equal(hud.isEclipseCardVisible(), false, 'dismiss hides the card');
+  assert.equal(hud.getEclipseVisible(), true, 'dismissing the card keeps the overlay on');
+
+  eclipseBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.getEclipseVisible(), false);
+  assert.equal(hud.isEclipseCardVisible(), false, 'switching off never shows the card');
+  eclipseBtn.dispatchEvent({ type: 'click' });
+  assert.equal(hud.isEclipseCardVisible(), true);
+  hud.setEclipseVisible(false);
+  assert.equal(hud.isEclipseCardVisible(), false, 'programmatic off hides the card');
+
+  hud.destroy();
+  assert.equal(container.children.length, 0, 'Destroy must remove the card');
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);

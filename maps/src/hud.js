@@ -180,6 +180,14 @@ export class FlightHUD {
     this.onRecenter = options.onRecenter || (() => {});
     this.onCollapseChange = options.onCollapseChange || (() => {});
     this.onProjectionChange = options.onProjectionChange || (() => {});
+    // [eclipse-overlay] Optional layer switch: { visible, onToggle(visible) }.
+    // The control is only built when this option is supplied.
+    this.eclipseOptions = options.eclipseToggle || null;
+    this.eclipseVisible = this.eclipseOptions ? this.eclipseOptions.visible !== false : false;
+    this.eclipseToggle = null;
+    this.eclipseBtn = null;
+    this.eclipseCard = null;
+    this.eclipseCardBody = null;
 
     // State
     this.originCity = normalizeCityRecord(options.initialOrigin);
@@ -343,6 +351,58 @@ export class FlightHUD {
     this.projToggle = projToggle;
     this.orthoBtn = orthoBtn;
     this.robinsonBtn = robinsonBtn;
+
+    // [eclipse-overlay] Eclipse layer switch, mounted under the projection toggle.
+    if (this.eclipseOptions) {
+      const eclipseToggle = doc.createElement('div');
+      eclipseToggle.className = 'hud-proj-toggle hud-eclipse-toggle';
+      eclipseToggle.setAttribute('role', 'group');
+      eclipseToggle.setAttribute('aria-label', 'Map overlays');
+
+      const eclipseBtn = doc.createElement('button');
+      eclipseBtn.className = `hud-proj-btn hud-eclipse-btn ${this.eclipseVisible ? 'is-active' : ''}`;
+      eclipseBtn.type = 'button';
+      eclipseBtn.setAttribute('title', 'Show or hide the 2 August 2027 total solar eclipse path');
+      eclipseBtn.setAttribute('aria-label', 'Toggle the 2 August 2027 solar eclipse overlay');
+      eclipseBtn.setAttribute('aria-pressed', String(this.eclipseVisible));
+      eclipseBtn.innerHTML = `
+        <svg class="hud-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="8"></circle>
+          <path d="M12 4a8 8 0 0 1 0 16 6 6 0 0 0 0-16z" fill="currentColor" stroke="none" opacity="0.6"></path>
+        </svg>
+        <span class="btn-text">${this.eclipseOptions.label || 'Eclipse 2027'}</span>
+      `;
+      eclipseBtn.addEventListener('click', () => {
+        const next = !this.eclipseVisible;
+        this.setEclipseVisible(next);
+        if (next) this.showEclipseCard();
+      });
+
+      eclipseToggle.appendChild(eclipseBtn);
+      this.container.appendChild(eclipseToggle);
+      this.eclipseToggle = eclipseToggle;
+      this.eclipseBtn = eclipseBtn;
+
+      // Short description card, shown when the overlay is switched on by click.
+      const card = doc.createElement('div');
+      card.className = 'hud-eclipse-card';
+      card.setAttribute('role', 'note');
+      card.setAttribute('aria-label', 'About the 2 August 2027 eclipse');
+      card.style.display = 'none';
+      const closeBtn = doc.createElement('button');
+      closeBtn.className = 'hud-eclipse-card-close';
+      closeBtn.type = 'button';
+      closeBtn.setAttribute('aria-label', 'Dismiss eclipse description');
+      closeBtn.textContent = '×';
+      closeBtn.addEventListener('click', () => this.hideEclipseCard());
+      const body = doc.createElement('div');
+      body.className = 'hud-eclipse-card-body';
+      card.appendChild(closeBtn);
+      card.appendChild(body);
+      this.container.appendChild(card);
+      this.eclipseCard = card;
+      this.eclipseCardBody = body;
+    }
 
     const recenterBtn = doc.createElement('button');
     recenterBtn.className = 'hud-btn hud-btn-recenter';
@@ -1026,6 +1086,63 @@ export class FlightHUD {
   }
 
   /**
+   * [eclipse-overlay] Shows or hides the eclipse overlay and notifies the owner.
+   */
+  setEclipseVisible(visible) {
+    if (!this.eclipseOptions) return;
+    const next = !!visible;
+    if (next === this.eclipseVisible) return;
+    this.eclipseVisible = next;
+    if (this.eclipseBtn) {
+      this.eclipseBtn.classList.toggle('is-active', next);
+      this.eclipseBtn.setAttribute('aria-pressed', String(next));
+    }
+    if (!next) this.hideEclipseCard();
+    if (typeof this.eclipseOptions.onToggle === 'function') {
+      this.eclipseOptions.onToggle(next);
+    }
+  }
+
+  /** [eclipse-overlay] */
+  getEclipseVisible() {
+    return this.eclipseVisible;
+  }
+
+  /**
+   * [eclipse-overlay] Fills and shows the description card. Content comes from
+   * eclipseToggle.getDescription(), which returns { title, lines: string[] }.
+   */
+  showEclipseCard() {
+    if (!this.eclipseCard || !this.eclipseOptions) return;
+    const getter = this.eclipseOptions.getDescription;
+    const desc = (typeof getter === 'function' ? getter() : null) || { title: 'Total solar eclipse', lines: [] };
+    const doc = this.doc;
+    const body = this.eclipseCardBody;
+    while (body.firstChild) body.removeChild(body.firstChild);
+    const title = doc.createElement('div');
+    title.className = 'hud-eclipse-card-title';
+    title.textContent = desc.title || '';
+    body.appendChild(title);
+    for (const line of desc.lines || []) {
+      const p = doc.createElement('p');
+      p.className = 'hud-eclipse-card-line';
+      p.textContent = line;
+      body.appendChild(p);
+    }
+    this.eclipseCard.style.display = '';
+  }
+
+  /** [eclipse-overlay] */
+  hideEclipseCard() {
+    if (this.eclipseCard) this.eclipseCard.style.display = 'none';
+  }
+
+  /** [eclipse-overlay] */
+  isEclipseCardVisible() {
+    return !!this.eclipseCard && this.eclipseCard.style.display !== 'none';
+  }
+
+  /**
    * Set Origin city programmatically.
    */
   setOrigin(city, triggerCallback = false) {
@@ -1138,6 +1255,9 @@ export class FlightHUD {
       projectionToggle: this.projToggle,
       orthoBtn: this.orthoBtn,
       robinsonBtn: this.robinsonBtn,
+      eclipseToggle: this.eclipseToggle, // [eclipse-overlay]
+      eclipseBtn: this.eclipseBtn, // [eclipse-overlay]
+      eclipseCard: this.eclipseCard, // [eclipse-overlay]
       handleBar: this.handleBar,
       floatingTrigger: this.floatingTrigger,
       floatingSummary: this.floatingSummaryEl,
@@ -1166,6 +1286,12 @@ export class FlightHUD {
     }
     if (this.projToggle && this.projToggle.parentElement) {
       this.projToggle.parentElement.removeChild(this.projToggle);
+    }
+    if (this.eclipseToggle && this.eclipseToggle.parentElement) { // [eclipse-overlay]
+      this.eclipseToggle.parentElement.removeChild(this.eclipseToggle);
+    }
+    if (this.eclipseCard && this.eclipseCard.parentElement) { // [eclipse-overlay]
+      this.eclipseCard.parentElement.removeChild(this.eclipseCard);
     }
     if (this.floatingTrigger && this.floatingTrigger.parentElement) {
       this.floatingTrigger.parentElement.removeChild(this.floatingTrigger);
