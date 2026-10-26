@@ -1133,9 +1133,20 @@ fn limits_panel(p: &Page) -> String {
             ),
         ));
     }
+    // The caption and legend render even with no bars, so their words
+    // reach the privacy guard's template vocabulary.
+    let caption = format!(
+        "<p>Each bar is every closed window, by how full it got before it reset. A tool needs {BANDS_MIN_WINDOWS} closed windows for a bar.</p>"
+    );
+    let legend: String = BAND_NAMES
+        .iter()
+        .enumerate()
+        .map(|(j, n)| format!("<span><i class=\"lb-{j}\"></i>{n}</span>"))
+        .collect();
+    let legend = format!("<div class=\"legend lb-legend\">{legend}</div>");
     if panels.is_empty() {
         return format!(
-            "<p class=\"empty\">No tool has {BANDS_MIN_WINDOWS} closed limit windows in this window yet.</p>"
+            "<figure class=\"chart-fig limits\"><figcaption>{caption}</figcaption><p class=\"empty\">No tool has {BANDS_MIN_WINDOWS} closed limit windows in this window yet, so none ran out.</p>{legend}</figure>"
         );
     }
     let name = |w: &str, hours: i64| {
@@ -1167,13 +1178,8 @@ fn limits_panel(p: &Page) -> String {
         [(w, hours, _)] => format!("<p class=\"lb-only\">{}</p>", name(w, *hours)),
         _ => format!("<div class=\"toggle\">{labels}</div>"),
     };
-    let legend: String = BAND_NAMES
-        .iter()
-        .enumerate()
-        .map(|(j, n)| format!("<span><i class=\"lb-{j}\"></i>{n}</span>"))
-        .collect();
     format!(
-        "<figure class=\"chart-fig toggled limits\">{inputs}<figcaption>{toggle}<p>Each bar is every closed window, by how full it got before it reset. A tool needs {BANDS_MIN_WINDOWS} closed windows for a bar.</p></figcaption>{bodies}<div class=\"legend lb-legend\">{legend}</div></figure>"
+        "<figure class=\"chart-fig toggled limits\">{inputs}<figcaption>{toggle}{caption}</figcaption>{bodies}{legend}</figure>"
     )
 }
 
