@@ -178,7 +178,7 @@ fn window_name(w: &WindowEstimate) -> String {
 }
 
 /// "Weekly" for a caption that opens with the window's name.
-fn capitalised(s: &str) -> String {
+pub(super) fn capitalised(s: &str) -> String {
     let mut c = s.chars();
     c.next()
         .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
@@ -417,13 +417,22 @@ fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) ->
     s
 }
 
-fn drift_table(t: &ToolValue, w: &WindowEstimate) -> String {
-    let mut s = String::new();
-    if let Some(d) = value::drift_sentence(t, w) {
-        let _ = write!(s, "<p>{}</p>", esc(&d));
+/// The drift of every plan window in one figure, then each window's
+/// value by model.
+fn drift_section(t: &ToolValue) -> String {
+    let windows: Vec<_> = t.windows.iter().filter(|w| w.pool.is_none()).collect();
+    let panels: Vec<_> = windows
+        .iter()
+        .map(|w| super::value_svg::DriftPanel {
+            window: w,
+            name: window_name(w),
+            sentence: value::drift_sentence(t, w),
+        })
+        .collect();
+    let mut s = super::value_svg::drift_chart(t, &panels);
+    for w in windows {
+        s.push_str(&super::value_svg::model_chart(t, w, &window_name(w)));
     }
-    s.push_str(&super::value_svg::drift_chart(t, w, &window_name(w)));
-    s.push_str(&super::value_svg::model_chart(t, w, &window_name(w)));
     s
 }
 
@@ -656,9 +665,7 @@ fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     let mut body = format!("<p class=\"note\">{}</p>", source_note(p, t));
     body.push_str(&noted(windows_table(p, t)));
     body.push_str("<div class=\"stack\">");
-    for w in t.windows.iter().filter(|w| w.pool.is_none()) {
-        body.push_str(&drift_table(t, w));
-    }
+    body.push_str(&drift_section(t));
     body.push_str(&noted(utilization_table(t)));
     body.push_str(&credits_note(p, t));
     body.push_str(&noted(months_table(p, t)));

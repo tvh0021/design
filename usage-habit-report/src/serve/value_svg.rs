@@ -143,18 +143,84 @@ pub(super) fn value_squares(p: &ValuePage) -> String {
 const DRIFT_W: f64 = 720.0;
 const DRIFT_PLOT: f64 = 150.0;
 
+/// One panel of [`drift_chart`]: a window's name, the sentence that reads
+/// its drift, and the window itself.
+pub(super) struct DriftPanel<'a> {
+    pub window: &'a WindowEstimate,
+    pub name: String,
+    pub sentence: Option<String>,
+}
+
 /// What one full window held each month, twice: at that month's own prices
 /// (solid, in the tool's hue) and at one reference model's prices (dashed,
 /// ink), so a change in prices reads apart from a change in the limit.
 /// Months resting on fewer than `DRIFT_MIN_RUNS` runs are drawn hollow.
-pub(super) fn drift_chart(t: &ToolValue, w: &WindowEstimate, window: &str) -> String {
+/// Several windows share one figure, with a radio toggle between them that
+/// needs no script.
+pub(super) fn drift_chart(t: &ToolValue, panels: &[DriftPanel]) -> String {
+    let drawn: Vec<_> = panels
+        .iter()
+        .filter_map(|p| Some((p, drift_svg(t, p.window, &p.name)?)))
+        .collect();
+    if drawn.is_empty() {
+        return String::new();
+    }
+    let tool = esc(&t.tool);
+    let key = match t.reference_model.as_deref() {
+        Some(m) => format!(
+            "Solid: what a full window held at each month's own prices. Dashed: the same use at {} prices, so a change in prices reads apart from a change in the limit.",
+            esc(m)
+        ),
+        None => "What a full window held at each month's own prices.".to_owned(),
+    };
+    let mut inputs = String::new();
+    let mut labels = String::new();
+    let mut bodies = String::new();
+    for (i, (p, svg)) in drawn.iter().enumerate() {
+        let id = format!("drift-{tool}-{}", p.window.window);
+        if drawn.len() > 1 {
+            let _ = write!(
+                inputs,
+                "<input type=\"radio\" class=\"sr\" name=\"drift-{tool}\" id=\"{id}\"{}>",
+                if i == 0 { " checked" } else { "" }
+            );
+            let _ = write!(
+                labels,
+                "<label for=\"{id}\">{}</label>",
+                esc(&super::value_html::capitalised(&p.name))
+            );
+        }
+        let sentence = p
+            .sentence
+            .as_ref()
+            .map(|s| format!("<p class=\"dr-sentence\">{}</p>", esc(s)))
+            .unwrap_or_default();
+        let _ = write!(bodies, "<div class=\"dr-panel\">{sentence}{svg}</div>");
+    }
+    let toggle = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"toggle\">{labels}</div>")
+    };
+    let heading = match drawn.as_slice() {
+        [(p, _)] => format!("What a full {} window holds, month by month", esc(&p.name)),
+        _ => "What a full window holds, month by month".to_owned(),
+    };
+    format!(
+        "<figure class=\"chart-fig drift\" data-tool=\"{tool}\">{inputs}<figcaption><h3>{heading}</h3>{toggle}<p>{key} A hollow dot rests on fewer than {DRIFT_MIN_RUNS} full windows.</p></figcaption>{bodies}</figure>"
+    )
+}
+
+/// The chart of one window for [`drift_chart`], or `None` with fewer than
+/// two priced months.
+fn drift_svg(t: &ToolValue, w: &WindowEstimate, window: &str) -> Option<String> {
     let points: Vec<_> = w
         .drift
         .iter()
         .filter_map(|d| Some((d, d.per_window.estimated_cost_usd?)))
         .collect();
     if points.len() < 2 {
-        return String::new();
+        return None;
     }
     let reference = t.reference_model.as_deref();
     let peak = points
@@ -163,7 +229,7 @@ pub(super) fn drift_chart(t: &ToolValue, w: &WindowEstimate, window: &str) -> St
         .flatten()
         .fold(0.0, f64::max);
     if peak <= 0.0 {
-        return String::new();
+        return None;
     }
     let top = 24.0;
     let base = top + DRIFT_PLOT;
@@ -245,20 +311,13 @@ pub(super) fn drift_chart(t: &ToolValue, w: &WindowEstimate, window: &str) -> St
         );
         desc.push(tip);
     }
-    let key = match reference {
-        Some(m) => format!(
-            "Solid: what a full {window} window held at each month's own prices. Dashed: the same use at {} prices, so a change in prices reads apart from a change in the limit.",
-            esc(m)
-        ),
-        None => format!("What a full {window} window held at each month's own prices."),
-    };
     let height = base + 28.0;
-    format!(
-        "<figure class=\"chart-fig drift\" data-tool=\"{tool}\"><figcaption><h3>What a full {window} window holds, month by month</h3><p>{key} A hollow dot rests on fewer than {DRIFT_MIN_RUNS} full windows.</p></figcaption><svg viewBox=\"0 0 {DRIFT_W} {height:.0}\" role=\"img\" aria-labelledby=\"drift-{id}-title drift-{id}-desc\"><title id=\"drift-{id}-title\">{tool}: est. cost of a full {window} window by month</title><desc id=\"drift-{id}-desc\">{}</desc>{body}</svg></figure>",
+    Some(format!(
+        "<svg viewBox=\"0 0 {DRIFT_W} {height:.0}\" role=\"img\" aria-labelledby=\"drift-{id}-title drift-{id}-desc\"><title id=\"drift-{id}-title\">{tool}: est. cost of a full {window} window by month</title><desc id=\"drift-{id}-desc\">{}</desc>{body}</svg>",
         esc(&desc.join("; ")),
         tool = esc(&t.tool),
         id = format!("{}-{}", esc(&t.tool), w.window),
-    )
+    ))
 }
 
 /// "Jun" from "2026-06"; the key itself when it does not parse.
