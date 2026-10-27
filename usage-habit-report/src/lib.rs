@@ -19,6 +19,7 @@ pub mod scan;
 pub mod serve;
 pub mod store;
 pub mod t3;
+pub mod untitled;
 pub mod value;
 
 pub mod config;

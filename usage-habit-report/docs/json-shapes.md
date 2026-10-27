@@ -317,5 +317,33 @@ uses `codex-name`; the weaker SQLite `title` uses `codex-title`.
 Antigravity summaries use `antigravity-summary`. Remaining sources are `t3`
 and `first-line`. Display titles collapse whitespace and keep at most 120
 characters. With no title, `display_title` is null and the source is
-`first-line` after a scan. MCP returns the same additive fields.
-Public snapshots contain none of these titles.
+`first-line` after a scan. A title set with the `title` command uses
+`manual` and wins over every other source. MCP returns the same additive
+fields. Public snapshots contain none of these titles.
+
+## `query untitled`
+
+An array, most-highlighted first. Empty when every highlighted session has a
+headline.
+
+```json
+[
+  {
+    "tool": "claude-code",
+    "session_id": "...",
+    "title_source": "first-line",
+    "title": "Read the scientific handoff at ...",
+    "path": "/home/demo/.claude/projects/-home-demo-proj/....jsonl",
+    "transcript": "/home/demo/.claude/projects/-home-demo-proj/....jsonl",
+    "pages": ["4w", "4w/claude-code", "12w"]
+  }
+]
+```
+
+`title_source` is `first-line` or `codex-title`; sessions with a harness,
+T3, or hand-set headline are left out. `path` is the raw log the session
+was read from (null when its source row is gone). `transcript` is the file to
+summarize from: for Antigravity the harness's
+`brain/<id>/.system_generated/logs/transcript.jsonl` when it exists, else
+`path`. `pages` are the dashboard pages that highlight the session, as
+`<window>` or `<window>/<tool>` for `1w`, `4w`, `12w`, `all`.

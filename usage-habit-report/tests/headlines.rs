@@ -145,10 +145,10 @@ fn v8_migration_preserves_usage_labels_and_cursors() {
         INSERT INTO codex_cursors VALUES (1,'{}');
         INSERT INTO session_labels VALUES ('claude-code','plain','coding',0);
         ALTER TABLE sessions DROP COLUMN display_title; ALTER TABLE sessions DROP COLUMN title_source;
-        DROP TABLE limit_samples; DROP TABLE live_limits; PRAGMA user_version=8;").unwrap();
+        DROP TABLE limit_samples; DROP TABLE live_limits; DROP TABLE session_titles; PRAGMA user_version=8;").unwrap();
     drop(s);
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 11);
+    assert_eq!(s.schema_version().unwrap(), 12);
     assert!(titles(&s).iter().all(|(_, _, source)| !source.is_empty()));
     headlines::refresh(&mut s.conn, &sources()).unwrap();
     // v9 keeps the Codex offset and cursor; v10 and v11 then schedule one

@@ -56,12 +56,13 @@ remains in `sessions.title` and JSON `title`.
 | T3 | Existing configured state databases | Stored `t3_title` |
 | Opening prompt | Existing transcript sources | Stored first-line `title` |
 
+A hand-set title (`usage-habit-report title`) wins over everything.
 Codex `name` wins over the index; an index headline wins over the weak SQLite
 `title`. Both `name` and index headlines use `codex-name` provenance. Harness
 headlines win over T3 titles, then the opening line is used.
 Claude Code keeps its opening line unless a T3 title is available. The JSON
-`title_source` values are `codex-name`, `codex-title`, `antigravity-summary`,
-`t3`, and `first-line`. A session without any title has a null `display_title`
+`title_source` values are `manual`, `codex-name`, `codex-title`,
+`antigravity-summary`, `t3`, and `first-line`. A session without any title has a null `display_title`
 and `first-line` provenance. Private session lists and fan-outs use the display
 headline. Public snapshots omit all titles.
 
@@ -462,6 +463,37 @@ an ambiguous prefix is refused and lists the candidates. Subagent sessions
 cannot be labelled: they take their parent's label. The hand-set label is
 kept in its own table, so later scans and a rebuild of the raw-log rows do
 not change it.
+
+### `title`
+
+```sh
+usage-habit-report title <session-id-or-prefix> "<title>"
+```
+
+Sets a session's display title by hand, for the private dashboard and
+`query session`. The session is found as for `label`. Whitespace is collapsed
+and the title is cut at 120 characters. The title is kept in its own table
+(`session_titles`); the headline refresh copies it into `display_title` with
+`manual` provenance and never replaces it, and a rebuild keeps it. The
+original opening line stays in `title`. Public snapshots omit all titles, so a
+hand-set title never reaches the published pages.
+
+### `query untitled`
+
+```sh
+usage-habit-report query untitled [--json]
+```
+
+Lists the sessions highlighted on any dashboard page (heaviest fan-outs,
+longest, costliest, for every window and tool page) whose title is still the
+opening prompt: `title_source` of `first-line` or `codex-title`. It reuses
+the page queries, so it tracks what a reader can see as sessions age in and
+out of the windows. `--json` adds the raw log path, the readable transcript
+(for Antigravity, the harness's `brain/<id>/.system_generated/logs/
+transcript.jsonl` when present) and the pages. The `/summarize-sessions`
+skill in `~/.claude/skills` reads this list, has a model summarize each
+transcript, and sets the results with `title`; run it by hand whenever the
+dashboard shows raw opening lines.
 
 ### `rebuild`
 

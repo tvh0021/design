@@ -152,6 +152,20 @@ pub fn refresh(conn: &mut Connection, sources: &Sources) -> Result<usize> {
         Err(_) => skipped += 1,
     }
     let tx = conn.transaction()?;
+    // A hand-set title beats every harness headline.
+    for row in tx
+        .prepare("SELECT tool, session_id, title FROM session_titles")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+    {
+        let (tool, id, title) = row?;
+        titles.insert((tool, id), (title, "manual"));
+    }
     let rows = tx
         .prepare("SELECT tool, session_id, title, t3_title FROM sessions")?
         .query_map([], |r| {
@@ -177,6 +191,36 @@ pub fn refresh(conn: &mut Connection, sources: &Sources) -> Result<usize> {
     label_from_headlines(&tx)?;
     tx.commit()?;
     Ok(skipped)
+}
+
+/// Record a hand-set title and show it at once. Returns the display title it
+/// replaced, if any.
+pub fn set_manual_title(
+    conn: &Connection,
+    tool: &str,
+    session_id: &str,
+    title: &str,
+    now_ms: i64,
+) -> Result<Option<String>> {
+    let Some(title) = normalize(title) else {
+        anyhow::bail!("title is empty");
+    };
+    let before: Option<String> = conn.query_row(
+        "SELECT display_title FROM sessions WHERE tool = ?1 AND session_id = ?2",
+        params![tool, session_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO session_titles (tool, session_id, title, set_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(tool, session_id) DO UPDATE SET title = excluded.title, set_at = excluded.set_at",
+        params![tool, session_id, title, now_ms],
+    )?;
+    conn.execute(
+        "UPDATE sessions SET display_title = ?3, title_source = 'manual'
+         WHERE tool = ?1 AND session_id = ?2",
+        params![tool, session_id, title],
+    )?;
+    Ok(before)
 }
 
 /// Root sessions (top-level ones, and subagents whose parent is unknown) whose
@@ -210,4 +254,44 @@ fn label_from_headlines(tx: &rusqlite::Transaction) -> Result<usize> {
         )?;
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    #[test]
+    fn manual_title_survives_refresh() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO sessions (tool, session_id, title, display_title, title_source)
+                 VALUES ('claude-code', 'aaaa1111', 'first line of prompt', 'first line of prompt', 'first-line')",
+                [],
+            )
+            .unwrap();
+        let before =
+            set_manual_title(&s.conn, "claude-code", "aaaa1111", "  Short   summary ", 5).unwrap();
+        assert_eq!(before.as_deref(), Some("first line of prompt"));
+        // Every source missing: the refresh falls back to the opening line
+        // for other sessions, but keeps the hand-set title.
+        let missing = Sources {
+            codex_state_dir: "/nonexistent".into(),
+            codex_session_index: "/nonexistent/index.jsonl".into(),
+            antigravity_summaries: "/nonexistent/summaries.db".into(),
+        };
+        refresh(&mut s.conn, &missing).unwrap();
+        let (title, source): (String, String) = s
+            .conn
+            .query_row(
+                "SELECT display_title, title_source FROM sessions WHERE session_id = 'aaaa1111'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Short summary");
+        assert_eq!(source, "manual");
+        assert!(set_manual_title(&s.conn, "claude-code", "aaaa1111", "   ", 6).is_err());
+    }
 }

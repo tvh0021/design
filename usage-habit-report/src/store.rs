@@ -203,6 +203,18 @@ const MIGRATIONS: &[&str] = &[
     DELETE FROM codex_cursors;
     UPDATE sessions SET user_turns = 0 WHERE tool = 'codex';
     "#,
+    // v12: hand-set session titles. Like `session_labels`, kept apart from
+    // `sessions` so a rebuild cannot lose them; the headline refresh copies
+    // them into `display_title` and never overwrites them.
+    r#"
+    CREATE TABLE session_titles (
+        tool       TEXT    NOT NULL,
+        session_id TEXT    NOT NULL,
+        title      TEXT    NOT NULL,
+        set_at     INTEGER NOT NULL,           -- epoch ms
+        PRIMARY KEY (tool, session_id)
+    );
+    "#,
 ];
 
 pub struct Store {

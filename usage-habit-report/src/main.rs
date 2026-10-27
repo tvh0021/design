@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use usage_habit_report::{
     agents, antigravity, codex, headlines, labels, limits, mcp, paths, project, query, rates, scan,
-    serve, store::Store, t3, value,
+    serve, store::Store, t3, untitled, value,
 };
 
 #[derive(Parser)]
@@ -86,6 +86,14 @@ enum Command {
         session: String,
         /// One of: research, coding, debugging, writing, review, data-analysis, ops-config, other.
         kind: String,
+    },
+    /// Set a session's display title by hand (survives rescans, rebuilds and
+    /// headline refreshes). Public snapshots still omit titles.
+    Title {
+        /// Session id or a unique prefix of it.
+        session: String,
+        /// The new title; whitespace is collapsed and it is cut at 120 characters.
+        title: String,
     },
     /// Subscription limit readings sampled live from `ai-usage`.
     Limits {
@@ -239,6 +247,14 @@ enum QueryCommand {
         /// Only requests in the last N hours/days/weeks: 12h, 7d, 2w.
         #[arg(long)]
         since: Option<String>,
+    },
+    /// Sessions highlighted on any dashboard page (heaviest fan-outs, longest,
+    /// costliest; every window and tool) whose title is still the opening
+    /// prompt. Feed these to a summarizer, then set each with `title`.
+    Untitled {
+        /// Print JSON (shape documented in docs/json-shapes.md).
+        #[arg(long)]
+        json: bool,
     },
     /// Sessions and tokens per task label.
     Labels {
@@ -582,7 +598,7 @@ fn main() -> Result<()> {
         Command::Rebuild { args } => {
             let start = std::time::Instant::now();
             let tx = store.conn.transaction()?;
-            // Children first; `session_labels` is not touched.
+            // Children first; `session_labels` and `session_titles` are not touched.
             for table in [
                 "session_events",
                 "codex_cursors",
@@ -594,7 +610,7 @@ fn main() -> Result<()> {
             }
             tx.commit()?;
             println!(
-                "rebuild: cleared sources, sessions, requests and codex cursors; kept session_labels"
+                "rebuild: cleared sources, sessions, requests and codex cursors; kept session_labels and session_titles"
             );
             let ing = ingest(&mut store, args)?;
             for l in &ing.lines {
@@ -673,6 +689,16 @@ fn main() -> Result<()> {
             }
         }
         Command::Query {
+            what: QueryCommand::Untitled { json },
+        } => {
+            let rows = untitled::untitled(&store.conn, scan::now_ms())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                print!("{}", untitled::render(&rows));
+            }
+        }
+        Command::Query {
             what: QueryCommand::Labels { json },
         } => {
             let (_, _) = priced(&mut store, cli.offline, false)?;
@@ -709,6 +735,19 @@ fn main() -> Result<()> {
                 labels::parse_kind(&kind).unwrap_or_default(),
                 match before {
                     Some(b) => format!(" (was {b})"),
+                    None => String::new(),
+                }
+            );
+        }
+        Command::Title { session, title } => {
+            let (tool, id) = labels::resolve_session(&store.conn, &session)?;
+            let before =
+                headlines::set_manual_title(&store.conn, &tool, &id, &title, scan::now_ms())?;
+            println!(
+                "{tool} {id}: title set to {:?}{}",
+                headlines::normalize(&title).unwrap_or_default(),
+                match before {
+                    Some(b) => format!(" (was {b:?})"),
                     None => String::new(),
                 }
             );
