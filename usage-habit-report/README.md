@@ -780,7 +780,10 @@ Each source path and its descendants belong to the target project. A
 self-mapping groups nested runs, judging directories, and embedded repositories
 under one umbrella. Paths must be absolute and cannot be `/`. The most specific
 source path wins; configured mappings override T3 mappings for the same source.
-Targets resolve through the Git rules above; aliases do not chain.
+Targets resolve through the Git rules above. Configured mappings do not
+chain, but a T3-recorded owner is mapped once more when it lies inside a
+configured source, so a recorded worktree of a repository aliased to an
+umbrella lands in the umbrella.
 A mapping for `/work/arena` does not match `/work/arena-other`.
 The next scan or `reindex` applies changed mappings to historical sessions.
 Shared container directories such as `/work` are not inferred as projects.

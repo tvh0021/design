@@ -80,8 +80,16 @@ fn main_toplevel(toplevel: &Path, dot_git: &Path) -> Option<PathBuf> {
 
 /// Explicit umbrella projects and T3's recorded worktree ownership. Filesystem
 /// boundaries prevent an alias for `arena` from matching `arena-other`.
+///
+/// `all` holds both kinds, configuration winning for the same source;
+/// `configured` holds only `config.toml` mappings, which are applied once more
+/// to a mapping's target so recorded worktree ownership folds into a
+/// configured umbrella.
 #[derive(Default)]
-struct Aliases(BTreeMap<String, String>);
+struct Aliases {
+    all: BTreeMap<String, String>,
+    configured: BTreeMap<String, String>,
+}
 
 impl Aliases {
     fn load(t3_paths: &[PathBuf]) -> Result<Self> {
@@ -100,30 +108,48 @@ impl Aliases {
             }
         }
         // User configuration takes priority over recorded ownership.
-        out.extend(crate::config::load()?.project_aliases);
-        Ok(Self(
-            out.into_iter()
-                .map(|(source, target)| {
-                    let source =
-                        std::fs::canonicalize(&source).unwrap_or_else(|_| PathBuf::from(source));
-                    (source.to_string_lossy().into_owned(), target)
-                })
-                .collect(),
-        ))
+        let configured = canonical_sources(crate::config::load()?.project_aliases);
+        out.extend(configured.clone());
+        Ok(Self {
+            all: canonical_sources(out),
+            configured,
+        })
     }
 
+    /// The project for a working directory: the most specific owner's target,
+    /// resolved through the Git rules. A recorded (T3) owner's target is first
+    /// folded into a configured umbrella when one contains it; configured
+    /// mappings themselves never chain.
     fn resolve(&self, cwd: &str) -> String {
-        let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
-        match self
-            .0
-            .iter()
-            .filter(|(source, _)| dir.starts_with(source))
-            .max_by_key(|(source, _)| Path::new(source).components().count())
-        {
-            Some((_, target)) => resolve(target),
-            None => resolve(cwd),
+        let Some((source, owned)) = owner(&self.all, cwd) else {
+            return resolve(cwd);
+        };
+        if self.configured.contains_key(source) {
+            return resolve(owned);
         }
+        resolve(owner(&self.configured, owned).map_or(owned, |(_, t)| t))
     }
+}
+
+/// Alias sources with symlinks resolved, so they compare with canonical cwds.
+fn canonical_sources(aliases: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    aliases
+        .into_iter()
+        .map(|(source, target)| {
+            let source = std::fs::canonicalize(&source).unwrap_or_else(|_| PathBuf::from(source));
+            (source.to_string_lossy().into_owned(), target)
+        })
+        .collect()
+}
+
+/// The most specific alias whose source contains `path`, as (source, target).
+fn owner<'a>(aliases: &'a BTreeMap<String, String>, path: &str) -> Option<(&'a str, &'a str)> {
+    let dir = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    aliases
+        .iter()
+        .filter(|(source, _)| dir.starts_with(source))
+        .max_by_key(|(source, _)| Path::new(source).components().count())
+        .map(|(source, target)| (source.as_str(), target.as_str()))
 }
 
 /// Last path component, or the whole string for `/` and the like.
@@ -728,10 +754,13 @@ mod tests {
 
     #[test]
     fn aliases_choose_the_most_specific_owner_without_matching_siblings() {
-        let aliases = Aliases(BTreeMap::from([
-            ("/missing/arena".into(), "/missing/arena".into()),
-            ("/missing/arena/independent".into(), "/missing/other".into()),
-        ]));
+        let aliases = Aliases {
+            all: BTreeMap::from([
+                ("/missing/arena".into(), "/missing/arena".into()),
+                ("/missing/arena/independent".into(), "/missing/other".into()),
+            ]),
+            configured: BTreeMap::new(),
+        };
         assert_eq!(
             aliases.resolve("/missing/arena/runs/seat-02"),
             "/missing/arena"
@@ -744,6 +773,28 @@ mod tests {
             aliases.resolve("/missing/arena-other"),
             "/missing/arena-other"
         );
+    }
+
+    #[test]
+    fn recorded_ownership_folds_into_a_configured_umbrella() {
+        // T3 maps a worktree to its repository; config maps that repository
+        // (and a sibling checkout) to one umbrella. The worktree lands in the
+        // umbrella too, but configured mappings never chain into each other.
+        let configured = BTreeMap::from([
+            ("/missing/repo".into(), "/missing/umbrella".into()),
+            ("/missing/other".into(), "/missing/umbrella".into()),
+            ("/missing/umbrella".into(), "/missing/elsewhere".into()),
+        ]);
+        let mut all = configured.clone();
+        all.insert("/missing/repo-worktrees/wt1".into(), "/missing/repo".into());
+        let aliases = Aliases { all, configured };
+        assert_eq!(
+            aliases.resolve("/missing/repo-worktrees/wt1/src"),
+            "/missing/umbrella"
+        );
+        assert_eq!(aliases.resolve("/missing/other/x"), "/missing/umbrella");
+        assert_eq!(aliases.resolve("/missing/umbrella/x"), "/missing/elsewhere");
+        assert_eq!(aliases.resolve("/missing/unrelated"), "/missing/unrelated");
     }
 
     #[test]
