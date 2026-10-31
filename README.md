@@ -26,7 +26,10 @@ Codex and Antigravity into SQLite and reports token usage, estimated API cost,
 model mix, task labels, subagent fan-out, and active time with idle gaps
 removed. No prompt or response text is stored. `serve` opens a local dashboard
 and regenerates the public snapshot in `usage-habit-report/site/`, which the
-Pages deploy publishes to [/design/usage/](https://tvh0021.github.io/design/usage/).
+Pages deploy publishes from `main` to [/design/usage/](https://tvh0021.github.io/design/usage/).
+From a project branch, the snapshot commit also fast-forwards `main` when
+every commit `main` lacks is a snapshot commit that changes only the snapshot
+directory.
 Project names in the public snapshot are pseudonyms unless the project is a
 public GitHub repo.
 

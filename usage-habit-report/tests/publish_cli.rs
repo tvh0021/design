@@ -518,3 +518,246 @@ fn publish_accepts_project_folders_that_collide_with_template_words() {
     assert!(result.status.success(), "template-word publish failed");
     assert_eq!(std::fs::read_dir(out).unwrap().count(), 17);
 }
+
+/// A clone of a bare origin whose default branch is `main`, checked out on a
+/// project branch that tracks `origin/project`, like the design repository.
+fn project_branch_clone(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let seed = tmp.join("seed");
+    repo(&seed);
+    let origin = tmp.join("origin.git");
+    git(
+        tmp,
+        &[
+            "clone",
+            "--bare",
+            seed.to_str().unwrap(),
+            origin.to_str().unwrap(),
+        ],
+    );
+    let root = tmp.join("repo");
+    git(
+        tmp,
+        &["clone", origin.to_str().unwrap(), root.to_str().unwrap()],
+    );
+    git(&root, &["config", "user.name", "Demo"]);
+    git(&root, &["config", "user.email", "demo@example.invalid"]);
+    git(&root, &["switch", "-c", "project"]);
+    git(&root, &["push", "-u", "origin", "project"]);
+    (root, origin)
+}
+
+fn serve_first_line_and_stderr(tmp: &Path, out: &Path) -> String {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+    let config = tmp.join("config/usage-habit-report");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!("[publish]\ndir = '{}'\n", out.display()),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_usage-habit-report"))
+        .arg("--db")
+        .arg(tmp.join("usage.db"))
+        .args([
+            "--no-scan",
+            "--offline",
+            "serve",
+            "--no-open",
+            "--port",
+            "0",
+        ])
+        .env("HOME", tmp.join("home"))
+        .env("XDG_CONFIG_HOME", tmp.join("config"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(first.starts_with("serving http://127.0.0.1:"));
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    err
+}
+
+#[test]
+fn serve_on_a_project_branch_updates_the_deployed_default_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    fixture(&tmp.path().join("usage.db"));
+    let (root, origin) = project_branch_clone(tmp.path());
+    let err = serve_first_line_and_stderr(tmp.path(), &root.join("site"));
+    assert!(
+        err.contains("committed; pushed; main fast-forwarded"),
+        "{err}"
+    );
+    let head = git(&root, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&root, &["log", "-1", "--format=%s"]), publish::MESSAGE);
+    assert_eq!(git(&origin, &["rev-parse", "project"]), head);
+    // GitHub Pages deploys from the default branch.
+    assert_eq!(git(&origin, &["rev-parse", "main"]), head);
+}
+
+#[test]
+fn default_branch_moves_only_past_snapshot_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    let store = fixture(&db);
+    let (root, origin) = project_branch_clone(tmp.path());
+    let out = root.join("site");
+    let main = git(&origin, &["rev-parse", "main"]);
+
+    // Disabled pushing leaves both remote branches alone.
+    let summary = publish::run(&db, &out, false, NOW).unwrap();
+    assert!(
+        summary.ends_with("committed; not pushed (disabled)"),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+
+    // Pushed but unmerged code keeps the public pages on the default branch.
+    git(
+        &root,
+        &["commit", "--allow-empty", "-m", "Code awaiting review"],
+    );
+    git(&root, &["push"]);
+    store
+        .conn
+        .execute("UPDATE requests SET input_tokens = 43", [])
+        .unwrap();
+    let summary = publish::run(&db, &out, true, NOW).unwrap();
+    assert!(
+        summary.ends_with("pushed; main not updated (1 other commits awaiting merge; merge project into main to publish)"),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+    assert_eq!(
+        git(&origin, &["rev-parse", "project"]),
+        git(&root, &["rev-parse", "HEAD"])
+    );
+
+    // A default branch that moved on is never rewritten.
+    let (root, origin) = {
+        let tmp = tmp.path().join("diverged");
+        std::fs::create_dir(&tmp).unwrap();
+        let (root, origin) = project_branch_clone(&tmp);
+        let other = tmp.join("other");
+        git(
+            &tmp,
+            &["clone", origin.to_str().unwrap(), other.to_str().unwrap()],
+        );
+        git(&other, &["config", "user.name", "Demo"]);
+        git(&other, &["config", "user.email", "demo@example.invalid"]);
+        git(
+            &other,
+            &["commit", "--allow-empty", "-m", "Merged elsewhere"],
+        );
+        git(&other, &["push"]);
+        (root, origin)
+    };
+    let main = git(&origin, &["rev-parse", "main"]);
+    let summary = publish::run(&db, &root.join("site"), true, NOW).unwrap();
+    assert!(
+        summary.ends_with("pushed; main not updated (it has commits this branch lacks)"),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+}
+
+#[test]
+fn publish_on_the_default_branch_pushes_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    fixture(&db);
+    let (root, origin) = project_branch_clone(tmp.path());
+    git(&root, &["switch", "main"]);
+    let summary = publish::run(&db, &root.join("site"), true, NOW).unwrap();
+    assert!(summary.ends_with("committed; pushed"), "{summary}");
+    assert_eq!(
+        git(&origin, &["rev-parse", "main"]),
+        git(&root, &["rev-parse", "HEAD"])
+    );
+    // A later run with nothing new still reports the default branch state.
+    git(&root, &["switch", "project"]);
+    git(&root, &["merge", "--ff-only", "main"]);
+    git(&root, &["push"]);
+    let summary = publish::run(&db, &root.join("site"), true, NOW).unwrap();
+    assert!(
+        summary.ends_with("no commit; pushed; main up to date"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn snapshot_message_alone_does_not_ship_other_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    fixture(&db);
+    let (root, origin) = project_branch_clone(tmp.path());
+    let out = root.join("site");
+    let main = git(&origin, &["rev-parse", "main"]);
+
+    // An amended snapshot commit that also adds code is not pushed.
+    publish::run(&db, &out, false, NOW).unwrap();
+    std::fs::write(root.join("unreviewed-code.js"), "ship()").unwrap();
+    git(&root, &["add", "unreviewed-code.js"]);
+    git(&root, &["commit", "--amend", "--no-edit"]);
+    let summary = publish::run(&db, &out, true, NOW).unwrap();
+    assert!(
+        summary.ends_with("no commit; not pushed (1 other unpushed commits)"),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+
+    // Pushed by hand, it still never reaches the default branch.
+    git(&root, &["push"]);
+    let summary = publish::run(&db, &out, true, NOW).unwrap();
+    assert!(
+        summary.ends_with(
+            "no commit; pushed; main not updated (1 other commits awaiting merge; merge project into main to publish)"
+        ),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+
+    // A later snapshot-message commit that deletes the code leaves no net
+    // change outside the snapshot, but the commit that added it still counts.
+    git(&root, &["rm", "--quiet", "unreviewed-code.js"]);
+    git(&root, &["commit", "-m", publish::MESSAGE]);
+    git(&root, &["push"]);
+    let summary = publish::run(&db, &out, true, NOW).unwrap();
+    assert!(
+        summary.ends_with(
+            "main not updated (2 other commits awaiting merge; merge project into main to publish)"
+        ),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+}
+
+#[test]
+fn unknown_remote_default_branch_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    fixture(&db);
+    let (root, origin) = project_branch_clone(tmp.path());
+    let main = git(&origin, &["rev-parse", "main"]);
+    git(&root, &["remote", "set-head", "origin", "--delete"]);
+    let summary = publish::run(&db, &root.join("site"), true, NOW).unwrap();
+    assert!(
+        summary.ends_with(
+            "committed; pushed; default branch not checked (origin/HEAD unknown; run `git remote set-head origin --auto`)"
+        ),
+        "{summary}"
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+}
