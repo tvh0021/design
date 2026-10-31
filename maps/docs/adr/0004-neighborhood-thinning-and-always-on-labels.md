@@ -20,6 +20,7 @@ Four thinning rules were implemented in `selectPlaceDots` and compared on the Wa
 - Label fit: a candidate is skipped unless its name badge fits right or left of the dot without covering a kept dot, kept label, route pin or pin label. On its own this did not reduce clutter (the badges fit between the satellites), so it is not a neighborhood mode but a check applied whenever labels are on. The reserved rect is stored on the dot so the renderer draws the label where it was checked.
 - Every kept dot is labeled with its name on every device; hovering or tapping adds the country. The options `placeLabels` and `placeLabelCount` replace `touchLabels` and `placeTouchLabelCount` (kept as aliases).
 - The dot budget is 20 on canvases at least 900 px wide and 10 below that, so a phone shows 10 labeled dots instead of 20 unlabeled ones. 30 on desktop was tried and let the penalized satellites (Providence, Baltimore) back in once the free-standing cities were placed. Label text is 13 px on canvases at least 900 px wide and 11 px below that. `placeDotLimit` still fixes it.
+- Amended 2026-10-30: the desktop budget is now 15 at the owner's request. Phones stay at 10.
 - URL parameters `neighborhood`, `reach` and `spacing` override the mode, radius reach and minimum spacing for comparison; `debug=1` exposes the renderer as `window.__globe`.
 
 ## Consequences

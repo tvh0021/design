@@ -93,7 +93,7 @@ function normalizeMidpoint(mid) {
  * @returns {Array<{place: object, index: number, x: number, y: number, score: number, labelRect?: object}>}
  */
 export function selectPlaceDots(places, project, rect, {
-  limit = 20, minSpacing = 16, exclude = [], center = null, centerBias = 0, previous = [], stickyBonus = 0.3,
+  limit = 15, minSpacing = 16, exclude = [], center = null, centerBias = 0, previous = [], stickyBonus = 0.3,
   neighborhood = 'fixed', reach = 0, softRadius = 0, softWeight = 0, labelRect = null, excludeRects = []
 } = {}) {
   const dots = [];
@@ -982,7 +982,11 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   let verticalCenterRatio = typeof options.verticalCenterRatio === 'number' ? options.verticalCenterRatio : 0.5;
 
   let minScale = Math.min(width, height) * 0.2;
-  let maxScale = Math.min(width, height) * 3.5;
+  // Zoom cap: 5x the shorter canvas side (3.5x before the 16k terrain tier).
+  // At 5x on a 900 px canvas the 16k texture (2608 texels per radian) is
+  // magnified about 1.7x, softer than 1:1 but sharper than the 8k texture was
+  // at the old 3.5x cap (2.4x). The Robinson cap below keeps the same ratio.
+  let maxScale = Math.min(width, height) * 5;
   let currentScale = options.scale || Math.min(width, height) * 0.42;
   const initialRot = options.initialRotation || [0, -20, 0];
 
@@ -1014,7 +1018,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
   }
   let robinsonScale = options.robinsonScale || defaultRobinsonScale();
   let minRobinsonScale = worldRobinsonScale() * 0.4;
-  let maxRobinsonScale = Math.min(width, height) * 4.0;
+  let maxRobinsonScale = Math.min(width, height) * 5.75;
   let robinsonCenterLng = 0;
   let robinsonCenterLat = 0;
 
@@ -1064,10 +1068,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   // Population-ranked city dots ("places"). placeVecs caches unit vectors so
   // the orthographic view can cull the far side before projecting.
-  // Dot budget: 20 on desktop-sized canvases, 10 on phones, unless the
+  // Dot budget: 15 on desktop-sized canvases, 10 on phones, unless the
   // caller fixes it.
   const placeDotLimit = options.placeDotLimit || 0;
-  const placeDotBudget = () => placeDotLimit || (width >= 900 ? 20 : 10);
+  const placeDotBudget = () => placeDotLimit || (width >= 900 ? 15 : 10);
   // Label badges: 13 px text on desktop-sized canvases, 11 px on phones.
   const labelFontPx = () => (width >= 900 ? 13 : 11);
   const labelFont = () => `600 ${labelFontPx()}px system-ui, -apple-system, sans-serif`;
@@ -1515,7 +1519,7 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
 
   // Center bias for a view of the given angular radius. Full strength
   // (2/3)·ln(N) from a hemisphere (<= 80 deg) inward, fading to 0 at a
-  // whole-world view so the world map still shows the global top 20 instead
+  // whole-world view so the world map still shows the global top 15 instead
   // of piling dots at its center. 2·ln(N) was tried first and clustered dots
   // too tightly around the center.
   function centerBiasFor(halfAngleDeg) {
@@ -1984,10 +1988,10 @@ export function createGlobeRenderer(containerElement, worldTopology, options = {
       height = containerElement.clientHeight;
     }
     minScale = Math.min(width, height) * 0.2;
-    maxScale = Math.min(width, height) * 3.5;
+    maxScale = Math.min(width, height) * 5;
     robinsonScale = defaultRobinsonScale() * robinsonZoomRatio;
     minRobinsonScale = worldRobinsonScale() * 0.4;
-    maxRobinsonScale = Math.min(width, height) * 4.0;
+    maxRobinsonScale = Math.min(width, height) * 5.75;
     if (robinsonProj) robinsonProj.scale(robinsonScale);
 
     updateCanvasDimensions();
