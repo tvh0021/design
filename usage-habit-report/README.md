@@ -996,12 +996,30 @@ there are already staged changes. Repeating an unchanged export makes no
 commit; changes in generation time and page-load timing alone do not count. Outside a repository,
 it only writes the files.
 
-Before pushing, it checks `git log @{u}..HEAD --format=%s`. Every unpushed
-commit must have the snapshot commit message. If other commits exist, it
-keeps the snapshot commit locally and reports the count of other commits.
-`--no-push` or `push = false` always disables pushing. Git failures, including
-a missing upstream or a network error, fail the standalone command.
-The summary reports the file count, commit result, and push result or reason.
+Before pushing, it checks every commit in `@{u}..HEAD`. Each must be a
+snapshot commit: the snapshot commit message, one parent, and no changed,
+added, deleted, or renamed path outside the destination directory. A commit
+amended or reworded to carry other files fails the check, and so does a commit
+whose change a later commit reverts. If other commits exist, it keeps the
+snapshot commit locally and reports their count. `--no-push` or `push = false`
+always disables pushing. Git failures, including a missing upstream or a
+network error, fail the standalone command.
+
+GitHub Pages deploys only the remote's default branch (`origin/HEAD`, here
+`main`). After pushing a project branch such as `usage-habit-report`, `publish`
+fetches the default branch and pushes `HEAD` to it as a fast-forward when every
+commit it lacks passes the same snapshot check. It never force-pushes. If the
+default branch has commits the project branch lacks, the default branch stays
+where it is. If the project branch holds other commits, the summary asks you to
+merge the project branch into the default branch; until then the public pages
+keep the last deployed snapshot. If `origin/HEAD` is not set, `publish` does
+not guess the default branch and says to run `git remote set-head origin
+--auto`. On the default branch itself, the ordinary push is the deploy.
+
+The summary reports the file count, commit result, push result or reason, and
+on a project branch the default branch result (`main fast-forwarded`, `main up
+to date`, `main not updated` with the reason, or `default branch not
+checked`).
 
 GitHub Pages copies `usage-habit-report/site/` to `/usage/`; the flight visualizer is at `/map/`.
 The deploy workflow uses committed HTML and does not build Rust. The checked-in

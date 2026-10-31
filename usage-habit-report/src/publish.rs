@@ -93,19 +93,122 @@ pub fn run(db: &Path, out: &Path, push: bool, now_ms: i64) -> Result<String> {
     let reason = if !push {
         "not pushed (disabled)".to_owned()
     } else {
-        let log = git(&root, &["log", "@{u}..HEAD", "--format=%s"])?;
-        let others = log.lines().filter(|line| *line != MESSAGE).count();
+        let others = other_commits(&root, "@{u}..HEAD", relative)?;
         if others > 0 {
             format!("not pushed ({others} other unpushed commits)")
         } else {
             git(&root, &["push"])?;
-            "pushed".to_owned()
+            format!("pushed{}", update_default_branch(&root, relative)?)
         }
     };
     Ok(format!(
         "publish: {files} files written; {}; {reason}",
         if changed { "committed" } else { "no commit" }
     ))
+}
+
+/// Counts the commits in `range` that are not snapshot commits. A snapshot
+/// commit has the snapshot message, one parent, and no changes outside the
+/// snapshot directory, so an amended or reworded commit cannot carry other
+/// files out. Each commit is checked, because a later commit can revert an
+/// earlier one and hide it from the combined diff.
+fn other_commits(root: &Path, range: &str, relative: &str) -> Result<usize> {
+    let log = git(
+        root,
+        &[
+            "log",
+            "--no-show-signature",
+            "--format=%H%x09%P%x09%s",
+            range,
+        ],
+    )?;
+    let outside = format!(":(top,literal,exclude){relative}");
+    let mut others = 0;
+    for line in log.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let commit = fields.next().unwrap_or_default();
+        let parents = fields.next().unwrap_or_default();
+        let subject = fields.next().unwrap_or_default();
+        // Merges and root commits have no single diff to check.
+        let snapshot = subject == MESSAGE
+            && parents.split_whitespace().count() == 1
+            && git(
+                root,
+                &[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-commit-id",
+                    "--no-renames",
+                    "--name-only",
+                    commit,
+                    "--",
+                    &outside,
+                ],
+            )?
+            .is_empty();
+        others += usize::from(!snapshot);
+    }
+    Ok(others)
+}
+
+/// GitHub Pages deploys the remote's default branch, so a snapshot pushed to a
+/// project branch also fast-forwards the default branch. It moves only when
+/// every commit it lacks is a snapshot commit: unmerged code never ships.
+fn update_default_branch(root: &Path, relative: &str) -> Result<String> {
+    let branch = git(root, &["symbolic-ref", "--short", "HEAD"])?;
+    let remote = git(root, &["config", &format!("branch.{branch}.remote")])?;
+    let upstream = git(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )?;
+    let default = git(
+        root,
+        &[
+            "symbolic-ref",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ],
+    );
+    let Some(name) = default
+        .as_ref()
+        .ok()
+        .and_then(|d| d.strip_prefix(&format!("{remote}/")))
+    else {
+        return Ok(format!(
+            "; default branch not checked ({remote}/HEAD unknown; run `git remote set-head {remote} --auto`)"
+        ));
+    };
+    let default = format!("{remote}/{name}");
+    if upstream == default {
+        return Ok(String::new());
+    }
+    git(root, &["fetch", "--quiet", &remote, name])?;
+    let ancestor = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", &default, "HEAD"])
+        .output()?;
+    if ancestor.status.code() == Some(1) {
+        return Ok(format!(
+            "; {name} not updated (it has commits this branch lacks)"
+        ));
+    }
+    if !ancestor.status.success() {
+        bail!("git merge-base failed");
+    }
+    let range = format!("{default}..HEAD");
+    let others = other_commits(root, &range, relative)?;
+    if others > 0 {
+        return Ok(format!(
+            "; {name} not updated ({others} other commits awaiting merge; merge {branch} into {name} to publish)"
+        ));
+    }
+    if git(root, &["rev-list", "--count", &range])? == "0" {
+        return Ok(format!("; {name} up to date"));
+    }
+    git(root, &["push", &remote, &format!("HEAD:refs/heads/{name}")])?;
+    Ok(format!("; {name} fast-forwarded"))
 }
 
 fn without_timing(body: &str) -> String {
