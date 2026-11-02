@@ -1,14 +1,14 @@
 # Scenic route planner: plan
 
-Status: preliminary, 2026-11-02. Nothing built yet. Revised once after review
-(see "Review changes" at the end).
+Status: preliminary, 2026-11-02. Nothing built yet. Revised after review (see
+"Review changes" at the end), then changed to need no Google API key.
 
 ## Goal
 
 Two modes, both handing off to Google Maps on desktop:
 
-1. **A to B.** Take the route Google suggests and bend it onto prettier roads.
-   Target about 30% over Google's ETA; never go past 50%.
+1. **A to B.** Take the fastest route and bend it onto prettier roads.
+   Target about 30% over the fastest ETA; never go past 50%.
 2. **Drive-around.** Start and end at the same place. Given a time budget, suggest
    loops that pass the best scenery and stops within reach.
 
@@ -26,14 +26,15 @@ is the first test case, not the product.
 | Region | All of New York State | Score every road once, offline; queries route on the statewide graph. |
 | Handoff | Google Maps URL, desktop | Desktop links take more waypoints than mobile ones (about 9 vs 3; confirm in phase 0). |
 | ETA budget | target +30%, hard cap +50% | User choice. |
-| ETA accuracy | loose | Our own OSM-based ETA drives the search; Google gives the baseline and checks the result. |
+| ETA accuracy | loose | Our own OSM-based ETA drives the search and sets the baseline. A free public OSRM or Valhalla server gives a second opinion. |
+| Google API | none | Too much account setup. Google is used only through Maps links, which need no key and are free. |
 | Score weights | hand-set from the user's priorities | Water, hills and views are what the user wants; fitting weights to the byway list would let the byway list decide. |
 | Location | `scenic/` on the `scenic` branch | Same pattern as `maps/` and `usage-habit-report/`. |
 
 ## How it works
 
-Google cannot be told to prefer pretty roads. It only takes waypoints and
-avoid-highways/tolls/ferries flags. So we route on our own copy of the road
+Google Maps cannot be told to prefer pretty roads. A Maps link only takes
+waypoints. So we route on our own copy of the road
 network (OpenStreetMap), score every road for scenery, find a scenic route, and
 then reduce it to a few waypoints that make Google drive the same roads.
 
@@ -82,13 +83,14 @@ A statewide heatmap of S is the visual sanity check.
 
 ### 2. A to B
 
-1. **Baseline.** One Google Routes API call for A to B at the departure time
-   gives the reference ETA T₀. Our own fastest route gives t₀ on the same roads
-   model. Without an API key, use t₀ alone (fine for development).
-2. **Budget, as a ratio.** Our ETAs and Google's disagree, so compare like with
-   like: a candidate route with our ETA t passes if t / t₀ ≤ 1.3 (target) or
-   ≤ 1.5 (cap). Google's check at the end reports the real figure. Logged
-   Google-vs-ours errors later give a speed correction per road class.
+1. **Baseline.** Our own fastest route from A to B gives t₀. No traffic, so
+   it is a free-flow ETA, like Google's at 3 a.m.
+2. **Budget, as a ratio.** A candidate route with our ETA t passes if
+   t / t₀ ≤ 1.3 (target) or ≤ 1.5 (cap). Because both numbers come from the
+   same speed model, its errors mostly cancel. The public OSRM demo server
+   (router.project-osrm.org, about 1 request per second, light use only) or
+   FOSSGIS Valhalla gives a second ETA for the same waypoints; logging the gap
+   tells us how loose ours is.
 3. **Search.** Edge cost = t · (1 + λ·(1 − S)). λ = 0 is the fastest route;
    larger λ makes unscenic roads more expensive. Costs stay positive for every
    λ, so Dijkstra stays valid. Sweep λ over a grid on the full statewide graph
@@ -110,12 +112,12 @@ A statewide heatmap of S is the visual sanity check.
    place the next waypoint there, repeat. This uses the fewest waypoints. Each
    waypoint must snap to the intended road: reject spots with a parallel road
    within ~50 m and move along the road until clear.
-   - First pass offline, with our own λ = 0 router standing in for Google.
-   - Then 2–4 Google calls: compare Google's returned route with ours (overlap
-     within a buffer), add or move waypoints where Google leaves our route.
-     Target ≥ 90% overlap within 9 waypoints.
-5. **Final check.** Report Google's ETA with waypoints vs T₀. Over +50%: drop to
-   the next route down the kept set.
+   - Our own λ = 0 router stands in for Google; OSRM, a different engine, is a
+     second stand-in. Target ≥ 90% overlap within 9 waypoints for both.
+   - Spot-check by hand: open a sample of the links in desktop Google Maps and
+     see whether Google draws the same roads.
+5. **Final check.** Report the OSRM ETA through the waypoints vs t₀. Over +50%:
+   drop to the next route down the kept set.
 6. **Output.** Route on a map, the three budget options with scenic minutes
    gained, and an "Open in Google Maps" link.
 
@@ -138,7 +140,7 @@ Start with anchor loops; add a full solver only if they fall short.
    loop get attached as optional stops (10–30 min each, or 0 for drive-only),
    if they fit in the remaining budget.
 3. **Return 3 loops** that differ in direction or theme (lakes, hills,
-   waterfalls), each with ETA, stops and a Google Maps link. One Google check
+   waterfalls), each with ETA, stops and a Google Maps link. One OSRM check
    per loop.
 4. **Deferred: OR-Tools orienteering.** Only if anchor loops miss obvious good
    stops. If built, its time matrix must use the scenic leg times, not the
@@ -149,7 +151,7 @@ Start with anchor loops; add a full solver only if they fall short.
 Not a constraint. The statewide scoring is a one-off batch (minutes, vectorised
 with numpy/geopandas/rasterio). A query is a λ sweep of about 10–20 Dijkstra
 runs on the statewide graph with `scipy.sparse.csgraph` or igraph, so seconds,
-plus a few Google calls. If that gets slow, cut the graph to the ellipse with A
+plus a few OSRM calls. If that gets slow, cut the graph to the ellipse with A
 and B as foci (|AP| + |PB| ≤ v_max · 1.5 · t₀) before searching. The one heavy
 piece is true line-of-sight views (v1); if that is slow in numpy, that function
 is the candidate for numba or Rust.
@@ -168,7 +170,7 @@ scenic/
     route.py              λ sweep, kept route set, budgets, local improvement
     waypoints.py          greedy farthest-reach waypoints, snapping check
     loop.py               anchor loops, stops
-    google.py             Routes API baseline + check, Maps URL builder
+    handoff.py            Google Maps URL builder, OSRM check
     cli.py                `scenic route A B`, `scenic loop HOME --hours 2`
   tests/
   data/                   gitignored raw and derived data
@@ -181,18 +183,18 @@ cover under 1 GB each. All gitignored.
 ## Phases
 
 0. **Prove the handoff first.** It is the riskiest piece. Hand-build a
-   Rochester to Syracuse route via 5&20 with 5–9 waypoints, open it in desktop
-   Google Maps, and confirm Google follows it. Confirm the desktop waypoint
-   limit. Compare Google's avoid-highways route with +30%: that is the trivial
-   baseline to beat. Needs a Google Maps Platform API key.
+   Rochester to Syracuse route via 5&20 with 5–9 waypoints, open the link in
+   desktop Google Maps, and confirm Google follows it and accepts 9 waypoints.
+   Note Google's ETA for the fastest route and the scenic one by eye. No API key
+   needed.
 1. **Data.** Download NY OSM, elevation, land cover, AADT, byway list. Build the
    statewide graph.
 2. **Score v0.** Water (with visibility), hills, land cover, view proxy, quiet,
    curves. Statewide heatmap. Byway check. Start the hand-labelled sample.
 3. **A to B.** λ sweep, kept route set, three budgets, Rochester to Syracuse end
    to end, routes drawn on a 2D map.
-4. **Waypoints + Google.** Farthest-reach reduction, Google correction calls,
-   final check, Maps link.
+4. **Waypoints + handoff.** Farthest-reach reduction, OSRM check, Maps link,
+   hand spot-checks in Google Maps.
 5. **Statewide benchmark.** ~50 city pairs across NY (short, medium, long; flat
    west, Finger Lakes, Adirondacks, Catskills, Hudson Valley, Long Island).
    Metrics below.
@@ -203,25 +205,27 @@ cover under 1 GB each. All gitignored.
 
 ## Metrics (benchmark)
 
-- ETA ratio vs fastest (target ~1.3, cap 1.5), by our estimate and by Google's.
+- ETA ratio vs fastest (target ~1.3, cap 1.5), by our estimate and by OSRM's.
 - Scenic minutes above baseline, per extra minute driven.
 - Share of distance on small roads (secondary, tertiary, unclassified).
 - Overlap with designated scenic byways.
-- Waypoints used (≤ 9) and overlap between Google's route and ours.
-- Our ETA error vs Google, by road class.
+- Waypoints used (≤ 9) and overlap between the stand-in routes and ours; hand
+  spot-check pass rate in Google Maps.
+- Our ETA error vs OSRM, by road class.
 - Score quality: rank correlation with the hand-labelled sample.
 
 ## Risks
 
-- **Loose ETAs.** OSM speeds on back roads are guesses. The ratio budget and the
-  final Google check limit the damage; the logged errors tell us whether to
-  calibrate.
+- **Loose ETAs, no traffic.** OSM speeds on back roads are guesses, and there is
+  no live traffic. The ratio budget cancels most of the error; the OSRM gap and
+  the hand spot-checks show how far off we are. If it matters later, add the
+  Google Routes API back as an optional check.
 - **Score quality.** v0 will mislabel some roads (a rural strip of big-box stores
   on a secondary road). The heatmap, byway check and hand-labelled sample are
   there to catch this.
-- **Google terms.** Google route geometry may only be shown on a Google map and
-  cannot be cached long term. Our routes come from OSM; Google is used for ETAs,
-  route checks and navigation. Read the terms before building the web page.
+- **Public server limits.** The OSRM and FOSSGIS servers are free demos with
+  fair-use rules. If the benchmark needs more, run OSRM locally in Docker on
+  the NY extract.
 - **Waypoint limit.** If Google still cuts corners with 9 waypoints on long
   trips, prefer fewer, longer scenic stretches over many short ones.
 
@@ -236,7 +240,7 @@ A review (2026-11-02) led to these changes from the first draft:
   fastest route's average.
 - Budget compared as a ratio of our own ETAs, not ours against Google's.
 - Waypoints placed by greedy farthest reach with a snapping check, then
-  corrected with a few Google calls instead of trusting the offline stand-in.
+  checked against a second engine (OSRM) and by hand in Google Maps.
 - Dropped the doubling-back penalty and the mandatory corridor cut.
 - Water counts only when visible; curves added as a small bonus; smoothing
   follows the same road.
