@@ -10,6 +10,59 @@ scenic = 0.70   # expected S >= this
 dull = 0.35     # expected S <= this
 need = 8        # of 10, per list
 
+# v0.2 checks (docs/SCORE_V02.md section 1). The v0.1 checks above are still
+# reported for comparison. Dull items carry `kind`: "urban" (default),
+# "motorway" (reported only) or "flat" (rural band).
+[v3]
+scenic_min = 0.65
+scenic_need = 8
+urban_max = 0.20
+urban_need = 6            # of the 7 urban strips
+flat_band = [0.20, 0.50]  # all flat rural roads (here and in [holdout])
+
+[v4]
+landscape = ["Adirondack Trail", "Central Adirondack Trail", "Southern Adirondack Trail",
+             "Roosevelt-Marcy Trail", "High Peaks Byway (Route 73)", "Olympic Trail",
+             "Catskill Mountains", "Mountain Cloves", "Durham Valley Scenic Byway",
+             "Upper Delaware Scenic Byway", "Shawangunk Mountains", "Cayuga Lake", "Seneca Lake",
+             "Scenic Route 90", "Dude Ranch Trail", "Lakes to Locks Passage"]
+landscape_median_min = 0.65
+neighbour_radius_m = 15000.0
+rural_dev_max = 0.3
+neighbours_need = 18      # of 25 designated byways
+
+# Lake fronts on the Rochester-Syracuse corridor (SCORE_V02 section 2),
+# reported only.
+[[fronts]]
+label = "Seneca front, Geneva (US-20/NY-5, Lake Front Drive to Waterloo-Geneva Road)"
+ref = "US 20"
+bbox = [-76.99, 42.855, -76.955, 42.89]
+
+[[fronts]]
+label = "Geneva Lake Front Drive, the 374 m edge of SCORE_V02 section 2"
+ref = "US 20"
+bbox = [-76.9806, 42.8628, -76.9802, 42.8632]
+
+[[fronts]]
+label = "Skaneateles front (US-20 Genesee Street)"
+ref = "US 20"
+bbox = [-76.445, 42.94, -76.413, 42.95]
+
+[[fronts]]
+label = "Cayuga crossing (US-20/NY-5 over the outlet at the north end of Cayuga Lake)"
+ref = "US 20"
+bbox = [-76.755, 42.955, -76.73, 42.97]
+
+[[fronts]]
+label = "SCORE_V02's 'Cayuga N end' 1 km edge (actually Seneca River, east of Geneva)"
+ref = "US 20"
+bbox = [-76.9100, 42.8950, -76.9085, 42.8960]
+
+[[fronts]]
+label = "Canandaigua Lakeshore Drive (2 km)"
+name = "Lakeshore Drive"
+bbox = [-77.275, 42.870, -77.255, 42.880]
+
 [[scenic]]
 label = "NY-97 Hawk's Nest, Port Jervis to Barryville"
 ref = "NY 97"
@@ -62,6 +115,7 @@ bbox = [-76.44, 42.87, -76.10, 42.96]
 
 [[dull]]
 label = "I-490 Rochester, Inner Loop to I-590"
+kind = "motorway"
 ref = "I 490"
 bbox = [-77.605, 43.12, -77.55, 43.16]
 
@@ -87,6 +141,7 @@ bbox = [-73.55, 40.71, -73.48, 40.74]
 
 [[dull]]
 label = "I-495 Long Island Expressway, Queens"
+kind = "motorway"
 ref = "I 495"
 bbox = [-73.96, 40.72, -73.70, 40.76]
 
@@ -107,6 +162,7 @@ bbox = [-78.86, 42.96, -78.78, 43.05]
 
 [[dull]]
 label = "NY-5 Batavia to Le Roy"
+kind = "flat"
 ref = "NY 5"
 bbox = [-78.17, 42.96, -78.00, 43.01]
 
@@ -182,10 +238,137 @@ bbox = [-76.14, 43.10, -76.10, 43.17]
 
 [[holdout.dull]]
 label = "NY-104 Ridge Road, Ridgeway to Gaines (flat Orleans County farmland, lake out of sight)"
+kind = "flat"
 ref = "NY 104"
 bbox = [-78.30, 43.25, -78.10, 43.31]
 
 [[holdout.dull]]
 label = "NY-98 Batavia to Elba (flat farmland)"
+kind = "flat"
 ref = "NY 98"
 bbox = [-78.21, 43.02, -78.17, 43.10]
+
+# ---------------------------------------------------------------------------
+# Holdout-2 (docs/SCORE_V02.md section 1), written before the first v0.2 line
+# of code. Scenic stretches from the unscored pool there plus one road named
+# nowhere else in the repo; urban strips and flat-rural roads likewise; OD
+# pairs for the corridor test (V1, not built yet). Nothing is computed on this
+# set until the v0.2 run is declared final: validation skips it while
+# declared_final is false. Looking early retires the set.
+
+[holdout2]
+declared_final = true
+urban_max = 0.20          # V3: urban strips S <= this, need 4 of 5
+flat_band = [0.20, 0.50]  # V3: flat rural, all three inside the band
+scenic_min = 0.65         # V3: scenic S >= this, need 8 of 10
+
+[[holdout2.scenic]]
+label = "NY-3 Saranac Lake to Tupper Lake"
+ref = "NY 3"
+bbox = [-74.48, 44.19, -74.12, 44.34]
+
+[[holdout2.scenic]]
+label = "NY-86 Wilmington Notch, Wilmington to Lake Placid"
+ref = "NY 86"
+bbox = [-73.97, 44.29, -73.81, 44.40]
+
+[[holdout2.scenic]]
+label = "NY-8 Speculator to Wells"
+ref = "NY 8"
+bbox = [-74.40, 43.38, -74.25, 43.52]
+
+[[holdout2.scenic]]
+label = "NY-30 Long Lake to Tupper Lake"
+ref = "NY 30"
+bbox = [-74.55, 43.99, -74.38, 44.21]
+
+[[holdout2.scenic]]
+label = "NY-28N Long Lake to North Creek (Newcomb, Minerva)"
+ref = "NY 28N"
+bbox = [-74.42, 43.69, -73.97, 44.00]
+
+[[holdout2.scenic]]
+label = "NY-23 Acra to Windham (northern Catskills)"
+ref = "NY 23"
+bbox = [-74.26, 42.28, -74.05, 42.34]
+
+[[holdout2.scenic]]
+label = "NY-21 Cheshire to Naples (west of Canandaigua Lake)"
+ref = "NY 21"
+bbox = [-77.42, 42.61, -77.27, 42.85]
+
+[[holdout2.scenic]]
+label = "NY-54A Penn Yan to Hammondsport (Keuka Lake west branch and west shore)"
+ref = "NY 54A"
+bbox = [-77.24, 42.40, -77.04, 42.67]
+
+[[holdout2.scenic]]
+label = "US-9W Catskill to Saugerties (Hudson valley)"
+ref = "US 9W"
+bbox = [-73.98, 42.07, -73.86, 42.22]
+
+[[holdout2.scenic]]
+label = "NY-214 Phoenicia to Hunter (Stony Clove Notch)"
+ref = "NY 214"
+bbox = [-74.33, 42.07, -74.20, 42.21]
+
+[[holdout2.urban]]
+label = "NY-104 Irondequoit-Wayne County Expressway, Webster"
+ref = "NY 104"
+bbox = [-77.48, 43.20, -77.40, 43.23]
+
+[[holdout2.urban]]
+label = "NY-33 Genesee Street, Cheektowaga"
+ref = "NY 33"
+bbox = [-78.73, 42.92, -78.66, 42.95]
+
+[[holdout2.urban]]
+label = "NY-347 Nesconset-Port Jefferson Highway, Hauppauge to Lake Grove"
+ref = "NY 347"
+bbox = [-73.20, 40.82, -73.10, 40.88]
+
+[[holdout2.urban]]
+label = "NY-7 Troy-Schenectady Road, Niskayuna to Latham"
+ref = "NY 7"
+bbox = [-73.87, 42.75, -73.775, 42.80]
+
+[[holdout2.urban]]
+label = "NY-25 Jericho Turnpike, Huntington to Commack"
+ref = "NY 25"
+bbox = [-73.42, 40.83, -73.27, 40.86]
+
+[[holdout2.flat]]
+label = "NY-31 Brockport to Albion"
+ref = "NY 31"
+bbox = [-78.18, 43.20, -77.96, 43.26]
+
+[[holdout2.flat]]
+label = "NY-63 Batavia to Oakfield"
+ref = "NY 63"
+bbox = [-78.27, 43.01, -78.19, 43.07]
+
+[[holdout2.flat]]
+label = "NY-19 Le Roy to Bergen"
+ref = "NY 19"
+bbox = [-77.99, 42.99, -77.93, 43.08]
+
+# OD pairs (lon, lat) for V1; no route search exists yet, so they are not run.
+[[holdout2.od]]
+label = "Binghamton to Cooperstown"
+from = [-75.918, 42.099]
+to = [-74.924, 42.701]
+
+[[holdout2.od]]
+label = "Glens Falls to North Creek"
+from = [-73.644, 43.310]
+to = [-73.983, 43.701]
+
+[[holdout2.od]]
+label = "Watertown to Tupper Lake"
+from = [-75.911, 43.975]
+to = [-74.464, 44.224]
+
+[[holdout2.od]]
+label = "Olean to Ellicottville"
+from = [-78.430, 42.078]
+to = [-78.672, 42.275]

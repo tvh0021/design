@@ -1,8 +1,9 @@
-"""Scenery score v0.1 (docs/SCORE_SPEC.md): one score S in [0, 1] per edge of
-edges.parquet.
+"""Scenery score v0.2 (docs/SCORE_SPEC.md, with its "v0.1 changes" and "v0.2
+changes"): one score S in [0, 1] per edge of edges.parquet.
 
-Stages (each writes its product to disk and is skipped on rerun while the
-product is newer than its inputs; `--force` reruns them):
+Stages (each writes its product to disk and is skipped on rerun while its
+fingerprint, the hash of its code, config sections and input files, is
+unchanged and its outputs are as it left them; `--force` reruns them):
 
   grid       working 30 m grid in EPSG:5070            rasters/grid.json
   dem        3DEP mosaic warped to the grid             rasters/dem30.tif, dem90.tif
@@ -162,15 +163,18 @@ def lookup(grid: Grid, arr: np.ndarray, px, py, fallback=0.0) -> np.ndarray:
 
 def sight_line(px, py, ze, tx, ty, zt, grid: Grid, dem: np.ndarray, step: float, tol: float,
                cls: np.ndarray | None = None, canopy: np.ndarray | None = None, log_t: np.ndarray | None = None,
-               stop=None, dem_nodata: float = -32768, max_samples: int = 20_000_000) -> np.ndarray:
+               stop=None, dem_nodata: float = -32768, max_samples: int = 20_000_000,
+               max_obstructed: int | None = None) -> np.ndarray:
     """Share of the view from (px, py, eye height ze) to (tx, ty, zt) that
     gets through, per ray, in [0, 1].
 
-    The ray is sampled every `step` metres from `step` out to one step short
-    of `stop` (default: the target). Bare ground (`dem`) more than `tol`
+    The ray is sampled at every positive multiple of `step` strictly before
+    `stop` (default: the target). Bare ground (`dem`) more than `tol`
     above the straight sight line blocks it (0). With `cls`, a cell whose
     obstacle top (ground + canopy[class]) rises above the sight line passes
-    exp(log_t[class]) of the view, and those shares multiply along the ray."""
+    exp(log_t[class]) of the view, and those shares multiply along the ray;
+    with `max_obstructed`, only the first that many such cells from the
+    observer do (the roadside screen; cells further out do not multiply)."""
     px, py, ze, tx, ty, zt = (np.asarray(a, dtype=np.float64) for a in (px, py, ze, tx, ty, zt))
     n = len(px)
     vis = np.ones(n)
@@ -178,7 +182,8 @@ def sight_line(px, py, ze, tx, ty, zt, grid: Grid, dem: np.ndarray, step: float,
         return vis
     d = np.hypot(tx - px, ty - py)
     reach = d if stop is None else np.minimum(np.asarray(stop, dtype=np.float64), d)
-    K = np.maximum(np.floor((reach - step) / step), 0).astype(np.int64)
+    # Samples at j * step for j = 1 .. K, all strictly short of `reach`.
+    K = np.maximum(np.ceil(reach / step - 1e-9) - 1, 0).astype(np.int64)
     cum = np.cumsum(K)
     a = 0
     while a < n:
@@ -202,6 +207,13 @@ def sight_line(px, py, ze, tx, ty, zt, grid: Grid, dem: np.ndarray, step: float,
                 cc = cls[r, c]
                 h = canopy[cc]
                 lt = np.where((h > 0) & inside & (g + h > los), log_t[cc], 0.0)
+                if max_obstructed is not None:
+                    # Samples of one ray are contiguous and ordered outward.
+                    ob = lt < 0
+                    cs = np.cumsum(ob)
+                    first = np.cumsum(k) - k
+                    rank = cs - np.repeat(np.concatenate([[0], cs])[first], k)
+                    lt = np.where(ob & (rank > max_obstructed), 0.0, lt)
             vis[a:b] = np.where(blocked, 0.0, np.exp(np.bincount(idx, weights=lt, minlength=b - a)))
         a = b
     return vis
@@ -263,17 +275,23 @@ def near_falloff(d, reach, full_min: float, full_frac: float) -> np.ndarray:
 
 
 def view_score(px, py, ze, ux, uy, d, wr, wc, val, reach, beyond: bool, grid: Grid, dem, nlcd, canopy, log_t,
-               w: dict) -> np.ndarray:
+               w: dict, zsurf_of=None) -> np.ndarray:
     """val * vis for rays from (px, py) along (ux, uy) to water cell (wr, wc)
     at distance d. Closer than vis_min_dist_m: vis = 1. For areal water the
     sight line aims past the shore (the open water beyond the shore strip,
-    not the water right behind it); obstacles are checked up to the shore."""
+    not the water right behind it); obstacles are checked up to the shore.
+    The sight line ends on the water surface, `zsurf_of(x, y)` (NaN: unknown);
+    without it, or where it is unknown, on the DEM at the water cell (which
+    may be bathymetry)."""
     out = np.asarray(val, dtype=np.float64).copy()
     far = np.flatnonzero(d >= w["vis_min_dist_m"])
     if len(far) == 0:
         return out
     zt = dem[wr[far], wc[far]].astype(np.float64)
     zt = np.where(zt <= -32768, ze[far] - w["eye_m"], zt)
+    if zsurf_of is not None:
+        zs = np.asarray(zsurf_of(*grid.centres(wr[far], wc[far])), dtype=np.float64)
+        zt = np.where(np.isfinite(zs), zs, zt)
     ext = np.zeros(len(far))
     if beyond:
         ext = np.minimum(np.clip(w["beyond_frac"] * d[far], grid.res, w["beyond_max_m"]),
@@ -281,18 +299,20 @@ def view_score(px, py, ze, ux, uy, d, wr, wc, val, reach, beyond: bool, grid: Gr
     tx = px[far] + ux[far] * (d[far] + ext)
     ty = py[far] + uy[far] * (d[far] + ext)
     out[far] *= sight_line(px[far], py[far], ze[far], tx, ty, zt, grid, dem, w["ray_step_m"], w["terrain_tol_m"],
-                           nlcd, canopy, log_t, stop=d[far])
+                           nlcd, canopy, log_t, stop=d[far], max_obstructed=w.get("max_obstructed_cells"))
     return out
 
 
 def water_points(s: Samples, grid: Grid, area: np.ndarray, line: np.ndarray, size: np.ndarray, reach_of,
-                 z_pt: np.ndarray, dem: np.ndarray, nlcd: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+                 z_pt: np.ndarray, dem: np.ndarray, nlcd: np.ndarray, cfg: dict,
+                 zsurf_of=None) -> tuple[np.ndarray, np.ndarray]:
     """Per-point W and nearest-water distance (inf when none in reach), v0.1.
 
     area: bool 30 m areal-water mask; line: uint8 linear water (river, canal,
     stream) outside it; size: size score per cell; reach_of(x, y) -> reach (m)
     of areal water at those cell centres; z_pt: ground height at the points;
-    dem, nlcd: 30 m rasters for the sight lines.
+    dem, nlcd: 30 m rasters for the sight lines; zsurf_of(x, y) -> water
+    surface height (m) at water cell centres (view_score).
 
     Areal water is represented by its shore cells (a cell with a 4-neighbour
     that is not water); points on water (bridges, causeways) get W = size.
@@ -301,7 +321,12 @@ def water_points(s: Samples, grid: Grid, area: np.ndarray, line: np.ndarray, siz
     each point, sight lines go to the nearest shore cell of the band and
     along a fan (water.fan_deg) either side of it, to the first water cell
     within the band's reach. W_pt = max over bands and sight lines of
-    size * falloff(d, reach) * vis."""
+    size * falloff(d, reach) * vis.
+
+    v0.2 shore-road term (water.shore_road): within full_m of an areal
+    water cell of size >= min_size, W_pt >= frac * size whatever the sight
+    lines say (the lake shows through every gap), fading linearly to 0 at
+    zero_m. The nearest such cell counts."""
     from scipy import ndimage
     from scipy.spatial import cKDTree
 
@@ -358,15 +383,19 @@ def water_points(s: Samples, grid: Grid, area: np.ndarray, line: np.ndarray, siz
         pi = q[hit]
         dmin[pi] = np.minimum(dmin[pi], dh)
         val = size[cr[ci], cc[ci]].astype(np.float64) * near_falloff(dh, reach[ci], full_min, full_frac)
-        go = np.flatnonzero(val > 0)
-        if len(go) == 0:
+        if len(pi) == 0:
             continue
-        pi, ci, dh, val = pi[go], ci[go], dh[go], val[go]
         px, py = s.x[pi], s.y[pi]
         ux = (cx[ci] - px) / np.maximum(dh, 1e-9)
         uy = (cy[ci] - py) / np.maximum(dh, 1e-9)
-        best = view_score(px, py, ze[pi], ux, uy, dh, cr[ci], cc[ci], val, reach[ci], is_area, grid, dem, nlcd,
-                          canopy, log_t, w)
+        # The nearest shore may be worth nothing (a pond under 1 ha, or a
+        # shore out of its own reach); the point still gets the fan, so a pond
+        # beside the road cannot hide the lake beyond it.
+        best = np.zeros(len(pi))
+        go = np.flatnonzero(val > 0)
+        if len(go):
+            best[go] = view_score(px[go], py[go], ze[pi[go]], ux[go], uy[go], dh[go], cr[ci[go]], cc[ci[go]],
+                                  val[go], reach[ci[go]], is_area, grid, dem, nlcd, canopy, log_t, w, zsurf_of)
         # A fan of sight lines either side of the nearest shore: the driver
         # sees water through whichever gap there is, not only straight across.
         mask = area if is_area else linemask
@@ -384,9 +413,21 @@ def water_points(s: Samples, grid: Grid, area: np.ndarray, line: np.ndarray, siz
                 continue
             o2 = ok[g2]
             cand = view_score(px[o2], py[o2], ze[pi[o2]], fx[o2], fy[o2], th[o2], hr[o2], hc[o2], v[g2], rch[g2],
-                              is_area, grid, dem, nlcd, canopy, log_t, w)
+                              is_area, grid, dem, nlcd, canopy, log_t, w, zsurf_of)
             best[o2] = np.maximum(best[o2], cand)
         W[pi] = np.maximum(W[pi], best)  # one query per point: pi is unique
+    sr_cfg = w.get("shore_road")
+    if sr_cfg and len(shore_cells):
+        sr, sc = np.divmod(shore_cells, grid.width)
+        big = size[sr, sc] >= sr_cfg["min_size"]
+        if big.any():
+            bx, by = grid.centres(sr[big], sc[big])
+            dist, idx = cKDTree(np.column_stack([bx, by])).query(qxy, distance_upper_bound=sr_cfg["zero_m"],
+                                                                 workers=-1)
+            hit = np.flatnonzero(np.isfinite(dist))
+            fade = np.clip((sr_cfg["zero_m"] - dist[hit]) / (sr_cfg["zero_m"] - sr_cfg["full_m"]), 0, 1)
+            floor = sr_cfg["frac"] * size[sr[big][idx[hit]], sc[big][idx[hit]]] * fade
+            W[q[hit]] = np.maximum(W[q[hit]], floor)
     return W, dmin
 
 
@@ -475,11 +516,14 @@ def water_view_points(px, py, z_pt, grid90: Grid, big_idx: np.ndarray, water_z: 
 def views_points(open_pt: np.ndarray, forest_pt: np.ndarray, prospect: np.ndarray, wv: np.ndarray,
                  cfg: dict) -> np.ndarray:
     """V = open * (base + (1 - base) * view) + forest * forest_base, where
-    view = 1 - (1 - prospect) * (1 - water_view). Open flat ground with
+    view = 1 - (1 - w_prospect * prospect) * (1 - water_view). Open flat ground with
     nothing in view scores `base`, an open slope over a valley or lake 1,
     a road inside forest `forest_base`, a built-up street 0."""
     v = cfg["views"]
-    view = 1 - (1 - np.clip(prospect, 0, 1)) * (1 - np.clip(wv, 0, 1))
+    # v0.2: prospect (3 km relief) is weighted by w_prospect, 0 by default: it
+    # duplicates H and saturates on plateaus (docs/SCORE_V02.md, change 4).
+    wp = v.get("w_prospect", 1.0)
+    view = 1 - (1 - wp * np.clip(prospect, 0, 1)) * (1 - np.clip(wv, 0, 1))
     return open_pt * (v["base"] + (1 - v["base"]) * view) + forest_pt * v["forest_base"]
 
 
@@ -696,6 +740,30 @@ def percentile_rank(values: np.ndarray, length: np.ndarray, active: np.ndarray) 
     return S
 
 
+def window_top(s, d, w, values, n, top_m: float) -> np.ndarray:
+    """Per window (pairs s -> d with weights w): the w-weighted mean of
+    `values` over the best `top_m` metres of window weight (pairs sorted by
+    value, descending; the last one taken in part). A window lighter than
+    `top_m` gives its maximum."""
+    x = np.asarray(values, dtype=np.float64)[d]
+    order = np.lexsort((-x, s))
+    so, xo, wo = s[order], x[order], w[order]
+    start = np.ones(len(so), bool)
+    start[1:] = so[1:] != so[:-1]
+    cw = np.cumsum(wo)
+    first = np.flatnonzero(start)
+    base = np.repeat(cw[first] - wo[first], np.diff(np.append(first, len(so))))
+    before = cw - wo - base                      # window weight above this pair
+    take = np.clip(top_m - before, 0.0, wo)
+    num = np.bincount(so, weights=take * xo, minlength=n)
+    den = np.bincount(so, weights=take, minlength=n)
+    wsum = np.bincount(so, weights=wo, minlength=n)
+    mx = np.full(n, np.nan)
+    mx[so[first]] = xo[first]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(wsum >= top_m, num / den, mx)
+
+
 def combine(sig: dict, edges_extra: dict, active: np.ndarray, cfg: dict, pairs=None) -> dict:
     """Penalties, pre, smoothing and rank. `sig` holds per-edge W, H, V, L,
     Q, turn_deg (or a ready C), dev, signals (count per edge), junction_halves; `edges_extra` holds
@@ -725,17 +793,32 @@ def combine(sig: dict, edges_extra: dict, active: np.ndarray, cfg: dict, pairs=N
     else:
         C = np.asarray(sig["C"], dtype=np.float64)
     hw = np.asarray(edges_extra["highway"], dtype=object).astype(str)
+    town = np.clip((sig["dev"] - pen["town_lo"]) / pen["town_span"], 0, 1)
+    if pen.get("town_water_gate", False):
+        # v0.2: with water in view the town is the lake's foreground.
+        town = town * (1 - np.clip(np.maximum(sig["W"], sig["V_water"]), 0, 1))
     p = (pen["junction_weight"] * np.clip((junc_km - pen["junction_lo_per_km"]) / pen["junction_span_per_km"], 0, 1)
          + pen["signal_weight"] * np.clip(sig_km / pen["signal_full_per_km"], 0, 1)
-         + pen["town_weight"] * np.clip((sig["dev"] - pen["town_lo"]) / pen["town_span"], 0, 1)
+         + pen["town_weight"] * town
          + pen["urban_speed_weight"] * (np.asarray(edges_extra["maxspeed_tagged"], bool)
                                         & (np.asarray(edges_extra["speed_mph"]) <= pen["urban_speed_mph"]))
          + pen["motorway_weight"] * np.isin(hw, ["motorway", "motorway_link"]))
     P = np.minimum(p, pen["cap"])
-    pre = raw * (1 + cb["bonus_quiet"] * sig["Q"] + cb["bonus_curves"] * C) - P
+    bonus = 1 + cb["bonus_quiet"] * sig["Q"] + cb["bonus_curves"] * C
+    if pen.get("mode", "subtract") == "multiply":
+        pre = raw * bonus * (1 - P)              # v0.2: a penalty cannot erase a view
+    else:
+        pre = raw * bonus - P
     pre = np.where(active, pre, np.nan)
     with np.errstate(invalid="ignore", divide="ignore"):
-        smooth = window_sum(s, d, w, np.nan_to_num(pre), n) / wsum
+        mean = window_sum(s, d, w, np.nan_to_num(pre), n) / wsum
+    pw = sm.get("pool_weight", 0.0)
+    if pw > 0:
+        # v0.2: a driver remembers the best of the last kilometre, not its average.
+        top = window_top(s, d, w, np.nan_to_num(pre), n, sm["pool_top_m"])
+        smooth = (1 - pw) * mean + pw * top
+    else:
+        smooth = mean
     smooth = np.where(active, smooth, np.nan)
     S = percentile_rank(smooth, L, active)
     return {"raw": raw, "penalty": P, "pre": pre, "smooth": smooth, "S": S, "C": C,
@@ -787,6 +870,46 @@ def write_scores(table, edges_path: Path, out_path: Path) -> Path:
     pq.write_table(table, tmp, compression="zstd")
     tmp.replace(out_path)
     return out_path
+
+
+def write_edge_signals(cols: dict, path: Path, fingerprint: str) -> Path:
+    """edge_signals.parquet with the fingerprint of the edges it was computed
+    for (graph.edges_fingerprint) in its metadata."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from .graph import FINGERPRINT_KEY
+
+    t = pa.table({k: pa.array(v) for k, v in cols.items()})
+    t = t.replace_schema_metadata({FINGERPRINT_KEY: fingerprint.encode()})
+    pq.write_table(t, path, compression="zstd")
+    return path
+
+
+def read_edge_signals(path: Path, fingerprint: str):
+    """edge_signals.parquet, after checking it was computed for the edges with
+    this fingerprint (same rows in the same order). Raises ValueError if not."""
+    import pyarrow.parquet as pq
+
+    from .graph import FINGERPRINT_KEY
+
+    stored = (pq.read_schema(path).metadata or {}).get(FINGERPRINT_KEY)
+    if stored is None or stored.decode() != fingerprint:
+        raise ValueError(f"{path} was not computed for the current edges.parquet; rerun the edges stage")
+    return pq.read_table(path)
+
+
+def save_samples(path: Path, s: "Samples", fingerprint: str) -> None:
+    np.savez(path, x=s.x.astype(np.float32), y=s.y.astype(np.float32), edge=s.edge,
+             edges_fingerprint=np.array(fingerprint))
+
+
+def load_samples(path: Path, fingerprint: str) -> dict:
+    """samples.npz (x, y, edge), after the same check as read_edge_signals."""
+    z = np.load(path)
+    if "edges_fingerprint" not in z.files or str(z["edges_fingerprint"]) != fingerprint:
+        raise ValueError(f"{path} was not computed for the current edges.parquet; rerun the edges stage")
+    return {k: z[k] for k in ("x", "y", "edge")}
 
 
 def load(edges_path: Path | None = None, scores_path: Path | None = None):

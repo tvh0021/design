@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing as mp
 import sys
@@ -32,10 +33,26 @@ class Paths:
         return Path(self.raw) / "new-york-latest.osm.pbf"
 
 
+class TrackedConfig(dict):
+    """The score config, recording which top-level sections a stage reads, so
+    the runner can check them against the sections the stage declares (and
+    whose contents go into its fingerprint)."""
+
+    accessed: set[str] = set()
+
+    def __getitem__(self, key):
+        TrackedConfig.accessed.add(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        TrackedConfig.accessed.add(key)
+        return super().get(key, default)
+
+
 def _cfg(paths: Paths) -> dict:
     from .score import load_config
 
-    return load_config(Path(paths.config))
+    return TrackedConfig(load_config(Path(paths.config)))
 
 
 def _grid(paths: Paths):
@@ -219,14 +236,13 @@ def st_controls(paths: Paths) -> dict:
 
 
 def st_edges(paths: Paths) -> dict:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
     from scipy.spatial import cKDTree
 
+    from .graph import read_edges_fingerprint
     from .rasters import read_tif
     from .score import (curvature, excluded_mask, hills_edges, land_points, lookup, project_lonlat,
-                        prospect_points, quiet, read_edges, road_keys, sample_points, turning, views_points,
-                        water_points, water_view_points)
+                        prospect_points, quiet, read_edges, road_keys, sample_points, save_samples, turning,
+                        views_points, water_points, water_view_points, write_edge_signals)
 
     cfg = _cfg(paths)
     g30 = _grid(paths)
@@ -249,15 +265,17 @@ def st_edges(paths: Paths) -> dict:
     line = R("water_line.tif")
     size = R("water_size.tif")
     reach90 = R("reach90.tif")
+    water_z90 = R("water_z90.tif")
     W_pt, d_pt = water_points(s, g30, area, line, size, lambda x, y: lookup(g90, reach90, x, y,
                                                                               cfg["water"]["reach_min_m"]),
-                              z, dem30, R("nlcd30.tif"), cfg)
+                              z, dem30, R("nlcd30.tif"), cfg,
+                              zsurf_of=lambda x, y: lookup(g90, water_z90, x, y, np.nan))
     del area, line, size, reach90, dem30
     timing["water_s"] = round(time.monotonic() - t, 1)
     _log(f"W: {timing['water_s']} s")
 
     t = time.monotonic()
-    wv_pt = water_view_points(s.x, s.y, z, g90, R("bigwater_idx90.tif"), R("water_z90.tif"), dem90,
+    wv_pt = water_view_points(s.x, s.y, z, g90, R("bigwater_idx90.tif"), water_z90, dem90,
                               R("wv_reach90.tif"), cfg)
     timing["water_view_s"] = round(time.monotonic() - t, 1)
 
@@ -304,9 +322,9 @@ def st_edges(paths: Paths) -> dict:
         "excluded": excluded_mask(E.surface, E.name, cfg),
         "key": road_keys(E.ref, E.name, E.way_id),
     }
-    pq.write_table(pa.table({k: pa.array(v) for k, v in cols.items()}), paths.p("out", "edge_signals.parquet"),
-                   compression="zstd")
-    np.savez(paths.p("out", "samples.npz"), x=s.x.astype(np.float32), y=s.y.astype(np.float32), edge=s.edge)
+    fp = read_edges_fingerprint(Path(paths.graph))
+    write_edge_signals(cols, paths.p("out", "edge_signals.parquet"), fp)
+    save_samples(paths.p("out", "samples.npz"), s, fp)
     return {"sample_points": int(len(s.x)), "signal_nodes_matched": matched,
             "points_with_water_hit": round(float(np.isfinite(d_pt).mean()), 4),
             "points_with_water_view": round(float((wv_pt > 0).mean()), 4), **timing}
@@ -315,15 +333,14 @@ def st_edges(paths: Paths) -> dict:
 def st_score(paths: Paths) -> dict:
     import pyarrow.parquet as pq
 
-    from .score import _dict_col, combine, scores_table, write_scores
+    from .graph import edges_fingerprint
+    from .score import _dict_col, combine, read_edge_signals, scores_table, write_scores
 
     cfg = _cfg(paths)
-    sig_t = pq.read_table(paths.p("out", "edge_signals.parquet"))
-    sig = {c: sig_t.column(c).to_numpy() for c in sig_t.column_names}
     et = pq.read_table(paths.p("graph", "edges.parquet"),
                        columns=["u", "v", "way_id", "length_m", "highway", "maxspeed_tagged", "speed_mph"])
-    if et.num_rows != sig_t.num_rows:
-        raise RuntimeError("edge_signals.parquet does not match edges.parquet; rerun the edges stage")
+    sig_t = read_edge_signals(paths.p("out", "edge_signals.parquet"), edges_fingerprint(et))
+    sig = {c: sig_t.column(c).to_numpy() for c in sig_t.column_names}
     extra = {c: et.column(c).to_numpy() for c in ("u", "v", "way_id", "length_m", "maxspeed_tagged", "speed_mph")}
     extra["highway"] = _dict_col(et, "highway")
     extra["key"] = sig["key"]
@@ -344,9 +361,13 @@ def st_outputs(paths: Paths) -> dict:
 
     import pyarrow.parquet as pq
 
+    from .graph import edges_fingerprint
+    from .score import load_samples
+
     t = _load_scores(paths)
-    L = pq.read_table(paths.p("graph", "edges.parquet"), columns=["length_m"]).column("length_m").to_numpy()
-    smp = np.load(paths.p("out", "samples.npz"))
+    et = pq.read_table(paths.p("graph", "edges.parquet"), columns=["u", "v", "way_id", "length_m"])
+    L = et.column("length_m").to_numpy()
+    smp = load_samples(paths.p("out", "samples.npz"), edges_fingerprint(et))
     cfg = _cfg(paths)
     heatmap(t, smp, L, paths.p("out", "heatmap.png"), cfg["output"]["heatmap_cell_m"],
             cfg["output"]["heatmap_width_px"])
@@ -373,10 +394,24 @@ def _load_scores(paths: Paths):
 # Runner
 
 
-def stages(paths: Paths) -> list[tuple[str, object, list[Path], list[Path]]]:
+@dataclass
+class Stage:
+    """One stage: its body, the files it reads and writes, the scenic modules
+    whose code it runs and the config sections it reads. All of these go into
+    its fingerprint (see `stage_fingerprint`)."""
+
+    name: str
+    fn: object
+    inputs: list[Path]
+    outputs: list[Path]
+    modules: tuple[str, ...] = ()
+    sections: tuple[str, ...] = ()
+
+
+def stages(paths: Paths) -> list[Stage]:
     R = lambda n: paths.p("rasters", n)  # noqa: E731
     O = lambda n: paths.p("out", n)  # noqa: E731
-    cfgp = Path(paths.config)
+    cfgd = Path(paths.config).parent
     edges = paths.p("graph", "edges.parquet")
     nlcd_in = sorted(Path(paths.raw, "nlcd").glob("Annual_NLCD_LndCov_*_CU_*.tif"))[-1:]
     byway_in = sorted(Path(paths.raw, "byways").glob("*.geojson"))
@@ -385,34 +420,139 @@ def stages(paths: Paths) -> list[tuple[str, object, list[Path], list[Path]]]:
     water = [R(n) for n in ("water_area.tif", "water_line.tif", "water_size.tif")]
     water90 = [R(n) for n in ("wfrac90.tif", "reach90.tif", "water_z90.tif", "bigwater_idx90.tif", "wv_reach90.tif")]
     return [
-        ("grid", st_grid, [edges, cfgp], [R("grid.json")]),
-        ("dem", st_dem, [R("grid.json"), *dem_tiles(paths)], [R("dem30.tif"), R("dem90.tif")]),
-        ("nlcd", st_nlcd, [R("grid.json"), *nlcd_in], [R("nlcd30.tif")]),
-        ("water", st_water, [R("grid.json"), R("nlcd30.tif"), paths.pbf, cfgp], water),
-        ("water90", st_water90, [R("water_area.tif"), R("dem30.tif"), cfgp], water90),
-        ("terrain90", st_terrain90, [R("dem90.tif"), cfgp], terrain90),
-        ("land90", st_land90, [R("nlcd30.tif"), cfgp], land90),
-        ("controls", st_controls, [paths.pbf], [O("signal_nodes.npy")]),
-        ("edges", st_edges, [edges, R("dem30.tif"), R("dem90.tif"), R("nlcd30.tif"), *water, *water90, *terrain90,
-                             *land90, O("signal_nodes.npy"), cfgp],
-         [O("edge_signals.parquet"), O("samples.npz")]),
-        ("score", st_score, [O("edge_signals.parquet"), edges, cfgp], [O("scores.parquet")]),
-        ("outputs", st_outputs, [O("scores.parquet"), O("samples.npz"), cfgp], [O("heatmap.png"), O("summary.md")]),
-        ("validate", st_validate,
-         [O("scores.parquet"), O("samples.npz"), *byway_in, cfgp.parent / "spot_checks.toml",
-          cfgp.parent / "byways.toml"],
-         [O("validation.json")]),
+        Stage("grid", st_grid, [edges], [R("grid.json")], ("rasters", "score"), ("grid",)),
+        Stage("dem", st_dem, [R("grid.json"), *dem_tiles(paths)], [R("dem30.tif"), R("dem90.tif")],
+              ("rasters",), ("grid",)),
+        Stage("nlcd", st_nlcd, [R("grid.json"), *nlcd_in], [R("nlcd30.tif")], ("rasters",)),
+        Stage("water", st_water, [R("grid.json"), R("nlcd30.tif"), paths.pbf], water, ("rasters", "water"),
+              ("water", "groups")),
+        Stage("water90", st_water90, [R("grid.json"), R("water_area.tif"), R("dem30.tif")], water90, ("rasters",),
+              ("grid", "water", "views")),
+        Stage("terrain90", st_terrain90, [R("grid.json"), R("dem90.tif")], terrain90, ("rasters",),
+              ("grid", "hills", "views")),
+        Stage("land90", st_land90, [R("grid.json"), R("nlcd30.tif")], land90, ("rasters",),
+              ("grid", "landcover", "groups", "views", "penalty")),
+        Stage("controls", st_controls, [paths.pbf], [O("signal_nodes.npy")], ("water",)),
+        Stage("edges", st_edges, [edges, R("grid.json"), R("dem30.tif"), R("dem90.tif"), R("nlcd30.tif"), *water,
+                                  *water90, *terrain90, *land90, O("signal_nodes.npy")],
+              [O("edge_signals.parquet"), O("samples.npz")], ("score", "rasters", "graph"),
+              ("grid", "sampling", "water", "hills", "views", "landcover", "quiet", "curves", "penalty", "exclude")),
+        Stage("score", st_score, [O("edge_signals.parquet"), edges], [O("scores.parquet")], ("score", "graph"),
+              ("combine", "penalty", "smoothing", "curves")),
+        Stage("outputs", st_outputs, [O("scores.parquet"), O("samples.npz"), edges], [O("heatmap.png"), O("summary.md")],
+              ("report", "score", "graph"), ("output",)),
+        Stage("validate", st_validate,
+              [O("scores.parquet"), O("samples.npz"), O("edge_signals.parquet"), edges, *byway_in,
+               cfgd / "spot_checks.toml", cfgd / "byways.toml",
+               # RoadGraph.load reads these for the Rochester-Syracuse route
+               paths.p("graph", "nodes.npz"), paths.p("graph", "edge_delays.parquet")],
+              [O("validation.json")], ("validate", "score", "report", "route", "graph")),
     ]
 
 
-def fresh(inputs: list[Path], outputs: list[Path]) -> bool:
-    if not all(p.exists() for p in outputs):
+# --------------------------------------------------------------------------
+# Freshness: a stage is up to date when its outputs exist, are the files it
+# wrote last time, and its fingerprint is unchanged. The fingerprint hashes
+# the stage's code (its body, the runner helpers and the scenic modules it
+# uses), the config sections it reads and the contents of its input files.
+# A stage whose code or config changes reruns; if that changes its outputs,
+# every stage that reads them gets a new fingerprint and reruns too.
+
+_SHARED = ("Paths", "TrackedConfig", "_cfg", "_grid", "dem_tiles", "nlcd_tif", "_load_scores")
+PKG_DIR = Path(__file__).resolve().parent
+
+
+def code_hash(fn, modules, pkg_dir: Path = PKG_DIR) -> str:
+    """Hash of a stage body, the shared runner helpers and the source files of
+    `modules` (scenic module names, e.g. "score")."""
+    import inspect
+
+    h = hashlib.sha256()
+    h.update(inspect.getsource(fn).encode())
+    me = sys.modules[__name__]
+    for name in _SHARED:
+        h.update(inspect.getsource(getattr(me, name)).encode())
+    for m in sorted(modules):
+        h.update(m.encode() + b"\0" + (Path(pkg_dir) / f"{m}.py").read_bytes())
+    return h.hexdigest()
+
+
+def config_hash(cfg: dict, sections) -> str:
+    sub = {k: cfg.get(k) for k in sorted(sections)}
+    return hashlib.sha256(json.dumps(sub, sort_keys=True, default=str).encode()).hexdigest()
+
+
+class FileHashes:
+    """SHA-256 of file contents, cached by (path, size, mtime_ns) in a JSON file."""
+
+    def __init__(self, cache_path: Path | None = None):
+        self.path = Path(cache_path) if cache_path else None
+        self.cache = {}
+        if self.path and self.path.exists():
+            try:
+                self.cache = json.loads(self.path.read_text())
+            except ValueError:
+                self.cache = {}
+
+    def __call__(self, p: Path) -> str:
+        p = Path(p)
+        if not p.exists():
+            return "missing"
+        st = p.stat()
+        key = str(p.resolve())
+        ent = self.cache.get(key)
+        if ent and ent[0] == st.st_size and ent[1] == st.st_mtime_ns:
+            return ent[2]
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            while chunk := f.read(1 << 22):
+                h.update(chunk)
+        self.cache[key] = [st.st_size, st.st_mtime_ns, h.hexdigest()]
+        return h.hexdigest()
+
+    def save(self) -> None:
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.cache))
+
+
+def stage_fingerprint(code_h: str, cfg_h: str, inputs: list[Path], hashes: FileHashes) -> str:
+    h = hashlib.sha256()
+    h.update(code_h.encode() + cfg_h.encode())
+    for p in inputs:
+        h.update(str(Path(p).name).encode() + b"=" + hashes(p).encode() + b";")
+    return h.hexdigest()
+
+
+def stamp_path(stage: Stage) -> Path:
+    return Path(stage.outputs[0]).parent / ".stages" / f"{stage.name}.json"
+
+
+def read_stamp(stage: Stage) -> dict | None:
+    p = stamp_path(stage)
+    try:
+        return json.loads(p.read_text()) if p.exists() else None
+    except ValueError:
+        return None
+
+
+def write_stamp(stage: Stage, fingerprint: str, hashes: FileHashes) -> None:
+    p = stamp_path(stage)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"fingerprint": fingerprint,
+                             "outputs": {Path(o).name: hashes(o) for o in stage.outputs}}, indent=1) + "\n")
+
+
+def is_fresh(stage: Stage, fingerprint: str, hashes: FileHashes) -> bool:
+    if not all(Path(p).exists() for p in stage.outputs):
         return False
-    newest_in = max((p.stat().st_mtime for p in inputs if p.exists()), default=0.0)
-    return min(p.stat().st_mtime for p in outputs) > newest_in
+    st = read_stamp(stage)
+    if not st or st.get("fingerprint") != fingerprint:
+        return False
+    return all(st.get("outputs", {}).get(Path(o).name) == hashes(o) for o in stage.outputs)
 
 
-def _child(name: str, paths_d: dict) -> tuple[dict, float, float]:
+def _child(name: str, paths_d: dict) -> tuple[dict, float, float, list[str]]:
     import os
 
     # GDAL's default block cache is 5 % of RAM (3+ GB here); the stages read
@@ -420,17 +560,18 @@ def _child(name: str, paths_d: dict) -> tuple[dict, float, float]:
     os.environ.setdefault("GDAL_CACHEMAX", "256")
     from .graph import peak_rss_mb
 
-    fn = dict((n, f) for n, f, _, _ in stages(Paths(**paths_d)))[name]
+    fn = {s.name: s.fn for s in stages(Paths(**paths_d))}[name]
+    TrackedConfig.accessed = set()
     t0 = time.monotonic()
     info = fn(Paths(**paths_d))
-    return info, time.monotonic() - t0, peak_rss_mb()
+    return info, time.monotonic() - t0, peak_rss_mb(), sorted(TrackedConfig.accessed)
 
 
 def run(graph_dir: Path | None = None, out_dir: Path | None = None, force=None,
         raw_dir: Path | None = None, rasters_dir: Path | None = None, config: Path | None = None) -> dict:
     """Run every stage that is stale (or forced), then write score_report.json.
     `force`: None = nothing forced, [] = all stages, else stage names."""
-    from .score import CONFIG_DIR
+    from .score import CONFIG_DIR, load_config
 
     d = data_dir()
     paths = Paths(graph=str(graph_dir or d / "graph"), raw=str(raw_dir or d / "raw"),
@@ -442,20 +583,30 @@ def run(graph_dir: Path | None = None, out_dir: Path | None = None, force=None,
     stage_rep = dict(prev.get("stages", {}))
     force_all = force is not None and len(force) == 0
     forced = set(force or [])
+    cfg = load_config(Path(paths.config))
+    hashes = FileHashes(paths.p("rasters", ".file_hashes.json"))
     t_all = time.monotonic()
-    for name, _fn, ins, outs in stages(paths):
-        stale = force_all or name in forced or not fresh(ins, outs)
+    for st in stages(paths):
+        fp = stage_fingerprint(code_hash(st.fn, st.modules), config_hash(cfg, st.sections), st.inputs, hashes)
+        stale = force_all or st.name in forced or not is_fresh(st, fp, hashes)
         if not stale:
-            print(f"[{name}] up to date")
-            stage_rep.setdefault(name, {})["ran"] = False
+            print(f"[{st.name}] up to date")
+            stage_rep.setdefault(st.name, {})["ran"] = False
             continue
-        print(f"[{name}] running")
+        print(f"[{st.name}] running")
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
-            info, secs, rss = ex.submit(_child, name, asdict(paths)).result()
-        stage_rep[name] = {"ran": True, "seconds": round(secs, 1), "peak_rss_mb": round(rss, 1),
-                           "run_date": date.today().isoformat(), **info}
-        print(f"[{name}] {secs:.1f} s, peak RSS {rss:.0f} MB")
+            info, secs, rss, used = ex.submit(_child, st.name, asdict(paths)).result()
+        undeclared = sorted(set(used) - set(st.sections))
+        if undeclared:
+            raise RuntimeError(f"stage {st.name} read config sections {undeclared} it does not declare; "
+                               "add them to its Stage(..., sections=...) so they count in its fingerprint")
+        write_stamp(st, fp, hashes)
+        hashes.save()
+        stage_rep[st.name] = {"ran": True, "seconds": round(secs, 1), "peak_rss_mb": round(rss, 1),
+                              "run_date": date.today().isoformat(), **info}
+        print(f"[{st.name}] {secs:.1f} s, peak RSS {rss:.0f} MB")
+    hashes.save()
     from .report import build_report
 
     report = build_report(paths, stage_rep, round(time.monotonic() - t_all, 1))

@@ -32,8 +32,10 @@ DEVIATIONS = [
     "Summary statistics are over non-excluded edges.",
     "NLCD C1V1 declares an Albers CRS on a WGS84 datum with the EPSG:5070 parameters; treated as EPSG:5070 "
     "as the spec says. Its origin (-2415585, 3314805) is on the spec's 30 m lattice, so no resampling.",
-    "3DEP contains Hudson River bathymetry (down to -89 m near the Hudson Highlands); left as is, so relief "
-    "next to the deep Hudson is slightly inflated. Lakes (Ontario, Erie, Finger Lakes) are flat surfaces.",
+    "3DEP over water is mostly a flat (hydro-flattened) surface; its lowest cells (to -96 m) are quarries "
+    "along the Hudson (Haverstraw, Clinton Point), which are land. The water surface used as the sight-line "
+    "target is read off the shore (low quantile of the DEM on shore land cells), not the DEM over the water, "
+    "so bathymetry would not lower it and low land is not clamped.",
     "Smoothing BFS uses numpy sort/searchsorted joins instead of pandas merge (allowed by the spec); "
     "the adjacency and BFS skip excluded edges.",
     "config/byways.toml (ref fallback, unused this run) uses lon/lat boxes instead of county sets: no county "
@@ -46,6 +48,11 @@ DEVIATIONS = [
     "prospect, broad water in view and a forest baseline; C is scored over the 1 km smoothing window.",
     "Holdout spot checks (config/spot_checks.toml, [holdout]) were added before any v0.1 formula change and "
     "their v0 results kept in data/score_v0/holdout_v0.json; they were not consulted while tuning.",
+    "v0.2 (docs/SCORE_SPEC.md, 'v0.2 changes'; docs/SCORE_V02.md changes 1-4): pooled smoothing, a "
+    "multiplicative and water-gated penalty without the motorway term, V without prospect, weights "
+    "0.40/0.30/0.15/0.15, a capped roadside screen, forest transmit 0.5 and a shore-road floor on W.",
+    "Holdout-2 ([holdout2]) was written before the first v0.2 line of code and stays sealed until "
+    "declared_final is set; its v0.1 scores were written unread to data/score_v01/holdout2_v01.json.",
 ]
 
 
@@ -107,7 +114,7 @@ def heatmap(scores, samples, length_m: np.ndarray, out: Path, cell_m: float = 50
     ax.set_yticks([])
     for sp in ax.spines.values():
         sp.set_visible(False)
-    ax.set_title(f"Scenery score v0.1, New York State: length-weighted mean S per {cell_m:.0f} m cell "
+    ax.set_title(f"Scenery score v0.2, New York State: length-weighted mean S per {cell_m:.0f} m cell "
                  f"(run {date.today().isoformat()})", fontsize=6)
     cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
     cb.ax.tick_params(labelsize=5)
@@ -141,7 +148,7 @@ def summary_stats(scores, length_m: np.ndarray) -> dict:
 
 def summary_md(scores, length_m: np.ndarray, out: Path) -> Path:
     st = summary_stats(scores, length_m)
-    lines = [f"# Scenery score v0.1 summary ({date.today().isoformat()})", "",
+    lines = [f"# Scenery score v0.2 summary ({date.today().isoformat()})", "",
              f"{scores.num_rows:,} edges, {st['total_km']:,.0f} km; excluded (unpaved or seasonal) "
              f"{st['excluded_km']:,.0f} km. Statistics are length-weighted over non-excluded edges.", "",
              "| Column | Mean | p10 | p50 | p90 | Share of length at 0 |", "|---|---|---|---|---|---|"]

@@ -1,5 +1,6 @@
-"""Scenery score v0.1 on tiny synthetic rasters and edges (no network, no statewide data)."""
+"""Scenery score v0.2 on tiny synthetic rasters and edges (no network, no statewide data)."""
 
+import copy
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -9,13 +10,27 @@ from scipy import ndimage
 from scenic.rasters import (Grid, block_mean, disk_footprint, disk_max, disk_mean, disk_min, landcover_products,
                             make_grid, reach_from_frac, relief_tpi, size_score, water90_products, water_size)
 from scenic.score import (Samples, check_alignment, combine, curvature, excluded_mask, hills_edges, land_points,
-                          load, load_config, near_falloff, percentile_rank, prospect_points, quiet, road_keys,
+                          load, load_config, near_falloff, window_top, percentile_rank, prospect_points, quiet, road_keys,
                           sample_points, scores_table, sight_line, turning, views_points, water_points,
                           water_view_points, window_pairs, write_scores)
-from scenic.validate import byway_edge_mask, match_road
+from scenic.validate import byway_edge_mask, byway_neighbours, holdout2, match_road, v3_lists
 from scenic.water import is_areal_water, is_signal_node, line_code
 
 CFG = load_config()
+
+
+def cfg_v01():
+    """CFG with the v0.1 combination: subtractive penalty with a motorway term,
+    no town water gate, mean smoothing, prospect in V, 0.35/0.30/0.20/0.15."""
+    c = copy.deepcopy(CFG)
+    c["combine"].update(w_water=0.35, w_hills=0.30, w_views=0.20, w_land=0.15)
+    c["penalty"].update(mode="subtract", town_water_gate=False, motorway_weight=0.10)
+    c["smoothing"]["pool_weight"] = 0.0
+    c["views"]["w_prospect"] = 1.0
+    c["water"]["transmit"] = {k: (0.4 if k in ("41", "42", "43") else t) for k, t in c["water"]["transmit"].items()}
+    c["water"].pop("max_obstructed_cells", None)
+    c["water"].pop("shore_road", None)
+    return c
 
 
 def one_edge(xs, ys):
@@ -182,16 +197,22 @@ def test_point_on_water_scores_its_size():
 
 def test_water_visibility_trees_cottages_and_height():
     g, area, line, size, dem, nlcd = lake_scene()
+    v01 = cfg_v01()
     s = pts([[600, 585]])                                            # 315 m from the shore
-    W_open, _ = run_w(s, g, area, line, size, dem, nlcd)
+    W_open, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=v01)
     # One 30 m cell of forest along the shore: 40 % of the view gets through.
     nlcd[:, 29] = 41
-    W1, _ = run_w(s, g, area, line, size, dem, nlcd)
+    W1, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=v01)
     assert W1[0] == pytest.approx(0.4 * W_open[0])
     # Four cells of forest: almost nothing.
     nlcd[:, 26:30] = 41
-    W4, _ = run_w(s, g, area, line, size, dem, nlcd)
+    W4, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=v01)
     assert W4[0] == pytest.approx(0.4 ** 4 * W_open[0])
+    # v0.2: forest passes 50 % per cell and only the first three cells count.
+    assert run_w(s, g, area, line, size, dem, nlcd)[0][0] == pytest.approx(0.5 ** 3 * W_open[0])
+    nlcd[:, 10:30] = 41                                              # 600 m of forest: still the screen
+    assert run_w(s, g, area, line, size, dem, nlcd)[0][0] == pytest.approx(0.5 ** 3 * W_open[0])
+    nlcd[:, 10:30] = 81
     # A road 60 m above the lake on a slope looks over a row of 20 m trees at the shore.
     nlcd[:, 26:29] = 81
     dem2 = dem.copy()
@@ -204,17 +225,49 @@ def test_water_visibility_trees_cottages_and_height():
 
 def test_water_seen_through_a_gap_off_to_the_side():
     g, area, line, size, dem, nlcd = lake_scene()
+    v01 = cfg_v01()
     s = pts([[600, 585]])                                            # row 20, 315 m from the shore
-    W_open, _ = run_w(s, g, area, line, size, dem, nlcd)
+    W_open, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=v01)
     nlcd[:, 29] = 41                                                  # trees all along the shore
-    W1, _ = run_w(s, g, area, line, size, dem, nlcd)
+    W1, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=v01)
     # A gap in the trees about 30 degrees off the straight line to the shore:
     # the driver sees the lake through it, a little farther away.
     nlcd[12:17, 29] = 81
     nlcd[24:29, 29] = 81
-    Wg, _ = run_w(s, g, area, line, size, dem, nlcd)
+    Wg, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=v01)
     assert W1[0] == pytest.approx(0.4 * W_open[0])
     assert 0.8 * W_open[0] < Wg[0] < W_open[0]
+
+
+def test_shore_road_term_floors_w_near_big_water():
+    g, area, line, size, dem, nlcd = lake_scene()
+    dem[:, 29] = 140                                                  # a bank hides the lake entirely
+    sz = float(size[20, 35])
+    assert sz >= 0.4
+    shore_x = 30 * 30.0                                               # first water column starts at x = 900
+    d = np.array([60.0, 210.0, 400.0])                                # from the nearest water cell centre
+    s = pts([[shore_x + 15 - dd, 585] for dd in d])
+    W, _ = run_w(s, g, area, line, size, dem, nlcd)
+    assert W[0] == pytest.approx(0.5 * sz)                            # within 120 m: full floor
+    assert W[1] == pytest.approx(0.5 * sz * (300 - 210) / 180)        # fading to 0 at 300 m
+    assert W[2] == pytest.approx(0, abs=1e-12)
+    W01, _ = run_w(s, g, area, line, size, dem, nlcd, cfg=cfg_v01())
+    assert W01[0] == pytest.approx(0, abs=1e-12)                      # v0.1: the bank hid it
+
+
+def test_sight_line_counts_only_the_first_obstructed_cells():
+    g = tiny_grid()
+    dem = np.full(g.shape, 100.0, np.float32)
+    cls = np.zeros(g.shape, np.uint8)
+    canopy = np.zeros(256)
+    log_t = np.zeros(256)
+    canopy[41], log_t[41] = 20.0, np.log(0.5)
+    cls[:, 5:30] = 41
+    args = (np.array([45.0, 45.0]), np.array([600.0, 300.0]), np.array([101.2, 101.2]),
+            np.array([1005.0, 1005.0]), np.array([600.0, 300.0]), np.array([100.0, 100.0]), g)
+    full = sight_line(*args, dem, 30.0, 2.0, cls, canopy, log_t)
+    capped = sight_line(*args, dem, 30.0, 2.0, cls, canopy, log_t, max_obstructed=3)
+    assert full[0] < 0.5 ** 10 and capped.tolist() == pytest.approx([0.125, 0.125])   # per ray
 
 
 def test_water_hidden_behind_a_ridge():
@@ -278,11 +331,17 @@ def test_views_land_and_prospect_formulas():
     open_ = np.array([1.0, 1.0, 0.0, 0.0, 0.5])
     forest = np.array([0.0, 0.0, 1.0, 0.0, 0.5])
     prospect = np.array([0.0, 1.0, 1.0, 0.0, 0.5])
-    V = views_points(open_, forest, prospect, zero, CFG)
+    v01 = cfg_v01()
+    V = views_points(open_, forest, prospect, zero, v01)
     assert V.tolist() == pytest.approx([0.35, 1.0, 0.25, 0.0, 0.5 * (0.35 + 0.65 * 0.5) + 0.5 * 0.25])
-    # Water in view and prospect combine as independent chances of a view.
-    assert views_points(np.ones(1), np.zeros(1), np.array([0.5]), np.array([0.5]), CFG)[0] == \
+    # v0.1: water in view and prospect combine as independent chances of a view.
+    assert views_points(np.ones(1), np.zeros(1), np.array([0.5]), np.array([0.5]), v01)[0] == \
         pytest.approx(0.35 + 0.65 * 0.75)
+    # v0.2: prospect is left to H; V = open * (0.35 + 0.65 * V_water) + forest * 0.25.
+    assert views_points(open_, forest, prospect, zero, CFG).tolist() == \
+        pytest.approx([0.35, 0.35, 0.25, 0.0, 0.5 * 0.35 + 0.5 * 0.25])
+    assert views_points(np.ones(1), np.zeros(1), np.array([1.0]), np.array([0.5]), CFG)[0] == \
+        pytest.approx(0.35 + 0.65 * 0.5)
     p = prospect_points(np.array([100.0, 300.0, 100.0]), np.array([90.0, 100.0, 100.0]),
                         np.array([120.0, 300.0, 900.0]), CFG)
     assert p.tolist() == pytest.approx([0.0, (200 - 30) / 200, 1.0])
@@ -325,12 +384,14 @@ def test_water90_products_reach_and_broad_water():
     area = np.zeros((90, 90), bool)
     area[:, 60:] = True                                               # broad water, 900 m wide
     area[30:33, 10:13] = True                                         # 90 m pond
-    dem = np.full(area.shape, 150, np.int16)
-    dem[area] = 100
+    dem = np.full(area.shape, 100, np.int16)
+    dem[area] = -40                                                   # bathymetry under both
     p = water90_products(area, dem, k, 90.0, CFG)
     assert p["reach90"][15, 25] == pytest.approx(CFG["water"]["reach_max_m"])  # lake shore cell
     assert p["reach90"][10, 3] < 400                                  # the pond
-    assert p["water_z90"][15, 25] == 100 and np.isnan(p["water_z90"][0, 0])
+    # The surface is the shore height, not the bed; the middle of the lake too.
+    assert p["water_z90"][15, 25] == 100 and p["water_z90"][15, 29] == 100
+    assert np.isnan(p["water_z90"][0, 0])
     # Nearest broad water from the west side is the lake, not the pond.
     i = int(p["bigwater_idx90"][10, 3])
     assert i >= 0 and i % 30 == 20
@@ -379,7 +440,7 @@ def test_curvature_is_scored_over_the_window():
     # own would saturate C (450 deg/km); over its 1000 m window it is 90 deg/km.
     u, v, key, L = chain()
     n = 6
-    sig = {k: np.zeros(n) for k in ("W", "H", "V", "L", "Q", "dev", "signals", "junction_halves")}
+    sig = {k: np.zeros(n) for k in ("W", "H", "V", "L", "Q", "dev", "signals", "junction_halves", "V_water")}
     sig["turn_deg"] = np.array([0, 0, 90.0, 0, 0, 0])
     extra = {"u": u, "v": v, "key": key, "length_m": L, "highway": np.array(["tertiary"] * n, object),
              "maxspeed_tagged": np.zeros(n, bool), "speed_mph": np.full(n, 45.0)}
@@ -456,12 +517,12 @@ def test_smoothing_and_penalty_windows():
     n = 6
     sig = {"W": np.array([0, 0, 1.0, 0, 0, 0]), "H": np.zeros(n), "V": np.zeros(n), "L": np.zeros(n),
            "Q": np.zeros(n), "C": np.zeros(n), "dev": np.zeros(n), "signals": np.zeros(n),
-           "junction_halves": np.zeros(n)}
+           "junction_halves": np.zeros(n), "V_water": np.zeros(n)}
     extra = {"u": u, "v": v, "key": key, "length_m": L, "highway": np.array(["tertiary"] * n, object),
              "maxspeed_tagged": np.zeros(n, bool), "speed_mph": np.full(n, 45.0)}
     active = np.ones(n, bool)
     active[4] = False
-    r = combine(sig, extra, active, CFG)
+    r = combine(sig, extra, active, cfg_v01())
     assert np.isnan(r["pre"][4]) and np.isnan(r["smooth"][4]) and r["S"][4] == 0
     # Edge 2 window: itself (200), edges 1 and 3 (200 each, d=0); edge 0 at d=200: w=200.
     assert r["window_m"][2] == pytest.approx(800)
@@ -471,7 +532,7 @@ def test_smoothing_and_penalty_windows():
     assert r["smooth"][5] == 0.0               # the cross street sees none of Lake Rd's water
     # A signal on edge 3 counts in edge 2's window by length share.
     sig["signals"] = np.array([0, 0, 0, 1.0, 0, 0])
-    r2 = combine(sig, extra, active, CFG)
+    r2 = combine(sig, extra, active, cfg_v01())
     per_km = 1 / 0.8
     assert r2["signals_per_km"][2] == pytest.approx(per_km)
     assert r2["penalty"][2] == pytest.approx(0.20 * per_km / 3)
@@ -479,16 +540,65 @@ def test_smoothing_and_penalty_windows():
 
 def test_penalties_cap_and_motorway_urban():
     n = 2
-    sig = {k: np.zeros(n) for k in ("W", "H", "V", "L", "Q", "C", "signals", "junction_halves")}
+    sig = {k: np.zeros(n) for k in ("W", "H", "V", "L", "Q", "C", "signals", "junction_halves", "V_water")}
     sig["dev"] = np.array([0.0, 1.0])
     sig["signals"] = np.array([0.0, 50.0])
     sig["junction_halves"] = np.array([0.0, 50.0])
     extra = {"u": np.array([0, 2]), "v": np.array([1, 3]), "key": np.array([0, 1]), "length_m": np.array([1000.0, 1000.0]),
              "highway": np.array(["motorway", "residential"], object), "maxspeed_tagged": np.array([False, True]),
              "speed_mph": np.array([65.0, 25.0])}
-    r = combine(sig, extra, np.ones(n, bool), CFG)
+    r = combine(sig, extra, np.ones(n, bool), cfg_v01())
     assert r["penalty"][0] == pytest.approx(0.10)
     assert r["penalty"][1] == pytest.approx(0.5)  # 0.15 + 0.20 + 0.25 + 0.10, capped
+    r = combine(sig, extra, np.ones(n, bool), CFG)
+    assert r["penalty"][0] == 0.0                 # v0.2: no motorway term
+    assert r["penalty"][1] == pytest.approx(0.5)
+
+
+def test_window_top_takes_the_best_metres_of_the_window():
+    # Window of edge 0: pairs to edges 0..3 with weights 200, 200, 100, 50.
+    s = np.array([0, 0, 0, 0, 1])
+    d = np.array([0, 1, 2, 3, 1])
+    w = np.array([200.0, 200.0, 100.0, 50.0, 120.0])
+    vals = np.array([0.1, 0.5, 0.9, 0.3])
+    top = window_top(s, d, w, vals, 2, 300.0)
+    assert top[0] == pytest.approx((100 * 0.9 + 200 * 0.5) / 300)   # best 300 m: edge 2, then 200 m of edge 1
+    assert top[1] == pytest.approx(0.5)                             # window under 300 m: its max
+
+
+def test_v02_penalty_multiplies_and_spares_water_in_town():
+    n = 3
+    sig = {k: np.zeros(n) for k in ("H", "V", "L", "Q", "C", "signals", "junction_halves")}
+    sig["W"] = np.array([0.8, 0.0, 0.8])
+    sig["V_water"] = np.array([1.0, 0.0, 0.0])
+    sig["dev"] = np.array([0.8, 0.8, 0.8])              # all in town
+    extra = {"u": np.array([0, 2, 4]), "v": np.array([1, 3, 5]), "key": np.array([0, 1, 2]),
+             "length_m": np.full(n, 1000.0), "highway": np.array(["primary"] * n, object),
+             "maxspeed_tagged": np.zeros(n, bool), "speed_mph": np.full(n, 45.0)}
+    r = combine(sig, extra, np.ones(n, bool), CFG)
+    raw = 0.40 * sig["W"]
+    assert r["penalty"][0] == 0.0                        # lake in full view: no town penalty
+    assert r["penalty"][1] == pytest.approx(0.25)
+    assert r["penalty"][2] == pytest.approx(0.25 * 0.2)  # gated by max(W, V_water) = 0.8
+    assert r["pre"].tolist() == pytest.approx((raw * (1 - r["penalty"])).tolist())
+    assert (r["pre"] >= 0).all()                         # a penalty never makes a view negative
+    r01 = combine(sig, extra, np.ones(n, bool), cfg_v01())
+    assert r01["pre"][1] == pytest.approx(-0.25)
+
+
+def test_v02_pooled_smoothing_keeps_the_lake_edge():
+    u, v, key, L = chain()
+    n = 6
+    sig = {k: np.zeros(n) for k in ("H", "V", "L", "Q", "C", "dev", "signals", "junction_halves", "V_water")}
+    sig["W"] = np.array([0, 0, 1.0, 0, 0, 0])
+    extra = {"u": u, "v": v, "key": key, "length_m": L, "highway": np.array(["tertiary"] * n, object),
+             "maxspeed_tagged": np.zeros(n, bool), "speed_mph": np.full(n, 45.0)}
+    r = combine(sig, extra, np.ones(n, bool), CFG)
+    # Edge 2 window: 1000 m (edges 0-4), mean 0.40 * 200 / 1000; best 300 m: 200 m of lake, 100 m of 0.
+    assert r["window_m"][2] == pytest.approx(1000)
+    assert r["smooth"][2] == pytest.approx(0.5 * 0.40 * 200 / 1000 + 0.5 * 0.40 * 200 / 300)
+    r01 = combine(sig, extra, np.ones(n, bool), cfg_v01())
+    assert r["smooth"][2] > r01["smooth"][2] * 2
 
 
 def test_percentile_rank_by_length_with_ties():
@@ -555,3 +665,144 @@ def test_byway_mask_needs_most_points_near_the_line():
     sy = np.r_[np.full(11, 10.0), np.linspace(0, 400, 5)]
     se = np.r_[np.zeros(11), np.ones(5)].astype(np.int32)
     assert byway_edge_mask(line, sx, sy, se, 2).tolist() == [True, False]
+
+
+# ---------------------------------------------------------------- review fixes (v0.1.1)
+
+
+def test_sight_line_checks_every_step_before_the_stop():
+    g = tiny_grid()
+    dem = np.full(g.shape, 100.0, np.float32)
+    # An 89 m ray at 30 m steps samples 30 and 60 m (was: 30 m only).
+    px, py = np.array([15.0]), np.array([615.0])
+    args = (px, py, np.array([101.2]), px + 89.0, py, np.array([100.0]), g)
+    assert sight_line(*args, dem, 30.0, 2.0)[0] == 1.0
+    dem[:, 2] = 120.0                                                 # a bank 60 m out (x = 60..90)
+    assert sight_line(*args, dem, 30.0, 2.0)[0] == 0.0
+    # The stop itself is never sampled: a 90 m ray samples 30 and 60 m only.
+    dem[:, 2] = 100.0
+    dem[:, 3] = 120.0                                                 # x = 90..120
+    args90 = (px, py, np.array([101.2]), px + 90.0, py, np.array([100.0]), g)
+    assert sight_line(*args90, dem, 30.0, 2.0)[0] == 1.0
+
+
+def test_water_surface_is_the_shore_not_the_bed_nor_clamped():
+    from scenic.rasters import water_surface90
+    k = 3
+    area = np.zeros((60, 90), bool)
+    area[:, 60:] = True
+    dem = np.full(area.shape, 50, np.int16)
+    dem[area] = -80                                                   # river bed
+    z = water_surface90(area, dem, k, 5, 0.1)
+    assert np.all(z[:, 20:] == 50) and np.all(np.isnan(z[:, :19]))
+    # A flooded quarry below sea level keeps its height.
+    dem2 = np.full(area.shape, -30, np.int16)
+    dem2[area] = -55
+    assert np.nanmax(water_surface90(area, dem2, k, 5, 0.1)) == -30
+    # A river falling downstream: each reach takes its own shore height.
+    dem3 = np.where(np.arange(60)[:, None] < 30, 200, 100).astype(np.int16) * np.ones((1, 90), np.int16)
+    dem3[area] = 0
+    z3 = water_surface90(area, dem3, k, 5, 0.1)
+    assert z3[0, 25] == 200 and z3[19, 25] == 100
+
+
+def test_water_points_use_the_surface_height():
+    g, area, line, size, dem, nlcd = lake_scene()
+    dem[area] = 40                                                    # bathymetry 60 m below the shore
+    s = pts([[600, 585]])
+    W_bed, _ = run_w(s, g, area, line, size, dem, nlcd)
+    W_surf, _ = water_points(s, g, area, line, size, lambda x, y: np.full(len(x), 1000.0), np.full(1, 100.0),
+                             dem, nlcd, CFG, zsurf_of=lambda x, y: np.full(len(x), 100.0))
+    W_ref, _ = run_w(s, g, area, line, size, np.full_like(dem, 100), nlcd)
+    assert W_surf[0] == pytest.approx(W_ref[0])
+    assert W_bed[0] <= W_surf[0]
+
+
+def test_worthless_nearest_shore_still_gets_the_fan():
+    g, area, line, size, dem, nlcd = lake_scene()
+    # A pond under 1 ha (size 0) right in front of the road, same reach band
+    # as the lake; the lake is visible to either side of it.
+    area[18:22, 22:24] = True
+    size[18:22, 22:24] = 0.0
+    nlcd[18:22, 22:24] = 11
+    s = pts([[600, 585]])
+    W, _ = run_w(s, g, area, line, size, dem, nlcd, reach=1000.0)
+    assert W[0] > 0.5
+
+
+def test_cached_signals_and_samples_must_match_the_edges(tmp_path):
+    from scenic.graph import edges_fingerprint
+    from scenic.score import load_samples, read_edge_signals, save_samples, write_edge_signals
+    e1 = pa.table({"u": [0, 1], "v": [1, 2], "way_id": [5, 6], "length_m": [10.0, 20.0]})
+    e2 = pa.table({"u": [1, 0], "v": [2, 1], "way_id": [6, 5], "length_m": [20.0, 10.0]})  # same rows, reordered
+    fp1, fp2 = edges_fingerprint(e1), edges_fingerprint(e2)
+    p = write_edge_signals({"W": np.array([0.1, 0.2])}, tmp_path / "sig.parquet", fp1)
+    assert read_edge_signals(p, fp1).column("W").to_pylist() == pytest.approx([0.1, 0.2])
+    with pytest.raises(ValueError):
+        read_edge_signals(p, fp2)
+    s = Samples(np.zeros(4), np.zeros(4), np.array([0, 0, 1, 1], np.int32), np.array([2, 2]), np.array([0, 2, 4]))
+    save_samples(tmp_path / "s.npz", s, fp1)
+    assert load_samples(tmp_path / "s.npz", fp1)["edge"].tolist() == [0, 0, 1, 1]
+    with pytest.raises(ValueError):
+        load_samples(tmp_path / "s.npz", fp2)
+
+
+# ---------------------------------------------------------------- v0.2 validation
+
+
+def _roads():
+    """Four roads along a line; refs, names and midpoints for the list checks."""
+    refs = np.array(["NY 1", "NY 2", "NY 3", "I 9"], object)
+    names = np.array([None] * 4, object)
+    lon = np.array([-75.0, -74.0, -73.0, -72.0])
+    lat = np.full(4, 43.0)
+    return refs, names, lon, lat
+
+
+def test_v3_splits_urban_motorway_and_flat():
+    refs, names, lon, lat = _roads()
+    S = np.array([0.9, 0.15, 0.35, 0.3])
+    L = np.full(4, 1000.0)
+    box = lambda x: [x - 0.1, 42.9, x + 0.1, 43.1]                  # noqa: E731
+    cfg = {"v3": {"scenic_min": 0.65, "scenic_need": 1, "urban_max": 0.20, "urban_need": 1,
+                  "flat_band": [0.20, 0.50]},
+           "scenic": [{"label": "a", "ref": "NY 1", "bbox": box(-75)}],
+           "dull": [{"label": "b", "ref": "NY 2", "bbox": box(-74)},
+                    {"label": "m", "ref": "I 9", "bbox": box(-72), "kind": "motorway"}],
+           "holdout": {"dull": [{"label": "f", "ref": "NY 3", "bbox": box(-73), "kind": "flat"}]}}
+    r = v3_lists(cfg, S, L, np.zeros(4, bool), refs, names, lon, lat)
+    assert r["pass"] and r["urban"]["of"] == 1 and r["flat"]["of"] == 1
+    assert r["flat"]["items"][0]["S"] == 0.35                       # farmland in the band, not "dull"
+    assert r["motorway_reported"]["items"][0]["S"] == 0.3 and "pass" not in r["motorway_reported"]
+
+
+def test_holdout2_is_sealed_until_declared_final():
+    refs, names, lon, lat = _roads()
+    S = np.array([0.9, 0.15, 0.35, 0.3])
+    L = np.full(4, 1000.0)
+    box = lambda x: [x - 0.1, 42.9, x + 0.1, 43.1]                  # noqa: E731
+    h = {"declared_final": False, "urban_max": 0.2, "flat_band": [0.2, 0.5], "scenic_min": 0.65,
+         "scenic": [{"label": "a", "ref": "NY 1", "bbox": box(-75)}],
+         "urban": [{"label": "b", "ref": "NY 2", "bbox": box(-74)}],
+         "flat": [{"label": "f", "ref": "NY 3", "bbox": box(-73)}], "od": []}
+    diag = {"W": S}
+    r = holdout2({"holdout2": h}, S, L, np.zeros(4, bool), refs, names, lon, lat, diag)
+    assert r["status"] == "sealed" and "S" not in str(r)
+    h["declared_final"] = True
+    r = holdout2({"holdout2": h}, S, L, np.zeros(4, bool), refs, names, lon, lat, diag)
+    assert r["status"] == "scored" and r["scenic"]["items"][0]["S"] == 0.9 and r["pass"]
+
+
+def test_byway_neighbours_compare_same_class_rural_roads_nearby():
+    # Byway: two rural primaries (S 0.8); neighbours: a primary at 0.5 within
+    # 15 km, a residential at 0.9 (other class), a primary at 0.95 far away,
+    # a town primary on the byway (dev 0.6) that is left out.
+    S = np.array([0.8, 0.8, 0.5, 0.9, 0.95, 0.1])
+    L = np.full(6, 1000.0)
+    hw = np.array(["primary", "primary", "primary", "residential", "primary", "primary"], object)
+    dev = np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.6])
+    x = np.array([0.0, 1000.0, 5000.0, 5000.0, 40000.0, 500.0])
+    by = np.array([True, True, False, False, False, True])
+    r = byway_neighbours({"b": by}, by, S, L, hw, dev, np.zeros(6, bool), x, np.zeros(6), 15000.0, 0.3)
+    assert r["b"]["median_S"] == pytest.approx(0.8) and r["b"]["neighbour_median_S"] == pytest.approx(0.5)
+    assert r["b"]["beats"] and r["b"]["rural_km"] == 2.0

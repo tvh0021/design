@@ -5,7 +5,8 @@ A scenic route planner for New York State. See `docs/PLAN.md` for the full plan.
 So far it does phase 1 for OpenStreetMap only. It downloads the New York OSM
 extract, builds a statewide graph of drivable roads, and finds the fastest
 route between two points. It also gives every road edge a scenery score
-(v0.1, `docs/SCORE_SPEC.md`; the v0.1 changes are listed at its end).
+(v0.2, `docs/SCORE_SPEC.md`; the v0.1 and v0.2 changes are listed at its end,
+and `docs/SCORE_V02.md` gives the reasons for v0.2).
 
 ## Setup
 
@@ -73,9 +74,13 @@ Scores every edge in `data/graph/edges.parquet`. Settings are in
 `config/score.toml`. The stages are grid, dem, nlcd, water, water90,
 terrain90, land90, controls, edges, score, outputs and validate. Each one
 runs in its own process and caches its result in `data/rasters/` or
-`data/score/`. A stage is skipped when its outputs are newer than its inputs
-(`config/score.toml` counts as an input, so editing it reruns nearly every
-stage). `--force` reruns all stages, or just the ones named. A full run takes
+`data/score/`. A stage is skipped while its fingerprint is unchanged and its
+outputs are the files it last wrote. The fingerprint hashes the stage's code
+(its body and the scenic modules it calls), the `config/score.toml` sections
+it reads and the contents of its input files, so editing a formula or a
+setting reruns the stages it touches, and a stage whose output changes
+reruns every stage that reads it. Fingerprints live in `.stages/` next to
+each stage's outputs. `--force` reruns all stages, or just the ones named. A full run takes
 about 3.5 minutes; the water90 stage peaks at about 13.5 GB of memory and the
 water and edges stages at about 9.6 GB. It writes these files to
 `data/score/`:
@@ -85,14 +90,25 @@ water and edges stages at about 9.6 GB. It writes these files to
   excluded.
 - `heatmap.png`: a statewide map of S.
 - `summary.md`: distributions of the signals and how they correlate.
-- `validation.json`: the byway, spot-check and Rochester to Syracuse checks.
+- `validation.json`: the byway, spot-check and Rochester to Syracuse checks,
+  and the v0.2 checks (V3 split dull lists, V4 byways, lake fronts).
   The spot checks are listed in `config/spot_checks.toml`, which also holds
-  a holdout set (10 scenic, 5 dull) that was fixed before v0.1 and is
-  not used for tuning.
+  a holdout set (10 scenic, 5 dull) that was fixed before v0.1, and
+  holdout-2 (10 scenic, 5 urban, 3 flat, 4 OD pairs), fixed before v0.2.
+  Holdout-2 is skipped until `declared_final = true` is set in
+  `[holdout2]`; then it is scored once.
 - `edge_signals.parquet`: per-edge signals and their parts (W, H_relief,
   H_grade, V_prospect, V_water, turn_deg, water_dist_m and so on).
 - `score_report.json`: inputs, versions, run time and peak memory per
   stage, deviations from the spec, and the validation results.
+
+Known limitations of the score pipeline:
+
+- The water90 stage peaks at about 14.8 GB of memory (the 1 km and 3 km disk
+  filters on the full grid). It fits a 64 GB machine; on a 16 GB one it
+  would need to be tiled.
+- `fetch-layers` skips a file that is already downloaded when its size
+  matches the server's, without re-checking its md5.
 
 ## Road model
 

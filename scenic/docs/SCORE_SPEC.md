@@ -390,3 +390,89 @@ scenic 3/10 → 6/10, holdout dull 3/5 → 4/5; Rochester to Syracuse fastest
 designated byways are heritage routes through farmland and towns (Seaway
 Trail 837 km at median 0.44, Revolutionary Byway 0.37, Maple Traditions
 0.41).
+
+## v0.2 changes
+
+Design and reasons: `docs/SCORE_V02.md` §3, changes 1–4. The moments layer,
+the route search and checks V1, V2 and V5 (§4) are not built yet. Every new
+key in `config/score.toml` can switch the old behaviour back on.
+
+**Fixes made first (v0.1.1).**
+- Stage caching uses fingerprints: each stage hashes its code, its config
+  sections and its input files, and is rerun when any of them changes.
+- `edge_signals.parquet` and `samples.npz` carry the edges fingerprint and
+  are refused for any other `edges.parquet`.
+- A sight line samples every step strictly before the shore.
+- The water-surface target is now the 10th percentile of the DEM on shore
+  land cells within 5×5 90 m blocks (`water.surface_*`), instead of the DEM
+  over the water.
+- A point whose nearest shore is worth nothing still gets the fan of rays.
+
+**1. Pooled smoothing.** The window is unchanged. The smoothed value is now
+`smooth = 0.5·mean + 0.5·top`, where `top` is the w-weighted mean of `pre`
+over the best 300 m of window weight, with the last edge taken in part. A
+window under 300 m uses its maximum (`smoothing.pool_weight`,
+`pool_top_m`).
+
+**2. Penalty.** Penalties now multiply instead of subtract:
+`pre = raw·(1 + 0.10·Q + 0.05·C)·(1 − P)` (`penalty.mode = "multiply"`).
+The town term is multiplied by `1 − max(W, V_water)` (`town_water_gate`).
+The motorway term is gone (`motorway_weight = 0`). The cap stays at 0.5.
+
+**3. W.**
+- Only the first 3 obstructed 30 m cells from the road multiply
+  (`water.max_obstructed_cells`).
+- Forest (classes 41, 42, 43) now lets 0.5 of the view through instead of
+  0.4.
+- Shore-road floor (`water.shore_road`): the nearest areal water cell of
+  size ≥ 0.4 gives `W_pt ≥ 0.5·size` within 120 m. The floor fades linearly
+  to 0 at 300 m and applies whatever the sight lines show.
+
+**4. V and weights.** V no longer uses prospect (`views.w_prospect = 0`):
+`V = open·(0.35 + 0.65·V_water) + forest·0.25`. The weights are now
+`raw = 0.40·W + 0.30·H + 0.15·V + 0.15·L`.
+
+**Validation.**
+- The v0.1 checks are still reported.
+- New checks:
+  - V3: scenic ≥ 0.65 (8/10). Urban strips ≤ 0.20 (6 of the 7 dull items
+    that are neither motorways nor farmland). Flat rural roads in
+    [0.20, 0.50]: NY-5 Batavia, NY-98 and NY-104 Ridge, all three.
+  - V4a: landscape-byway median, reported only.
+  - V4b: each designated byway's rural km (dev ≤ 0.3) against non-byway
+    rural roads of the same classes within 15 km, reweighted to the byway's
+    class mix. Reported only.
+  - Lake-front diagnostics.
+  - Holdout-2 (`[holdout2]`), sealed until `declared_final`.
+
+**Results** (v0.1 → v0.1.1 → v0.2a (changes 1, 2, 4) → v0.2b (+ change 3)):
+
+| check | v0.1 | v0.1.1 | v0.2a | v0.2b | SCORE_V02 §5 |
+|---|---|---|---|---|---|
+| scenic ≥ 0.70 / dull ≤ 0.35 | 8, 10 | 8, 10 | 9, 10 | 9, 10 | 9, 10 |
+| holdout-1 scenic, dull (burnt) | 6, 4 | 5, 4 | 7, 4 | 8, 4 | 8, 4 |
+| designated byway median | 0.553 | 0.550 | 0.596 | 0.625 | 0.618 |
+| landscape-byway median (V4a) | 0.651 | 0.648 | 0.699 | 0.716 | ≥ 0.62 |
+| V4b byways beating neighbours | 18/25 | 18/25 | 22/25 | 21/25 | ≥ 18 |
+| V3 scenic, urban, flat | 10, 7, 3 | 10, 7, 3 | 10, 6, 3 | 10, 7, 3 | 8, 6, 3 |
+| Seneca front, Geneva | 0.25 | 0.24 | 0.65 | 0.76 | ≥ 0.65 |
+| Skaneateles front | 0.32 | 0.30 | 0.58 | 0.63 | ≥ 0.65 |
+| Rochester→Syracuse fastest (I-90) | 0.254 | 0.253 | 0.302 | 0.308 | 0.317 |
+| US-20 Canandaigua–Skaneateles | 0.326 | 0.325 | 0.382 | 0.404 | 0.415 |
+| NY-28 Old Forge–Inlet | 0.58 | 0.58 | 0.68 | 0.73 | ≥ 0.70 |
+
+Holdout-2 was scored once, on v0.2b. It passes V3: scenic 8/10 ≥ 0.65,
+urban 4/5 ≤ 0.20 and flat 3/3. v0.1 would also have passed V3 on it, so it
+does not separate the two versions. Its OD pairs have not been routed.
+
+**Deviations from SCORE_V02.md.**
+- §2's "Cayuga N end" edge (1 km, W 0.68) is the Seneca River east of
+  Geneva. The Cayuga crossing is reported separately.
+- §5's "landscape-byway median ≥ 0.62" matches §3's "byway med" column,
+  which covers all designated byways. Both medians are reported.
+- V4b reproduces 18/25, not "15/25 today": the comparison method is not
+  given in the design.
+- The Skaneateles front misses the ≥ 0.65 prediction. The v0.1.1 fixes
+  lowered its W from 0.31 to 0.22; the §3 what-ifs used v0.1's W. Which of
+  those fixes caused the drop was not isolated, and the formula was not
+  tuned further.

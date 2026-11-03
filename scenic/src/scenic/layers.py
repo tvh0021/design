@@ -94,23 +94,27 @@ def download_resumable(url: str, dest: Path, info: dict | None = None, quiet: bo
     if size and have > size:
         part.unlink()
         have = 0
-    headers = {"Range": f"bytes={have}-"} if have else {}
     t0 = time.monotonic()
-    last = 0.0
-    with _request(url, headers=headers, timeout=120) as r:
-        mode = "ab" if (have and r.status == 206) else "wb"
-        done = have if mode == "ab" else 0
-        with open(part, mode) as f:
-            while chunk := r.read(CHUNK):
-                f.write(chunk)
-                done += len(chunk)
-                now = time.monotonic()
-                if not quiet and now - last > 0.5:
-                    _progress(done, size, t0)
-                    last = now
-    if not quiet:
-        _progress(done, size, t0)
-        sys.stderr.write("\n")
+    # A .part that already has every byte (the last run stopped before the
+    # check and rename) is verified and promoted as it is: a Range request
+    # from its end would get HTTP 416.
+    if not (size and have == size):
+        headers = {"Range": f"bytes={have}-"} if have else {}
+        last = 0.0
+        with _request(url, headers=headers, timeout=120) as r:
+            mode = "ab" if (have and r.status == 206) else "wb"
+            done = have if mode == "ab" else 0
+            with open(part, mode) as f:
+                while chunk := r.read(CHUNK):
+                    f.write(chunk)
+                    done += len(chunk)
+                    now = time.monotonic()
+                    if not quiet and now - last > 0.5:
+                        _progress(done, size, t0)
+                        last = now
+        if not quiet:
+            _progress(done, size, t0)
+            sys.stderr.write("\n")
     got = part.stat().st_size
     if size and got != size:
         raise RuntimeError(f"{url}: got {got} bytes, expected {size}; rerun to resume")

@@ -267,14 +267,65 @@ def reach_from_frac(wfrac: np.ndarray, r_cells: int, res: float, w: dict) -> np.
     return np.clip(w["reach_k"] * np.sqrt(area), w["reach_min_m"], w["reach_max_m"]).astype(np.float32)
 
 
+def water_surface90(area30: np.ndarray, dem30: np.ndarray, k: int, window: int, q: float,
+                    dem_nodata: int = -32768) -> np.ndarray:
+    """Water surface height (m) per k x k block that holds water (NaN elsewhere).
+
+    The DEM over water can be bathymetry (a river bed far below the surface),
+    so the surface is read off the shore instead: the q-quantile of the DEM
+    on shore cells (land cells 4-adjacent to water, valid DEM) within a
+    `window` x `window` block neighbourhood. Land is never lower than the
+    water beside it, so a low quantile is the waterline; it follows a river
+    downstream, and land legitimately below sea level (a flooded quarry)
+    keeps its height. Water blocks with no shore in their window (the middle
+    of a big lake) take the value of the nearest block that has one."""
+    h, w = area30.shape
+    hb, wb = h // k, w // k
+    s4 = ndimage.generate_binary_structure(2, 1)
+    shore = ndimage.binary_dilation(area30, s4) & ~area30 & (dem30 > dem_nodata)
+    vals = np.where(shore, dem30.astype(np.float32), np.nan)
+    del shore
+    vals = vals.reshape(hb, k, wb, k).transpose(0, 2, 1, 3).reshape(hb, wb, k * k)
+    has_shore = np.any(np.isfinite(vals), axis=2)
+    wet = block_count(area30, k) > 0
+    r = window // 2
+    near = ndimage.maximum_filter(has_shore, size=window, mode="constant")
+    br, bc = np.nonzero(wet & near)
+    out = np.full((hb, wb), np.nan, dtype=np.float32)
+    chunk = 500_000
+    for a in range(0, len(br), chunk):
+        rr, cc = br[a:a + chunk], bc[a:a + chunk]
+        parts = []
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                ry, cx = rr + dy, cc + dx
+                ok = (ry >= 0) & (ry < hb) & (cx >= 0) & (cx < wb)
+                v = vals[np.clip(ry, 0, hb - 1), np.clip(cx, 0, wb - 1)]
+                v[~ok] = np.nan
+                parts.append(v)
+        allv = np.sort(np.concatenate(parts, axis=1), axis=1)  # NaN last
+        n = np.isfinite(allv).sum(axis=1)
+        idx = np.floor(q * np.maximum(n - 1, 0)).astype(np.int64)
+        out[rr, cc] = allv[np.arange(len(rr)), idx]
+    del vals
+    done = np.isfinite(out)
+    if done.any() and (wet & ~done).any():
+        _, (ir, ic) = ndimage.distance_transform_edt(~done, return_indices=True)
+        fill = wet & ~done
+        out[fill] = out[ir[fill], ic[fill]]
+    out[~wet] = np.nan
+    return out
+
+
 def water90_products(area30: np.ndarray, dem30: np.ndarray, k: int, res90: float, cfg: dict,
                      dem_nodata: int = -32768) -> dict[str, np.ndarray]:
     """90 m water products for v0.1:
 
     - wfrac90: water fraction of the 1 km disk around each 90 m cell.
     - reach90: W reach (m) of water in that cell (reach_from_frac).
-    - water_z90: mean DEM over the water cells of the block (NaN: no water),
-      i.e. the water surface without the shore land a plain block mean mixes in.
+    - water_z90: water surface height of the block (NaN: no water), read off
+      the shore (water_surface90), not the DEM over the water, which can be
+      bathymetry.
     - bigwater_idx90: flat index of the nearest broad-water 90 m cell (cell at
       least bigwater_cell_frac water, disk at least bigwater_disk_frac water),
       -1 when none within views.wv_max_m.
@@ -285,8 +336,7 @@ def water90_products(area30: np.ndarray, dem30: np.ndarray, k: int, res90: float
     frac = block_count(area30, k).astype(np.float32) / (k * k)
     wfrac = disk_mean(frac, w["reach_radius_cells"])
     reach = reach_from_frac(wfrac, w["reach_radius_cells"], res90, w)
-    valid = area30 & (dem30 > dem_nodata)
-    wz = block_mean(dem30, k, valid=valid)
+    wz = water_surface90(area30, dem30, k, w["surface_window_blocks"], w["surface_shore_q"], dem_nodata)
     big = (frac >= v["bigwater_cell_frac"]) & (wfrac >= v["bigwater_disk_frac"]) & np.isfinite(wz)
     idx = np.full(frac.shape, -1, dtype=np.int32)
     if big.any():
