@@ -1,5 +1,6 @@
 import http.client
 import json
+import re
 import threading
 
 import numpy as np
@@ -141,7 +142,7 @@ def test_route_payload_is_compact_json(app):
     ({"from": A, "to": [46.0, -75.0]}, 422, "outside New York"),
     ({"from": "x", "to": B}, 400, "[lat, lon]"),
     ({"to": B}, 400, "[lat, lon]"),
-    ({"from": A, "to": [44.5, -74.0]}, 422, "km from the nearest road"),  # in NY, far from the toy graph
+    ({"from": A, "to": [44.5, -74.0]}, 422, "too far from the nearest road"),  # in NY, far from the toy graph
     ({"from": A, "to": A}, 404, "No route"),
 ])
 def test_route_errors(app, body, status, words):
@@ -461,7 +462,7 @@ def test_nominatim_request_identifies_the_project_only(monkeypatch):
     assert seen["url"].startswith("https://nominatim.openstreetmap.org/search?")
     for part in ("countrycodes=us", "bounded=1", "viewbox=", "q=seneca+lake"):
         assert part in seen["url"]
-    assert seen["headers"] == {"User-agent": "scenic-route-planner/0.1 (personal research)",
+    assert seen["headers"] == {"User-agent": "maps-for-wanderers/0.1 (personal research project)",
                                "Accept": "application/json"}
     assert "@" not in seen["url"] and "email" not in seen["url"]
 
@@ -516,8 +517,11 @@ def test_http_round_trip(live):
     assert st == 200 and hdr["Content-Type"] == "application/json"
     assert len(json.loads(data)["routes"]) == 2
     st, hdr, data = request(live, "GET", "/")
-    assert st == 200 and b"leaflet@1.9.4" in data and b'integrity="sha256-' in data
-    assert "Content-Security-Policy" in hdr
+    assert st == 200 and b"static/vendor/leaflet-1.9.4/leaflet.js" in data and b'integrity="sha256-' in data
+    assert b"unpkg" not in data and b"Maps for Wanderers" in data
+    assert "Content-Security-Policy" in hdr and "unpkg" not in hdr["Content-Security-Policy"]
+    st, _, data = request(live, "GET", "/static/vendor/leaflet-1.9.4/images/layers.png")
+    assert st == 200 and data[:4] == b"\x89PNG"
     st, _, data = request(live, "GET", "/static/app.js")
     assert st == 200 and b"/api/route" in data
 
@@ -562,11 +566,30 @@ def test_page_never_hands_leaflet_html_strings():
         assert m.group(2) in {"tip", "textNode", "momentPopup"}, m.group(0)
 
 
-def test_csp_allows_the_three_base_layers():
+def test_csp_allows_the_three_base_layers_and_nothing_else():
     js = (web.STATIC_DIR / "app.js").read_text()
-    for host in ("tile.openstreetmap.org", "server.arcgisonline.com"):
+    for host in ("tile.openstreetmap.org", "basemap.nationalmap.gov"):
         assert host in web.CSP
-    assert "World_Topo_Map" in js and "World_Imagery" in js
+    assert "USGSTopo" in js and "USGSImageryOnly" in js
+    assert "arcgisonline" not in js + web.CSP and "unpkg" not in web.CSP
+    assert "script-src 'self';" in web.CSP and "style-src 'self';" in web.CSP
+    # every https host the page loads images from is in img-src
+    for host in set(re.findall(r"L\.tileLayer\(\s*\"https://([^/]+)/", js)):
+        assert "https://" + host in web.CSP
+
+
+def test_self_hosted_leaflet_matches_its_integrity_hashes():
+    import base64
+    import hashlib
+
+    html = (web.STATIC_DIR / "index.html").read_text()
+    refs = re.findall(r'(?:src|href)="(static/vendor/[^"]+)"\s+integrity="sha256-([^"]+)"', html)
+    assert len(refs) == 2
+    for path, want in refs:
+        got = base64.b64encode(hashlib.sha256((web.STATIC_DIR.parent / path).read_bytes()).digest()).decode()
+        assert got == want, path
+    assets = re.findall(r'<(?:script|link)[^>]+(?:src|href)="([^"]+)"', html)
+    assert assets and not [a for a in assets if re.match(r"(?:https?:)?//", a)]  # no CDN: every asset is ours
 
 
 @pytest.mark.parametrize("forward", [True, False])
@@ -608,3 +631,198 @@ def test_moment_minutes_out_and_back_uses_the_first_pass():
               time_s=1200.0, length_m=16300.0, cost=1200.0, geometry=out.geometry + back.geometry[1:])
     got = web.moment_minutes(ctx, SimpleNamespace(edges=r.edges, route=r))
     assert got[0] == pytest.approx(0.4, abs=0.1)
+
+
+# ---- unit-neutral errors and stop groups -------------------------------------------
+
+
+def test_snap_error_sends_numbers_not_a_unit(app):
+    st, out = app.api("POST", "/api/route", {"from": A, "to": [44.5, -74.0]})
+    assert st == 422 and out["code"] == "snap_far" and out["point"] == "to"
+    assert isinstance(out["snap_m"], int) and out["snap_m"] > out["limit_m"] == 2000
+    assert not re.search(r"\d\s*(km|mi|m)\b", out["error"])  # no distance in the text
+    js = (web.STATIC_DIR / "app.js").read_text()
+    # the page builds the words from the numbers, in its own units
+    assert 'd.code === "snap_far"' in js and "dist(d.snap_m / 1000" in js and "dist(d.limit_m / 1000" in js
+
+
+@pytest.mark.parametrize("features, groups", [
+    ([], []),
+    (["Lake Ontario"], [(0, 0, "Lake Ontario")]),
+    (["Lake Ontario"] * 3 + [None, "Lake Ontario"],
+     [(0, 2, "Lake Ontario"), (3, 3, None), (4, 4, "Lake Ontario")]),  # only consecutive stops merge
+    ([None, None], [(0, 0, None), (1, 1, None)]),  # unnamed stops never merge
+    (["Genesee River", "Lake Ontario", "Lake Ontario"], [(0, 0, "Genesee River"), (1, 2, "Lake Ontario")]),
+])
+def test_stop_groups(features, groups):
+    got = web.stop_groups([{"feature": f} for f in features])
+    assert [(g["first"], g["last"], g["feature"]) for g in got] == groups
+
+
+def test_stop_groups_merge_bays_under_their_parent_body():
+    stops = [{"feature": "Lake George", "parent_feature": "Lake George"},
+             {"feature": "Boon Bay", "parent_feature": "Lake George"},
+             {"feature": "Huddle Bay", "parent_feature": "Lake George"},
+             {"feature": "Hudson River", "parent_feature": "Hudson River"}]
+    got = web.stop_groups(stops)
+    assert [(g["first"], g["last"], g["feature"]) for g in got] == [(0, 2, "Lake George"), (3, 3, "Hudson River")]
+
+
+def test_route_payload_carries_features_and_stop_groups():
+    app = App(ctx=ladder(two_moments=True), geocoder=FakeGeocoder())
+    _, out = app.api("POST", "/api/route", {"from": A, "to": B})
+    top = next(r for r in out["routes"] if "+50%" in r["labels"])
+    assert [m["feature"] for m in top["moments"]] == [None, "Toy Lake"]
+    assert [m["parent_feature"] for m in top["moments"]] == [None, "Toy Lake"]
+    mins = [m["min_along"] for m in top["moments"]]
+    assert None not in mins and mins == sorted(mins)
+    assert top["stop_groups"] == [{"first": 0, "last": 0, "feature": None},
+                                  {"first": 1, "last": 1, "feature": "Toy Lake"}]
+    js = (web.STATIC_DIR / "app.js").read_text()
+    assert "stopGroups(r)" in js and "r.stop_groups" in js
+
+
+# ---- static demo -------------------------------------------------------------------
+
+DEMO_TOML = """
+[[preset]]
+id = "toy"
+name = "Toy ladder"
+from = [43.0, -77.0]
+from_label = "West end"
+to = [43.0, -76.88]
+to_label = "East end"
+
+[[preset]]
+id = "toy-back"
+name = "Toy ladder, back"
+from = [43.0, -76.88]
+to = [43.0, -77.0]
+"""
+
+
+@pytest.fixture
+def demo_site(tmp_path):
+    from scenic.web.demo import build_site
+
+    presets = tmp_path / "demo_routes.toml"
+    presets.write_text(DEMO_TOML)
+    out = tmp_path / "site"
+    build_site(out=out, presets_path=presets, ctx=ladder(two_moments=True), log=lambda s: None)
+    return out
+
+
+def test_demo_writes_valid_json_for_every_preset(demo_site):
+    meta = json.loads((demo_site / "data" / "presets.json").read_text())
+    assert [p["id"] for p in meta["presets"]] == ["toy", "toy-back"]
+    assert meta["title"] == "Maps for Wanderers" and len(meta["s_breaks"]) == 4
+    for p in meta["presets"]:
+        assert not p["file"].startswith("/") and (demo_site / p["file"]).is_file()
+        d = json.loads((demo_site / p["file"]).read_text())  # strict JSON: no NaN
+        assert d["preset"]["id"] == p["id"] and d["search"]["id"] == p["id"]
+        routes = d["search"]["routes"]
+        assert routes and set(d["waypoints"]) == {r["key"] for r in routes}
+        for r in routes:
+            assert "points_raw" not in r and "stop_groups" in r
+            assert all(round(x, 5) == x for pt in r["line"] for x in pt)
+            assert len(r["line"]) <= 1500
+            assert d["waypoints"][r["key"]]["url"].startswith("https://www.google.com/maps/dir/?api=1&")
+        assert "seconds" not in d["search"]
+
+
+def test_demo_html_uses_relative_self_hosted_assets_only(demo_site):
+    html = (demo_site / "index.html").read_text()
+    assert '<html lang="en" data-mode="demo">' in html
+    assert 'http-equiv="Content-Security-Policy"' in html and "frame-ancestors" not in html
+    assert "Preset demo routes. The interactive planner runs locally" in html
+    refs = re.findall(r'<(?:script|link)[^>]+(?:src|href)="([^"]+)"', html)
+    assert refs and all(r.startswith("static/") or r.startswith("data:") for r in refs), refs
+    for r in refs:
+        if r.startswith("static/"):
+            assert (demo_site / r).is_file(), r
+    # Leaflet's CSS images resolve inside the site too
+    css = (demo_site / "static/vendor/leaflet-1.9.4/leaflet.css").read_text()
+    for img in set(re.findall(r"url\((images/[^)]+)\)", css)):
+        assert (demo_site / "static/vendor/leaflet-1.9.4" / img).is_file(), img
+    # no server code, no absolute-path assets, nothing from outside but the CSP's tile hosts
+    assert not list(demo_site.rglob("*.py"))
+    assert not re.search(r'(?:src|href)="/', html)
+
+
+def test_demo_mode_makes_no_api_calls():
+    """The page's only network calls are `api()` (live mode, /api/*) and
+    `demoFetch()` (demo mode, relative data/ paths). In demo mode `api()`
+    throws before fetching, and nothing that calls it is wired up."""
+    js = (web.STATIC_DIR / "app.js").read_text()
+    assert len(re.findall(r"\bfetch\(", js)) == 2
+    assert re.search(r"async function api\(path, body\) \{\s*if \(DEMO\) throw", js)
+    assert re.search(r"async function demoFetch\(file\) \{[^}]*\bfetch\(file", js)
+    for m in re.finditer(r"demoFetch\(([^)]*)\)", js):
+        assert m.group(1) in ("file", '"data/presets.json"', "p.file"), m.group(0)
+    assert not re.search(r"XMLHttpRequest|sendBeacon|WebSocket|EventSource", js)
+    # the live wiring (search, Find routes, health polling) sits in the non-demo branch only
+    demo_branch = js[js.index("if (DEMO) {\n    startDemo();"):]
+    live = demo_branch[demo_branch.index("} else {"):]
+    for call in ("pollHealth();", 'wireSearch("a");', 'addEventListener("click", findRoutes)'):
+        assert js.count(call) == 1 and call in live, call
+    assert "if (!s || DEMO) return;" in js  # getWaypoints
+
+
+def test_demo_refuses_to_clear_a_folder_it_did_not_make(tmp_path):
+    from scenic.web.demo import DemoError, build_site
+
+    presets = tmp_path / "p.toml"
+    presets.write_text(DEMO_TOML)
+    out = tmp_path / "mine"
+    out.mkdir()
+    (out / "notes.txt").write_text("keep me")
+    with pytest.raises(DemoError):
+        build_site(out=out, presets_path=presets, ctx=ladder(), log=lambda s: None)
+    assert (out / "notes.txt").read_text() == "keep me"
+    # a folder it made is rebuilt in place
+    out2 = tmp_path / "site"
+    build_site(out=out2, presets_path=presets, ctx=ladder(), log=lambda s: None)
+    (out2 / "data" / "stale.json").write_text("{}")
+    build_site(out=out2, presets_path=presets, ctx=ladder(), log=lambda s: None)
+    assert not (out2 / "data" / "stale.json").exists()
+
+
+def test_demo_presets_file_is_valid():
+    from scenic.web.demo import load_presets
+
+    ps = load_presets()
+    assert len(ps) == 5 and len({p["id"] for p in ps}) == 5
+    s, w, n, e = web.NY_BBOX
+    for p in ps:
+        for lat, lon in (p["from"], p["to"]):
+            assert s <= lat <= n and w <= lon <= e
+
+
+def _js_function(js: str, head: str) -> str:
+    """The body of the app.js function starting with `head` (to its closing
+    brace at the same indent)."""
+    i = js.index(head)
+    indent = js[js.rindex("\n", 0, i) + 1:i]
+    return js[i:js.index("\n" + indent + "}", i)]
+
+
+def test_preset_is_committed_only_after_its_data_loads():
+    js = (web.STATIC_DIR / "app.js").read_text()
+    body = _js_function(js, "async function loadPreset(")
+    fetched = body.index("await demoFetch(")
+    assert body.index("state.preset = id") > fetched and body.index("renderPresets()") > fetched
+    assert body.index("writeHash()") > body.index("state.preset = id")
+
+
+def test_changed_points_rewrite_the_link():
+    js = (web.STATIC_DIR / "app.js").read_text()
+    body = _js_function(js, "function onPointsChanged(")
+    assert "clearResults()" in body and "writeHash()" in body
+    # Swap ends in onPointsChanged, so its old #from=…&to=…&route=… goes too
+    swap = js[js.index('$("swap").addEventListener'):]
+    swap = swap[:swap.index("});")]
+    assert swap.rstrip().endswith("onPointsChanged();")
+
+
+def test_app_js_has_no_unused_source_url():
+    assert "SOURCE_URL" not in (web.STATIC_DIR / "app.js").read_text()

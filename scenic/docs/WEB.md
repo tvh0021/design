@@ -1,6 +1,8 @@
-# Web UI
+# Web UI: Maps for Wanderers
 
-`scenic serve` runs a map page for A-to-B route search on your own machine.
+`scenic serve` runs Maps for Wanderers, a map page for A-to-B route search, on
+your own machine. The same page also runs as a read-only static demo with
+preset routes (`scenic demo build`, see `docs/PUBLISH.md`).
 
 ```
 scenic serve [--port 8765] [--graph DIR] [--score DIR] [--verbose]
@@ -24,7 +26,9 @@ just after that.
   can start from it). "From home" puts it in A.
 - **Units.** The mi / km switch (top of the panel) sets every distance on
   the page. Miles are the default; the choice is kept in localStorage
-  (`scenic.units`). Server error messages stay in km.
+  (`scenic.units`). Server errors send distances as numbers (`snap_m`,
+  `limit_m`), and the page words them in the chosen unit, so an error
+  already on screen switches units too.
 - **Find routes.** Shows the fastest route as a dashed grey line and the
   most scenic route under +15 %, +30 % and +50 % of its time in blue
   (#0072B2), orange (#E69F00) and reddish purple (#CC79A7), the Okabe-Ito
@@ -44,7 +48,10 @@ just after that.
   ("on average, scenier than 58% of NY road miles") and lists its scenic
   stops in drive order, as `min 47 · Lake Ontario on CR 101 near Sodus
   Point` (minutes from the start). Moments the route passes but that earn no
-  credit are not listed. The stops are white dots on the map; each popup
+  credit are not listed. Consecutive stops at the same named lake or river
+  (bays count as part of their lake) fold into one line, such as `min 243–288 · Lake Ontario shoreline, 5
+  stops`, which opens to list them; each keeps its own dot on the map. The
+  server sends these runs as `stop_groups`. The stops are white dots on the map; each popup
   gives the label, the kind of stop, the minute, and a link to the spot in
   Google Maps.
 - **Color by scenery** is on by default. It draws the selected route in
@@ -65,9 +72,12 @@ just after that.
   before the result is known.
 - **Map key.** With results on screen, a key at the bottom left explains
   the scenic stop dot, the numbered waypoint and the weak waypoint outline.
-- **Base layers.** Switch between OpenStreetMap streets, Esri World Topo
-  Map (terrain and contours, for hills) and Esri World Imagery (top right).
-  Satellite shows shorelines and lakes under the routes.
+- **Base layers.** Switch between OpenStreetMap streets, USGS Topo
+  (terrain and contours, for hills) and USGS Imagery (top right), all from
+  public tile servers that need no API key (`docs/PUBLISH.md` gives their
+  terms). The USGS layers have tiles to zoom 16 and are enlarged beyond it.
+  Satellite shows shorelines and lakes under the routes. The attribution
+  always credits OpenStreetMap for the routes, whatever the base layer.
 - **Drive-around (loop)** is a placeholder; loops are not built yet.
 
 The page URL keeps the trip, for example
@@ -87,7 +97,8 @@ puts a pulsing red ring on that pin. The page shows the server's message for:
 
 - a point outside New York State's bounding box (422, "Drag A into New York"),
 - a point more than 2 km from the nearest road in the graph, such as one out
-  in a lake (422, "Drag A onto a road"),
+  in a lake (422, "Drag A onto a road"; `code` `snap_far` with `snap_m` and
+  `limit_m`, which the page words in miles or km),
 - no route, for example when both points snap to the same junction (404),
 - a search sent while the data is still loading (503),
 - a place search that Nominatim could not answer (502).
@@ -104,14 +115,18 @@ a unique temp file, and an entry that is not JSON of the shape
 `{"results": [{name, lat, lon, type}]}` counts as a miss and is fetched
 again. Names lose a trailing ", New York, United States" (or ", United
 States"). The request carries the query, the box and
-the User-Agent `scenic-route-planner/0.1 (personal research)`. It sends no
-name, email or other personal detail.
+the User-Agent `maps-for-wanderers/0.1 (personal research project)`. It
+sends no name, email or other personal detail. The place list ends with the
+credit "Place search: Nominatim, © OpenStreetMap contributors", as the
+Nominatim usage policy asks.
 
 ## API
 
 All bodies are JSON; POST requests must send `Content-Type:
-application/json`. Errors are `{"error": "...", "point": "from" | "to"}`,
-with `point` only when the message is about one point. Responses over 1 KB are gzipped when the client accepts
+application/json`. Errors are `{"error": "...", "point": "from" | "to",
+"code": "...", ...}`, with `point` only when the message is about one point
+and `code` only for errors the page words itself (now `snap_far`, which
+adds `snap_m` and `limit_m` in metres). Responses over 1 KB are gzipped when the client accepts
 it. Coordinates are `[lat, lon]` with 5 decimals.
 
 `GET /api/health`
@@ -139,7 +154,8 @@ it. Coordinates are `[lat, lon]` with 5 decimals.
     "km": 140.6, "scenic_minutes": 4.3, "mean_S": 0.3, "mean_S_pct": 32, "moment_points": 4.8,
     "score": 28.4, "roads": [["I 90", 98.1], ...],
     "moments": [{"id": 232, "type": "water", "m": 1.0, "label": "...", "lat": ..., "lon": ...,
-                 "min_along": 12.3}],
+                 "min_along": 12.3, "feature": "Lake Ontario", "parent_feature": "Lake Ontario"}],
+    "stop_groups": [{"first": 0, "last": 4, "feature": "Lake Ontario"}, ...],
     "moments_passed": 7,
     "line": [[lat, lon], ...],        // display geometry
     "runs": [[first, last, class]],   // point ranges of `line` by S class (0..4)
@@ -153,7 +169,13 @@ budget), which picks the colour. `mean_S_pct` is the share of New York road
 length (0-100) with S below the route's time-weighted mean S. `moments` are
 the credited moments in drive order; `min_along` is the drive time in
 minutes from the start to each one (the moment's position along the route,
-converted with the cumulative edge times). `line` is simplified per S run with a tolerance that starts at about
+converted with the cumulative edge times). `feature` is the named lake,
+river or falls (null when unnamed or generic). `parent_feature` is the
+water body it belongs to: Lake George for a stop named after Huddle Bay,
+otherwise the feature. `stop_groups` splits `moments` into runs of
+consecutive stops with the same `parent_feature`, as index ranges that
+cover every stop once; a stop with no feature is its own run. A group's
+`feature` is that parent. `line` is simplified per S run with a tolerance that starts at about
 0.5 m and doubles until the route has at most 5,000 points. Run ends stay
 exact. The server keeps the last 8 searches for `/api/waypoints`.
 
@@ -179,10 +201,14 @@ Results are cached per search and route.
 - The server refuses requests whose `Host` header is not `127.0.0.1` or
   `localhost`, which keeps DNS-rebinding pages out. POSTs must be JSON, which
   keeps cross-site form posts out.
-- Leaflet 1.9.4 loads from unpkg with subresource integrity hashes. The page
-  sets a Content-Security-Policy that allows only that CDN and the tile
-  servers (tile.openstreetmap.org; server.arcgisonline.com serves both Esri
-  layers).
+- Leaflet 1.9.4 is self-hosted under `static/vendor/leaflet-1.9.4/` (the
+  unchanged npm files, BSD-2-Clause, with their subresource integrity hashes
+  still checked). All page paths are relative. The Content-Security-Policy
+  allows scripts and styles from the page's own origin only, and images from
+  the two tile hosts (tile.openstreetmap.org, basemap.nationalmap.gov).
+- The referrer policy is `strict-origin-when-cross-origin`: tile requests
+  carry the page's origin as Referer, as OSM's tile policy asks, and nothing
+  more. Google Maps links still open with `rel="noopener noreferrer"`.
 - Text from OpenStreetMap or Nominatim (moment labels, road and place
   names) reaches the page only through `textContent` or DOM nodes; Leaflet
   would parse a string given to `bindTooltip`, `bindPopup`, `setContent` or

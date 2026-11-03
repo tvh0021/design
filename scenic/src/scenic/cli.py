@@ -1,4 +1,5 @@
-"""Command line: scenic fetch | build-graph | fastest | route | serve | calibrate | fetch-layers | score."""
+"""Command line for Maps for Wanderers (the `scenic` command): scenic fetch | build-graph | fastest |
+route | serve | demo build | calibrate | fetch-layers | score."""
 
 from __future__ import annotations
 
@@ -85,6 +86,18 @@ def cmd_serve(args) -> int:
     return serve(port=args.port, graph_dir=args.graph, score_dir=args.score, verbose=args.verbose)
 
 
+def cmd_demo_build(args) -> int:
+    from .web.demo import DemoError, build_site
+
+    try:
+        build_site(out=args.out, presets_path=args.presets, graph_dir=args.graph, score_dir=args.score,
+                   max_points=args.max_points)
+    except DemoError as exc:
+        print(f"scenic demo build: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_calibrate(args) -> int:
     from .calibrate import run_fit
     from . import data_dir
@@ -116,7 +129,7 @@ def cmd_score(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="scenic", description="Scenic route planner (New York State)")
+    p = argparse.ArgumentParser(prog="scenic", description="Maps for Wanderers: scenic drives across New York State")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("fetch", help="download the New York OSM extract")
@@ -146,12 +159,22 @@ def main(argv: list[str] | None = None) -> int:
     rt.add_argument("--score", type=Path, help="score directory (default data/score)")
     rt.set_defaults(func=cmd_route)
 
-    sv = sub.add_parser("serve", help="local map UI for route search (http://127.0.0.1:PORT/, docs/WEB.md)")
+    sv = sub.add_parser("serve", help="Maps for Wanderers, the local map UI (http://127.0.0.1:PORT/, docs/WEB.md)")
     sv.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765)")
     sv.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     sv.add_argument("--score", type=Path, help="score directory (default data/score)")
     sv.add_argument("--verbose", action="store_true", help="log every request")
     sv.set_defaults(func=cmd_serve)
+
+    dm = sub.add_parser("demo", help="static demo site with preset routes (docs/PUBLISH.md)")
+    dsub = dm.add_subparsers(dest="demo_cmd", required=True)
+    db = dsub.add_parser("build", help="run the presets in config/demo_routes.toml and write a static site")
+    db.add_argument("--out", type=Path, help="output folder (default scenic/site; cleared on rebuild)")
+    db.add_argument("--presets", type=Path, help="preset file (default config/demo_routes.toml)")
+    db.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    db.add_argument("--score", type=Path, help="score directory (default data/score)")
+    db.add_argument("--max-points", type=int, default=1500, help="points per route line (default 1500)")
+    db.set_defaults(func=cmd_demo_build)
 
     c = sub.add_parser("calibrate", help="write edge_delays.parquet (signal, stop and junction delays)")
     c.add_argument("--features", action="store_true", help="recount delay features from the PBF")

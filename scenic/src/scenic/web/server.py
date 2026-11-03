@@ -1,4 +1,6 @@
-"""Local map server for the scenic route planner (docs/WEB.md).
+"""Local map server for Maps for Wanderers, the scenic route planner
+(docs/WEB.md). The same page also runs as a static demo with preset routes
+(`scenic.web.demo`, docs/PUBLISH.md).
 
 `scenic serve` binds to 127.0.0.1 only, loads the `Context` once in a
 background thread and serves a single-page Leaflet app from `static/`.
@@ -49,7 +51,7 @@ BASE_TOL_DEG = 5e-6  # ~0.5 m: drops collinear points without visible change
 KEEP_RESULTS = 8  # searches kept for /api/waypoints
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "scenic-route-planner/0.1 (personal research)"
+USER_AGENT = "maps-for-wanderers/0.1 (personal research project)"
 GEOCODE_INTERVAL_S = 1.0  # Nominatim usage policy: at most 1 request per second
 MAX_QUERY = 200
 
@@ -60,16 +62,22 @@ class ApiError(Exception):
     """An error for the page. `point` ("from" or "to") names the pin the
     message is about, so the page can tint it."""
 
-    def __init__(self, status: int, message: str, point: str | None = None):
+    def __init__(self, status: int, message: str, point: str | None = None, code: str | None = None,
+                 **numbers):
         super().__init__(message)
         self.status = status
         self.message = message
         self.point = point
+        self.code = code  # machine-readable kind, e.g. "snap_far"
+        self.numbers = numbers  # raw values the page formats in its own units (snap_m, limit_m)
 
     def payload(self) -> dict:
         out = {"error": self.message}
         if self.point:
             out["point"] = self.point
+        if self.code:
+            out["code"] = self.code
+        out.update(self.numbers)
         return out
 
 
@@ -355,11 +363,27 @@ def route_display(g, S: np.ndarray, sr, breaks: list[float], max_points: int = M
     return {"line": latlon, "runs": merged, "points_raw": int(len(geom)), "tolerance_deg": tol}
 
 
+def stop_groups(moments: list[dict]) -> list[dict]:
+    """Runs of consecutive stops (in drive order) at the same named feature,
+    for the stop list: [{"first": i, "last": j, "feature": name or None}],
+    covering every stop once. A stop with no feature is a run of its own.
+    Bays group under their parent water body (`parent_feature`)."""
+    groups: list[dict] = []
+    for i, m in enumerate(moments):
+        f = m.get("parent_feature") or m.get("feature")
+        if f and groups and groups[-1]["feature"] == f and groups[-1]["last"] == i - 1:
+            groups[-1]["last"] = i
+        else:
+            groups.append({"first": i, "last": i, "feature": f or None})
+    return groups
+
+
 def _label(budget: float) -> str:
     return f"+{round((budget - 1) * 100)}%"
 
 
-def route_payload(ctx, res, breaks: list[float], grid: np.ndarray | None = None) -> tuple[dict, dict]:
+def route_payload(ctx, res, breaks: list[float], grid: np.ndarray | None = None,
+                  max_points: int = MAX_POINTS) -> tuple[dict, dict]:
     """The fastest route and the budget picks, one entry per distinct edge
     path (identical picks share an entry and list every label). `role` is
     the index of the entry's first label: 0 for the fastest route, k for
@@ -376,17 +400,23 @@ def route_payload(ctx, res, breaks: list[float], grid: np.ndarray | None = None)
             by_key[k]["labels"].append(label)
             continue
         d = describe(ctx, sr)
-        disp = route_display(ctx.g, ctx.S, sr, breaks)
+        disp = route_display(ctx.g, ctx.S, sr, breaks, max_points=max_points)
         at = moment_minutes(ctx, sr) if d["moments"] else {}
-        # credited moments are a subset of the passed ones, already in drive order
-        moments = [{**m, "min_along": round(at[m["id"]], 1) if m["id"] in at else None} for m in d["moments"]]
+        feat = getattr(ctx.moments, "feature", None)
+        body = getattr(ctx.moments, "body", feat)
+        moments = [{**m, "min_along": round(at[m["id"]], 1) if m["id"] in at else None,
+                    "feature": (str(feat[m["id"]]) if feat is not None and feat[m["id"]] else None),
+                    "parent_feature": (str(body[m["id"]]) if body is not None and body[m["id"]] else None)}
+                   for m in d["moments"]]
+        # drive order: projected minutes, stops without a time keep their place at the end
+        moments.sort(key=lambda m: (m["min_along"] is None, m["min_along"] or 0.0))
         entry = {
             "key": f"r{len(routes)}", "labels": [label], "role": role, "origin": d["origin"],
             "minutes": d["minutes"], "ratio": d["ratio"], "km": d["km"],
             "scenic_minutes": d["scenic_minutes"], "mean_S": d["mean_S"],
             "mean_S_pct": s_percentile(grid, d["mean_S"]), "moment_points": d["moment_points"],
             "score": d["score"], "roads": [[lab, km] for lab, km in d["roads"]],
-            "moments": moments, "moments_passed": d["moments_passed"],
+            "moments": moments, "stop_groups": stop_groups(moments), "moments_passed": d["moments_passed"],
             "line": disp["line"], "runs": disp["runs"], "points_raw": disp["points_raw"],
         }
         by_key[k] = entry
@@ -404,7 +434,7 @@ class App:
     last few searches, waypoint results and the geocoder."""
 
     def __init__(self, ctx=None, loader: Callable[[], object] | None = None, geocoder: Geocoder | None = None,
-                 search_fn=None, waypoints_fn=None):
+                 search_fn=None, waypoints_fn=None, max_points: int = MAX_POINTS):
         self.ctx = ctx
         self.loader = loader
         self.geocoder = geocoder or Geocoder()
@@ -418,6 +448,7 @@ class App:
         self._rlock = threading.Lock()  # guards `results`
         self._search = search_fn
         self._waypoints = waypoints_fn
+        self.max_points = max_points  # per route in the payload (the static demo uses fewer)
 
     # ---- loading -----------------------------------------------------------
 
@@ -460,8 +491,8 @@ class App:
         if self.status == "loading":
             raise ApiError(503, "Still loading the road graph and scores. Try again in a moment.")
         if self.status != "ready":
-            raise ApiError(503, f"The route data failed to load ({self.error}). Check the data folders "
-                                "and restart `scenic serve`.")
+            raise ApiError(503, f"The route data failed to load ({self.error}). If you run this server, "
+                                "check the data folders and restart `scenic serve`.")
         return self.ctx
 
     # ---- handlers ------------------------------------------------------------
@@ -510,15 +541,17 @@ class App:
             for name, which, pin, p in (("from", "start", "A", a), ("to", "end", "B", b)):
                 _, d = ctx.g.snap(*p)
                 if d > MAX_SNAP_M:
-                    raise ApiError(422, f"The {which} point is {d / 1000:.1f} km from the nearest road in the graph "
-                                        f"(limit {MAX_SNAP_M / 1000:.0f} km). Drag {pin} onto a road.", name)
+                    # no distance in the text: the page formats snap_m and limit_m in its own units
+                    raise ApiError(422, f"The {which} point is too far from the nearest road in the graph. "
+                                        f"Drag {pin} onto a road.", name, code="snap_far",
+                                   snap_m=round(d), limit_m=round(MAX_SNAP_M))
             t0 = time.monotonic()
             res = search_fn(ctx, a, b)
             search_s = time.monotonic() - t0
         if res is None:
             raise ApiError(404, "No route found between these points: they may snap to the same junction "
                                 "or be disconnected. Move A or B to a different road.")
-        payload, sr_by_key = route_payload(ctx, res, self.breaks, self.grid)
+        payload, sr_by_key = route_payload(ctx, res, self.breaks, self.grid, self.max_points)
         rid = uuid.uuid4().hex[:12]
         with self._rlock:
             self.results[rid] = {"res": res, "routes": sr_by_key, "waypoints": {}}
@@ -550,7 +583,9 @@ class App:
         fn = self._waypoints or reduce_to_waypoints
         with self.lock:
             t0 = time.monotonic()
-            wr = fn(ctx.g, edge_path=np.asarray(sr.edges, dtype=np.int64), **WAYPOINT_OPTS)
+            # only roads scenier than the fastest route count toward the waypoint spacing limit
+            wr = fn(ctx.g, edge_path=np.asarray(sr.edges, dtype=np.int64), scenic=ctx.S,
+                    s_fast=stored["res"].s_fast, **WAYPOINT_OPTS)
             secs = time.monotonic() - t0
         try:
             url = wr.url
@@ -595,17 +630,21 @@ _TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=
           ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
           ".ico": "image/x-icon"}
 
-# img-src: OSM streets, and Esri World Imagery and World Topo Map (both on server.arcgisonline.com)
-CSP = ("default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self' https://unpkg.com; "
-       "img-src 'self' data: https://tile.openstreetmap.org https://server.arcgisonline.com https://unpkg.com; "
-       "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+# Leaflet is self-hosted under static/vendor/, so scripts and styles are 'self' only.
+# img-src: the base layers' tile servers (docs/PUBLISH.md): OSM streets, and USGS
+# The National Map topo and imagery (both on basemap.nationalmap.gov).
+TILE_HOSTS = ("https://tile.openstreetmap.org", "https://basemap.nationalmap.gov")
+CSP_BASE = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+            f"img-src 'self' data: {' '.join(TILE_HOSTS)}; "
+            "connect-src 'self'; base-uri 'none'; form-action 'none'")
+CSP = CSP_BASE + "; frame-ancestors 'none'"  # frame-ancestors only works as a header, not in <meta>
 
 MAX_BODY = 64 * 1024
 
 
 class Handler(BaseHTTPRequestHandler):
     app: App  # set by make_server
-    server_version = "scenic-web/0.1"
+    server_version = "maps-for-wanderers/0.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # quieter than the default; no client address
@@ -627,7 +666,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # OSM's tile policy asks for a Referer; cross-site requests get the origin only
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         if gz:
             self.send_header("Content-Encoding", "gzip")
         for k, v in (extra or {}).items():
@@ -706,7 +746,7 @@ def serve(port: int = DEFAULT_PORT, graph_dir: Path | None = None, score_dir: Pa
     httpd = make_server(app, port, verbose)
     app.start_loading()
     host, p = httpd.server_address[:2]
-    print(f"scenic web UI on http://{host}:{p}/  (loading route data in the background; Ctrl-C stops)",
+    print(f"Maps for Wanderers on http://{host}:{p}/  (loading route data in the background; Ctrl-C stops)",
           flush=True)
     try:
         httpd.serve_forever()

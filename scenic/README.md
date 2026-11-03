@@ -1,6 +1,16 @@
-# scenic
+# Maps for Wanderers
 
-A scenic route planner for New York State. See `docs/PLAN.md` for the full plan.
+Scenic drives across New York State: a route planner that finds the most
+scenic route under a time budget. See `docs/PLAN.md` for the full plan.
+
+The product is called Maps for Wanderers. The code keeps its working name: the
+Python package is `scenic`, the command is `scenic`, and the folder and
+branch are still `scenic`.
+
+- `scenic serve` runs the interactive planner on your own machine
+  (`docs/WEB.md`).
+- `scenic demo build` writes a static demo site with five preset routes,
+  for GitHub Pages (`docs/PUBLISH.md`).
 
 So far it does phase 1 for OpenStreetMap only. It downloads the New York OSM
 extract, builds a statewide graph of drivable roads, and finds the fastest
@@ -78,13 +88,17 @@ How it searches (`scenic.search`):
 5. Every kept route is scored as `scenic_min + 5 · moment_pts`:
    - `scenic_min` is Σ t·max(0, S − S_fast) / 60, where S_fast is the
      fastest route's time-weighted mean S.
-   - `moment_pts` is the sum of m over the moments the route passes, within
+   - `moment_pts` is the sum of m² over the moments the route passes, within
      100 m or by driving one of the moment's edges. Moments are taken best
      first, at most one per 2 km of route, and the same named lake or river
-     at most once per 10 km. The total is capped at 6 moments per hour of t0.
+     at most once per 10 km (a bay counts as its lake). The total is capped
+     at 8 moments per hour of t0, and at least 3.
 
    The best route under each budget is picked. Budgets are our own ETA ratio
-   to our own fastest route.
+   to our own fastest route. When a larger budget's best route is a cheaper
+   pick or shares more than 80% of its length with one, the larger budget
+   takes the best different route scoring at least 85% of its best; with
+   none, the pick is marked shared.
 
 ```
 scenic calibrate [--features] [--fit]
@@ -144,10 +158,16 @@ water and edges stages at about 9.6 GB. It writes these files to
 - `osm_features.parquet`: OSM viewpoints, waterfalls, cliffs, bridge way
   ids, named lakes (0.2 km² and up), named rivers and places. Used to find
   and name moments.
-- `moments.parquet`: scenic moments (`docs/SCORE_V02.md` section 4). Each
+- `moments.parquet`: scenic moments (`docs/SCORE_V02.md` section 4, with
+  the v0.3 filters in `docs/SCORE_SPEC.md`). Water moments at stormwater
+  basins, small ponds, built-up streets and motorways are dropped unless the
+  water is a large named lake or a wide river. Water takes the name of the
+  most specific body (Irondequoit Bay, not Lake Ontario). A vista needs a far
+  view in at least three directions and stands at least 5 km from the next. Each
   row has an id, a type (water, vista, gorge, osm), a value m, a point,
-  its best edge and member edges, the road, the named feature, the nearest
-  place and a label.
+  its best edge and member edges, the road, the named feature, the water
+  body it belongs to (`parent_feature`: Lake George for Huddle Bay), the
+  nearest place and a label.
 - `route_validation.json`: the route checks of `docs/SCORE_V02.md`
   section 1. V1 runs the full search on eight corridors, V2 pairs each scenic
   stretch with the fastest route between its ends, and V5 checks hand-named
@@ -309,10 +329,18 @@ are rounded to 5 decimals and snapped back to the nearest road, and the
 report comes from that: overall overlap with the target, ETA, and per-leg
 times next to the target's.
 
-`time_margin=0.1` places waypoints as if the target's own roads were 10%
-slower, so legs still follow when Google rates those roads lower than we do.
-It adds waypoints, including spurious ones in city grids where parallel
-streets tie.
+Google weighs roads a little differently from our router, so by default
+each leg is checked with the target's own roads 10% slower
+(`time_margin=0.1`). This adds waypoints, including spurious ones in city
+grids where parallel streets tie. Waypoints are also at most 15 km of scenic
+road apart (`max_gap_m=15_000`). Scenic road is any part of the target the
+plain fastest route doesn't use; pass `scenic=S, s_fast=...` to count only
+roads scenier than the fastest route, as the web app does. When 9 waypoints
+can't meet both rules, the reducer keeps the ones that leave the least scenic
+road at risk. The notes then list each leg still at risk, worst first, with
+its main road and how much scenic road it leaves uncovered or a slightly
+different router could skip. `summary()` reports `risk_legs` and
+`max_scenic_gap_km`.
 
 `route_via(g, points)` builds a target through (lat, lon) points. Each inner
 point snaps to its nearest edge and the route drives along that edge. The

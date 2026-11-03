@@ -60,6 +60,13 @@ class Route:
         }
 
 
+# words for unnamed roads, by OSM highway class
+_CLASS_WORDS = {
+    **{f"{c}_link": "ramp" for c in ("motorway", "trunk", "primary", "secondary", "tertiary")},
+    "unclassified": "unnamed road", "residential": "local street", "service": "service road",
+    "living_street": "local street", "track": "track",
+}
+
 class RoadGraph:
     """Directed road graph: every edge gives an arc u -> v, and two-way edges
     also v -> u. Parallel arcs between the same pair keep the cheapest."""
@@ -244,6 +251,6 @@ class RoadGraph:
         sub = self.edges_table.select(["ref", "name", "highway"]).take(route.edges).to_pylist()
         km: dict[str, float] = {}
         for row, e in zip(sub, route.edges):
-            label = row["ref"] or row["name"] or row["highway"]
+            label = row["ref"] or row["name"] or _CLASS_WORDS.get(row["highway"], row["highway"])
             km[label] = km.get(label, 0.0) + self.length_m[e] / 1000
         return sorted(km.items(), key=lambda kv: -kv[1])[:top]

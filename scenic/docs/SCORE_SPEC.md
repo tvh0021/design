@@ -579,3 +579,140 @@ The Lake Ontario shore wins +50 % (77.8).
   minutes than the fastest route but more moment points.
 - The vista count (1,205) is well above §4's "a few hundred".
 
+
+## Moments v0.3
+
+Fixes the known issues above and four found by looking at the moments on a
+map: water moments at stormwater basins and town ponds, bays named after
+the lake they open into, too many vistas, and budget picks that repeat each
+other. The edge score is unchanged. Settings: `[moments]` and `[route]` in
+`config/score.toml`; every new key has a value that turns the rule off.
+
+**OSM features.** `osm_features.parquet` gains `area_m2` and `tag`, and two
+kinds:
+- `bay`: named `natural=bay` or `natural=strait` areas, and named
+  `natural=bay` nodes (no geometry).
+- `stormwater`: `water=basin|wastewater|reflecting_pool|fountain|pool`,
+  `landuse=basin` or any `basin=*`, at any size, plus unnamed `water=pond`
+  under 4 ha (`pond_floor_m2`). A named body of at least 10 ha
+  (`water_named_min_m2`) is `water` whatever these tags say, unless it is
+  wastewater: Lewiston Reservoir (7.6 km²) and Muskrat Lake (39 ha) are
+  tagged `landuse=basin`.
+
+Named water areas are kept from 1 ha (`osm_water_min_m2`, was 20 ha). The
+stage now depends on `[moments]`.
+
+**Water gate.** The v0.2c water test still finds the candidates. Then each
+candidate edge is dropped for the first of these reasons that applies
+(`water_gate`, counts in `score_report.json`):
+
+| reason | rule | edges |
+|---|---|---|
+| small | size < 0.40 (`water_min_size`), or < 0.25 when named water is near (`water_named_min_size`) | 37 |
+| narrow | unnamed, and the 1 km disk water fraction (max within 300 m) < 0.06 (`water_unnamed_min_wfrac`) | 468 |
+| stormwater | a stormwater area within 100 m (`water_storm_m`) and size < 0.5 | 1 |
+| motorway | a motorway edge | 613 |
+| town | dev ≥ 0.30 or ≥ 30 junctions/km² within 400 m (`water_town_*`) | 6,048 |
+| kept | | 14,193 |
+
+"Named" means a named lake or bay of at least 10 ha (`water_named_min_m2`)
+within 450 m, or a named river within 300 m. A named river within 1,500 m
+counts where the water is broad (`river_wide_name_m`), because the Hudson's
+centreline can lie 750 m from the shore road. Big water lifts the
+stormwater, motorway and town rules: named, size ≥ 0.6, and a 1 km disk
+water fraction ≥ 0.20 within 300 m (`water_big_size`, `water_broad_*`). So
+the Lake Ontario shore in Rochester and the Hudson under the Tappan Zee
+stay. The "narrow" rule catches creeks and canals whose size comes from the
+lake they drain into (8-connected components), such as Cazenovia Creek at
+Spring Brook, with size 1.0 and 5.7 % water nearby. Most stormwater
+candidates are already gone as small or town; the reason is kept for the
+rest.
+
+**Motorways.** Only the types in `motorway_types` (water, vista,
+gorge_bridge) may sit on a motorway edge. Cliffs beside I-90 and I-87 are
+road cuts, and so are no longer gorge moments. Nor do they name one: a
+motorway gorge_bridge beside a road-cut cliff takes the water's name
+(Eighteen Mile Creek on I-90, not "cliff"). On the Lewiston-Queenston bridge
+(I-190) the nearest named water area, the Chippawa-Queenston Power Canal,
+still wins over the Niagara River, because lakes and canals are tried
+before rivers.
+
+**Vistas.** An eye point needs a far sight line (≥ 2 km to ground 75 m
+below) along at least 3 of the 16 rays (`vista_min_rays`), not just one.
+After clustering, vista heads within 5 km of a better head are dropped,
+along with their members (`vista_spacing_m`).
+
+| step | count |
+|---|---|
+| open, drop ≥ 150 m | 37,591 points |
+| a far sight line on ≥ 1 ray (v0.2c rule) | 14,346 points |
+| on ≥ 3 rays | 4,365 points, 891 edges |
+| heads after clustering, then thinned | 548 → 273 vistas |
+
+The 273 vistas sit in the Southern Tier and Catskills: 73 in 42N 76W,
+45 in 42N 74W, 36 in 42N 77W, 34 in 42N 75W and 32 in 42N 78W. The other
+1° cells have 14 or fewer. m quartiles are 0.57, 0.64 and 0.74.
+
+**Names.** Lakes (named water ≥ 10 ha) and bays within 1.5 km are the
+candidates. The nearest is the fallback. A smaller candidate wins if it is
+at most 300 m farther away (`name_slack_m`) and is either a bay or touches
+the nearest polygon within 50 m (`name_touch_m`, an arm of the lake rather
+than a pond behind the shore). If the pick is still 100 km² or larger, a
+named bay node within 800 m names the moment instead. Rivers come next, as
+before. Irondequoit Bay and Sodus Bay now carry their own names (5 and 7
+moments, was 0 and 3), as do Little Sodus Bay and Bear Creek Harbor. Lake
+Ontario labels fall from 116 to 81. The 1,500 m river radius applies where
+the water fraction at the moment's head is broad, for every type, so a
+gorge_bridge or vista over a wide river is named too.
+
+The label keeps the bay's name, but `parent_feature` records the water body
+it belongs to: the lake whose shore a bay node names, the nearest body when
+a smaller arm of it won, and for a bay polygon the largest candidate it
+touches (Lake Ontario for Irondequoit Bay). Otherwise it is the feature.
+Same-feature spacing (`feature_spacing_km`), the one-seed-per-feature rule
+for vias and the stop groups in the web UI use `parent_feature`, so the
+bays along Lake George's west shore count as Lake George.
+
+**Route credit.** Per route, `moment_pts = Σ m²` (`moment_power = 2`) over at
+most max(3, ⌊8·t0/h⌋) moments (`moments_per_hour = 8`, `moments_min_cap =
+3`). Via-moment ranking uses m² too. Over the 15 test ODs, the fastest route now uses
+0–67 % of the cap (median 18 %). In v0.2c it used 0–100 % (median 63 %).
+A weak moment (m = 0.5) earns a quarter of a full one, so passing better
+moments beats passing more of them. Some pick hit the cap in 13 of the 15
+ODs in v0.2c. With the v0.3 moments that falls to 7 at 6/h, and to 5 at 8/h
+with the floor. The floor of 3 covers trips under 23 minutes, where the cap
+had been 1–2 moments.
+
+**Distinct picks.** Picks are made smallest budget first. Suppose a larger
+budget's best route shares more than 80 % of its length (edges) with an
+earlier pick (`pick_max_overlap`). That budget then takes its best route
+that overlaps no earlier pick by more than 80 %, scores at least 85 % of
+its best (`pick_min_score_frac`) and has a ratio above the largest earlier
+budget its best duplicates, so it uses the extra time. If no route
+qualifies, it repeats the earlier pick it overlaps most. When a smaller
+budget fell back to the fastest route, overlapping that pick is fine; only
+a larger budget whose best is the fastest route itself repeats it. `SearchResult.shared` maps that budget to the
+earlier one, and `result_json` writes it as `shared`. An alternative can
+score below the smaller budget's pick: it is the best clearly different
+route, not a better one.
+
+**Results** (v0.2c → v0.3; spot checks in `validation.json` unchanged):
+
+| | v0.2c | v0.3 |
+|---|---|---|
+| moments | 3,820 | 2,506 |
+| water, vista, gorge, osm | 2,276, 1,205, 278, 61 | 1,868, 273, 299, 66 |
+| water moments on dev > 0.3 edges | 35.2 % | 21.3 % (mostly big named water) |
+| all moments on dev > 0.3 edges | 23.1 % | 20.1 % |
+| V5 by point, non-moments | 5/30, 2/15 | 7/30, 0/15 |
+| V5 by member edges, non-moments | 29/30, 4/15 | 29/30, 1/15 |
+| V1, bands | 7/8, 8/8 | 7/8, 8/8 |
+| holdout-2 V1, bands | 3/4, 4/4 | 3/4, 4/4 |
+| picks repeating or > 80 % overlapping an earlier pick (15 ODs) | 11, in 10 ODs | 3, all marked shared (Rochester→Syracuse V1 +30 %; Olean→Ellicottville +30 % and +50 %) |
+
+The remaining member-edge non-moment hit is I-490 over the Genesee: the
+Upper Falls waterfall (an OSM feature, gorge type) sits 219 m from it. The
+Thousand Islands bridge is still missed; its edge never reaches the water
+threshold (W 0.45, V_water 0.65). Gorge moments rose from 278 to 299, and
+osm from 61 to 66. These are edges that had held a vista or water moment,
+the better type, and now fall back to gorge or osm.

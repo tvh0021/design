@@ -29,7 +29,7 @@ scenic = "scenic.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"scenic.web" = ["static/*"]
+"scenic.web" = ["static/*", "static/vendor/*/*", "static/vendor/*/images/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

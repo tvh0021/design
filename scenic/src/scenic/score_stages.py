@@ -382,7 +382,9 @@ def st_osm_features(paths: Paths) -> dict:
 
     from .moments import read_osm_features
 
-    t = read_osm_features(paths.pbf)
+    mc = _cfg(paths)["moments"]
+    t = read_osm_features(paths.pbf, mc["osm_water_min_m2"], mc["pond_floor_m2"],
+                          named_min_m2=mc["water_named_min_m2"])
     out = paths.p("out", "osm_features.parquet")
     out.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(t, out, compression="zstd")
@@ -477,10 +479,12 @@ def stages(paths: Paths) -> list[Stage]:
               ("combine", "penalty", "smoothing", "curves")),
         Stage("outputs", st_outputs, [O("scores.parquet"), O("samples.npz"), edges], [O("heatmap.png"), O("summary.md")],
               ("report", "score", "graph"), ("output",)),
-        Stage("osm_features", st_osm_features, [paths.pbf], [O("osm_features.parquet")], ("moments", "water")),
+        Stage("osm_features", st_osm_features, [paths.pbf], [O("osm_features.parquet")], ("moments", "water"),
+              ("moments",)),
         Stage("moments", st_moments,
               [edges, O("edge_signals.parquet"), O("samples.npz"), O("osm_features.parquet"), R("grid.json"),
-               R("dem30.tif"), R("dem90.tif"), R("open90.tif"), R("min3k90.tif"), *water, R("bigwater_idx90.tif")],
+               R("dem30.tif"), R("dem90.tif"), R("open90.tif"), R("min3k90.tif"), *water, R("bigwater_idx90.tif"),
+               R("wfrac90.tif")],
               [O("moments.parquet")], ("moments", "score", "rasters", "graph", "water"),
               ("moments", "grid", "water")),
         Stage("validate", st_validate,

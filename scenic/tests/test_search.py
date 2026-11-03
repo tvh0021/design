@@ -104,6 +104,26 @@ def test_credit_moments_spacing_cap_and_feature_spacing():
     assert list(credit_moments(ids, pos, m, 2000.0, 10, feat, 10000.0)) == [11, 13]
 
 
+def test_moments_space_bays_by_their_parent_body():
+    """moments.parquet's parent_feature, not the bay name, keys the 10 km
+    same-feature spacing (five Lake George bays in 15 km of NY 9N)."""
+    import pyarrow as pa
+
+    t = pa.table({"id": [0, 1, 2], "m": [1.0, 1.0, 0.9], "x": [0.0] * 3, "y": [0.0] * 3, "lon": [0.0] * 3,
+                  "lat": [0.0] * 3, "edge_idx": [0, 1, 2], "type": ["water"] * 3,
+                  "label": ["a", "b", "c"], "members": [[0], [1], [2]],
+                  "feature": ["Lake George", "Boon Bay", "cliff"],
+                  "parent_feature": ["Lake George", "Lake George", "cliff"]})
+    mom = Moments.from_table(t, 3)
+    assert list(mom.feature) == ["Lake George", "Boon Bay", None]
+    assert list(mom.body) == ["Lake George", "Lake George", None]
+    ids, pos = np.array([0, 1, 2]), np.array([0.0, 4000.0, 8000.0])
+    got = credit_moments(ids, pos, mom.m, 2000.0, 10, mom.body, 10000.0)
+    assert list(got) == [0, 2]  # Boon Bay is 4 km along the same lake
+    old = t.drop_columns(["parent_feature"])  # files from before the column: the feature itself
+    assert list(Moments.from_table(old, 3).body) == ["Lake George", "Boon Bay", None]
+
+
 def test_top_distinct_one_per_named_feature():
     assert _top_distinct([5, 6, 7, 8], ["A", "A", None, "B"], 3) == [5, 7, 8]
     assert _top_distinct([5, 6, 7], [None, None, None], 2) == [5, 6]
@@ -257,3 +277,125 @@ def test_geometric_spur_uses_segment_distance_near_radius(gap, expected):
     lon, lat = Transformer.from_crs(5070, 4326, always_xy=True).transform(xy[:, 0]+x0[0], xy[:, 1]+y0[0])
     route = Route(np.arange(5), np.arange(4), np.zeros(4, bool), 60, 6000, 60, list(zip(lon, lat)))
     assert has_spur(route) is expected
+
+
+def test_moment_points_power_and_cap_floor():
+    from scenic.search import moment_cap, moment_points
+
+    cfg = {"moments_per_hour": 8.0, "moments_min_cap": 3, "moment_power": 2.0}
+    assert moment_points(np.array([1.0, 0.5]), cfg) == pytest.approx(1.25)
+    assert moment_points(np.zeros(0), cfg) == 0.0
+    assert moment_points(np.array([1.0, 0.5]), {"moments_per_hour": 6.0}) == pytest.approx(1.5)  # default power 1
+    assert moment_cap(cfg, 20 * 60) == 3  # short trip: floor
+    assert moment_cap(cfg, 90 * 60) == 12
+    assert moment_cap({"moments_per_hour": 6.0}, 5 * 60) == 1
+
+
+def test_score_route_pays_strong_moments_more_than_weak_ones():
+    ctx = ladder()
+    ctx.cfg["moment_power"] = 2.0
+    res = search(ctx, latlon(ctx.g, 0), latlon(ctx.g, 4))
+    top = res.picks[1.30]
+    assert top.moment_pts == pytest.approx(1.0)
+    ctx.moments.m[:] = 0.5
+    sr = score_route(ScenicRoute(route=top.route, origin="x"), ctx, res.t0, res.s_fast)
+    assert sr.moment_pts == pytest.approx(0.25)
+    assert sr.score == pytest.approx(sr.scenic_min + 5 * 0.25)
+
+
+def _toy_routes():
+    """Four routes on a 10-edge graph of 1 km edges: A and B share 9 of 10
+    edges, C shares 2 with A."""
+    from scenic.route import Route
+
+    length = np.full(30, 1000.0)
+
+    def mk(edges, ratio, score):
+        r = Route(nodes=np.arange(len(edges) + 1), edges=np.asarray(edges), reversed=np.zeros(len(edges), bool),
+                  time_s=ratio * 100, cost=ratio * 100,
+                  length_m=1000.0 * len(edges))
+        return ScenicRoute(route=r, origin=f"r{ratio}", ratio=ratio, score=score)
+
+    A = mk(list(range(10)), 1.10, 10.0)
+    B = mk(list(range(9)) + [20], 1.25, 12.0)
+    C = mk([0, 1] + list(range(21, 29)), 1.28, 11.0)
+    D = mk(list(range(10)) + [29], 1.45, 13.0)
+    return length, A, B, C, D
+
+
+def test_route_overlap_by_length():
+    from scenic.search import route_overlap
+
+    length, A, B, C, D = _toy_routes()
+    assert route_overlap(A.route, B.route, length) == pytest.approx(0.9)
+    assert route_overlap(A.route, C.route, length) == pytest.approx(0.2)
+    assert route_overlap(A.route, D.route, length) == pytest.approx(10 / 11)
+    assert route_overlap(A.route, A.route, length) == pytest.approx(1.0)
+
+
+def test_choose_picks_prefers_a_different_route_with_a_reasonable_score():
+    from scenic.search import choose_picks
+
+    length, A, B, C, D = _toy_routes()
+    budgets = [1.15, 1.30, 1.50]
+    # no dedup (overlap limit 1): the plain best under each budget
+    picks, shared = choose_picks([A, B, C, D], budgets, length)
+    assert [picks[b] for b in budgets] == [A, B, D] and shared == {}
+    # B overlaps A by 90 %: C (score 11 >= 0.85 x 12) replaces it; D overlaps
+    # A by 91 % and nothing else under +50 % is different enough and good
+    # enough, so +50 % repeats A, the pick it overlaps most
+    picks, shared = choose_picks([A, B, C, D], budgets, length, 0.8, 0.85)
+    assert picks[1.15] is A and picks[1.30] is C and picks[1.50] is A
+    assert shared == {1.50: 1.15}
+    # a stricter score floor rules C out: +30 % repeats A too
+    picks, shared = choose_picks([A, B, C, D], budgets, length, 0.8, 0.95)
+    assert picks[1.30] is A and picks[1.50] is A and shared == {1.30: 1.15, 1.50: 1.15}
+
+
+def test_choose_picks_identical_best_is_shared():
+    from scenic.search import choose_picks
+
+    length, A, B, C, D = _toy_routes()
+    picks, shared = choose_picks([A], [1.15, 1.30, 1.50], length, 0.8, 0.85)
+    assert all(picks[b] is A for b in picks) and shared == {1.30: 1.15, 1.50: 1.15}
+
+
+def _mk_route(edges, ratio, score, origin=None):
+    from scenic.route import Route
+
+    r = Route(nodes=np.arange(len(edges) + 1), edges=np.asarray(edges), reversed=np.zeros(len(edges), bool),
+              time_s=ratio * 100, cost=ratio * 100, length_m=1000.0 * len(edges))
+    return ScenicRoute(route=r, origin=origin or f"r{ratio}", ratio=ratio, score=score)
+
+
+def test_choose_picks_replacement_must_use_the_extra_time():
+    """A larger budget whose best repeats the +30 % pick may not swap in a
+    route that fits the +30 % budget anyway (faster and lower-scoring than
+    that pick, as Buffalo to Jamestown once did)."""
+    from scenic.search import choose_picks
+
+    length = np.full(40, 1000.0)
+    A = _mk_route(range(10), 1.10, 10.0)
+    P = _mk_route(range(10, 20), 1.25, 12.0)
+    Q = _mk_route(list(range(10, 19)) + [30], 1.45, 13.0)  # 90 % of P
+    R = _mk_route(range(20, 30), 1.22, 11.5)  # different, good enough, but under 1.30
+    picks, shared = choose_picks([A, P, Q, R], [1.15, 1.30, 1.50], length, 0.8, 0.85)
+    assert picks[1.30] is P and picks[1.50] is P and shared == {1.50: 1.30}
+    S = _mk_route(list(range(31, 40)) + [0], 1.40, 11.2)  # uses the extra time
+    picks, shared = choose_picks([A, P, Q, R, S], [1.15, 1.30, 1.50], length, 0.8, 0.85)
+    assert picks[1.50] is S and shared == {}
+
+
+def test_choose_picks_fastest_fallback_does_not_block_overlap():
+    """+15 % fell back to the fastest route; a +30 % best that overlaps it by
+    90 % is still the +30 % pick. Only the fastest route itself repeats it."""
+    from scenic.search import choose_picks
+
+    length = np.full(40, 1000.0)
+    F = _mk_route(range(10), 1.0, 5.0, origin="fastest")
+    G = _mk_route(list(range(9)) + [20], 1.2, 9.0)
+    picks, shared = choose_picks([F, G], [1.15, 1.30, 1.50], length, 0.8, 0.85)
+    assert picks[1.15] is F and picks[1.30] is G and picks[1.50] is G
+    assert shared == {1.50: 1.30}
+    picks, shared = choose_picks([F], [1.15, 1.30, 1.50], length, 0.8, 0.85)
+    assert all(picks[b] is F for b in picks) and shared == {1.30: 1.15, 1.50: 1.15}

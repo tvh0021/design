@@ -25,12 +25,18 @@ Steps:
    time stays under the cap.
 5. Every kept route is scored (`score_route`):
      scenic_min = sum_e t_e * max(0, S_e - S_fast) / 60
-     moment_pts = sum of m over distinct moments the route passes (within
+     moment_pts = sum of points of distinct moments the route passes (within
                   moment_radius_m, or driving one of the moment's edges),
                   at most one per moment_spacing_km of route and
                   moments_per_hour per hour of t0, best first
      score      = scenic_min + moment_minutes * moment_pts
-   and the best route under each budget is picked.
+   where a moment's points are m ** moment_power and the cap is at least
+   moments_min_cap.
+6. The best route under each budget is picked, smallest budget first. A
+   larger budget whose best route repeats (or shares more than
+   pick_max_overlap of its length with) a smaller budget's pick takes the
+   best clearly different route scoring at least pick_min_score_frac of
+   its best; with none it repeats the earlier pick and is marked shared.
 
 The budget is our own ETA ratio t / t0, both from the same speed model.
 """
@@ -132,7 +138,8 @@ class Moments:
     type: np.ndarray
     label: np.ndarray
     of_edge: np.ndarray  # moment id per edge, -1 if none
-    feature: np.ndarray | None = None  # named lake, river, falls ...; None if unnamed or generic
+    feature: np.ndarray | None = None  # named lake, bay, river, falls ...; None if unnamed or generic
+    group: np.ndarray | None = None  # the water body a bay belongs to (parent_feature), else feature
 
     @classmethod
     def from_table(cls, t, n_edges: int) -> "Moments":
@@ -145,17 +152,25 @@ class Moments:
             raise ValueError("moment ids must be 0..n-1")
         col = lambda c: np.asarray(t.column(c).to_pylist(), dtype=object)[order]  # noqa: E731
         num = lambda c: t.column(c).to_numpy()[order]  # noqa: E731
-        feat = col("feature")
-        feat = np.asarray([f if f and f not in GENERIC_FEATURES else None for f in feat], dtype=object)
+        named = lambda a: np.asarray([f if f and f not in GENERIC_FEATURES else None for f in a],  # noqa: E731
+                                     dtype=object)
+        feat = named(col("feature"))
+        group = named(col("parent_feature")) if "parent_feature" in t.column_names else feat
         return cls(id=ids[order], m=num("m").astype(np.float64), x=num("x"), y=num("y"), lon=num("lon"),
                    lat=num("lat"), edge=num("edge_idx").astype(np.int64), type=col("type"), label=col("label"),
-                   of_edge=of_edge, feature=feat)
+                   of_edge=of_edge, feature=feat, group=group)
+
+    @property
+    def body(self) -> np.ndarray | None:
+        """The named feature for spacing and grouping: the parent water body
+        of a bay (Lake George for Huddle Bay), else the feature."""
+        return self.group if self.group is not None else self.feature
 
     @classmethod
     def empty(cls, n_edges: int) -> "Moments":
         z = np.zeros(0)
         return cls(np.zeros(0, np.int64), z, z, z, z, z, np.zeros(0, np.int64), np.zeros(0, object),
-                   np.zeros(0, object), np.full(n_edges, -1, np.int64), np.zeros(0, object))
+                   np.zeros(0, object), np.full(n_edges, -1, np.int64), np.zeros(0, object), np.zeros(0, object))
 
 
 @dataclass
@@ -360,6 +375,21 @@ def credit_moments(ids: np.ndarray, pos: np.ndarray, m: np.ndarray, spacing_m: f
     return np.asarray([ids[k] for k in take], dtype=np.int64)
 
 
+def moment_cap(cfg: dict, t0: float) -> int:
+    """Most moments one route is credited with: moments_per_hour per hour of
+    the fastest time t0, at least moments_min_cap."""
+    return max(int(cfg.get("moments_min_cap", 1)), int(np.floor(cfg["moments_per_hour"] * t0 / 3600)))
+
+
+def moment_points(m: np.ndarray, cfg: dict) -> float:
+    """Points for credited moments: sum of m ** moment_power. A power above 1
+    pays a strong moment (m = 1) in full and a marginal one (m = 0.5) a
+    fraction, so a route earns more by passing better moments, not just
+    more of them."""
+    m = np.asarray(m, dtype=np.float64)
+    return float(np.sum(m ** float(cfg.get("moment_power", 1.0)))) if len(m) else 0.0
+
+
 def score_route(sr: ScenicRoute, ctx: Context, t0: float, s_fast: float) -> ScenicRoute:
     cfg = ctx.cfg
     e = sr.route.edges
@@ -368,13 +398,14 @@ def score_route(sr: ScenicRoute, ctx: Context, t0: float, s_fast: float) -> Scen
     sr.scenic_min = float(np.sum(t * np.maximum(0.0, ctx.S[e] - s_fast)) / 60)
     sr.mean_S = float(np.sum(t * ctx.S[e]) / max(t.sum(), 1e-9))
     ids, pos = passed_moments(sr.route, ctx.g, ctx.moments, cfg["moment_radius_m"])
-    cap = max(1, int(np.floor(cfg["moments_per_hour"] * t0 / 3600)))
-    feat = ctx.moments.feature[ids] if ctx.moments.feature is not None else None
+    cap = moment_cap(cfg, t0)
+    body = ctx.moments.body
+    feat = body[ids] if body is not None else None
     cred = credit_moments(ids, pos, ctx.moments.m[ids], cfg["moment_spacing_km"] * 1000, cap,
                           feat, cfg.get("feature_spacing_km", 0.0) * 1000)
     sr.passed = [int(i) for i in ids]
     sr.moments = [int(i) for i in cred]
-    sr.moment_pts = float(ctx.moments.m[cred].sum()) if len(cred) else 0.0
+    sr.moment_pts = moment_points(ctx.moments.m[cred], cfg)
     sr.score = sr.scenic_min + cfg["moment_minutes"] * sr.moment_pts
     return sr
 
@@ -397,6 +428,56 @@ class SearchResult:
     region_nodes: int
     via_candidates: int = 0
     spur_rejections: int = 0
+    shared: dict = field(default_factory=dict)  # budget -> smaller budget whose pick it repeats
+
+
+def route_overlap(a: Route, b: Route, length_m: np.ndarray) -> float:
+    """Length of the edges two routes share over the longer route's length."""
+    ea, eb = np.unique(a.edges), np.unique(b.edges)
+    both = np.intersect1d(ea, eb, assume_unique=True)
+    longer = max(length_m[ea].sum(), length_m[eb].sum())
+    return float(length_m[both].sum() / longer) if longer > 0 else 1.0
+
+
+def _pick_key(sr: ScenicRoute):
+    return (round(sr.score, 9), -sr.route.time_s)
+
+
+def choose_picks(routes: list, budgets, length_m: np.ndarray, max_overlap: float = 1.0,
+                 min_score_frac: float = 1.0) -> tuple[dict, dict]:
+    """The best route under each budget, smallest budget first. When the
+    best under a larger budget is the same as, or shares more than
+    `max_overlap` of its length with, a smaller budget's pick, take instead
+    the best route under that budget that overlaps no earlier pick by more
+    than `max_overlap`, scores at least `min_score_frac` of the best and
+    takes longer than the largest earlier budget the best duplicates (so it
+    uses the extra time). With none, the larger budget repeats the earlier
+    pick it overlaps most; `shared` maps that budget to the earlier one.
+    An earlier pick that is the fastest route (a smaller budget with
+    nothing better) only blocks a best that is the fastest route itself;
+    overlapping it is fine."""
+    picks: dict = {}
+    shared: dict = {}
+    for b in sorted(budgets):
+        under = sorted((sr for sr in routes if sr.ratio <= b + 1e-9), key=_pick_key, reverse=True)
+        best = under[0]
+        earlier = [(pb, sr) for pb, sr in picks.items()
+                   if pb not in shared and (sr.origin != "fastest" or sr is best)]
+        ov = [(route_overlap(best.route, sr.route, length_m), pb) for pb, sr in earlier]
+        if not ov or max(ov)[0] <= max_overlap:
+            picks[b] = best
+            continue
+        floor = min_score_frac * best.score
+        dup = max(pb for o, pb in ov if o > max_overlap)
+        alt = next((sr for sr in under[1:] if sr.score >= floor - 1e-9 and sr.ratio > dup + 1e-9
+                    and all(route_overlap(sr.route, e.route, length_m) <= max_overlap for _, e in earlier)), None)
+        if alt is not None:
+            picks[b] = alt
+        else:
+            pb = max(ov)[1]
+            picks[b] = picks[pb]
+            shared[b] = pb
+    return picks, shared
 
 
 class _Kept:
@@ -543,7 +624,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     fa, ra = edge_arcs(g)
     t_arc = g.time_s[g.arc_edge]
     on_fast = set(passed_moments(fast, g, mom, cfg["moment_radius_m"])[0].tolist())
-    feat = mom.feature if mom.feature is not None else np.full(len(mom.id), None, dtype=object)
+    feat = mom.body if mom.body is not None else np.full(len(mom.id), None, dtype=object)
     fast_feats = {feat[i] for i in on_fast} - {None}
     dA_r, dB_r = T.tree(src)[0], T.tree(dst, reverse=True)[0]
     # every moment, both directions of its best edge: (tail, head, arc, id)
@@ -568,7 +649,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
         best = order[first]
         via_arcs, vt = via_arcs[best], vt[best]
         extra = np.maximum((vt - t0) / 60, cfg["via_min_extra_min"])
-        rank = mom.m[via_arcs[:, 3]] / extra
+        rank = mom.m[via_arcs[:, 3]] ** float(cfg.get("moment_power", 1.0)) / extra
         mid = via_arcs[:, 3]
         top = np.argsort(-rank, kind="stable")
         pick = _top_distinct(top, feat[mid[top]], int(cfg["via_top"]))
@@ -588,7 +669,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     t1 = time.monotonic()
     lam_v = float(cfg["via_lambda"])
     GV = graphs.get(lam_v) or CostGraph(g, arcs, g.time_s * (1 + lam_v * (1 - S)))
-    m_by_id = mom.m
+    m_by_id = mom.m ** float(cfg.get("moment_power", 1.0))
     for seed in seeds:
         seq = [seed]
         for step in range(int(cfg["via_max_moments"])):
@@ -638,16 +719,14 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     for sr in kept.routes:
         score_route(sr, ctx, t0, s_fast)
     fastest = kept.routes[0]
-    picks = {}
-    for b in budgets:
-        under = [sr for sr in kept.routes if sr.ratio <= b + 1e-9]
-        picks[b] = max(under, key=lambda sr: (round(sr.score, 9), -sr.route.time_s))
+    picks, shared = choose_picks(kept.routes, budgets, g.length_m, cfg.get("pick_max_overlap", 1.0),
+                                 cfg.get("pick_min_score_frac", 1.0))
     secs["score"] = time.monotonic() - t1
     secs["total"] = time.monotonic() - t_start
     return SearchResult(a=tuple(a_latlon), b=tuple(b_latlon), snap=snap, t0=t0, s_fast=s_fast, fastest=fastest,
                         kept=kept.routes, picks=picks, seconds={k: round(v, 2) for k, v in secs.items()},
                         region_nodes=int(region.sum()), via_candidates=int(len(via_arcs)),
-                        spur_rejections=kept.spur_rejections)
+                        spur_rejections=kept.spur_rejections, shared=shared)
 
 
 # --------------------------------------------------------------------------
@@ -681,6 +760,7 @@ def result_json(ctx: Context, res: SearchResult) -> dict:
         "spur_rejections": res.spur_rejections,
         "fastest": describe(ctx, res.fastest),
         "picks": {f"+{round((b - 1) * 100)}%": describe(ctx, sr) for b, sr in res.picks.items()},
+        "shared": {f"+{round((b - 1) * 100)}%": f"+{round((pb - 1) * 100)}%" for b, pb in res.shared.items()},
     }
 
 

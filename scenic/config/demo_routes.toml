@@ -1,0 +1,44 @@
+# Preset routes for the static demo site (`scenic demo build`, docs/PUBLISH.md).
+# Each preset runs the real search; every pick also gets its Google Maps
+# waypoints. `id` names the JSON file (data/<id>.json) and the URL hash
+# (#preset=<id>), so keep it short, lower case and stable.
+
+[[preset]]
+id = "niagara"
+name = "Niagara Falls and the river"
+from = [42.8864, -78.8784]
+from_label = "Buffalo"
+to = [43.2630, -79.0630]
+to_label = "Old Fort Niagara, Youngstown"
+
+[[preset]]
+id = "albany-rochester"
+name = "Albany to Rochester"
+from = [42.6526, -73.7562]
+from_label = "Albany"
+to = [43.1566, -77.6088]
+to_label = "Rochester"
+
+[[preset]]
+id = "catskills"
+name = "Through the Catskills"
+from = [41.9270, -73.9974]
+from_label = "Kingston"
+to = [42.4529, -75.0638]
+to_label = "Oneonta"
+
+[[preset]]
+id = "finger-lakes"
+name = "Finger Lakes: Rochester to Watkins Glen"
+from = [43.1566, -77.6088]
+from_label = "Rochester"
+to = [42.3806, -76.8733]
+to_label = "Watkins Glen"
+
+[[preset]]
+id = "adirondacks"
+name = "Into the Adirondacks: Lake George to Lake Placid"
+from = [43.4262, -73.7123]
+from_label = "Lake George"
+to = [44.2795, -73.9799]
+to_label = "Lake Placid"

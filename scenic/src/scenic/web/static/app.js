@@ -1,4 +1,8 @@
-/* scenic web UI: one page, Leaflet, no build step. The server is scenic/web/server.py.
+/* Maps for Wanderers: one page, Leaflet, no build step. The server is scenic/web/server.py.
+ *
+ * Two modes. Live (default): the page talks to `scenic serve` through /api/*. Demo
+ * (<html data-mode="demo">, written by `scenic demo build`): read-only preset routes from
+ * data/*.json by relative path; no /api calls, no geocoding, no point picking.
  *
  * Text from OpenStreetMap or Nominatim (moment labels, road names, place names) goes into
  * the page only through textContent or DOM nodes, never as an HTML string: Leaflet treats a
@@ -17,6 +21,7 @@
   const UNITS_KEY = "scenic.units"; // "mi" | "km"
   const KM_PER_MI = 1.609344;
   const SNAP_NOTE_M = 500;
+  const DEMO = document.documentElement.dataset.mode === "demo";
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => {
@@ -37,7 +42,7 @@
     a: null, b: null, markerA: null, markerB: null, badPin: null,
     gen: 0, // bumped whenever A or B changes; a search answer for an older generation is dropped
     search: null, selected: null, visible: {}, waypoints: {},
-    busy: false,
+    busy: false, lastError: null, presets: null, preset: null,
     units: store.get(UNITS_KEY) === "km" ? "km" : "mi",
   };
   let searchToken = 0; // the latest route request; older answers are dropped
@@ -45,25 +50,29 @@
   // ---- map -------------------------------------------------------------------
 
   const map = L.map("map", { zoomControl: true, preferCanvas: false }).setView([42.9, -75.8], 7);
+  // Base layers and their terms: docs/PUBLISH.md. No API keys. Tiles send the page's origin as
+  // Referer (OSM's tile policy asks for one); the page itself never sends a full URL off-site.
+  const TILE_OPTS = { maxZoom: 19, referrerPolicy: "strict-origin-when-cross-origin" };
   const streets = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
+    ...TILE_OPTS,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   });
+  const USGS_ATTR = 'Map services and data from the <a href="https://www.usgs.gov/programs/national-geospatial-program/national-map">' +
+    "U.S. Geological Survey, National Geospatial Program</a>";
   const topo = L.tileLayer(
-    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", {
-      maxZoom: 19,
-      attribution: "Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, TomTom, Intermap, iPC, USGS, FAO, NPS, NRCAN, " +
-        "GeoBase, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), and the GIS User Community",
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}", {
+      ...TILE_OPTS, maxNativeZoom: 16, attribution: USGS_ATTR,
     });
   const satellite = L.tileLayer(
-    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
-      maxZoom: 19,
-      attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}", {
+      ...TILE_OPTS, maxNativeZoom: 16, attribution: USGS_ATTR,
     });
   const BASES = { streets, topo, satellite };
   streets.addTo(map);
-  L.control.layers({ "Streets (OpenStreetMap)": streets, "Terrain (Esri World Topo)": topo,
-    "Satellite (Esri World Imagery)": satellite }, null, { position: "topright", collapsed: false }).addTo(map);
+  L.control.layers({ "Streets (OpenStreetMap)": streets, "Terrain (USGS Topo)": topo,
+    "Satellite (USGS Imagery)": satellite }, null, { position: "topright", collapsed: false }).addTo(map);
+  // the routes, stops and place names are OpenStreetMap data whatever the base layer (ODbL)
+  map.attributionControl.addAttribution('Routes: <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> data');
   L.control.scale({ imperial: true, metric: true }).addTo(map);
 
   const routeLayer = L.layerGroup().addTo(map);
@@ -113,7 +122,7 @@
     const key = which === "a" ? "markerA" : "markerB";
     state[which] = [ll.lat, ll.lng];
     if (!state[key]) {
-      state[key] = L.marker(ll, { draggable: true, icon: pinIcon(which), autoPan: true,
+      state[key] = L.marker(ll, { draggable: !DEMO, icon: pinIcon(which), autoPan: true,
         title: which === "a" ? "Start" : "End", zIndexOffset: 1000 }).addTo(map);
       state[key].on("dragend", (e) => {
         const p = e.target.getLatLng();
@@ -146,6 +155,8 @@
     setBadPin(null);
     updateFind();
     updateHome();
+    // keep the link in step with the points (not before a #from=…&to=… link has been read)
+    if (DEMO || hashDone) writeHash();
     $("hint").textContent = !state.a ? "Click the map to set the start, then the end."
       : !state.b ? "Click the map to set the end."
       : "Drag the markers to adjust, or press Find routes.";
@@ -156,6 +167,7 @@
   }
 
   map.on("click", (e) => {
+    if (DEMO) return; // read-only: the presets set A and B
     if (!state.a) setPoint("a", e.latlng);
     else if (!state.b) setPoint("b", e.latlng);
     else $("hint").textContent = "Both points are set. Drag a marker to move it, or press Clear to start over.";
@@ -175,6 +187,7 @@
     $("u-km").setAttribute("aria-pressed", String(u === "km"));
     $("dist-head").textContent = u;
     if (state.search) { renderTable(); renderDetail(); }
+    if (state.lastError) showError(state.lastError); // distances in errors follow the units too
   }
 
   // ---- home ----------------------------------------------------------------------
@@ -214,29 +227,45 @@
   // ---- API -------------------------------------------------------------------
 
   async function api(path, body) {
+    if (DEMO) throw new Error("The demo has no server."); // never reached: demo code paths read data/*.json
     const opts = body === undefined ? {} : {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
     let r;
     try {
       r = await fetch(path, opts);
     } catch (e) {
-      throw new Error("The scenic server is not responding. Check that `scenic serve` is still running.");
+      throw new Error("The server is not responding. If you run it, check that `scenic serve` is still running.");
     }
     let data = null;
     try { data = await r.json(); } catch (e) { /* not JSON */ }
     if (!r.ok) {
       const err = new Error(cap((data && data.error) || `HTTP ${r.status}. Try again.`));
       err.point = data && data.point === "from" ? "a" : data && data.point === "to" ? "b" : null;
+      err.data = data; // raw numbers (snap_m, limit_m) for messages in the page's units
       throw err;
     }
     return data;
   }
 
-  function showError(msg, pin) {
+  // The server sends distances as numbers; the words are built here, in the chosen units.
+  function errorText(err) {
+    const d = err && err.data;
+    if (d && d.code === "snap_far" && Number.isFinite(d.snap_m) && Number.isFinite(d.limit_m)) {
+      const [which, pin] = d.point === "to" ? ["end", "B"] : ["start", "A"];
+      return `The ${which} point is ${dist(d.snap_m / 1000, 1)} from the nearest road in the graph ` +
+        `(limit ${dist(d.limit_m / 1000, 1)}). Drag ${pin} onto a road.`;
+    }
+    return err && err.message !== undefined ? err.message : err || "";
+  }
+
+  // showError(message or Error, pin); an Error is kept so a units switch can re-word it
+  function showError(err, pin) {
+    const msg = typeof err === "string" ? err : errorText(err);
+    state.lastError = msg && typeof err !== "string" ? err : null;
     const e = $("error");
     e.textContent = cap(msg || "");
     e.hidden = !msg;
-    setBadPin(msg ? pin || null : null);
+    setBadPin(msg ? pin || (err && err.point) || null : null);
   }
 
   function setBusy(on, text) {
@@ -305,9 +334,10 @@
           });
           list.appendChild(li);
         }
+        list.appendChild(el("li", "none attr", "Place search: Nominatim, © OpenStreetMap contributors"));
       } catch (e) {
         list.hidden = true;
-        showError(e.message);
+        showError(e);
       }
     });
   }
@@ -339,7 +369,7 @@
       renderAll(true);
     } catch (e) {
       if (token !== searchToken || gen !== state.gen) return;
-      showError(e.message, e.point);
+      showError(e, e.point);
     } finally {
       if (token === searchToken) setBusy(false);
     }
@@ -562,21 +592,50 @@
     d.appendChild(el("h3", null, n ? `${n} scenic stop${n === 1 ? "" : "s"}, in drive order` : "No scenic stops on this route"));
     if (n) {
       const ol = el("ol", "moments");
-      for (const m of r.moments) {
-        const li = el("li");
-        const link = el("a", null, minText(m) + m.label); // OSM text: textContent only
-        link.href = "#";
-        link.addEventListener("click", (ev) => {
-          ev.preventDefault();
-          map.setView([m.lat, m.lon], Math.max(map.getZoom(), 13));
-          L.popup().setLatLng([m.lat, m.lon]).setContent(momentPopup(m)).openOn(map);
-        });
-        li.appendChild(link);
-        li.appendChild(el("span", "mtype mt-" + m.type, (MOMENT_NAMES[m.type] || m.type).toLowerCase()));
+      for (const g of stopGroups(r)) {
+        const ms = r.moments.slice(g.first, g.last + 1);
+        if (ms.length === 1) { ol.appendChild(stopItem(ms[0])); continue; }
+        // several stops in a row at one named lake or river: one line, the stops folded under it
+        const li = el("li", "group");
+        const det = el("details");
+        const sum = el("summary", null, groupText(g.feature, ms)); // OSM text: textContent only
+        sum.appendChild(el("span", "mtype mt-" + ms[0].type, (MOMENT_NAMES[ms[0].type] || ms[0].type).toLowerCase()));
+        det.appendChild(sum);
+        const inner = el("ol", "moments");
+        for (const m of ms) inner.appendChild(stopItem(m));
+        det.appendChild(inner);
+        li.appendChild(det);
         ol.appendChild(li);
       }
       d.appendChild(ol);
     }
+  }
+
+  // runs of consecutive stops at the same named feature (server `stop_groups`; one per stop if absent)
+  function stopGroups(r) {
+    if (Array.isArray(r.stop_groups) && r.stop_groups.length) return r.stop_groups;
+    return r.moments.map((m, i) => ({ first: i, last: i, feature: null }));
+  }
+
+  function groupText(feature, ms) {
+    const mins = ms.map((m) => m.min_along).filter((x) => Number.isFinite(x));
+    const when = mins.length ? `min ${Math.round(Math.min(...mins))}–${Math.round(Math.max(...mins))} · ` : "";
+    const lake = ms.every((m) => m.type === "water") && /\b(lake|pond|reservoir|bay|harbor|sound)\b/i.test(feature);
+    return `${when}${feature}${lake ? " shoreline" : ""}, ${ms.length} stops`;
+  }
+
+  function stopItem(m) {
+    const li = el("li");
+    const link = el("a", null, minText(m) + m.label); // OSM text: textContent only
+    link.href = "#";
+    link.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      map.setView([m.lat, m.lon], Math.max(map.getZoom(), 13));
+      L.popup().setLatLng([m.lat, m.lon]).setContent(momentPopup(m)).openOn(map);
+    });
+    li.appendChild(link);
+    li.appendChild(el("span", "mtype mt-" + m.type, (MOMENT_NAMES[m.type] || m.type).toLowerCase()));
+    return li;
   }
 
   // Google Maps: one action for the selected route. The first click reduces the route to
@@ -584,6 +643,10 @@
   function mapsBlock(r) {
     const box = el("div", "gm");
     const w = state.waypoints[r.key];
+    if (DEMO && (!w || w.error)) { // precomputed; nothing to retry
+      box.appendChild(el("div", "note", "No Google Maps link was made for this route" + (w && w.error ? `: ${w.error}` : ".")));
+      return box;
+    }
     if (!w || w.error) {
       const btn = el("button", "primary", w && w.error ? "Try the Google Maps link again" : "Get a Google Maps link");
       btn.type = "button";
@@ -625,7 +688,7 @@
 
   async function getWaypoints(key) {
     const s = state.search;
-    if (!s) return;
+    if (!s || DEMO) return;
     const sid = s.id; // the answer belongs to this search only
     const cur = state.waypoints[key];
     if (cur && (cur.pending || cur.data)) return;
@@ -659,7 +722,11 @@
 
   function writeHash() {
     const parts = [];
-    if (state.a && state.b) {
+    if (DEMO && state.preset) {
+      parts.push("preset=" + encodeURIComponent(state.preset));
+      const sel = state.search && state.search.routes.find((r) => r.key === state.selected);
+      if (sel) parts.push("route=" + encodeURIComponent(sel.labels[0]));
+    } else if (!DEMO && state.a && state.b) {
       parts.push(`from=${state.a[0].toFixed(5)},${state.a[1].toFixed(5)}`, `to=${state.b[0].toFixed(5)},${state.b[1].toFixed(5)}`);
       const sel = state.search && state.search.routes.find((r) => r.key === state.selected);
       if (sel) parts.push("route=" + encodeURIComponent(sel.labels[0]));
@@ -697,37 +764,118 @@
 
   // ---- wiring ----------------------------------------------------------------
 
-  wireSearch("a");
-  wireSearch("b");
-  $("find").addEventListener("click", findRoutes);
-  $("clear").addEventListener("click", () => {
-    removePoint("a");
-    removePoint("b");
-    clearResults();
-    showError("");
-    writeHash();
-    onPointsChanged();
-  });
-  $("swap").addEventListener("click", () => {
-    const a = state.a, b = state.b, qa = $("q-a").value, qb = $("q-b").value;
-    if (!a && !b) return;
-    for (const [w, p, q] of [["a", b, qb], ["b", a, qa]]) {
-      if (p) setPoint(w, p, q);
-      else removePoint(w);
-    }
-    clearResults();
-    showError("");
-    onPointsChanged();
-  });
-  $("by-s").addEventListener("change", () => { renderLegend(); renderMap(false); writeHash(); });
-  $("u-mi").addEventListener("click", () => setUnits("mi"));
-  $("u-km").addEventListener("click", () => setUnits("km"));
-  $("home-a").addEventListener("click", fromHome);
-  $("home-set-a").addEventListener("click", () => setHome("a"));
-  $("home-set-b").addEventListener("click", () => setHome("b"));
-  $("tab-loop").addEventListener("click", (ev) => ev.preventDefault());
+  // ---- demo: preset routes from data/*.json ------------------------------------
 
+  async function demoFetch(file) { // relative path, so the site works under any folder
+    const r = await fetch(file, { cache: "no-cache" });
+    if (!r.ok) throw new Error(`Could not load ${file} (HTTP ${r.status}).`);
+    return r.json();
+  }
+
+  function renderPresets() {
+    const ul = $("preset-list");
+    ul.replaceChildren();
+    for (const p of state.presets.presets) {
+      const li = el("li", "preset" + (p.id === state.preset ? " selected" : ""));
+      const b = el("button", "preset-btn");
+      b.type = "button";
+      b.setAttribute("aria-pressed", String(p.id === state.preset));
+      b.appendChild(el("span", "preset-name", p.name));
+      const ends = [p.from_label, p.to_label].filter(Boolean).join(" → ");
+      b.appendChild(el("span", "preset-sub", `${ends}${ends ? " · " : ""}${Math.round(p.t0_min)} min fastest, ${dist(p.km)}`));
+      b.addEventListener("click", () => loadPreset(p.id));
+      li.appendChild(b);
+      ul.appendChild(li);
+    }
+  }
+
+  let presetToken = 0;
+  async function loadPreset(id, wantRoute) {
+    const p = state.presets.presets.find((x) => x.id === id);
+    if (!p) return;
+    const token = ++presetToken;
+    showError("");
+    setBusy(true, "Loading the preset…");
+    try {
+      const data = await demoFetch(p.file);
+      if (token !== presetToken) return;
+      // only now: a failed fetch leaves the shown preset highlighted and in the link
+      state.preset = id;
+      renderPresets();
+      setPoint("a", data.search.from, p.from_label || null);
+      setPoint("b", data.search.to, p.to_label || null);
+      state.search = data.search;
+      state.waypoints = {};
+      for (const [k, w] of Object.entries(data.waypoints || {})) state.waypoints[k] = w.error ? { error: w.error } : { data: w };
+      state.visible = {};
+      for (const r of data.search.routes) state.visible[r.key] = true;
+      const pick = (wantRoute && data.search.routes.find((r) => r.labels.includes(wantRoute))) ||
+        data.search.routes.find((r) => r.labels.includes("+30%")) || data.search.routes[data.search.routes.length - 1];
+      state.selected = pick.key;
+      writeHash();
+      renderAll(true);
+    } catch (e) {
+      if (token === presetToken) showError(e);
+    } finally {
+      if (token === presetToken) setBusy(false);
+    }
+  }
+
+  async function startDemo() {
+    $("demo-note").hidden = false;
+    $("demo-foot").hidden = false;
+    $("presets").hidden = false;
+    $("loading").hidden = true;
+    try {
+      state.presets = await demoFetch("data/presets.json");
+    } catch (e) {
+      showError(e);
+      return;
+    }
+    renderPresets();
+    const h = new URLSearchParams(location.hash.slice(1));
+    const want = h.get("preset");
+    const first = state.presets.presets.find((p) => p.id === want) || state.presets.presets[0];
+    if (first) loadPreset(first.id, want === first.id ? h.get("route") : null);
+  }
+
+  // ---- wiring ----------------------------------------------------------------
+
+  $("by-s").addEventListener("change", () => { renderLegend(); renderMap(false); writeHash(); });
+  $("u-mi").addEventListener("click", () => { setUnits("mi"); if (DEMO && state.presets) renderPresets(); });
+  $("u-km").addEventListener("click", () => { setUnits("km"); if (DEMO && state.presets) renderPresets(); });
   setUnits(state.units);
-  onPointsChanged();
-  pollHealth();
+
+  if (DEMO) {
+    startDemo();
+  } else {
+    wireSearch("a");
+    wireSearch("b");
+    $("find").addEventListener("click", findRoutes);
+    $("clear").addEventListener("click", () => {
+      removePoint("a");
+      removePoint("b");
+      clearResults();
+      showError("");
+      writeHash();
+      onPointsChanged();
+    });
+    $("swap").addEventListener("click", () => {
+      const a = state.a, b = state.b, qa = $("q-a").value, qb = $("q-b").value;
+      if (!a && !b) return;
+      for (const [w, p, q] of [["a", b, qb], ["b", a, qa]]) {
+        if (p) setPoint(w, p, q);
+        else removePoint(w);
+      }
+      clearResults();
+      showError("");
+      onPointsChanged();
+    });
+    $("home-a").addEventListener("click", fromHome);
+    $("home-set-a").addEventListener("click", () => setHome("a"));
+    $("home-set-b").addEventListener("click", () => setHome("b"));
+    $("tab-loop").addEventListener("click", (ev) => ev.preventDefault());
+    onPointsChanged();
+    pollHealth();
+  }
 })();

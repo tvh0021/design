@@ -46,9 +46,39 @@ def _is_bridge(tags) -> bool:
     return b not in ("", "no")
 
 
-def read_osm_features(pbf: Path, min_water_m2: float = 2e5, progress: bool = True):
-    """Point features and named water from the PBF, as a pyarrow table with
-    columns kind, name, lon, lat, way_id, wkb (EPSG:4326 WKB or null).
+STORM_WATER = ("basin", "wastewater", "reflecting_pool", "fountain", "pool")  # water=* values
+
+
+def storm_tag(tags) -> str | None:
+    """The tag that marks an OSM water area as stormwater or otherwise
+    artificial (water=basin/wastewater/..., landuse=basin, any basin=*),
+    None for ordinary water. Ponds are judged by size elsewhere."""
+    w = (tags.get("water") or "").strip().lower()
+    if w in STORM_WATER:
+        return f"water={w}"
+    if tags.get("landuse") == "basin":
+        return "landuse=basin"
+    b = (tags.get("basin") or "").strip().lower()
+    if b:
+        return f"basin={b}"
+    return None
+
+
+def is_stormwater(storm: str | None, name, area: float, named_min_m2: float) -> bool:
+    """Whether an area with stormwater tag `storm` (storm_tag) is
+    stormwater. A named body of at least named_min_m2 is a lake whatever
+    its tags (Lewiston Reservoir, 7.6 km2, and Muskrat Lake, 39 ha, are
+    landuse=basin), unless it is wastewater."""
+    if not storm:
+        return False
+    return not (name and area >= named_min_m2 and storm != "water=wastewater")
+
+
+def read_osm_features(pbf: Path, min_water_m2: float = 1e4, pond_floor_m2: float = 4e4, progress: bool = True,
+                      named_min_m2: float = 1e5):
+    """Point features and water areas from the PBF, as a pyarrow table with
+    columns kind, name, lon, lat, way_id, wkb (EPSG:4326 WKB or null),
+    place, area_m2 and tag.
 
     kinds: viewpoint (tourism=viewpoint, nodes and way/area centroids),
     waterfall (waterway=waterfall, nodes and way vertices), cliff
@@ -56,17 +86,23 @@ def read_osm_features(pbf: Path, min_water_m2: float = 2e5, progress: bool = Tru
     bridge (highway way with bridge=*: way_id only), place (place=city ...
     locality nodes with a name; name of its kind in `wkb` is null),
     water (named natural=water / landuse=reservoir / waterway=riverbank
-    area of at least `min_water_m2`, WKB polygon), river (named
-    waterway=river line, WKB)."""
+    area of at least `min_water_m2`, WKB polygon, tag = its water=* value),
+    bay (named natural=bay or natural=strait area, WKB polygon; or a named
+    natural=bay node, no WKB), stormwater (water=basin, wastewater ...,
+    landuse=basin or basin=* area of any size, or an unnamed water=pond
+    under `pond_floor_m2`; tag says which; a named one of at least
+    `named_min_m2` is water unless it is wastewater), river (named waterway=river
+    line, WKB)."""
     import osmium
     import pyarrow as pa
     import shapely
     from osmium.filter import KeyFilter
 
     wkbf = osmium.geom.WKBFactory()
-    rows = {"kind": [], "name": [], "lon": [], "lat": [], "way_id": [], "wkb": [], "place": []}
+    rows = {"kind": [], "name": [], "lon": [], "lat": [], "way_id": [], "wkb": [], "place": [], "area_m2": [],
+            "tag": []}
 
-    def add(kind, name, lon, lat, way_id=-1, wkb=None, place=None):
+    def add(kind, name, lon, lat, way_id=-1, wkb=None, place=None, area=np.nan, tag=None):
         rows["kind"].append(kind)
         rows["name"].append(name)
         rows["lon"].append(lon)
@@ -74,11 +110,14 @@ def read_osm_features(pbf: Path, min_water_m2: float = 2e5, progress: bool = Tru
         rows["way_id"].append(way_id)
         rows["wkb"].append(wkb)
         rows["place"].append(place)
+        rows["area_m2"].append(area)
+        rows["tag"].append(tag)
 
     proc = (osmium.FileProcessor(str(pbf))
             .with_locations("flex_mem")
-            .with_areas(KeyFilter("natural", "landuse", "waterway", "tourism"))
-            .with_filter(KeyFilter("tourism", "waterway", "natural", "highway", "place", "landuse")))
+            .with_areas(KeyFilter("natural", "landuse", "waterway", "tourism", "water", "basin"))
+            .with_filter(KeyFilter("tourism", "waterway", "natural", "highway", "place", "landuse", "water",
+                                   "basin")))
     n = bad = 0
     from pyproj import Geod
 
@@ -97,6 +136,8 @@ def read_osm_features(pbf: Path, min_water_m2: float = 2e5, progress: bool = Tru
                     add("waterfall", name, loc.lon, loc.lat)
                 if tags.get("natural") == "cliff":
                     add("cliff", name, loc.lon, loc.lat)
+                if tags.get("natural") == "bay" and name:
+                    add("bay", name, loc.lon, loc.lat)
                 pl = tags.get("place")
                 if pl in PLACE_RANK and name:
                     add("place", name, loc.lon, loc.lat, place=pl)
@@ -120,15 +161,28 @@ def read_osm_features(pbf: Path, min_water_m2: float = 2e5, progress: bool = Tru
                     g = shapely.from_wkb(bytes.fromhex(wkbf.create_multipolygon(obj)))
                     c = g.centroid
                     add("viewpoint", name, c.x, c.y, way_id=obj.orig_id())
-                water = (tags.get("natural") == "water" or tags.get("landuse") == "reservoir"
-                         or tags.get("waterway") == "riverbank")
-                if water and name:
-                    gb = bytes.fromhex(wkbf.create_multipolygon(obj))
-                    g = shapely.from_wkb(gb)
-                    area = abs(geod.geometry_area_perimeter(g)[0])
-                    if area >= min_water_m2:
-                        c = g.representative_point()
-                        add("water", name, c.x, c.y, way_id=obj.orig_id(), wkb=gb)
+                nat = tags.get("natural")
+                water = (nat == "water" or tags.get("landuse") in ("reservoir", "basin")
+                         or tags.get("waterway") == "riverbank" or bool(tags.get("basin")))
+                bay = nat in ("bay", "strait") and bool(name)
+                if not (water or bay):
+                    continue
+                storm = storm_tag(tags) if water else None
+                wv = (tags.get("water") or "").strip().lower() or None
+                if not (bay or storm or name or wv == "pond"):
+                    continue
+                gb = bytes.fromhex(wkbf.create_multipolygon(obj))
+                g = shapely.from_wkb(gb)
+                area = abs(geod.geometry_area_perimeter(g)[0])
+                c = g.representative_point()
+                if bay:
+                    add("bay", name, c.x, c.y, way_id=obj.orig_id(), wkb=gb, area=area, tag=nat)
+                elif is_stormwater(storm, name, area, named_min_m2):
+                    add("stormwater", name, c.x, c.y, way_id=obj.orig_id(), wkb=gb, area=area, tag=storm)
+                elif wv == "pond" and not name and area < pond_floor_m2:
+                    add("stormwater", name, c.x, c.y, way_id=obj.orig_id(), wkb=gb, area=area, tag="water=pond")
+                elif name and area >= min_water_m2 and (tags.get("intermittent") or "").lower() != "yes":
+                    add("water", name, c.x, c.y, way_id=obj.orig_id(), wkb=gb, area=area, tag=wv)
         except (RuntimeError, osmium.InvalidLocationError, ValueError):
             bad += 1
         if progress and n % 500_000 == 0:
@@ -143,6 +197,8 @@ def read_osm_features(pbf: Path, min_water_m2: float = 2e5, progress: bool = Tru
         "way_id": pa.array(rows["way_id"], pa.int64()),
         "wkb": pa.array(rows["wkb"], pa.binary()),
         "place": pa.array(rows["place"], pa.string()),
+        "area_m2": pa.array(rows["area_m2"], pa.float64()),
+        "tag": pa.array(rows["tag"], pa.string()),
     })
 
 
@@ -163,23 +219,24 @@ def vista_value(drop_m: np.ndarray, cfg: dict) -> np.ndarray:
     return np.clip(np.asarray(drop_m, dtype=np.float64) / cfg["vista_drop_scale_m"], cfg["vista_m_min"], 1.0)
 
 
-def far_sight(px, py, ze, grid90, dem90: np.ndarray, n_rays: int, max_m: float, tol: float,
-              below_m: float) -> np.ndarray:
-    """Longest terrain sight line (m) from each eye point (px, py, ze) over
-    dem90, over `n_rays` azimuths, to ground at least `below_m` below the eye.
-    Ground at distance d is in sight when it is not more than `tol` below
-    the steepest elevation angle of the ground before it (a viewshed along
-    the ray)."""
+def sight_rays(px, py, ze, grid90, dem90: np.ndarray, n_rays: int, max_m: float, tol: float,
+               below_m: float) -> np.ndarray:
+    """Terrain sight line (m) along each of `n_rays` azimuths from each eye
+    point (px, py, ze) over dem90, to ground at least `below_m` below the
+    eye; shape (n, n_rays). Ground at distance d is in sight when it is not
+    more than `tol` below the steepest elevation angle of the ground before
+    it (a viewshed along the ray)."""
     px = np.asarray(px, dtype=np.float64)
     py = np.asarray(py, dtype=np.float64)
     ze = np.asarray(ze, dtype=np.float64)
     n = len(px)
-    best = np.zeros(n)
+    out = np.zeros((n, n_rays))
     step = grid90.res
     ks = np.arange(1, int(max_m // step) + 1)
-    for a in np.arange(n_rays) * 2 * np.pi / n_rays:
+    for j, a in enumerate(np.arange(n_rays) * 2 * np.pi / n_rays):
         ux, uy = np.cos(a), np.sin(a)
         amax = np.full(n, -np.inf)
+        best = np.zeros(n)
         for k in ks:
             d = k * step
             r, c, ins = grid90.rowcol(px + ux * d, py + uy * d)
@@ -189,7 +246,15 @@ def far_sight(px, py, ze, grid90, dem90: np.ndarray, n_rays: int, max_m: float, 
             ok = seen & (zg <= ze - below_m)
             best = np.where(ok, np.maximum(best, d), best)
             amax = np.where(ins, np.fmax(amax, ang), amax)
-    return best
+        out[:, j] = best
+    return out
+
+
+def far_sight(px, py, ze, grid90, dem90: np.ndarray, n_rays: int, max_m: float, tol: float,
+              below_m: float) -> np.ndarray:
+    """Longest terrain sight line (m) from each eye point over `n_rays`
+    azimuths (the maximum of `sight_rays`)."""
+    return sight_rays(px, py, ze, grid90, dem90, n_rays, max_m, tol, below_m).max(axis=1)
 
 
 def window_min(arr: np.ndarray, r: np.ndarray, c: np.ndarray, radius_cells: float,
@@ -244,6 +309,103 @@ def densify_lines(wkbs, step: float = 50.0):
     if not xs:
         return np.zeros(0), np.zeros(0), np.zeros(0, np.int64)
     return np.concatenate(xs), np.concatenate(ys), np.concatenate(owner)
+
+
+def junction_density(u, v, node_x, node_y, qx, qy, radius: float) -> np.ndarray:
+    """Junctions (nodes where three or more edges meet) per km2 within
+    `radius` of each query point."""
+    from scipy.spatial import cKDTree
+
+    n_nodes = len(node_x)
+    deg = np.bincount(u, minlength=n_nodes) + np.bincount(v, minlength=n_nodes)
+    j = np.flatnonzero((deg >= 3) & np.isfinite(node_x))
+    if len(j) == 0 or len(qx) == 0:
+        return np.zeros(len(qx))
+    tree = cKDTree(np.column_stack([node_x[j], node_y[j]]))
+    cnt = tree.query_ball_point(np.column_stack([qx, qy]), radius, return_length=True, workers=-1)
+    return np.asarray(cnt, dtype=np.float64) / (np.pi * (radius / 1000) ** 2)
+
+
+def edges_near(px, py, pe, geoms, radius: float, n_edges: int) -> np.ndarray:
+    """Per edge, True when any of its sample points (px, py, edge pe) lies
+    within `radius` of one of the (projected) shapely `geoms`."""
+    import shapely
+
+    out = np.zeros(n_edges, bool)
+    geoms = [g_ for g_ in geoms if g_ is not None and not g_.is_empty]
+    if not geoms or len(px) == 0:
+        return out
+    tree = shapely.STRtree(geoms)
+    qi, _ = tree.query(shapely.points(px, py), predicate="dwithin", distance=radius)
+    out[np.asarray(pe)[qi]] = True
+    return out
+
+
+WATER_DROP = ("kept", "small", "stormwater", "motorway", "town", "narrow")
+
+
+def water_gate(highway, size, wfrac, dev, jdens, named, storm, mc: dict) -> np.ndarray:
+    """Why each water candidate edge is dropped (index into WATER_DROP; 0 =
+    kept), in this order:
+
+      small       size < water_min_size, or < water_named_min_size when a
+                  named lake, bay or river is near
+      narrow      unnamed water filling less than water_unnamed_min_wfrac
+                  of the 1 km disk (a creek or canal whose size comes from
+                  the lake it drains into)
+      stormwater  a stormwater area (basin, wastewater, small pond ...) is
+                  near and size < water_storm_override_size
+      motorway    a motorway edge
+      town        built up: dev >= water_town_dev or junction density >=
+                  water_town_junctions_km2
+
+    "big" water lifts the last three: named, size >= water_big_size and a
+    local water fraction (1 km disk) >= water_broad_wfrac, i.e. a named lake
+    or a wide river (Lake Ontario in a town, the Hudson under a motorway
+    bridge)."""
+    hw = np.asarray(highway).astype(str)
+    size, wfrac = np.asarray(size, dtype=np.float64), np.asarray(wfrac, dtype=np.float64)
+    named, storm = np.asarray(named, bool), np.asarray(storm, bool)
+    big = named & (size >= mc["water_big_size"]) & (wfrac >= mc["water_broad_wfrac"])
+    town = (np.asarray(dev) >= mc["water_town_dev"]) | (np.asarray(jdens) >= mc["water_town_junctions_km2"])
+    floor = np.where(named, mc["water_named_min_size"], mc["water_min_size"])
+    reason = np.zeros(len(hw), np.int8)
+    reason[size < floor] = 1
+    reason[(reason == 0) & ~named & (wfrac < mc.get("water_unnamed_min_wfrac", 0.0))] = 5
+    reason[(reason == 0) & storm & (size < mc["water_storm_override_size"]) & ~big] = 2
+    reason[(reason == 0) & (hw == "motorway") & ~big] = 3
+    reason[(reason == 0) & town & ~big] = 4
+    return reason
+
+
+def type_allowed(highway, moment_type: str, motorway_types) -> np.ndarray:
+    """Per edge, whether it may hold a moment of `moment_type`: any
+    non-motorway edge, and motorway edges only for the types listed in
+    motorway_types."""
+    hw = np.asarray(highway).astype(str)
+    if moment_type in set(motorway_types):
+        return np.ones(len(hw), bool)
+    return hw != "motorway"
+
+
+def thin_heads(m, x, y, radius: float) -> np.ndarray:
+    """Greedy thinning, best m first: a point within `radius` of a better
+    kept point is dropped. Returns the kept mask (input order)."""
+    from scipy.spatial import cKDTree
+
+    n = len(m)
+    keep = np.zeros(n, bool)
+    if n == 0:
+        return keep
+    xy = np.column_stack([x, y])
+    tree = cKDTree(xy)
+    gone = np.zeros(n, bool)
+    for i in np.lexsort((np.arange(n), -np.asarray(m, dtype=np.float64))):
+        if gone[i]:
+            continue
+        keep[i] = True
+        gone[np.asarray(tree.query_ball_point(xy[i], radius), dtype=np.int64)] = True
+    return keep
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +502,7 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     W = sig.column("W").to_numpy().astype(np.float64)
     Vw = sig.column("V_water").to_numpy().astype(np.float64)
     excluded = sig.column("excluded").to_numpy()
+    dev = sig.column("dev").to_numpy().astype(np.float64)
     key = sig.column("key").to_numpy()
     hw = _dict_col(et, "highway").astype(str)
     ref, name = _dict_col(et, "ref"), _dict_col(et, "name")
@@ -349,6 +512,14 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     smp = load_samples(out_dir / "samples.npz", fp)
     sx_all, sy_all, se_all = smp["x"].astype(np.float64), smp["y"].astype(np.float64), smp["edge"]
     mx, my = edge_midpoints(sx_all, sy_all, se_all, n_e)
+    u, v = et.column("u").to_numpy().astype(np.int64), et.column("v").to_numpy().astype(np.int64)
+    n_nodes = int(max(u.max(), v.max())) + 1 if n_e else 0
+    node_x, node_y = np.full(n_nodes, np.nan), np.full(n_nodes, np.nan)
+    e_first = np.searchsorted(se_all, np.arange(n_e))
+    e_last = np.searchsorted(se_all, np.arange(n_e), side="right") - 1
+    node_x[u], node_y[u] = sx_all[e_first], sy_all[e_first]
+    node_x[v], node_y[v] = sx_all[e_last], sy_all[e_last]
+    del e_first, e_last
     keep = ok_edge[se_all]
     sx, sy, se = sx_all[keep], sy_all[keep], se_all[keep]
     del sx_all, sy_all, se_all
@@ -361,6 +532,21 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     z[bad] = lookup(g90, dem90, sx[bad], sy[bad], fallback=0.0)
 
     m_type = np.zeros((n_e, len(TYPES)))
+    ft = pq.read_table(out_dir / "osm_features.parquet")
+    kind = ft.column("kind").to_pylist()
+    kind = np.asarray(kind, dtype=object)
+    flon, flat = ft.column("lon").to_numpy(), ft.column("lat").to_numpy()
+    fname = np.asarray(ft.column("name").to_pylist(), dtype=object)
+    fwkb = ft.column("wkb").to_pylist()
+    farea = ft.column("area_m2").to_numpy() if "area_m2" in ft.column_names else np.full(len(kind), np.nan)
+    ftag = np.asarray(ft.column("tag").to_pylist() if "tag" in ft.column_names else [None] * len(kind),
+                      dtype=object)
+
+    def pts_of(kinds):
+        sel = np.flatnonzero(np.isin(kind, kinds) & np.isfinite(flon))
+        x, y = project_lonlat(flon[sel], flat[sel])
+        return x, y, sel
+
 
     # water ------------------------------------------------------------------
     wcand = ok_edge & ((W >= mc["water_W"]) | (Vw >= mc["water_V"]))
@@ -386,37 +572,59 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     size_view = np.zeros(n_e)
     np.maximum.at(size_view, se[pw], sv)
     size_e = np.where(Vw >= mc["water_V"], np.maximum(size_e, size_view), size_e)
-    m_type[:, 0] = np.where(wcand, water_value(W, Vw, size_e, mc), 0.0)
+    m_water = np.where(wcand, water_value(W, Vw, size_e, mc), 0.0)
     info["water_edges"] = int(wcand.sum())
+
+    # water gate (Moments v0.3): size or name, stormwater, motorways, towns
+    from .water import project_wkb
+
+    wf90 = read_tif(rasters_dir / "wfrac90.tif")
+    rb = int(round(mc["water_broad_radius_m"] / g90.res))
+    wf_near = ndimage.maximum_filter(wf90, size=2 * rb + 1) if rb > 0 else wf90
+    del wf90
+    wf_pt = lookup(g90, wf_near, sx[pw], sy[pw])
+    wfrac_e = np.zeros(n_e)
+    np.maximum.at(wfrac_e, se[pw], wf_pt)
+    has_wkb = np.asarray([w_ is not None for w_ in fwkb])
+    big_named = np.flatnonzero(np.isin(kind, ["water", "bay"]) & has_wkb & (np.nan_to_num(farea) >= mc["water_named_min_m2"]))
+    rivers = np.flatnonzero((kind == "river") & has_wkb)
+    storm = np.flatnonzero((kind == "stormwater") & has_wkb)
+    river_g = project_wkb([fwkb[i] for i in rivers])
+    named_e = (edges_near(sx[pw], sy[pw], se[pw], project_wkb([fwkb[i] for i in big_named]), mc["size_radius_m"],
+                          n_e)
+               | edges_near(sx[pw], sy[pw], se[pw], river_g, mc["river_name_m"], n_e))
+    # a wide river's named centre line can be far from the shore (the Hudson
+    # is 1-2 km wide; its area polygons carry no name)
+    pb = np.flatnonzero(wfrac_e[se[pw]] >= mc["water_broad_wfrac"])
+    named_e |= edges_near(sx[pw][pb], sy[pw][pb], se[pw][pb], river_g, mc["river_wide_name_m"], n_e)
+    del river_g
+    storm_e = edges_near(sx[pw], sy[pw], se[pw], project_wkb([fwkb[i] for i in storm]), mc["water_storm_m"], n_e)
+    we = np.flatnonzero(wcand)
+    jd = junction_density(u, v, node_x, node_y, mx[we], my[we], mc["water_town_junction_radius_m"])
+    why = water_gate(hw[we], size_e[we], wfrac_e[we], dev[we], jd, named_e[we], storm_e[we], mc)
+    m_water[we[why > 0]] = 0.0
+    m_type[:, 0] = m_water
+    info["water_gate_edges"] = {WATER_DROP[k]: int((why == k).sum()) for k in range(len(WATER_DROP))}
+    del node_x, node_y
 
     # vista ------------------------------------------------------------------
     open_pt = lookup(g90, read_tif(rasters_dir / "open90.tif"), sx, sy)
     min3k = lookup(g90, read_tif(rasters_dir / "min3k90.tif"), sx, sy, np.nan)
     drop = z - min3k
     vc = np.flatnonzero((open_pt >= mc["vista_open"]) & (drop >= mc["vista_drop_m"]))
-    sight = far_sight(sx[vc], sy[vc], z[vc] + cfg["water"]["eye_m"], g90, dem90, mc["vista_rays"],
+    rays = sight_rays(sx[vc], sy[vc], z[vc] + cfg["water"]["eye_m"], g90, dem90, mc["vista_rays"],
                       mc["vista_far_m"], cfg["water"]["terrain_tol_m"], mc["vista_seen_below_m"])
-    vp = vc[sight >= mc["vista_sight_m"]]
+    n_far = (rays >= mc["vista_sight_m"]).sum(axis=1)
+    del rays
+    vp = vc[n_far >= mc["vista_min_rays"]]
     vdrop = np.zeros(n_e)
     np.maximum.at(vdrop, se[vp], drop[vp])
     m_type[:, 1] = np.where(vdrop > 0, vista_value(vdrop, mc), 0.0)
-    info.update(vista_points_open_drop=int(len(vc)), vista_points=int(len(vp)),
-                vista_edges=int((vdrop > 0).sum()))
+    info.update(vista_points_open_drop=int(len(vc)), vista_points_any_ray=int((n_far >= 1).sum()),
+                vista_points=int(len(vp)), vista_edges=int((vdrop > 0).sum()))
     del open_pt, min3k
 
     # gorge / falls and OSM viewpoints ----------------------------------------
-    ft = pq.read_table(out_dir / "osm_features.parquet")
-    kind = ft.column("kind").to_pylist()
-    kind = np.asarray(kind, dtype=object)
-    flon, flat = ft.column("lon").to_numpy(), ft.column("lat").to_numpy()
-    fname = np.asarray(ft.column("name").to_pylist(), dtype=object)
-    fwkb = ft.column("wkb").to_pylist()
-
-    def pts_of(kinds):
-        sel = np.flatnonzero(np.isin(kind, kinds) & np.isfinite(flon))
-        x, y = project_lonlat(flon[sel], flat[sel])
-        return x, y, sel
-
     wfx, wfy, wsel = pts_of(["waterfall"])
     cl = np.flatnonzero((kind == "cliff"))
     cl_line = [i for i in cl if fwkb[i] is not None]
@@ -455,7 +663,12 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     gb = np.zeros(n_e, bool)
     gb[be] = deck - low_e[be] >= mc["gorge_bridge_drop_m"]
     info.update(bridge_edges=int(br.sum()), bridge_edges_over_water=int(over.sum()), gorge_bridge_edges=int(gb.sum()))
-    m_type[:, 2] = np.where(gorge | gb, mc["gorge_m"], 0.0)
+    # motorways: only the types in motorway_types (cliffs and waterfalls by a
+    # motorway are mostly road cuts; water has its own gate)
+    on = lambda t_: type_allowed(hw, t_, mc["motorway_types"])  # noqa: E731
+    m_type[:, 1] = np.where(on("vista"), m_type[:, 1], 0.0)
+    m_type[:, 2] = np.where((gorge & on("gorge")) | (gb & on("gorge_bridge")), mc["gorge_m"], 0.0)
+    gfeat[~on("gorge")] = -1  # a motorway gorge_bridge by a road cut is not named after the cliff
     del dem30
 
     vfx, vfy, vsel = pts_of(["viewpoint"])
@@ -463,8 +676,9 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     vfeat = np.full(n_e, -1, np.int64)
     h = np.flatnonzero(hit >= 0)
     vfeat[se[h]] = vsel[hit[h]]
-    m_type[:, 3] = np.where(vfeat >= 0, mc["osm_m"], 0.0)
+    m_type[:, 3] = np.where((vfeat >= 0) & on("osm"), mc["osm_m"], 0.0)
     info["osm_viewpoint_edges"] = int((vfeat >= 0).sum())
+    vfeat[~on("osm")] = -1
 
     # cluster ----------------------------------------------------------------
     m_type[~ok_edge] = 0
@@ -474,6 +688,17 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     heads, owner = cluster(m_edge[cand], mx[cand], my[cand], key[cand], mc["cluster_road_m"],
                            mc["cluster_cross_m"])
     info["candidate_moment_edges"] = int(len(cand))
+    # vistas: at most one per vista_spacing_m (the best by m); the others go
+    # with their member edges
+    is_v = t_edge[cand[heads]] == 1
+    keep_h = np.ones(len(heads), bool)
+    keep_h[is_v] = thin_heads(m_edge[cand[heads[is_v]]], mx[cand[heads[is_v]]], my[cand[heads[is_v]]],
+                              mc["vista_spacing_m"])
+    info["vistas_thinned"] = int((~keep_h).sum())
+    hpos = np.full(len(cand), -1, np.int64)
+    hpos[heads] = np.arange(len(heads))
+    alive = keep_h[hpos[owner]]
+    heads = heads[keep_h]
 
     # names --------------------------------------------------------------------
     hx, hy = mx[cand[heads]], my[cand[heads]]
@@ -484,7 +709,11 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
             feature[j] = fname[vfeat[e]] or "viewpoint"
         elif t_edge[e] == 2 and gfeat[e] >= 0:
             feature[j] = fname[gfeat[e]] or ("waterfall" if kind[gfeat[e]] == "waterfall" else "cliff")
-    feature = _name_water(feature, hx, hy, kind, fname, fwkb, mc)
+    # broad water at the head: water candidates carry wfrac_e, other types
+    # (gorge_bridge, vista) only the value at the head point
+    wide = np.maximum(wfrac_e[he], lookup(g90, wf_near, hx, hy)) >= mc["water_broad_wfrac"]
+    del wf_near
+    feature, parent = _name_water(feature, hx, hy, kind, fname, fwkb, farea, ftag, flon, flat, mc, wide=wide)
     plx, ply, psel = pts_of(["place"])
     prank = np.asarray([PLACE_RANK.get(p, 9) for p in ft.column("place").to_pylist()])[psel]
     big_place = prank <= PLACE_RANK["hamlet"]
@@ -496,7 +725,8 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
     members = [[] for _ in heads]
     pos = {int(h_): j for j, h_ in enumerate(heads)}
     for i, o in enumerate(owner):
-        members[pos[int(o)]].append(int(cand[i]))
+        if alive[i]:
+            members[pos[int(o)]].append(int(cand[i]))
     tbl = pa.table({
         "id": pa.array(np.arange(len(heads), dtype=np.int32)),
         "type": pa.array([TYPES[t] for t in t_edge[he]]),
@@ -507,6 +737,7 @@ def detect(graph_dir: Path, out_dir: Path, rasters_dir: Path, cfg: dict, log=pri
         "key": pa.array(key[he].astype(np.int64)),
         "road": pa.array(list(road), pa.string()),
         "feature": pa.array(list(feature), pa.string()),
+        "parent_feature": pa.array(list(parent), pa.string()),
         "place": pa.array(list(place), pa.string()),
         "label": pa.array([_label(f, r_, p) for f, r_, p in zip(feature, road, place)]),
         "n_edges": pa.array(np.asarray([len(x) for x in members], dtype=np.int32)),
@@ -529,28 +760,102 @@ def _unproject(x, y, crs: str = "EPSG:5070"):
     return np.asarray(lon), np.asarray(lat)
 
 
-def _name_water(feature, hx, hy, kind, fname, fwkb, mc):
-    """Fill unnamed moments with the nearest named lake (within
-    water_name_m) or river (within river_name_m)."""
+def _name_water(feature, hx, hy, kind, fname, fwkb, farea, ftag, flon, flat, mc, wide=None):
+    """Fill unnamed moments with the most specific named water near them.
+
+    Lakes (named water areas of at least water_named_min_m2) and bays
+    (natural=bay/strait areas, water=bay) within water_name_m are
+    candidates. The nearest one is the fallback; a smaller one wins when it
+    is at most name_slack_m farther and is a bay or touches the nearest one
+    (within name_touch_m: a bay or arm of the lake, not a pond behind the
+    shore). If the pick is still a large body (>= bay_node_parent_m2) a
+    named natural=bay node within bay_node_m names it instead. Moments with
+    no lake or bay take the nearest named river within river_name_m, or
+    within river_wide_name_m where `wide` (broad water at the moment).
+
+    Returns (feature, parent): parent is the water body the name belongs
+    to, for spacing and grouping: for a bay polygon the largest candidate
+    it touches (within name_touch_m), for an arm that won over the nearest
+    body that body, for a bay node the body it names a part of, and the
+    feature itself otherwise."""
     import shapely
 
     from .water import project_wkb
 
+    parent = feature.copy()
     todo = np.flatnonzero(feature == None)  # noqa: E711
     if len(todo) == 0:
-        return feature
+        return feature, parent
+    has = np.asarray([w_ is not None for w_ in fwkb])
+    area = np.nan_to_num(np.asarray(farea, dtype=np.float64))
+    bayish = (kind == "bay") | (np.asarray(ftag, dtype=object) == "bay")
+    idx = np.flatnonzero(has & (((kind == "water") & (area >= mc["water_named_min_m2"])) | (kind == "bay")))
     pts = shapely.points(hx[todo], hy[todo])
-    for k, radius in (("water", mc["water_name_m"]), ("river", mc["river_name_m"])):
-        idx = np.flatnonzero(kind == k)
-        if len(idx) == 0 or len(todo) == 0:
-            continue
+    named = np.zeros(len(todo), bool)
+    if len(idx):
         geoms = project_wkb([fwkb[i] for i in idx])
         tree = shapely.STRtree(geoms)
-        (qi, gi), d = tree.query_nearest(pts, max_distance=radius, return_distance=True, all_matches=False)
-        feature[todo[qi]] = fname[idx[gi]]
-        left = np.setdiff1d(np.arange(len(todo)), qi)
-        todo, pts = todo[left], pts[left]
-    return feature
+        qi, gi = tree.query(pts, predicate="dwithin", distance=mc["water_name_m"])
+        d = shapely.distance(pts[qi], geoms[gi])
+        touch: dict = {}
+        bx, by, bsel = np.zeros(0), np.zeros(0), np.zeros(0, np.int64)
+        bn = np.flatnonzero((kind == "bay") & ~has & np.isfinite(flon))
+        if len(bn):
+            from .score import project_lonlat
+
+            bx, by = project_lonlat(flon[bn], flat[bn])
+            bsel = bn
+        for q in np.unique(qi):
+            rows = np.flatnonzero(qi == q)
+            near = rows[np.argmin(d[rows])]
+            g0 = gi[near]
+            best = g0
+            for r in rows:
+                g1 = gi[r]
+                if g1 == g0 or d[r] > d[near] + mc["name_slack_m"] or area[idx[g1]] >= area[idx[best]]:
+                    continue
+                ok = bayish[idx[g1]]
+                if not ok:
+                    k_ = (int(g1), int(g0))
+                    if k_ not in touch:
+                        touch[k_] = bool(shapely.dwithin(geoms[g1], geoms[g0], mc["name_touch_m"]))
+                    ok = touch[k_]
+                if ok:
+                    best = g1
+            name = fname[idx[best]]
+            top = g0  # an arm that won over the nearest body belongs to it
+            if bayish[idx[best]]:  # a bay belongs to the largest body it touches
+                top = best
+                for r in rows:
+                    g1 = gi[r]
+                    if area[idx[g1]] > area[idx[top]]:
+                        k_ = (int(g1), int(best))
+                        if k_ not in touch:
+                            touch[k_] = bool(shapely.dwithin(geoms[g1], geoms[best], mc["name_touch_m"]))
+                        if touch[k_]:
+                            top = g1
+            parent[todo[q]] = fname[idx[top]]
+            if area[idx[best]] >= mc["bay_node_parent_m2"] and len(bsel):
+                dd = np.hypot(bx - hx[todo[q]], by - hy[todo[q]])
+                j = int(np.argmin(dd))
+                if dd[j] <= mc["bay_node_m"]:
+                    name = fname[bsel[j]]
+            feature[todo[q]] = name
+            named[q] = True
+    wide = np.zeros(len(feature), bool) if wide is None else np.asarray(wide, bool)
+    left = np.flatnonzero(~named)
+    todo, pts = todo[left], pts[left]
+    ridx = np.flatnonzero((kind == "river") & has)
+    if len(ridx) and len(todo):
+        geoms = project_wkb([fwkb[i] for i in ridx])
+        tree = shapely.STRtree(geoms)
+        radius = np.where(wide[todo], max(mc["river_wide_name_m"], mc["river_name_m"]), mc["river_name_m"])
+        (qi, gi), d = tree.query_nearest(pts, max_distance=float(radius.max()), return_distance=True,
+                                         all_matches=False)
+        ok = d <= radius[qi]
+        feature[todo[qi[ok]]] = fname[ridx[gi[ok]]]
+        parent[todo[qi[ok]]] = fname[ridx[gi[ok]]]
+    return feature, parent
 
 
 def load_moments(path: Path, fingerprint: str | None = None):

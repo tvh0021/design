@@ -191,8 +191,44 @@ osm_viewpoint_m = 100.0   # tourism=viewpoint within this of a sample point
 osm_m = 0.7
 cluster_road_m = 2000.0   # one moment per 2 km of the same road key ...
 cluster_cross_m = 1000.0  # ... and per 1 km across roads
-water_name_m = 1500.0     # labels: nearest named lake within this, else river within river_name_m
+water_name_m = 1500.0     # labels: named lake or bay within this, else river within river_name_m
 river_name_m = 300.0
+river_wide_name_m = 1500.0  # ... or within this where the water is broad (water_broad_wfrac)
+# Moments v0.3 (docs/SCORE_SPEC.md "Moments v0.3").
+# OSM layers (osm_features stage): named water areas from this size; unnamed
+# water=pond under pond_floor_m2 counts as stormwater with basins etc.
+osm_water_min_m2 = 1e4
+pond_floor_m2 = 4e4
+# Water gate. size is the water size score (log10 area: 0.25 = 10 ha,
+# 0.4 = 40 ha, 0.5 = 1 km2, 0.6 = 4 km2) within size_radius_m of the edge.
+water_min_size = 0.40          # unnamed water needs at least this ...
+water_named_min_size = 0.25    # ... a named lake, bay or river this
+water_named_min_m2 = 1e5       # named lake/bay areas this big within size_radius_m (rivers within river_name_m)
+water_storm_m = 100.0          # stormwater area this close ...
+water_storm_override_size = 0.5  # ... drops the edge unless size reaches this
+water_town_dev = 0.30          # built up: developed share (dev) at least this ...
+water_town_junctions_km2 = 30.0  # ... or this many junctions per km2 ...
+water_town_junction_radius_m = 400.0  # ... within this of the edge midpoint
+# Towns and motorways keep only big water: named, size >= water_big_size and
+# a 1 km disk water fraction >= water_broad_wfrac within water_broad_radius_m.
+water_big_size = 0.6
+water_broad_wfrac = 0.20
+water_broad_radius_m = 300.0
+water_unnamed_min_wfrac = 0.06  # unnamed water must fill this share of the 1 km disk (within 300 m)
+# Vistas: at least vista_min_rays of the vista_rays azimuths reach
+# vista_sight_m; at most one vista per vista_spacing_m.
+vista_min_rays = 3
+vista_spacing_m = 5000.0
+# Moment types allowed on motorway edges (water also needs big water, see
+# above; "gorge" = OSM cliff or waterfall, "gorge_bridge" = deep bridge).
+motorway_types = ["water", "vista", "gorge_bridge"]
+# Labels: named lakes of at least water_named_min_m2 and bays; a smaller lake
+# or bay within name_slack_m of the nearest one wins if it is a bay or
+# touches it.
+name_slack_m = 300.0
+name_touch_m = 50.0
+bay_node_parent_m2 = 1e8       # a named bay node within bay_node_m names a moment on a body this big
+bay_node_m = 800.0
 place_radius_m = 15000.0  # nearest city, town, village or hamlet
 
 [route]
@@ -214,8 +250,14 @@ via_min_extra_min = 1.0   # extra minutes floor when ranking m / extra minutes
 moment_radius_m = 100.0   # a moment counts when the route passes this close (or drives one of its edges)
 moment_spacing_km = 2.0   # at most one moment per 2 km of route
 feature_spacing_km = 10.0 # the same named lake/river/falls counts again only 10 km further on
-moments_per_hour = 6.0    # and 6 per hour of the fastest time
+moments_per_hour = 8.0    # and 8 per hour of the fastest time ...
+moments_min_cap = 3       # ... but at least 3 on short trips
+moment_power = 2.0        # a moment earns m ** 2 points: m = 1 counts in full, a marginal m = 0.5 a quarter
 moment_minutes = 5.0      # a full moment (m = 1) is worth 5 scenic minutes
+# Picks: a larger budget whose best route shares more than this share of its
+# length with a smaller budget's pick takes the best route that does not ...
+pick_max_overlap = 0.8
+pick_min_score_frac = 0.85  # ... if it scores at least this share of the best; else it repeats the pick (shared)
 
 [output]
 heatmap_cell_m = 500.0

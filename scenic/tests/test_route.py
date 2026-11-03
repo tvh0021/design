@@ -102,3 +102,15 @@ def test_save_load_roundtrip(tmp_path):
     assert len(coords) == 5  # 3 + 3 points, shared junction counted once
     json.dumps(gj)
     assert dict(g.road_summary(r)).keys() == {"NY 5", "Elm St"}
+
+
+def test_road_summary_names_unnamed_ramps_in_words():
+    import types
+
+    import pyarrow as pa
+
+    table = pa.table({"ref": [None, None, "NY 5"], "name": [None, None, None],
+                      "highway": ["motorway_link", "unclassified", "primary"]})
+    fake = types.SimpleNamespace(edges_table=table, length_m=np.array([2000.0, 1000.0, 3000.0]))
+    got = dict(RoadGraph.road_summary(fake, types.SimpleNamespace(edges=[0, 1, 2])))
+    assert got == {"NY 5": 3.0, "ramp": 2.0, "unnamed road": 1.0}
