@@ -214,6 +214,8 @@ water_town_junction_radius_m = 400.0  # ... within this of the edge midpoint
 water_big_size = 0.6
 water_broad_wfrac = 0.20
 water_broad_radius_m = 300.0
+water_bridge_min_m = 500.0    # long wet decks can qualify despite diluted edge-average W/V
+water_bridge_wet_m = 200.0  # sampled length over areal water; excludes short creek/ditch crossings
 water_unnamed_min_wfrac = 0.06  # unnamed water must fill this share of the 1 km disk (within 300 m)
 # Vistas: at least vista_min_rays of the vista_rays azimuths reach
 # vista_sight_m; at most one vista per vista_spacing_m.
@@ -227,6 +229,11 @@ motorway_types = ["water", "vista", "gorge_bridge"]
 # touches it.
 name_slack_m = 300.0
 name_touch_m = 50.0
+# A named lake, bay or reservoir of at least lake_wins_min_m2 (not tagged
+# canal/river/stream) within lake_wins_m keeps the label even when a river,
+# creek or canal line is nearer (a creek crossing on a lakeshore road).
+lake_wins_min_m2 = 1e6
+lake_wins_m = 400.0
 bay_node_parent_m2 = 1e8       # a named bay node within bay_node_m names a moment on a body this big
 bay_node_m = 800.0
 place_radius_m = 15000.0  # nearest city, town, village or hamlet

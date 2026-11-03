@@ -716,3 +716,87 @@ Thousand Islands bridge is still missed; its edge never reaches the water
 threshold (W 0.45, V_water 0.65). Gorge moments rose from 278 to 299, and
 osm from 61 to 66. These are edges that had held a vista or water moment,
 the better type, and now fall back to gorge or osm.
+
+### Moment geometry corrections
+
+Named canal lines now join named river lines in the water gate and labels.
+A waterway relation supplies its name to unnamed river or canal member ways
+when membership gives one unambiguous name. An unnamed canal segment also
+inherits a name through canal endpoints no more
+than 1 m apart, iteratively along connected segments. A segment adjacent
+to conflicting names stays unnamed. Streams and detached parallel canals
+cannot inherit a name. The size, stormwater and town filters still apply.
+
+Water labels compare distances to the selected lake or bay polygon and
+the nearest named river or canal line. The line wins only when it is
+closer, within the existing river naming radius, and no large lake is
+next to the moment: a named lake, bay or reservoir polygon of at least
+`lake_wins_min_m2` (1 km²), not tagged `water=canal` (nor river or
+stream), within `lake_wins_m` (400 m) of the moment keeps the polygon
+pick over any nearer line. A lakeshore road that crosses a creek mouth is
+the lake (Canadaway Creek on NY 5 at Dunkirk is Lake Erie; Sandy Creek on
+the Lake Ontario State Parkway is Lake Ontario, the lake there lying 304 m
+off), while Lewiston stays the Niagara River: the
+Chippawa-Queenston Power Canal polygon is tagged canal, 0.45 km², and 841
+m and 1358 m from those two moments. Lake arms and bay names retain the
+existing specificity and parent-body rules. A road inside a named lake
+polygon therefore keeps its lake name.
+
+One name now covers the whole Erie Canal (49 moments). The route
+search allows one via moment per name, so all Erie Canal moments compete
+for a single via slot. This is why V1 Rochester to Syracuse lost its
+1.2–1.3 budget band: the alternatives that filled it had passed canal
+moments that are now all named Erie Canal. The search is unchanged.
+
+A bridge edge at least `water_bridge_min_m` long, with at least
+`water_bridge_wet_m` of sampled length over areal water, can become a
+water candidate even if its edge-average W and V_water miss their usual
+thresholds. This additional candidate needs nearby named water or a named bridge, and the
+existing broad-water fraction. Its value uses max(W, V_water) times the usual water-size factor. This addresses long bridge decks whose averaged
+signals dilute the view over the middle of the span. Motorway water
+candidates must also meet the long wet bridge rule and the existing big
+named broad-water gate. Proximity to a large lake alone is insufficient.
+
+Clustering ranks long water-bridge candidates ahead of shore-road candidates, then
+by moment value within each group. The representative point remains on
+the chosen edge. This puts a bridge moment on its deck instead of a shore
+road up to 2 km away. A cluster anchored on a long water bridge takes the
+highest value among its member edges as its value `m`, not the deck
+edge's own (the deck's averaged signals are diluted; the shore edges it
+absorbed are the evidence). Without this, 16 clusters lost value to their
+anchor (Bear Mountain 1.0 to 0.90, Mid-Hudson 1.0 to 0.93, Gowanus 1.0 to
+0.61, New Croton on the Taconic 0.89 to 0.67, City Ship Canal 1.0 to
+0.66); with it, 17 bridge-anchored values rise, those five back to 1.0,
+1.0, 1.0, 0.89 and 1.0. Other
+clusters keep their head edge's value, which is already the best member.
+The ranking bonus does not enter route rewards. Cluster radii and the V5
+300 m test remain unchanged. Applying the bonus only along the same road
+(the across-roads pass ranked by plain `m`) was tried and rejected: shore
+heads on other roads then absorb the decks, so Bear Mountain moves to
+Hessian Lake (V5 9/30 to 8/30) and the Mid-Hudson Bridge to Fallkill Creek.
+
+A bridge name is a fallback label when nearby named water geometry is
+absent. It comes only from the way's `bridge:name`, or from a `name` that
+contains Bridge, Viaduct or Causeway; a plain road name ("FDR Drive") is
+not a bridge name, and a bridge whose only name is its road's does not
+count as a named bridge for the water gate either. A label omits
+"on <road>" when the road and the feature have the same name
+("Williamsburg Bridge near New York").
+
+Moment stops must lie on the US side of the border. The mask is the union
+of New York, Pennsylvania, New Jersey, Connecticut, Massachusetts and
+Vermont from the public-domain U.S. Census Bureau 2023 TIGER/Line state
+file (the legal boundary, which extends into Lake Ontario, Lake Champlain
+and New York Harbor; the cartographic file is clipped at the shoreline and
+would drop the Verrazzano-Narrows and Lake Champlain bridges). It is saved
+as WGS84 GeoJSON in `data/boundary/new_york.geojson`; fetch it with
+`.venv/bin/python -m scenic.boundary`. The local PBF's clipped
+administrative relation is not used. A cluster stays when its
+representative point is within 200 m of the mask (EPSG:5070 metres), or
+when its own road edge touches a node inside it; the second rule keeps
+international bridges whose cluster point lands on the Canadian shore,
+while a road wholly on Wolfe Island goes. A drive may run through a
+neighbouring state and stop there. Filtering runs after clustering and
+naming, removes whole clusters, and records removed labels and counts in
+`score_report.json`. Missing or invalid boundary data stops moment
+generation. The stage fingerprints the file. The road graph is unchanged.
