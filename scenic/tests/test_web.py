@@ -826,3 +826,48 @@ def test_changed_points_rewrite_the_link():
 
 def test_app_js_has_no_unused_source_url():
     assert "SOURCE_URL" not in (web.STATIC_DIR / "app.js").read_text()
+
+
+# ---- page design: self-hosted Spectral (docs/WEB.md, "Design") ----------------------
+
+def test_vendored_fonts_referenced_by_app_css_exist():
+    css = (web.STATIC_DIR / "app.css").read_text()
+    urls = re.findall(r'url\(\s*"?([^")]+)"?\s*\)', css)
+    fonts = [u for u in urls if u.endswith(".woff2")]
+    assert len(fonts) == 6 and len(set(fonts)) == 6
+    for u in urls:
+        assert not re.match(r"(?:https?:|data:)?//", u), u  # self-hosted only (CSP default-src 'self')
+        f = web.STATIC_DIR / u
+        assert f.is_file(), u
+        if u.endswith(".woff2"):
+            assert f.read_bytes()[:4] == b"wOF2", u
+    assert css.count("font-display: swap") == 6
+    assert (web.STATIC_DIR / "vendor/spectral/OFL.txt").is_file()
+    html = (web.STATIC_DIR / "index.html").read_text()
+    assert "fonts.googleapis" not in html + css and "fonts.gstatic" not in html + css
+    for pre in re.findall(r'<link rel="preload" href="([^"]+)"', html):
+        assert (web.STATIC_DIR.parent / pre).is_file(), pre
+    assert web._TYPES[".woff2"] == "font/woff2"
+
+
+def test_page_carries_the_site_nav_and_no_email():
+    html = (web.STATIC_DIR / "index.html").read_text()
+    assert '<a class="mark" href="https://tvh0021.github.io/">Trung Ha</a>' in html
+    assert re.search(r'href="https://tvh0021.github.io/design/" aria-current="true">Projects<', html)
+    assert "mailto:" not in html and not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", html)
+
+
+def test_demo_html_still_finds_its_markers():
+    from scenic.web.demo import demo_html
+
+    out = demo_html((web.STATIC_DIR / "index.html").read_text())
+    assert out.count('<html lang="en" data-mode="demo">') == 1
+    assert out.count('http-equiv="Content-Security-Policy"') == 1
+    assert out.index('<meta charset="utf-8">') < out.index("Content-Security-Policy") < out.index("<title>")
+
+
+def test_demo_site_carries_the_fonts(demo_site):
+    css = (demo_site / "static/app.css").read_text()
+    for u in re.findall(r'url\(\s*"?([^")]+)"?\s*\)', css):
+        assert (demo_site / "static" / u).is_file(), u
+    assert (demo_site / "static/vendor/spectral/OFL.txt").is_file()

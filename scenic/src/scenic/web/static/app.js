@@ -70,7 +70,7 @@
   const BASES = { streets, topo, satellite };
   streets.addTo(map);
   L.control.layers({ "Streets (OpenStreetMap)": streets, "Terrain (USGS Topo)": topo,
-    "Satellite (USGS Imagery)": satellite }, null, { position: "topright", collapsed: false }).addTo(map);
+    "Satellite (USGS Imagery)": satellite }, null, { position: "topright", collapsed: window.matchMedia("(max-width: 900px)").matches }).addTo(map);
   // the routes, stops and place names are OpenStreetMap data whatever the base layer (ODbL)
   map.attributionControl.addAttribution('Routes: <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> data');
   L.control.scale({ imperial: true, metric: true }).addTo(map);

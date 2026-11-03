@@ -10,17 +10,24 @@
      so the page also works as the static demo under any folder (docs/PUBLISH.md). -->
 <link rel="stylesheet" href="static/vendor/leaflet-1.9.4/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=">
+<!-- Spectral, self-hosted (SIL OFL 1.1, static/vendor/spectral/OFL.txt): the website's typeface. -->
+<link rel="preload" href="static/vendor/spectral/spectral-300.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="static/app.css">
 <script src="static/vendor/leaflet-1.9.4/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" defer></script>
 <script src="static/app.js" defer></script>
 </head>
 <body>
+<!-- the website's navigation (tvh0021.github.io), scaled down; this page sits under Projects -->
+<header class="site-nav"><nav aria-label="Primary">
+  <a class="mark" href="https://tvh0021.github.io/">Trung Ha</a>
+  <ul><li><a href="https://tvh0021.github.io/">Home</a></li><li><a href="https://tvh0021.github.io/research.html">Research</a></li><li><a href="https://tvh0021.github.io/cv.html">CV</a></li><li><a href="https://tvh0021.github.io/design/" aria-current="true">Projects</a></li><li><a href="https://tvh0021.github.io/contact.html">Contact</a></li></ul>
+</nav></header>
 <aside id="panel">
-  <header>
+  <header class="page-head">
     <div>
       <h1>Maps for Wanderers</h1>
-      <p class="sub">Scenic drives across New York State</p>
+      <p class="kind">Scenic drives across New York State</p>
     </div>
     <div class="units" role="group" aria-label="Distance units">
       <button type="button" id="u-mi" aria-pressed="true">mi</button><button type="button" id="u-km" aria-pressed="false">km</button>
@@ -101,6 +108,10 @@
     Check the road and the weather before you drive.
     <span id="demo-foot" hidden>Map tiles load from OpenStreetMap and the USGS. This page stores nothing about
     you except your mi/km choice, kept in your own browser.</span>
+  </footer>
+  <footer class="site-foot">
+    <span>Trung Ha, PhD</span>
+    <a href="https://github.com/tvh0021/design/tree/main/scenic" target="_blank" rel="noopener noreferrer">Source</a>
   </footer>
 </aside>
 <main id="map" aria-label="Map"></main>

@@ -193,6 +193,46 @@ exact. The server keeps the last 8 searches for `/api/waypoints`.
 `reduce_to_waypoints` runs with `max_waypoints=9` and `follow_target=0.9`.
 Results are cached per search and route.
 
+## Design
+
+The page carries the look of the author's website (tvh0021.github.io), so
+the demo reads as part of it. A compact copy of the site's navigation runs
+across the top (the italic "Trung Ha" mark, then Home, Research, CV,
+Projects and Contact, with Projects marked as the current section), and the
+panel ends with the site's footer line. The page has no email address.
+
+- **Palette**, from the website's stylesheet (`style.css`, sampled from its
+  star-trails photograph): `--sky-deep #172030` page and nav background,
+  `--sky #222c3b` panel, `--line #3a4658` hairlines, `--trail #eef1f5`
+  text, `--haze #a3b0c1` secondary text, `--halpha #e8687b` accent (link
+  underlines, hover, focus ring, active tab, selected route and preset).
+  Hairline borders, square corners, no drop shadows on the panel. Banners
+  tint the dark background (grey for info, amber for warnings, halpha for
+  errors) with a coloured left rule.
+- **Data colours stay as they were**: the Okabe-Ito route colours, the
+  YlGnBu scenery classes, the stop-type tags and the A/B pins (the panel's
+  A and B discs get a light ring, as on the map). Leaflet's zoom, layer,
+  scale and attribution controls, popups and tooltips take the dark panel
+  colours with a hairline; the base maps are unchanged.
+- **Type**: Spectral, as on the website (body 300, headings 200 with tight
+  letter-spacing, italic for the subtitle and secondary lines). It is
+  self-hosted under `static/vendor/spectral/`: the latin-subset woff2 files
+  Google Fonts serves for weights 200, 300, 400, 600 and italic 300 and 400
+  (Spectral v15, fetched 2026-11-03), unchanged, with the SIL Open Font
+  License (`OFL.txt`). Six files, 88,608 bytes in all; a page loads the
+  ones it uses (five on the demo, about 73 KB). `app.css` declares them with
+  `font-display: swap` and falls back to Georgia, serif; characters outside
+  the latin subset (the arrows) come from the fallback.
+- **CSP**: unchanged. Fonts fall under `default-src 'self'`, so self-hosted
+  files load and no font host is allowed. The page links no Google Fonts.
+  `scenic serve` sends the files as `font/woff2`.
+- **Narrow screens** (under 900 px, where the website goes to one column):
+  the panel sits above the map, takes a bit under half the height and
+  scrolls on its own, so the map stays on screen.
+
+`test_vendored_fonts_referenced_by_app_css_exist` checks that every
+`url()` in `app.css` is a self-hosted file that exists.
+
 ## Notes
 
 - Searches and waypoint reductions run one at a time (one lock), since the
