@@ -1,4 +1,4 @@
-"""Command line: scenic fetch | build-graph | fastest | calibrate | fetch-layers | score."""
+"""Command line: scenic fetch | build-graph | fastest | route | serve | calibrate | fetch-layers | score."""
 
 from __future__ import annotations
 
@@ -56,6 +56,35 @@ def cmd_fastest(args) -> int:
     return 0
 
 
+def cmd_route(args) -> int:
+    from .search import Context, format_table, geojson, plot_routes, result_json, search
+
+    t0 = time.monotonic()
+    ctx = Context.load(args.graph, args.score)
+    t1 = time.monotonic()
+    res = search(ctx, args.from_, args.to)
+    if res is None:
+        print("no route found")
+        return 1
+    print(f"loaded in {t1 - t0:.1f} s; snapped start {res.snap['from_snap_m']:.0f} m, end {res.snap['to_snap_m']:.0f} m")
+    print(format_table(ctx, res))
+    if args.geojson:
+        Path(args.geojson).write_text(json.dumps(geojson(ctx, res)))
+        print(f"wrote {args.geojson}")
+    if args.json:
+        Path(args.json).write_text(json.dumps(result_json(ctx, res), indent=1))
+        print(f"wrote {args.json}")
+    if args.png:
+        print(f"wrote {plot_routes(ctx, res, args.png)}")
+    return 0
+
+
+def cmd_serve(args) -> int:
+    from .web.server import serve
+
+    return serve(port=args.port, graph_dir=args.graph, score_dir=args.score, verbose=args.verbose)
+
+
 def cmd_calibrate(args) -> int:
     from .calibrate import run_fit
     from . import data_dir
@@ -106,6 +135,23 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--geojson", type=Path, help="write the route as GeoJSON")
     r.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     r.set_defaults(func=cmd_fastest)
+
+    rt = sub.add_parser("route", help="fastest route and the most scenic route under +15, +30 and +50 %%")
+    rt.add_argument("--from", dest="from_", type=_latlon, required=True, metavar="LAT,LNG")
+    rt.add_argument("--to", type=_latlon, required=True, metavar="LAT,LNG")
+    rt.add_argument("--geojson", type=Path, help="write the routes and their moments as GeoJSON")
+    rt.add_argument("--png", type=Path, help="write a map of the routes")
+    rt.add_argument("--json", type=Path, help="write the summary table as JSON")
+    rt.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    rt.add_argument("--score", type=Path, help="score directory (default data/score)")
+    rt.set_defaults(func=cmd_route)
+
+    sv = sub.add_parser("serve", help="local map UI for route search (http://127.0.0.1:PORT/, docs/WEB.md)")
+    sv.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765)")
+    sv.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    sv.add_argument("--score", type=Path, help="score directory (default data/score)")
+    sv.add_argument("--verbose", action="store_true", help="log every request")
+    sv.set_defaults(func=cmd_serve)
 
     c = sub.add_parser("calibrate", help="write edge_delays.parquet (signal, stop and junction delays)")
     c.add_argument("--features", action="store_true", help="recount delay features from the PBF")

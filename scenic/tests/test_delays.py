@@ -7,9 +7,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from scenic import graph as G
+from scenic import calibrate as C
 from scenic.calibrate import (
-    FREE_FLOW, OSRM_ROUTING, PARAM_NAMES, PRIORS, Model, Trip, evaluate, fit_params, osrm_motorway_share,
-    sample_pairs,
+    FREE_FLOW, GOOGLE_TRIPS, OSRM_ROUTING, PARAM_NAMES, PRIORS, Model, Trip, at_bounds, calibrate, evaluate,
+    fit_params, google_trips, objective, osrm_motorway_share, ratio_table, sample_pairs,
 )
 from scenic.graph import (
     WayCollector, build_edge_delays, build_graph, control_kind, delayed_time, edge_delay_features,
@@ -133,6 +134,14 @@ def test_minor_ends(toy):
     assert f["minor_ends"][e["sec"]] == 0  # class change where the road just continues
 
 
+def test_minor_road(toy):
+    w, g, e = toy
+    f = edge_delay_features(w, g, make_controls([]))
+    assert f["minor_road"][e["ter"]]
+    assert not f["minor_road"][e["p1"]] and not f["minor_road"][e["sec"]]
+    assert not f["minor_road"][e["mw"]]  # motorways take their own factor
+
+
 def test_built_up_from_junction_density(toy, monkeypatch):
     w, g, e = toy
     monkeypatch.setattr(G, "BUILT_UP_MIN_JUNCTIONS", 4)
@@ -143,12 +152,15 @@ def test_built_up_from_junction_density(toy, monkeypatch):
 
 
 def test_delayed_time():
-    feats = {"motorway": np.array([True, False, False]), "built_up": np.array([False, False, True]),
-             "signals": np.array([0.0, 1.0, 2.0]), "crossings": np.array([0.0, 2.0, 0.0]),
-             "stops": np.array([0.0, 0.5, 0.0]), "minor_ends": np.array([0.0, 0.5, 1.0])}
-    p = {"motorway": 1.1, "rural": 1.2, "built_up": 1.5, "signal_s": 10.0, "stop_s": 4.0, "minor_end_s": 2.0}
-    t = delayed_time(np.array([100.0, 100.0, 100.0]), feats, p)
-    assert t == pytest.approx([110.0, 120 + 10 * (1 + G.CROSSING_AS_SIGNALS * 2) + 2 + 1, 150 + 20 + 2])
+    feats = {"motorway": np.array([True, False, False, False]), "built_up": np.array([False, False, True, False]),
+             "minor_road": np.array([False, False, True, True]),
+             "signals": np.array([0.0, 1.0, 2.0, 0.0]), "crossings": np.array([0.0, 2.0, 0.0, 0.0]),
+             "stops": np.array([0.0, 0.5, 0.0, 0.0]), "minor_ends": np.array([0.0, 0.5, 1.0, 0.0])}
+    p = {"motorway": 1.1, "rural": 1.2, "rural_minor": 0.8, "built_up": 1.5, "signal_s": 10.0, "stop_s": 4.0,
+         "minor_end_s": 2.0}
+    t = delayed_time(np.full(4, 100.0), feats, p)
+    # Built-up wins over minor road; rural_minor only applies outside built-up areas.
+    assert t == pytest.approx([110.0, 120 + 10 * (1 + G.CROSSING_AS_SIGNALS * 2) + 2 + 1, 150 + 20 + 2, 80.0])
 
 
 # ---- edge_delays.parquet ---------------------------------------------------
@@ -175,6 +187,21 @@ def test_load_rejects_edge_delays_without_fingerprint(tmp_path, toy):
     save_graph(w, g, tmp_path)
     pq.write_table(pa.table({"time_s": pa.array([1.0, 2.0])}), tmp_path / "edge_delays.parquet")
     with pytest.raises(ValueError, match="does not record which edges.parquet"):
+        RoadGraph.load(tmp_path)
+
+
+def test_load_rejects_edge_delays_missing_a_column(tmp_path, toy):
+    """A file from before a feature column existed fails loudly, for routing
+    and calibration alike, instead of loading stale times."""
+    w, g, _ = toy
+    save_graph(w, g, tmp_path)
+    feats = edge_delay_features(w, g, make_controls([]))
+    edges = pq.read_table(tmp_path / "edges.parquet")
+    write_edge_delays(feats, edges.column("time_s").to_numpy(), tmp_path)
+    path = tmp_path / "edge_delays.parquet"
+    t = pq.read_table(path)
+    pq.write_table(t.drop_columns(["minor_road"]).replace_schema_metadata(t.schema.metadata), path)
+    with pytest.raises(ValueError, match="lacks minor_road"):
         RoadGraph.load(tmp_path)
 
 
@@ -258,11 +285,11 @@ def test_build_edge_delays_refuses_a_different_graph(tmp_path):
 
 def test_fit_recovers_known_parameters():
     rng = np.random.default_rng(0)
-    truth = {"motorway": 1.05, "rural": 1.1, "built_up": 1.3,
+    truth = {"motorway": 1.05, "rural": 1.1, "rural_minor": 0.85, "built_up": 1.3,
              **{k: m for k, (m, _) in PRIORS.items()}}  # delays at the prior means
     p = np.array([truth[k] for k in PARAM_NAMES])
-    Xg = np.abs(rng.normal([3000, 2000, 800, 30, 3, 10], [1500, 1000, 400, 15, 2, 5], size=(4, 6)))
-    Xo = np.abs(rng.normal([50, 3000, 600, 10, 5, 15], [50, 1500, 400, 8, 4, 8], size=(40, 6)))
+    Xg = np.abs(rng.normal([3000, 1500, 800, 800, 30, 3, 10], [1500, 800, 600, 400, 15, 2, 5], size=(9, 7)))
+    Xo = np.abs(rng.normal([50, 1500, 1500, 600, 10, 5, 15], [50, 800, 800, 400, 8, 4, 8], size=(40, 7)))
     po = p.copy()
     po[PARAM_NAMES.index("signal_s")] = 2.0  # OSRM's own signal cost
     beta = 0.8
@@ -290,8 +317,8 @@ def test_osrm_trips_are_routed_with_osrm_signal_cost(tmp_path):
     model.set_params({**FREE_FLOW, "signal_s": 16.0})
     trip = [Trip("t", [(43.0, -77.0), (43.0, -77 + 2 * D)], 1.0, "osrm")]
     k = PARAM_NAMES.index("signal_s")
-    X_fit, _ = evaluate(model, trip)
-    X_osrm, _ = evaluate(model, trip, OSRM_ROUTING)
+    X_fit, _, _ = evaluate(model, trip)
+    X_osrm, _, _ = evaluate(model, trip, OSRM_ROUTING)
     assert X_fit[0, k] == 0.0  # detour
     assert X_osrm[0, k] == pytest.approx(1.0)  # through the signal
     assert model.params["signal_s"] == 16.0  # restored
@@ -313,3 +340,96 @@ def test_sample_pairs_distance_band():
     for (_, la, lo), (_, lb, lob) in pairs:
         km = G.haversine_m(lo, la, lob, lb) / 1000
         assert 20 <= km <= 80
+
+
+def test_google_trips_have_minutes_and_miles():
+    trips = google_trips()
+    assert len(trips) == len(GOOGLE_TRIPS) == 9
+    for t in trips:
+        assert t.source == "google" and len(t.points) >= 2
+        assert 20 <= t.ref_min <= 200 and 15 <= t.ref_mi <= 120
+        assert 25 <= t.ref_mi / (t.ref_min / 60) <= 65  # plausible mph
+
+
+class StubModel:
+    """Stands in for Model: each trip takes the cheapest of a few candidate
+    paths (feature sums) under the current parameters, like a router."""
+
+    def __init__(self, paths):
+        self.paths = paths  # trip key -> (n_paths, n_params) feature sums
+        self.params = dict(FREE_FLOW)
+        self.fitted = []  # every full parameter set the fit tried
+
+    def set_params(self, params):
+        if len(params) == len(PARAM_NAMES):
+            self.fitted.append(dict(params))
+        self.params = {**self.params, **params}
+
+    def trip(self, points):
+        p = np.array([self.params[k] for k in PARAM_NAMES])
+        cand = self.paths[points[0][0]]
+        x = cand[np.argmin(cand @ p)]
+        return x, float(x @ p / 60), 0.0, 1000.0
+
+
+def stub_problem(seed):
+    rng = np.random.default_rng(seed)
+    scale = np.array([600, 600, 600, 600, 5, 2, 5.0])
+    paths = {i: np.abs(rng.normal(1, 0.6, size=(3, 7))) * scale for i in range(7)}
+    google = [Trip(f"g{i}", [(i, 0), (i, 1)], rng.uniform(25, 45), "google") for i in range(3)]
+    osrm = [Trip(f"o{i}", [(i, 0), (i, 1)], rng.uniform(25, 45), "osrm") for i in range(3, 7)]
+    return StubModel(paths), google, osrm
+
+
+def own_route_objective(model, params, google, osrm):
+    saved = dict(model.params)
+    model.set_params(params)
+    Xg, _, _ = evaluate(model, google)
+    Xo, _, _ = evaluate(model, osrm, OSRM_ROUTING)
+    model.params = saved
+    return objective(params, Xg, np.array([t.ref_min * 60 for t in google]), Xo,
+                     np.array([t.ref_min * 60 for t in osrm]))[0]
+
+
+def test_calibrate_keeps_best_state_when_paths_cycle(monkeypatch):
+    """Seed 40 cycles: refitting on each state's routes moves to a state whose
+    routes fit worse. The fit must return the best state it saw, not the last."""
+    monkeypatch.setattr(C, "log", lambda msg: None)
+    model, google, osrm = stub_problem(40)
+    params, _ = calibrate(model, google, osrm, iters=10)
+    tried = model.fitted[:-1]  # the last entry is the best state being restored
+    costs = [own_route_objective(model, p, google, osrm) for p in tried]
+    best = own_route_objective(model, params, google, osrm)
+    assert best == pytest.approx(min(costs))
+    assert costs[-1] > best * 1.2  # the last state is worse, so this did cycle
+    assert model.params == params
+
+
+def test_leave_one_out_ignores_the_held_out_eta(monkeypatch):
+    """A fold must not see its held-out trip, not even through its start."""
+    monkeypatch.setattr(C, "log", lambda msg: None)
+    preds = []
+    for factor in (1.0, 2.0):
+        model, google, osrm = stub_problem(0)
+        google[0] = Trip(google[0].name, google[0].points, google[0].ref_min * factor, "google")
+        full, _ = calibrate(model, google, osrm)
+        rows = C.leave_one_out(model, google, osrm, full)
+        assert model.params == full
+        preds.append(rows[0]["min"])
+    assert preds[0] == pytest.approx(preds[1])
+
+
+def test_ratio_table_flags_different_path():
+    model, _, _ = stub_problem(0)
+    model.set_params({**FREE_FLOW, "signal_s": 10.0})
+    x, minutes, _, _ = model.trip([(0, 0), (0, 1)])
+    near = Trip("near", [(0, 0), (0, 1)], minutes, "google", 1000 / 1609.344 * 1.04)
+    far = Trip("far", [(0, 0), (0, 1)], minutes, "google", 1000 / 1609.344 * 1.10)
+    rows = ratio_table(model, [near, far])
+    assert [r["path_differs"] for r in rows] == [False, True]
+    assert rows[0]["ratio"] == pytest.approx(1.0)
+
+
+def test_at_bounds():
+    p = {**FREE_FLOW, "built_up": C.BOUNDS["built_up"][0], "signal_s": 20.0}
+    assert at_bounds(p) == ["built_up", "stop_s", "minor_end_s"]  # FREE_FLOW delays are 0, the lower bound

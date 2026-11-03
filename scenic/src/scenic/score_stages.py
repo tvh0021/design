@@ -375,6 +375,30 @@ def st_outputs(paths: Paths) -> dict:
     return {"heatmap": str(paths.p("out", "heatmap.png")), "summary": str(paths.p("out", "summary.md"))}
 
 
+def st_osm_features(paths: Paths) -> dict:
+    import collections
+
+    import pyarrow.parquet as pq
+
+    from .moments import read_osm_features
+
+    t = read_osm_features(paths.pbf)
+    out = paths.p("out", "osm_features.parquet")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(t, out, compression="zstd")
+    return {"features": dict(collections.Counter(t.column("kind").to_pylist()))}
+
+
+def st_moments(paths: Paths) -> dict:
+    import pyarrow.parquet as pq
+
+    from .moments import detect
+
+    tbl, info = detect(Path(paths.graph), Path(paths.out), Path(paths.rasters), _cfg(paths), log=_log)
+    pq.write_table(tbl, paths.p("out", "moments.parquet"), compression="zstd")
+    return info
+
+
 def st_validate(paths: Paths) -> dict:
     from .validate import run_validation
 
@@ -382,6 +406,18 @@ def st_validate(paths: Paths) -> dict:
     paths.p("out", "validation.json").write_text(json.dumps(res, indent=2) + "\n")
     return {"byways_pass": res.get("byways", {}).get("pass"), "spot_scenic_pass": res["spot_checks"]["scenic"]["pass"],
             "spot_dull_pass": res["spot_checks"]["dull"]["pass"]}
+
+
+def st_validate_routes(paths: Paths) -> dict:
+    from .validate import run_route_validation
+
+    res = run_route_validation(Path(paths.graph), Path(paths.out), Path(paths.config).parent, _cfg(paths)["route"],
+                               log=_log)
+    paths.p("out", "route_validation.json").write_text(json.dumps(res, indent=1) + "\n")
+    return {"pass": res["pass"], "v1": f"{res['v1']['passed']}/{res['v1']['of']} (bands {res['v1']['bands_passed']})",
+            "v2": f"{res['v2']['passed']}/{res['v2']['non_trivial']}",
+            "v5": f"{res['v5']['moments_hit']}/{res['v5']['of']}, non {res['v5']['non_moments_hit']}/"
+                  f"{res['v5']['non_of']}", "holdout2": res["holdout2"]["status"]}
 
 
 def _load_scores(paths: Paths):
@@ -441,12 +477,23 @@ def stages(paths: Paths) -> list[Stage]:
               ("combine", "penalty", "smoothing", "curves")),
         Stage("outputs", st_outputs, [O("scores.parquet"), O("samples.npz"), edges], [O("heatmap.png"), O("summary.md")],
               ("report", "score", "graph"), ("output",)),
+        Stage("osm_features", st_osm_features, [paths.pbf], [O("osm_features.parquet")], ("moments", "water")),
+        Stage("moments", st_moments,
+              [edges, O("edge_signals.parquet"), O("samples.npz"), O("osm_features.parquet"), R("grid.json"),
+               R("dem30.tif"), R("dem90.tif"), R("open90.tif"), R("min3k90.tif"), *water, R("bigwater_idx90.tif")],
+              [O("moments.parquet")], ("moments", "score", "rasters", "graph", "water"),
+              ("moments", "grid", "water")),
         Stage("validate", st_validate,
               [O("scores.parquet"), O("samples.npz"), O("edge_signals.parquet"), edges, *byway_in,
                cfgd / "spot_checks.toml", cfgd / "byways.toml",
                # RoadGraph.load reads these for the Rochester-Syracuse route
                paths.p("graph", "nodes.npz"), paths.p("graph", "edge_delays.parquet")],
               [O("validation.json")], ("validate", "score", "report", "route", "graph")),
+        Stage("validate_routes", st_validate_routes,
+              [O("scores.parquet"), O("moments.parquet"), O("samples.npz"), edges, paths.p("graph", "nodes.npz"),
+               paths.p("graph", "edge_delays.parquet"), cfgd / "spot_checks.toml"],
+              [O("route_validation.json")], ("validate", "search", "route", "moments", "score", "report", "graph"),
+              ("route",)),
     ]
 
 

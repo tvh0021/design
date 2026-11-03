@@ -1,26 +1,32 @@
 """Fit the delay model (graph.DELAY_PARAMS) to reference travel times.
 
 References:
-  - Google Maps ETAs from phase 0 (docs/phase0-results.md): the fastest
-    Rochester-Syracuse route and the back-road variants A, B, C.
+  - Google Maps ETAs checked by hand (GOOGLE_TRIPS): phase 0's fastest
+    Rochester-Syracuse route and back-road variants A, B, C
+    (docs/phase0-results.md), plus five shorter trips across upstate New
+    York. These set the model.
   - The public OSRM demo server on village-to-village trips across upstate
     New York with little motorway driving (OSRM is 24% slow on interstates,
-    so motorway speed is anchored to Google's fastest route instead).
+    so motorway speed is anchored to Google's fastest route instead). These
+    enter with a small weight (OSRM_WEIGHT): OSRM's car profile has its own
+    class speeds, which disagree with Google's on county roads.
 
 OSRM's car profile drives at about 0.8x the posted limit and charges only
 ~2 s per traffic signal, so its absolute times and its signal cost are
 properties of the profile, not of real traffic. OSRM trips therefore enter
 the fit with a free scale factor `beta` (ours = beta * OSRM) and with signals
-priced at OSRM's own 2 s, both when routing them and in their residual: they constrain how class, built-up areas, stop
-signs and junctions trade off against each other, while Google sets the
-absolute level. Neither source separates signal delay from a general
-slowdown (A, B, C and the fastest route have similar mixes), so the
+priced at OSRM's own 2 s, both when routing them and in their residual: they
+only nudge how class, built-up areas, stop signs and junctions trade off
+against each other, while Google sets the level and the class split. Google
+does not separate signal delay from a general town slowdown well, so the
 per-event delays carry weak priors from traffic engineering figures.
 
 The model is linear in its parameters for a fixed path, so the fit
 alternates: route every trip with the current parameters, sum each path's
 features, solve a bounded least-squares problem on log(ours / reference),
-repeat until the parameters settle.
+repeat until the parameters settle. Path changes can make this cycle, so
+the fit keeps the state with the lowest objective on its own routes.
+Leave-one-out over the Google trips checks it out of sample.
 
 OSRM requests go out at most once per second and are cached under
 ~/.cache/scenic-calibrate/ (override with SCENIC_CALIBRATE_CACHE), so reruns
@@ -54,39 +60,56 @@ OSRM_MIN_INTERVAL_S = 1.1
 OSRM_MAX_REQUESTS = 55  # hard cap per run; cache hits do not count
 
 # Parameter order for the linear model, bounds and priors (mean, sd).
-PARAM_NAMES = ("motorway", "rural", "built_up", "signal_s", "stop_s", "minor_end_s")
+PARAM_NAMES = ("motorway", "rural", "rural_minor", "built_up", "signal_s", "stop_s", "minor_end_s")
 BOUNDS = {
     "motorway": (0.8, 1.3),
-    "rural": (0.9, 1.5),
-    "built_up": (0.9, 2.0),
+    "rural": (0.8, 1.5),
+    "rural_minor": (0.7, 1.5),  # class default speeds (tertiary 40 mph) run below NY's 55
+    "built_up": (0.8, 2.0),
     "signal_s": (0.0, 40.0),
     "stop_s": (0.0, 20.0),
     "minor_end_s": (0.0, 15.0),
 }
-FREE_FLOW = {"motorway": 1.0, "rural": 1.0, "built_up": 1.0, "signal_s": 0.0, "stop_s": 0.0, "minor_end_s": 0.0}
+FREE_FLOW = {"motorway": 1.0, "rural": 1.0, "rural_minor": 1.0, "built_up": 1.0,
+             "signal_s": 0.0, "stop_s": 0.0, "minor_end_s": 0.0}
 # Average delay for a through car: signal ~15 s (HCM control delay, light
 # traffic), stop sign ~8 s (decelerate, stop, accelerate), junction ~3 s.
 PRIORS = {"signal_s": (15.0, 10.0), "stop_s": (8.0, 5.0), "minor_end_s": (3.0, 3.0)}
 PRIOR_WEIGHT = 0.1  # a 1-sd miss costs as much as a 10% miss on one trip
-GOOGLE_WEIGHT = 10.0  # per Google trip; each OSRM trip has weight 1
+# Per-trip weights on squared log errors: Google 9 x 10 = 90 against
+# OSRM 40 x 0.1 = 4, so Google decides wherever the two disagree.
+GOOGLE_WEIGHT = 10.0
+OSRM_WEIGHT = 0.1
 OSRM_SIGNAL_PENALTY_S = 2.0  # traffic_signal_penalty in OSRM's car profile
 # OSRM trips are routed with these overrides, matching their residual in fit_params.
 OSRM_ROUTING = {"signal_s": OSRM_SIGNAL_PENALTY_S}
 BETA_BOUNDS = (0.6, 1.4)
 
-# Phase 0 Google Maps ETAs, 2026-11-02 around 7 pm (light traffic).
+# Google Maps ground truth: name -> (stops (lat, lon), minutes, miles), as
+# shown by desktop Google Maps on 2026-11-02 in the evening (light traffic).
+# The first four are phase 0 (docs/phase0-results.md); the other five were
+# checked the same evening. Every trip is in the fit; the report flags a trip
+# whose route length differs from Google's by more than PATH_TOLERANCE, as
+# that means a different path rather than a speed error.
 ROC = (43.15729, -77.61521)
 SYR = (43.04812, -76.14742)
 GOOGLE_TRIPS = {
-    "fastest": ([ROC, SYR], 87.0),
+    "fastest": ([ROC, SYR], 87.0, 87.2),
     "A": ([ROC, (43.07109, -77.49198), (43.03791, -77.45410), (42.99236, -77.42724), (42.86230, -77.18485),
            (42.87303, -76.97127), (42.93097, -76.78126), (42.93991, -76.49489), (42.96821, -76.42691),
-           (43.03570, -76.34214), SYR], 150.0),
+           (43.03570, -76.34214), SYR], 150.0, 105.0),
     "B": ([ROC, (42.99236, -77.42724), (42.86230, -77.18485), (42.93991, -76.49489), (42.96821, -76.42691),
-           (43.03570, -76.34214), SYR], 138.0),
+           (43.03570, -76.34214), SYR], 138.0, 105.0),
     "C": ([ROC, (42.87303, -76.97127), (42.93991, -76.49489), (42.96821, -76.42691), (43.03570, -76.34214),
-           SYR], 127.0),
+           SYR], 127.0, 103.0),
+    "Potsdam-Massena": ([(44.66980, -74.98133), (44.93008, -74.89224)], 30.0, 20.4),
+    "Ulster-Arlington": ([(41.96266, -73.98986), (41.69580, -73.89649)], 40.0, 25.5),
+    "Ashford-Caneadea": ([(42.32034, -78.60808), (42.38645, -78.15362)], 36.0, 27.3),
+    "Richmond-Howard": ([(42.79059, -77.53194), (42.36424, -77.50888)], 43.0, 34.3),
+    "Lindley-Scio": ([(42.02841, -77.13969), (42.17146, -77.97861)], 72.0, 58.9),
 }
+PATH_TOLERANCE = 0.05
+METERS_PER_MILE = 1609.344
 
 # OD sampling: villages 20-80 km apart (straight line), upstate New York.
 OD_MIN_KM, OD_MAX_KM = 20.0, 80.0
@@ -162,6 +185,7 @@ class Trip:
     points: list[tuple[float, float]]  # (lat, lon), legs between consecutive points
     ref_min: float  # reference ETA in minutes
     source: str  # "google" or "osrm"
+    ref_mi: float | None = None  # reference route length (Google trips)
 
 
 def read_villages(pbf: Path) -> list[tuple[str, float, float]]:
@@ -225,9 +249,10 @@ class Model:
         self.free_s = d.column("free_time_s").to_numpy()
         mw = self.feats["motorway"].astype(bool)
         bu = self.feats["built_up"].astype(bool)
+        minor = self.feats["minor_road"].astype(bool)
         f = self.free_s
         self.X = np.column_stack([
-            f * mw, f * (~mw & ~bu), f * (~mw & bu),
+            f * mw, f * (~mw & ~bu & ~minor), f * (~mw & ~bu & minor), f * (~mw & bu),
             self.feats["signals"] + CROSSING_AS_SIGNALS * self.feats["crossings"],
             self.feats["stops"], self.feats["minor_ends"],
         ])
@@ -240,8 +265,8 @@ class Model:
         p = np.array([self.params[k] for k in PARAM_NAMES])
         self.g.set_time(self.X @ p)
 
-    def trip(self, points) -> tuple[np.ndarray, float, float]:
-        """Route all legs. Returns (feature sums, minutes, fast-road share)."""
+    def trip(self, points) -> tuple[np.ndarray, float, float, float]:
+        """Route all legs. Returns (feature sums, minutes, fast-road share, metres)."""
         xs = np.zeros(self.X.shape[1])
         length = fast = 0.0
         for a, b in zip(points[:-1], points[1:]):
@@ -252,7 +277,7 @@ class Model:
             length += r.length_m
             fast += self.g.length_m[r.edges][self.fast[r.edges]].sum()
         p = np.array([self.params[k] for k in PARAM_NAMES])
-        return xs, float(xs @ p / 60), fast / max(length, 1.0)
+        return xs, float(xs @ p / 60), fast / max(length, 1.0), length
 
 
 def build_osrm_trips(model: Model, osrm: Osrm, pbf: Path, n: int = N_TRIPS) -> list[Trip]:
@@ -263,7 +288,7 @@ def build_osrm_trips(model: Model, osrm: Osrm, pbf: Path, n: int = N_TRIPS) -> l
         if len(trips) >= n:
             break
         a, b = (la, lo), (lb, lob)
-        _, _, share = model.trip([a, b])
+        _, _, share, _ = model.trip([a, b])
         if share > MAX_FAST_SHARE:
             continue
         resp = osrm.route(a, b)
@@ -275,99 +300,165 @@ def build_osrm_trips(model: Model, osrm: Osrm, pbf: Path, n: int = N_TRIPS) -> l
 
 
 def google_trips() -> list[Trip]:
-    return [Trip(k, pts, m, "google") for k, (pts, m) in GOOGLE_TRIPS.items()]
+    return [Trip(k, pts, m, "google", mi) for k, (pts, m, mi) in GOOGLE_TRIPS.items()]
 
 
 # ----------------------------------------------------------------- fit ------
 
 
+_O_IDX = [PARAM_NAMES.index(k) for k in OSRM_ROUTING]
+_O_VAL = np.array(list(OSRM_ROUTING.values()))
+_PRIOR_IDX = [PARAM_NAMES.index(k) for k in PRIORS]
+_PRIOR_MU = np.array([m for m, _ in PRIORS.values()])
+_PRIOR_SD = np.array([s for _, s in PRIORS.values()])
+
+
+def residuals(p: np.ndarray, beta: float, Xg: np.ndarray, ref_g: np.ndarray, Xo: np.ndarray,
+              ref_o: np.ndarray) -> np.ndarray:
+    """Weighted residuals of the fit. Rows of Xg / Xo are path feature sums
+    (seconds of free flow per group, signals, stops, minor ends); ref_* are
+    reference times in seconds.
+      Google: sqrt(GOOGLE_WEIGHT) * log(Xg @ p / ref)
+      OSRM:   sqrt(OSRM_WEIGHT) * log(Xo @ p_osrm / (beta * ref)), p_osrm = p
+              with OSRM_ROUTING (OSRM's signal cost; route the OSRM trips with it too)
+      priors: PRIOR_WEIGHT * (p - mean) / sd"""
+    p = np.asarray(p, dtype=np.float64)
+    po = p.copy()
+    po[_O_IDX] = _O_VAL
+    return np.concatenate([
+        math.sqrt(GOOGLE_WEIGHT) * np.log(Xg @ p / ref_g),
+        math.sqrt(OSRM_WEIGHT) * np.log(Xo @ po / (beta * ref_o)),
+        PRIOR_WEIGHT * (p[_PRIOR_IDX] - _PRIOR_MU) / _PRIOR_SD,
+    ])
+
+
+def best_beta(p: np.ndarray, Xo: np.ndarray, ref_o: np.ndarray) -> float:
+    """The OSRM scale that minimises the OSRM residuals for fixed p."""
+    if not len(ref_o):
+        return 1.0
+    po = np.asarray(p, dtype=np.float64).copy()
+    po[_O_IDX] = _O_VAL
+    return float(np.clip(np.exp(np.mean(np.log(Xo @ po / ref_o))), *BETA_BOUNDS))
+
+
+def objective(params: dict, Xg: np.ndarray, ref_g: np.ndarray, Xo: np.ndarray,
+              ref_o: np.ndarray) -> tuple[float, float]:
+    """Sum of squared residuals at `params` with its best beta. Returns (objective, beta)."""
+    p = np.array([params[k] for k in PARAM_NAMES])
+    beta = best_beta(p, Xo, ref_o)
+    return float(np.sum(residuals(p, beta, Xg, ref_g, Xo, ref_o) ** 2)), beta
+
+
 def fit_params(Xg: np.ndarray, ref_g: np.ndarray, Xo: np.ndarray, ref_o: np.ndarray,
                x0: dict | None = None) -> tuple[dict, float]:
-    """Bounded least squares. Rows of Xg / Xo are path feature sums (seconds
-    of free flow per group, signals, stops, minor ends); ref_* are reference
-    times in seconds. Residuals:
-      Google: sqrt(GOOGLE_WEIGHT) * log(Xg @ p / ref)
-      OSRM:   log(Xo @ p_osrm / (beta * ref)), p_osrm = p with OSRM_ROUTING
-              (OSRM's signal cost; route the OSRM trips with it too)
-      priors: PRIOR_WEIGHT * (p - mean) / sd
-    Returns (params, beta)."""
+    """Bounded least squares on `residuals` for fixed paths. Returns (params, beta)."""
     from scipy.optimize import least_squares
 
     x0 = {**FREE_FLOW, **(x0 or {})}
-    o_idx = [PARAM_NAMES.index(k) for k in OSRM_ROUTING]
-    o_val = np.array(list(OSRM_ROUTING.values()))
     lo = np.array([BOUNDS[k][0] for k in PARAM_NAMES] + [BETA_BOUNDS[0]])
     hi = np.array([BOUNDS[k][1] for k in PARAM_NAMES] + [BETA_BOUNDS[1]])
     start = np.clip([x0[k] for k in PARAM_NAMES] + [1.0], lo + 1e-9, hi - 1e-9)
-    prior_idx = [PARAM_NAMES.index(k) for k in PRIORS]
-    prior_mu = np.array([m for m, _ in PRIORS.values()])
-    prior_sd = np.array([s for _, s in PRIORS.values()])
-
-    def resid(x):
-        p, beta = x[:-1], x[-1]
-        po = p.copy()
-        po[o_idx] = o_val
-        return np.concatenate([
-            math.sqrt(GOOGLE_WEIGHT) * np.log(Xg @ p / ref_g),
-            np.log(Xo @ po / (beta * ref_o)),
-            PRIOR_WEIGHT * (p[prior_idx] - prior_mu) / prior_sd,
-        ])
-
-    res = least_squares(resid, start, bounds=(lo, hi))
+    res = least_squares(lambda x: residuals(x[:-1], x[-1], Xg, ref_g, Xo, ref_o), start, bounds=(lo, hi))
     return dict(zip(PARAM_NAMES, (float(v) for v in res.x[:-1]))), float(res.x[-1])
 
 
-def evaluate(model: Model, trips: list[Trip], overrides: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+def at_bounds(params: dict, tol: float = 1e-3) -> list[str]:
+    """Names of parameters pinned at a bound."""
+    return [k for k in PARAM_NAMES
+            if min(abs(params[k] - BOUNDS[k][0]), abs(params[k] - BOUNDS[k][1])) <= tol * (abs(params[k]) + 1)]
+
+
+def evaluate(model: Model, trips: list[Trip], overrides: dict | None = None
+             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Route every trip under the model's current parameters, with
     `overrides` applied while routing. Returns the feature matrix (trips x
-    params) and our minutes under the parameters used for routing."""
+    params), our minutes under the parameters used for routing, and route
+    lengths in miles."""
     saved = dict(model.params)
     if overrides:
         model.set_params(overrides)
     try:
         X = np.zeros((len(trips), len(PARAM_NAMES)))
         mins = np.zeros(len(trips))
+        miles = np.zeros(len(trips))
         for i, t in enumerate(trips):
-            X[i], mins[i], _ = model.trip(t.points)
+            X[i], mins[i], _, length = model.trip(t.points)
+            miles[i] = length / METERS_PER_MILE
     finally:
         if overrides:
             model.set_params(saved)
-    return X, mins
+    return X, mins, miles
 
 
-def calibrate(model: Model, google: list[Trip], osrm: list[Trip], iters: int = 8) -> tuple[dict, float]:
-    """Alternate routing and fitting until the parameters settle."""
+def calibrate(model: Model, google: list[Trip], osrm: list[Trip], iters: int = 10,
+              tol: float = 0.005) -> tuple[dict, float]:
+    """Alternate routing and fitting, starting from the model's parameters.
+    Path changes between rounds can make the parameters cycle instead of
+    settle, so every state is scored on the routes it picks itself and the
+    one with the lowest objective is kept. It is left set on the model."""
     ref_g = np.array([t.ref_min * 60 for t in google])
     ref_o = np.array([t.ref_min * 60 for t in osrm])
-    params, beta = dict(model.params), 1.0
-    for it in range(iters):
-        Xg, _ = evaluate(model, google)
-        Xo, _ = evaluate(model, osrm, OSRM_ROUTING)  # same signal cost as their residual
-        new, beta = fit_params(Xg, ref_g, Xo, ref_o, params)
-        change = max(abs(new[k] - params[k]) / (abs(params[k]) + 1.0) for k in PARAM_NAMES)
+    params = dict(model.params)
+    best: tuple[float, dict, float] | None = None
+    settled = False
+    for it in range(iters + 1):
+        Xg, _, _ = evaluate(model, google)
+        Xo, _, _ = evaluate(model, osrm, OSRM_ROUTING)  # same signal cost as their residual
+        cost, beta = objective(params, Xg, ref_g, Xo, ref_o)
+        if best is None or cost < best[0]:
+            best = (cost, params, beta)
+        log(f"  round {it}: objective {cost:.4f}; " + ", ".join(f"{k}={params[k]:.3g}" for k in PARAM_NAMES)
+            + f", beta={beta:.3f}")
+        if settled or it == iters:
+            break
+        new, _ = fit_params(Xg, ref_g, Xo, ref_o, params)
+        settled = max(abs(new[k] - params[k]) / (abs(params[k]) + 1.0) for k in PARAM_NAMES) < tol
         params = new
         model.set_params(params)
-        log(f"  iteration {it + 1}: " + ", ".join(f"{k}={params[k]:.3g}" for k in PARAM_NAMES)
-            + f", beta={beta:.3f}")
-        if change < 0.005:
-            break
+    cost, params, beta = best
+    model.set_params(params)
     return params, beta
 
 
-def ratio_table(model: Model, trips: list[Trip]) -> list[tuple[str, float, float, float]]:
-    _, mins = evaluate(model, trips)
-    return [(t.name, t.ref_min, m, m / t.ref_min) for t, m in zip(trips, mins)]
+def ratio_table(model: Model, trips: list[Trip]) -> list[dict]:
+    """Ours vs reference for each trip under the model's current parameters."""
+    _, mins, miles = evaluate(model, trips)
+    rows = []
+    for t, m, mi in zip(trips, mins, miles):
+        row = {"name": t.name, "ref_min": t.ref_min, "min": round(float(m), 1), "ratio": round(float(m / t.ref_min), 3)}
+        if t.ref_mi:
+            row |= {"ref_mi": t.ref_mi, "mi": round(float(mi), 1), "mi_ratio": round(float(mi / t.ref_mi), 3),
+                    "path_differs": bool(abs(mi / t.ref_mi - 1) > PATH_TOLERANCE)}
+        rows.append(row)
+    return rows
 
 
 def summarize(rows) -> str:
-    r = np.array([x[3] for x in rows])
+    r = np.array([x["ratio"] for x in rows])
     return (f"median {np.median(r):.3f}, IQR {np.percentile(r, 25):.3f}-{np.percentile(r, 75):.3f}, "
             f"range {r.min():.3f}-{r.max():.3f}, RMS log error {math.sqrt(np.mean(np.log(r) ** 2)):.3f}")
 
 
+def leave_one_out(model: Model, google: list[Trip], osrm: list[Trip], restore: dict) -> list[dict]:
+    """Refit without each Google trip in turn and score the trip left out.
+    Every fold starts from FREE_FLOW, like the full fit, so the held-out
+    trip cannot reach its own fold through the starting point. Leaves
+    `restore` set on the model."""
+    rows = []
+    for i, t in enumerate(google):
+        log(f"leave-one-out: without {t.name}")
+        model.set_params(FREE_FLOW)
+        params, beta = calibrate(model, google[:i] + google[i + 1:], osrm)
+        rows.append({**ratio_table(model, [t])[0], "params": params, "osrm_beta": beta,
+                     "at_bounds": at_bounds(params)})
+    model.set_params(restore)
+    return rows
+
+
 def run_fit(graph_dir: Path | None = None, pbf: Path | None = None, apply: bool = True) -> dict:
-    """Fit, print a report, and (if `apply`) rewrite edge_delays.parquet with
-    the fitted parameters. Returns the report."""
+    """Fit, validate by leave-one-out over the Google trips, print a report,
+    and (if `apply`) rewrite edge_delays.parquet with the fitted parameters.
+    Returns the report."""
     pbf = pbf or data_dir() / "raw" / "new-york-latest.osm.pbf"
     model = Model(graph_dir)
     osrm = Osrm()
@@ -378,31 +469,32 @@ def run_fit(graph_dir: Path | None = None, pbf: Path | None = None, apply: bool 
     before_g = ratio_table(model, g_trips)
     before_o = ratio_table(model, osrm_trips)
 
-    # Holdout: Google's fastest route only (it pins the motorway factor);
-    # A, B and C are then out of sample.
-    log("holdout fit: OSRM trips + Google fastest")
-    params_h, beta_h = calibrate(model, [t for t in g_trips if t.name == "fastest"], osrm_trips)
-    hold_g = ratio_table(model, g_trips)
-
     log("fit: OSRM trips + all Google trips")
-    model.set_params(FREE_FLOW)
     params, beta = calibrate(model, g_trips, osrm_trips)
     after_g = ratio_table(model, g_trips)
     after_o = ratio_table(model, osrm_trips)
+    loo = leave_one_out(model, g_trips, osrm_trips, params)
+    loo_err = np.abs([r["ratio"] - 1 for r in loo])
 
     report = {
         "params": params,
         "osrm_beta": beta,
-        "holdout_params": params_h,
-        "holdout_osrm_beta": beta_h,
-        "google": {r[0]: {"google_min": r[1], "before_min": round(b[2], 1), "after_min": round(r[2], 1),
-                          "before_ratio": round(b[3], 3), "after_ratio": round(r[3], 3),
-                          "holdout_min": round(h[2], 1), "holdout_ratio": round(h[3], 3)}
-                   for r, b, h in zip(after_g, before_g, hold_g)},
+        "at_bounds": at_bounds(params),
+        "weights": {"google": GOOGLE_WEIGHT, "osrm": OSRM_WEIGHT, "prior": PRIOR_WEIGHT},
+        "google": {a["name"]: {"google_min": a["ref_min"], "google_mi": a["ref_mi"],
+                               "before_min": b["min"], "before_ratio": b["ratio"],
+                               "after_min": a["min"], "after_ratio": a["ratio"], "after_mi": a["mi"],
+                               "path_differs": a["path_differs"],
+                               "loo_min": h["min"], "loo_ratio": h["ratio"], "loo_mi": h["mi"],
+                               "loo_path_differs": h["path_differs"], "loo_params": h["params"],
+                               "loo_at_bounds": h["at_bounds"]}
+                   for a, b, h in zip(after_g, before_g, loo)},
+        "loo_summary": {"max_abs_error": round(float(loo_err.max()), 3),
+                        "median_abs_error": round(float(np.median(loo_err)), 3)},
         "osrm_before": summarize(before_o),
         "osrm_after": summarize(after_o),
-        "osrm_trips": [{"name": a[0], "points": t.points, "osrm_min": round(a[1], 1),
-                        "before_min": round(b[2], 1), "after_min": round(a[2], 1)}
+        "osrm_trips": [{"name": a["name"], "points": t.points, "osrm_min": round(a["ref_min"], 1),
+                        "before_min": b["min"], "after_min": a["min"]}
                        for a, b, t in zip(after_o, before_o, osrm_trips)],
         "osrm_requests": {"sent": osrm.sent, "cached": osrm.hits},
     }
@@ -417,15 +509,21 @@ def run_fit(graph_dir: Path | None = None, pbf: Path | None = None, apply: bool 
 
 def format_report(rep: dict) -> str:
     lines = ["fitted parameters:"]
-    lines += [f"  {k:12s} {rep['params'][k]:8.3f}   (holdout fit {rep['holdout_params'][k]:8.3f})"
+    lines += [f"  {k:12s} {rep['params'][k]:8.3f}" + ("   (at bound)" if k in rep["at_bounds"] else "")
               for k in PARAM_NAMES]
-    lines.append(f"  OSRM scale beta (ours / OSRM) {rep['osrm_beta']:.3f} (holdout {rep['holdout_osrm_beta']:.3f})")
-    lines.append("vs Google (minutes, ours / Google):")
-    lines.append(f"  {'route':8s} {'Google':>7s} {'before':>7s} {'ratio':>6s} {'after':>7s} {'ratio':>6s}"
-                 f" {'holdout':>8s} {'ratio':>6s}")
+    lines.append(f"  OSRM scale beta (ours / OSRM) {rep['osrm_beta']:.3f}")
+    lines.append("vs Google (minutes, ours / Google; * = route length differs from Google's by more than "
+                 f"{PATH_TOLERANCE:.0%}, so a different path):")
+    lines.append(f"  {'route':17s} {'Google':>6s} {'mi':>5s} {'before':>6s} {'ratio':>6s} {'after':>6s} {'ratio':>6s}"
+                 f" {'our mi':>6s}  {'LOO':>6s} {'ratio':>6s}")
     for k, r in rep["google"].items():
-        lines.append(f"  {k:8s} {r['google_min']:7.0f} {r['before_min']:7.1f} {r['before_ratio']:6.3f} "
-                     f"{r['after_min']:7.1f} {r['after_ratio']:6.3f} {r['holdout_min']:8.1f} {r['holdout_ratio']:6.3f}")
+        lines.append(f"  {k:17s} {r['google_min']:6.0f} {r['google_mi']:5.1f} {r['before_min']:6.1f} "
+                     f"{r['before_ratio']:6.3f} {r['after_min']:6.1f} {r['after_ratio']:6.3f} "
+                     f"{r['after_mi']:6.1f}{'*' if r['path_differs'] else ' '} {r['loo_min']:6.1f} "
+                     f"{r['loo_ratio']:6.3f}{'*' if r['loo_path_differs'] else ''}"
+                     + (f"  (LOO fit at bound: {', '.join(r['loo_at_bounds'])})" if r["loo_at_bounds"] else ""))
+    s = rep["loo_summary"]
+    lines.append(f"  leave-one-out: max |error| {s['max_abs_error']:.3f}, median {s['median_abs_error']:.3f}")
     lines.append(f"vs OSRM, {len(rep['osrm_trips'])} trips, ours / OSRM:")
     lines.append(f"  before: {rep['osrm_before']}")
     lines.append(f"  after:  {rep['osrm_after']}")

@@ -63,6 +63,253 @@ label = "Canandaigua Lakeshore Drive (2 km)"
 name = "Lakeshore Drive"
 bbox = [-77.275, 42.870, -77.255, 42.880]
 
+# Routing checks (docs/SCORE_V02.md section 1: V1, V2, V5), run by the
+# validate_routes stage. Points are [lon, lat].
+[v1]
+need = 6                  # of 8 pairs
+best_budget = 1.30        # the best route under +30 % ...
+min_scenic_minutes = 8.0  # ... has at least this many scenic minutes
+min_new_road_km = 2.0     # a road counts as on a route with at least this many km
+bands = [[1.05, 1.20], [1.20, 1.30], [1.30, 1.50]]
+
+[[v1.od]]
+label = "Rochester to Syracuse"
+from = [-77.61521, 43.15729]
+to = [-76.14742, 43.04812]
+
+[[v1.od]]
+label = "Rochester to Geneva"
+from = [-77.61521, 43.15729]
+to = [-76.9858, 42.8687]
+
+[[v1.od]]
+label = "Syracuse to Skaneateles"
+from = [-76.14742, 43.04812]
+to = [-76.4291, 42.9470]
+
+[[v1.od]]
+label = "Albany to Lake Placid"
+from = [-73.7562, 42.6526]
+to = [-73.9799, 44.2795]
+
+[[v1.od]]
+label = "Buffalo to Jamestown"
+from = [-78.8784, 42.8864]
+to = [-79.2353, 42.0970]
+
+[[v1.od]]
+label = "Ithaca to Geneva"
+from = [-76.4966, 42.4396]
+to = [-76.9858, 42.8687]
+
+[[v1.od]]
+label = "Port Jervis to Hancock"
+from = [-74.6927, 41.3751]
+to = [-75.2807, 41.9534]
+
+[[v1.od]]
+label = "Kingston to Oneonta"
+from = [-73.9974, 41.9270]
+to = [-75.0638, 42.4529]
+
+# V2: each scenic stretch (the [[scenic]] list and [[holdout2.scenic]])
+# against the fastest route between its two ends.
+[v2]
+max_shared = 0.20         # fast alternative shares < 20 % of its length with the stretch
+min_gap = 0.25            # S_stretch - S0 >= this
+ratio = 1.3               # and S_stretch > 1 - (1 - S0) / ratio
+need_share = 0.80         # of non-trivial pairs
+
+# V5: hand-named moments and non-moments. Only the first seven moments and
+# three non-moments are named in SCORE_V02; the rest were added for this
+# check before moments were inspected near them. Each point was placed on
+# the named road with OSM data (road ref or name, a bridge way or the
+# nearest point to the named water), never with detected moments.
+[v5]
+radius_m = 300.0
+moments_need = 27         # of 30 within radius_m of a detected moment
+non_moments_max = 2       # of 15
+
+[[v5.moment]]
+label = "Geneva lakefront (US-20/NY-5, Seneca Lake)"
+at = [-76.98033, 42.86314]
+
+[[v5.moment]]
+label = "Skaneateles front (US-20 Genesee Street)"
+at = [-76.42626, 42.94547]
+
+[[v5.moment]]
+label = "Portageville bridge (NY-436 over the Genesee gorge)"
+at = [-78.04037, 42.57078]
+
+[[v5.moment]]
+label = "Hawk's Nest (NY-97)"
+at = [-74.73547, 41.41074]
+
+[[v5.moment]]
+label = "Cascade Lakes (NY-73)"
+at = [-73.8829, 44.2221]
+
+[[v5.moment]]
+label = "Rip Van Winkle Bridge (NY-23)"
+at = [-73.83783, 42.22036]
+
+[[v5.moment]]
+label = "Thousand Islands Bridge, US span (I-81)"
+at = [-75.98269, 44.30231]
+
+[[v5.moment]]
+label = "Taughannock (NY-89, Cayuga Lake)"
+at = [-76.60423, 42.54692]
+
+[[v5.moment]]
+label = "Watkins Glen lakefront (NY-14, Seneca Lake)"
+at = [-76.87749, 42.38613]
+
+[[v5.moment]]
+label = "Lake George at Bolton Landing (NY-9N)"
+at = [-73.66326, 43.54758]
+
+[[v5.moment]]
+label = "Bear Mountain Bridge (US-6/US-202)"
+at = [-73.98795, 41.32002]
+
+[[v5.moment]]
+label = "Storm King Highway (NY-218)"
+at = [-73.97211, 41.41658]
+
+[[v5.moment]]
+label = "Mid-Hudson Bridge (US-44/NY-55)"
+at = [-73.95169, 41.7035]
+
+[[v5.moment]]
+label = "Newburgh-Beacon Bridge (I-84)"
+at = [-74.00947, 41.52122]
+
+[[v5.moment]]
+label = "Mario Cuomo Bridge (I-87/I-287)"
+at = [-73.87759, 41.07087]
+
+[[v5.moment]]
+label = "Verrazzano-Narrows Bridge (I-278)"
+at = [-74.03681, 40.60902]
+
+[[v5.moment]]
+label = "Kingston-Rhinecliff Bridge (NY-199)"
+at = [-73.95722, 41.98115]
+
+[[v5.moment]]
+label = "Lake Champlain Bridge (NY-185)"
+at = [-73.42548, 44.02997]
+
+[[v5.moment]]
+label = "Niagara Gorge at the Whirlpool (Niagara Scenic Parkway)"
+at = [-79.06048, 43.11673]
+
+[[v5.moment]]
+label = "Lake Ontario State Parkway at Hamlin Beach"
+at = [-77.91797, 43.35608]
+
+[[v5.moment]]
+label = "Chautauqua Lake bridge (I-86)"
+at = [-79.38613, 42.15198]
+
+[[v5.moment]]
+label = "Canandaigua Lakeshore Drive"
+at = [-77.27174, 42.87587]
+
+[[v5.moment]]
+label = "Ausable Chasm bridge (US-9)"
+at = [-73.46344, 44.5245]
+
+[[v5.moment]]
+label = "Bastion Falls, Kaaterskill Clove (NY-23A)"
+at = [-74.07073, 42.19132]
+
+[[v5.moment]]
+label = "Blue Mountain Lake (NY-28)"
+at = [-74.43374, 43.85489]
+
+[[v5.moment]]
+label = "Long Lake bridge (NY-30)"
+at = [-74.42581, 43.97451]
+
+[[v5.moment]]
+label = "Breakneck Ridge (NY-9D)"
+at = [-73.97867, 41.44445]
+
+[[v5.moment]]
+label = "Lake Tiorati (Seven Lakes Drive)"
+at = [-74.09671, 41.26575]
+
+[[v5.moment]]
+label = "Aurora lakefront (NY-90, Cayuga Lake)"
+at = [-76.70882, 42.76613]
+
+[[v5.moment]]
+label = "Keuka Lake east shore (NY-54)"
+at = [-77.14503, 42.4825]
+
+[[v5.non_moment]]
+label = "I-690 over Onondaga Creek, Syracuse (canal bridges)"
+at = [-76.15183, 43.05327]
+
+[[v5.non_moment]]
+label = "I-90 Genesee River crossing"
+at = [-77.72612, 43.04312]
+
+[[v5.non_moment]]
+label = "Hempstead Turnpike by a pond, East Meadow"
+at = [-73.58756, 40.71985]
+
+[[v5.non_moment]]
+label = "I-490 Genesee River crossing, downtown Rochester"
+at = [-77.61102, 43.15114]
+
+[[v5.non_moment]]
+label = "I-390 Genesee River crossing, Genesee Valley Park"
+at = [-77.64478, 43.12091]
+
+[[v5.non_moment]]
+label = "NY-5 Erie Boulevard East, DeWitt"
+at = [-76.10182, 43.05379]
+
+[[v5.non_moment]]
+label = "NY-104 West Ridge Road, Greece"
+at = [-77.67158, 43.20608]
+
+[[v5.non_moment]]
+label = "NY-78 Transit Road, Williamsville"
+at = [-78.69678, 42.96047]
+
+[[v5.non_moment]]
+label = "NY-5 Central Avenue, Colonie"
+at = [-73.81078, 42.69829]
+
+[[v5.non_moment]]
+label = "I-90 near Batavia (farmland)"
+at = [-78.15079, 43.02134]
+
+[[v5.non_moment]]
+label = "NY-98 north of Batavia (farmland)"
+at = [-78.19323, 43.12998]
+
+[[v5.non_moment]]
+label = "NY-31 retail strip, Clay"
+at = [-76.19685, 43.18675]
+
+[[v5.non_moment]]
+label = "NY-96 retail strip, Victor"
+at = [-77.43999, 43.02993]
+
+[[v5.non_moment]]
+label = "I-495 Long Island Expressway, Melville"
+at = [-73.42006, 40.78097]
+
+[[v5.non_moment]]
+label = "NY-5 Erie Boulevard West at Salina Street, Syracuse (the old canal)"
+at = [-76.15138, 43.05126]
+
 [[scenic]]
 label = "NY-97 Hawk's Nest, Port Jervis to Barryville"
 ref = "NY 97"
@@ -258,6 +505,7 @@ bbox = [-78.21, 43.02, -78.17, 43.10]
 
 [holdout2]
 declared_final = true
+routes_sealed = false      # unsealed 2026-11-02 after the route search was final; V1 on the OD pairs, V2 on the scenic stretches
 urban_max = 0.20          # V3: urban strips S <= this, need 4 of 5
 flat_band = [0.20, 0.50]  # V3: flat rural, all three inside the band
 scenic_min = 0.65         # V3: scenic S >= this, need 8 of 10
@@ -352,7 +600,8 @@ label = "NY-19 Le Roy to Bergen"
 ref = "NY 19"
 bbox = [-77.99, 42.99, -77.93, 43.08]
 
-# OD pairs (lon, lat) for V1; no route search exists yet, so they are not run.
+# OD pairs (lon, lat) for V1. Routed only when routes_sealed = false (run once,
+# after the route search was final; see validate_routes).
 [[holdout2.od]]
 label = "Binghamton to Cooperstown"
 from = [-75.918, 42.099]

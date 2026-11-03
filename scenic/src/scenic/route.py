@@ -208,6 +208,20 @@ class RoadGraph:
         return self.route(src, dst, edge_cost), {"from_node": src, "from_snap_m": ds,
                                                  "to_node": dst, "to_snap_m": dd}
 
+    def make_route(self, path, arcs, cost: float = float("nan")) -> Route:
+        """A Route from a node path and the arc (index into arc_*) driven
+        between each pair of consecutive nodes; used by scenic.search,
+        which runs its own Dijkstra on a part of the graph."""
+        path = np.asarray(path, dtype=np.int64)
+        arcs = np.asarray(arcs, dtype=np.int64)
+        if len(arcs) != max(len(path) - 1, 0):
+            raise ValueError("need one arc per consecutive node pair")
+        edges = self.arc_edge[arcs]
+        rev = self.arc_rev[arcs]
+        return Route(nodes=path, edges=edges, reversed=rev,
+                     time_s=float(self.time_s[edges].sum()), length_m=float(self.length_m[edges].sum()),
+                     cost=float(cost), geometry=self._geometry(path, edges, rev))
+
     # ---- output ------------------------------------------------------------
 
     def _geometry(self, path, edges, rev) -> list[tuple[float, float]]:

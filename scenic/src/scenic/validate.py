@@ -5,8 +5,9 @@ Syracuse test case. Byways and spot checks are checks only, never inputs.
 v0.2 adds the non-routing checks of docs/SCORE_V02.md section 1: V3 (split
 dull lists), V4 (byways, reported only), the lake-front diagnostics of its
 section 2, and holdout-2, which stays sealed until `declared_final`. The
-v0.1 checks are still reported for comparison. V1, V2 and V5 need the route
-search and moments of section 4 and are not built."""
+v0.1 checks are still reported for comparison. V1, V2 and V5 (route search
+and moments, section 4) are run by the separate validate_routes stage
+(`run_route_validation`)."""
 
 from __future__ import annotations
 
@@ -412,4 +413,219 @@ def run_validation(graph_dir: Path, out_dir: Path, raw_dir: Path, config_dir: Pa
         res["rochester_syracuse"] = roc_syr(graph_dir, S, L, refs)
     except Exception as e:  # noqa: BLE001 - informational only
         res["rochester_syracuse"] = {"error": repr(e)}
+    return res
+
+
+# --------------------------------------------------------------------------
+# Route checks (SCORE_V02 section 1: V1, V2, V5). Written by the
+# validate_routes stage to route_validation.json.
+
+
+def named_road_km(g, edges: np.ndarray) -> dict[str, float]:
+    """km per named road (each ref of a multi-ref edge, else its name);
+    unnamed edges are left out."""
+    sub = g.edges_table.select(["ref", "name"]).take(edges).to_pylist()
+    km: dict[str, float] = {}
+    for row, e in zip(sub, edges):
+        labels = sorted(ref_set(row["ref"])) if row["ref"] else ([row["name"]] if row["name"] else [])
+        for lab in labels:
+            km[lab] = km.get(lab, 0.0) + g.length_m[e] / 1000
+    return km
+
+
+def v1_pair(ctx, od: dict, cfg: dict) -> dict:
+    """One V1 corridor: the full search, then the pass tests on the best
+    route under cfg['best_budget']."""
+    from .search import describe, search
+
+    a, b = tuple(od["from"][::-1]), tuple(od["to"][::-1])  # config is [lon, lat]
+    res = search(ctx, a, b)
+    if res is None:
+        return {"label": od["label"], "error": "no route", "pass": False, "bands_pass": False}
+    best = res.picks[cfg["best_budget"]]
+    fast = res.fastest
+    fkm = named_road_km(ctx.g, fast.edges)
+    bkm = named_road_km(ctx.g, best.edges)
+    new_roads = sorted(((r, km) for r, km in bkm.items()
+                        if km >= cfg["min_new_road_km"] and fkm.get(r, 0.0) < 0.5), key=lambda kv: -kv[1])
+    fast_passed = set(fast.passed)
+    new_moments = [int(i) for i in best.moments if i not in fast_passed]
+    differs = not np.array_equal(best.edges, fast.edges)
+    ok = differs and best.scenic_min >= cfg["min_scenic_minutes"] and bool(new_roads or new_moments)
+    ratios = np.array([sr.ratio for sr in res.kept])
+    bands = [{"band": [lo, hi], "routes": int(((ratios > lo) & (ratios <= hi)).sum())} for lo, hi in cfg["bands"]]
+    return {
+        "label": od["label"], "pass": bool(ok), "bands_pass": all(x["routes"] > 0 for x in bands),
+        "differs": bool(differs), "best_scenic_minutes": round(best.scenic_min, 1),
+        "new_named_roads": [(r, round(km, 1)) for r, km in new_roads[:6]],
+        "new_moments": [str(ctx.moments.label[i]) for i in new_moments],
+        "bands": bands, "kept": len(res.kept), "seconds": res.seconds["total"],
+        "t0_min": round(res.t0 / 60, 1), "S_fast": round(res.s_fast, 3),
+        "fastest": describe(ctx, fast),
+        "picks": {f"+{round((bb - 1) * 100)}%": describe(ctx, sr) for bb, sr in res.picks.items()},
+    }
+
+
+def v1_corridors(ctx, cfg: dict, ods: list[dict]) -> dict:
+    rows = [v1_pair(ctx, od, cfg) for od in ods]
+    n_ok, n_band = sum(r["pass"] for r in rows), sum(r["bands_pass"] for r in rows)
+    need = int(cfg["need"]) if len(ods) == 8 else int(np.ceil(0.75 * len(ods)))
+    return {"passed": n_ok, "bands_passed": n_band, "of": len(rows), "need": need,
+            "pass": n_ok >= need and n_band >= need, "pairs": rows}
+
+
+def stretch_ends(g, edges: np.ndarray) -> tuple[int, int]:
+    """The two end nodes of a stretch: the farthest-apart pair among the
+    nodes of its edges (in the strongly connected core)."""
+    from .graph import haversine_m
+
+    nodes = np.unique(np.concatenate([g.u[edges], g.v[edges]]))
+    core = nodes[g.lcc[nodes]]
+    nodes = core if len(core) >= 2 else nodes
+    lon, lat = g.node_lon[nodes], g.node_lat[nodes]
+    # the farthest pair is found from the extreme points (exact enough for
+    # road stretches, which are long and thin)
+    cand = np.unique(np.concatenate([[np.argmin(lon), np.argmax(lon), np.argmin(lat), np.argmax(lat)],
+                                     [np.argmin(lon + lat), np.argmax(lon + lat), np.argmin(lon - lat),
+                                      np.argmax(lon - lat)]]))
+    best, pair = -1.0, (int(nodes[0]), int(nodes[-1]))
+    for i in cand:
+        d = haversine_m(lon[i], lat[i], lon, lat)
+        j = int(np.argmax(d))
+        if d[j] > best:
+            best, pair = float(d[j]), (int(nodes[i]), int(nodes[j]))
+    a, b = pair
+    if not g.lcc[a]:
+        a = g.snap(g.node_lat[a], g.node_lon[a])[0]
+    if not g.lcc[b]:
+        b = g.snap(g.node_lat[b], g.node_lon[b])[0]
+    return a, b
+
+
+def v2_contrast(g, S, L, excluded, refs, names, mlon, mlat, items: list[dict], cfg: dict) -> dict:
+    """Each scenic stretch against the fastest route between its ends.
+    Means are length-weighted (as in V3)."""
+    rows = []
+    for it in items:
+        m = _match(it, refs, names, mlon, mlat, excluded)
+        row = {"label": it["label"], "km": round(float(L[m].sum() / 1000), 1)}
+        if not m.any():
+            rows.append({**row, "trivial": True, "note": "no edges matched"})
+            continue
+        stretch = np.flatnonzero(m)
+        s_st = wmean(S[stretch], L[stretch])
+        a, b = stretch_ends(g, stretch)
+        r = g.route(a, b)
+        if r is None or len(r.edges) == 0:
+            rows.append({**row, "trivial": True, "note": "no route between the ends"})
+            continue
+        e = r.edges
+        shared = float(L[e][m[e]].sum() / L[e].sum())
+        s0 = wmean(S[e], L[e])
+        trivial = shared >= cfg["max_shared"]
+        gap_ok = s_st - s0 >= cfg["min_gap"]
+        sel_ok = s_st > 1 - (1 - s0) / cfg["ratio"]
+        rows.append({**row, "S_stretch": round(s_st, 3), "S0": round(s0, 3), "gap": round(s_st - s0, 3),
+                     "selectable_above": round(1 - (1 - s0) / cfg["ratio"], 3),
+                     "fast_minutes": round(r.minutes, 1), "fast_km": round(r.km, 1), "shared": round(shared, 3),
+                     "fast_roads": [(lab, round(km, 1)) for lab, km in g.road_summary(r, top=4)],
+                     "trivial": bool(trivial), "pass": None if trivial else bool(gap_ok and sel_ok)})
+    nt = [r for r in rows if not r["trivial"]]
+    n_ok = sum(r["pass"] for r in nt)
+    return {"passed": n_ok, "non_trivial": len(nt), "of": len(rows),
+            "share": round(n_ok / len(nt), 3) if nt else None,
+            # no non-trivial pair: every stretch is itself the fastest way
+            # between its ends, so V2 cannot be tested (None, not a pass)
+            "pass": (n_ok / len(nt) >= cfg["need_share"]) if nt else None, "items": rows}
+
+
+def v5_moments(mom, cfg: dict, samples=None) -> dict:
+    """Hand-named moments must lie within radius_m of a detected moment's
+    point; hand-named non-moments must not. The distance to the nearest
+    sample point of a moment's member edges is reported alongside."""
+    from scipy.spatial import cKDTree
+
+    from .score import project_lonlat
+
+    tree = cKDTree(np.column_stack([mom.x, mom.y])) if len(mom.id) else None
+    mtree = None
+    if samples is not None:
+        sx, sy, se = samples
+        on = mom.of_edge[se] >= 0
+        if on.any():  # no member samples: report no member distance
+            mtree = (cKDTree(np.column_stack([sx[on], sy[on]])), mom.of_edge[se[on]])
+
+    def check(items):
+        rows = []
+        for it in items:
+            x, y = project_lonlat(np.array([it["at"][0]]), np.array([it["at"][1]]))
+            row = {"label": it["label"]}
+            if tree is not None:
+                d, i = tree.query([x[0], y[0]])
+                row.update(dist_m=round(float(d)), hit=bool(d <= cfg["radius_m"]),
+                           nearest=f"{mom.type[i]} {mom.m[i]:.2f}: {mom.label[i]}")
+            else:
+                row.update(dist_m=None, hit=False)
+            if mtree is not None:
+                d2, j = mtree[0].query([x[0], y[0]])
+                row["member_dist_m"] = round(float(d2))
+            rows.append(row)
+        return rows
+
+    pos, neg = check(cfg.get("moment", [])), check(cfg.get("non_moment", []))
+    n_pos, n_neg = sum(r["hit"] for r in pos), sum(r["hit"] for r in neg)
+    n_pos2 = sum(r.get("member_dist_m", 1e9) <= cfg["radius_m"] for r in pos)
+    n_neg2 = sum(r.get("member_dist_m", 1e9) <= cfg["radius_m"] for r in neg)
+    return {"moments_hit": n_pos, "of": len(pos), "need": cfg["moments_need"],
+            "non_moments_hit": n_neg, "non_of": len(neg), "max": cfg["non_moments_max"],
+            "pass": n_pos >= cfg["moments_need"] and n_neg <= cfg["non_moments_max"],
+            "by_member_edges": {"moments_hit": n_pos2, "non_moments_hit": n_neg2},
+            "moments": pos, "non_moments": neg}
+
+
+def run_route_validation(graph_dir: Path, out_dir: Path, config_dir: Path, route_cfg: dict, log=print) -> dict:
+    """V1 on the eight corridors, V2 on the scenic stretches and V5 on the
+    moments. Holdout-2 ODs and stretches are routed only once
+    `[holdout2] routes_sealed` is false."""
+    import pyarrow.parquet as pq
+
+    from .graph import read_edges_fingerprint
+    from .score import _dict_col, load_samples
+    from .search import Context
+
+    ctx = Context.load(graph_dir, out_dir, cfg=route_cfg)
+    g, S = ctx.g, ctx.S
+    sc = tomllib.loads((config_dir / "spot_checks.toml").read_text())
+    et = pq.read_table(graph_dir / "edges.parquet", columns=["length_m", "ref", "name", "lon", "lat"])
+    L = et.column("length_m").to_numpy()
+    refs, names = _dict_col(et, "ref"), _dict_col(et, "name")
+    lon, lat = et.column("lon").combine_chunks(), et.column("lat").combine_chunks()
+    off = lon.offsets.to_numpy()
+    mid = (off[:-1] + off[1:] - 1) // 2
+    mlon, mlat = lon.values.to_numpy()[mid], lat.values.to_numpy()[mid]
+    from .score import load
+
+    excluded = load(graph_dir / "edges.parquet", out_dir / "scores.parquet").column("excluded").to_numpy()
+    smp = load_samples(out_dir / "samples.npz", read_edges_fingerprint(graph_dir))
+
+    res: dict = {}
+    log("  V5 moments")
+    res["v5"] = v5_moments(ctx.moments, sc["v5"], (smp["x"].astype(np.float64), smp["y"].astype(np.float64),
+                                                   smp["edge"]))
+    log("  V2 paired contrast")
+    res["v2"] = v2_contrast(g, S, L, excluded, refs, names, mlon, mlat, sc.get("scenic", []), sc["v2"])
+    log("  V1 corridors")
+    res["v1"] = v1_corridors(ctx, sc["v1"], sc["v1"]["od"])
+    h = sc.get("holdout2", {})
+    if not h:
+        res["holdout2"] = {"status": "absent"}
+    elif h.get("routes_sealed", True):
+        res["holdout2"] = {"status": "sealed", "od": [o["label"] for o in h.get("od", [])]}
+    else:
+        log("  holdout-2 V1 and V2")
+        res["holdout2"] = {"status": "routed",
+                           "v1": v1_corridors(ctx, sc["v1"], h.get("od", [])),
+                           "v2": v2_contrast(g, S, L, excluded, refs, names, mlon, mlat, h.get("scenic", []),
+                                             sc["v2"])}
+    res["pass"] = {"v1": res["v1"]["pass"], "v2": res["v2"]["pass"], "v5": res["v5"]["pass"]}
     return res

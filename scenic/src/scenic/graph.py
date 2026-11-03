@@ -444,17 +444,20 @@ def save_graph(ways: Ways, g: Graph, out_dir: Path) -> dict:
 #
 #   time = free_flow * f(group) + a*(signals + crossings/2) + b*stops + d*minor_ends
 #
-# with f = `motorway` on motorways, `rural` on other roads outside built-up
-# areas, `built_up` inside them. Six parameters, fitted by `scenic calibrate
-# --fit` (calibrate.py); the values below are its output.
+# with f = `motorway` on motorways, `built_up` on other roads in built-up
+# areas, and outside them `rural` on trunk, primary and secondary roads and
+# `rural_minor` on tertiary and smaller roads (`minor_road`). Seven
+# parameters, fitted by `scenic calibrate --fit` (calibrate.py); the values
+# below are its output.
 
 DELAY_PARAMS = {
-    "motorway": 1.007,    # time factor, motorway and motorway_link
-    "rural": 1.020,       # time factor, other roads outside built-up areas
-    "built_up": 0.954,    # time factor, other roads in built-up areas
-    "signal_s": 16.8,     # per traffic signal (a signalised crossing counts as half)
-    "stop_s": 8.2,        # per stop sign
-    "minor_end_s": 3.21,  # per junction entered from, or left onto, a lower-class road
+    "motorway": 0.983,     # time factor, motorway and motorway_link
+    "rural": 1.087,        # time factor, trunk/primary/secondary outside built-up areas
+    "rural_minor": 0.815,  # time factor, tertiary and smaller roads outside built-up areas
+    "built_up": 1.072,     # time factor, non-motorway roads in built-up areas
+    "signal_s": 23.5,      # per traffic signal (a signalised crossing counts as half)
+    "stop_s": 8.55,        # per stop sign
+    "minor_end_s": 2.96,   # per junction entered from, or left onto, a lower-class road
 }
 # A signalised pedestrian crossing or a rail level crossing counts as this
 # many traffic signals (on demand / rarely closed, but you slow down).
@@ -468,6 +471,9 @@ CLASS_RANK = {
     "motorway_link": 0, "trunk_link": 1, "primary_link": 2, "secondary_link": 3, "tertiary_link": 4,
 }
 MOTORWAY_GROUP = frozenset({"motorway", "motorway_link"})
+# Roads outside built-up areas that take the `rural` time factor; smaller
+# roads (tertiary and below) take `rural_minor`.
+MAJOR_GROUP = frozenset({"trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link"})
 
 # Built-up flag: at least this many junctions within this radius of the edge's
 # midpoint. A village grid of ~100 m blocks gives 20-30; open country 0-4.
@@ -623,6 +629,7 @@ def edge_delay_features(ways: Ways, g: Graph, controls: Controls) -> dict[str, n
     out["junctions_300m"] = density.astype(np.int32)
     out["built_up"] = density >= BUILT_UP_MIN_JUNCTIONS
     out["motorway"] = no_delay
+    out["minor_road"] = np.array([h not in MAJOR_GROUP for h in hw]) & ~no_delay
     return out
 
 
@@ -631,13 +638,16 @@ def delayed_time(free_s: np.ndarray, feats: dict[str, np.ndarray], params: dict 
     p = {**DELAY_PARAMS, **(params or {})}
     mw = np.asarray(feats["motorway"], bool)
     bu = np.asarray(feats["built_up"], bool)
-    factor = np.where(mw, p["motorway"], np.where(bu, p["built_up"], p["rural"]))
+    minor = np.asarray(feats["minor_road"], bool)
+    factor = np.where(mw, p["motorway"], np.where(bu, p["built_up"],
+                                                  np.where(minor, p["rural_minor"], p["rural"])))
     signals = np.asarray(feats["signals"]) + CROSSING_AS_SIGNALS * np.asarray(feats["crossings"])
     return (np.asarray(free_s, dtype=np.float64) * factor + p["signal_s"] * signals
             + p["stop_s"] * feats["stops"] + p["minor_end_s"] * feats["minor_ends"])
 
 
-DELAY_COLUMNS = ("signals", "stops", "crossings", "minor_ends", "junctions_300m", "built_up", "motorway")
+DELAY_COLUMNS = ("signals", "stops", "crossings", "minor_ends", "junctions_300m", "built_up", "motorway",
+                 "minor_road")
 
 
 def delay_table(feats: dict[str, np.ndarray], free_s: np.ndarray, params: dict | None = None):
@@ -686,6 +696,10 @@ def read_edge_delays(path: Path, fingerprint: str, columns: list[str] | None = N
     if stored.decode() != fingerprint:
         raise ValueError(f"{path} was built for a different edges.parquet (rebuilt or reordered "
                          "since); rerun `scenic calibrate --features`")
+    missing = [c for c in (*DELAY_COLUMNS, "free_time_s", "time_s") if c not in pq.read_schema(path).names]
+    if missing:
+        raise ValueError(f"{path} lacks {', '.join(missing)} (written by an older version); "
+                         "rerun `scenic calibrate --features`")
     return pq.read_table(path, columns=columns)
 
 

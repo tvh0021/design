@@ -121,6 +121,14 @@ A statewide heatmap of S is the visual sanity check.
 6. **Output.** Route on a map, the three budget options with scenic minutes
    gained, and an "Open in Google Maps" link.
 
+Built (v0.2c, `scenic route`, `scenic.search`). Steps 1–3 follow
+`docs/SCORE_V02.md` §4: a λ sweep, edge-reuse alternatives and via-moment
+routes, scored by scenic minutes above baseline plus moment credit. The
+local-improvement pass in step 3 is not built; the via-moment routes fill
+that gap. Steps 4–6 are separate: `scenic.waypoints` makes the Maps link from
+a route's `node_path`/`edge_path`. See `docs/SCORE_SPEC.md` "v0.2c" for
+results.
+
 Rochester to Syracuse expectation: 390/90 is about 85–90 min, so +30% buys about
 25 min, enough for long back-road stretches (Route 5/20 through the north end of
 the Finger Lakes, Route 31 along the canal, or a mix with the Thruway). The

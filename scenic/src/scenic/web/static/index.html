@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>scenic: New York route planner</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+<link rel="stylesheet" href="/static/app.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<aside id="panel">
+  <header>
+    <div>
+      <h1>scenic</h1>
+      <p class="sub">Scenic drives across New York State</p>
+    </div>
+    <div class="units" role="group" aria-label="Distance units">
+      <button type="button" id="u-mi" aria-pressed="true">mi</button><button type="button" id="u-km" aria-pressed="false">km</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" class="tab active" aria-selected="true" id="tab-ab">A to B</button>
+    <button role="tab" class="tab" aria-selected="false" aria-disabled="true" disabled id="tab-loop"
+            title="Loops are not built yet">Drive-around (loop) <span class="soon">coming soon</span></button>
+  </nav>
+
+  <div id="loading" class="banner info"><span class="spinner"></span> <span id="loading-text">Loading the road graph and scenery scores&hellip;</span></div>
+
+  <section class="points">
+    <form id="form-a" class="place" autocomplete="off">
+      <div class="labelrow">
+        <label for="q-a"><span class="pin pin-a">A</span> Start</label>
+        <span class="home">
+          <button type="button" class="link" id="home-a" disabled title="Set a home point first">From home</button>
+          <button type="button" class="link" id="home-set-a" disabled>Set as home</button>
+        </span>
+      </div>
+      <div class="row">
+        <input id="q-a" name="q" type="text" placeholder="Click the map, or type a place">
+        <button type="submit" class="small">Search</button>
+      </div>
+      <ul class="results" id="res-a" hidden></ul>
+    </form>
+    <form id="form-b" class="place" autocomplete="off">
+      <div class="labelrow">
+        <label for="q-b"><span class="pin pin-b">B</span> End</label>
+        <span class="home">
+          <button type="button" class="link" id="home-set-b" disabled>Set as home</button>
+        </span>
+      </div>
+      <div class="row">
+        <input id="q-b" name="q" type="text" placeholder="Click the map, or type a place">
+        <button type="submit" class="small">Search</button>
+      </div>
+      <ul class="results" id="res-b" hidden></ul>
+    </form>
+    <p class="hint" id="hint">Click the map to set the start, then the end. Drag the markers to adjust.</p>
+    <div class="actions">
+      <button id="find" class="primary" disabled>Find routes</button>
+      <button id="swap" type="button" title="Swap start and end">Swap</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+  </section>
+
+  <div id="error" class="banner error" hidden></div>
+  <div id="busy" class="banner info" hidden><span class="spinner"></span> <span id="busy-text">Searching&hellip;</span></div>
+
+  <section id="results" hidden>
+    <table id="routes">
+      <thead><tr><th>Route</th><th class="num">min</th><th class="num">extra min</th><th class="num" id="dist-head">mi</th><th class="num">scenic min</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="caption">Scenic min: drive time on roads scenier than the fastest route&rsquo;s average, weighted by how much scenier they are.</p>
+    <p class="details" id="details"></p>
+    <label class="toggle"><input type="checkbox" id="by-s" checked> Color the selected route by scenery</label>
+    <div id="legend" hidden></div>
+    <div id="detail"></div>
+  </section>
+
+  <footer class="foot">
+    Routes are suggestions from OpenStreetMap data and our own speed model.
+    Check the road and the weather before you drive.
+  </footer>
+</aside>
+<main id="map" aria-label="Map"></main>
+</body>
+</html>

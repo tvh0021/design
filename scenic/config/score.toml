@@ -167,6 +167,53 @@ max_rounds = 8
 pool_weight = 0.5
 pool_top_m = 300.0
 
+[moments]
+# Route-level scenic moments (docs/SCORE_V02.md section 4). Candidates are
+# non-excluded edges of these classes; values come from unsmoothed signals.
+classes = ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified"]
+water_W = 0.5             # water: W >= water_W or V_water >= water_V
+water_V = 0.7
+size_radius_m = 450.0     # size = largest water size score within this of the edge
+vista_open = 0.6          # vista: open >= this at a sample point ...
+vista_drop_m = 150.0      # ... the lowest ground within 3 km at least this far below ...
+vista_drop_scale_m = 300.0  # m = clip(drop / scale, vista_m_min, 1)
+vista_m_min = 0.5
+vista_rays = 16           # ... and a terrain sight line (dem90) over this many azimuths
+vista_far_m = 3000.0
+vista_sight_m = 2000.0    # reaching ground at least this far away ...
+vista_seen_below_m = 75.0 # ... that lies at least this far below the eye
+gorge_feature_m = 150.0   # OSM waterfall or cliff within this of a sample point
+cliff_step_m = 50.0       # cliff lines densified to points this far apart
+gorge_bridge_drop_m = 30.0  # road bridge over water, ground this far below the deck ...
+gorge_bridge_radius_m = 200.0  # ... within this radius
+gorge_m = 0.8
+osm_viewpoint_m = 100.0   # tourism=viewpoint within this of a sample point
+osm_m = 0.7
+cluster_road_m = 2000.0   # one moment per 2 km of the same road key ...
+cluster_cross_m = 1000.0  # ... and per 1 km across roads
+water_name_m = 1500.0     # labels: nearest named lake within this, else river within river_name_m
+river_name_m = 300.0
+place_radius_m = 15000.0  # nearest city, town, village or hamlet
+
+[route]
+# A-to-B search (docs/PLAN.md section 2, docs/SCORE_V02.md section 4). Not a
+# score input; read by `scenic route` and the validate_routes stage.
+budgets = [1.15, 1.30, 1.50]  # ETA ratio vs our own fastest route; the last is the hard cap
+lambdas = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]  # cost = t * (1 + lambda * (1 - S))
+alt_lambdas = [1.0, 3.0, 8.0]  # alternatives: edges of routes already kept cost more ...
+alt_rounds = 2
+reuse_penalty = 1.0       # ... cost * (1 + reuse_penalty) on a reused edge
+via_lambda = 1.0          # legs of via-moment routes (also built with lambda 0)
+via_top = 12              # moments ranked by m / extra minutes ...
+via_top_per_band = 4      # ... plus the best this many in each budget band
+via_max_moments = 3       # greedy 2nd and 3rd moment
+via_min_extra_min = 1.0   # extra minutes floor when ranking m / extra minutes
+moment_radius_m = 100.0   # a moment counts when the route passes this close (or drives one of its edges)
+moment_spacing_km = 2.0   # at most one moment per 2 km of route
+feature_spacing_km = 10.0 # the same named lake/river/falls counts again only 10 km further on
+moments_per_hour = 6.0    # and 6 per hour of the fastest time
+moment_minutes = 5.0      # a full moment (m = 1) is worth 5 scenic minutes
+
 [output]
 heatmap_cell_m = 500.0
 heatmap_width_px = 3000

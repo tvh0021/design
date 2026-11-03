@@ -394,7 +394,7 @@ Trail 837 km at median 0.44, Revolutionary Byway 0.37, Maple Traditions
 ## v0.2 changes
 
 Design and reasons: `docs/SCORE_V02.md` §3, changes 1–4. The moments layer,
-the route search and checks V1, V2 and V5 (§4) are not built yet. Every new
+the route search and checks V1, V2 and V5 (§4) are in "v0.2c" below. Every new
 key in `config/score.toml` can switch the old behaviour back on.
 
 **Fixes made first (v0.1.1).**
@@ -463,7 +463,8 @@ The motorway term is gone (`motorway_weight = 0`). The cap stays at 0.5.
 
 Holdout-2 was scored once, on v0.2b. It passes V3: scenic 8/10 ≥ 0.65,
 urban 4/5 ≤ 0.20 and flat 3/3. v0.1 would also have passed V3 on it, so it
-does not separate the two versions. Its OD pairs have not been routed.
+does not separate the two versions. Its OD pairs were routed once, after
+the route search was final (v0.2c below).
 
 **Deviations from SCORE_V02.md.**
 - §2's "Cayuga N end" edge (1 km, W 0.68) is the Seneca River east of
@@ -476,3 +477,105 @@ does not separate the two versions. Its OD pairs have not been routed.
   lowered its W from 0.31 to 0.22; the §3 what-ifs used v0.1's W. Which of
   those fixes caused the drop was not isolated, and the formula was not
   tuned further.
+
+## v0.2c: moments and route search
+
+Design: `docs/SCORE_V02.md` §4. The edge score is unchanged. New code:
+`scenic.moments` (stages osm_features and moments), `scenic.search` (the A-to-B
+search, `scenic route`), and V1, V2 and V5 in `scenic.validate` (stage
+validate_routes, `route_validation.json`). Settings: `[moments]` and `[route]`
+in `config/score.toml`, and `[v1]`, `[v2]` and `[v5]` in
+`config/spot_checks.toml`.
+
+**Moments** (`moments.parquet`). Candidates are non-excluded edges of class
+motorway to unclassified. Each test uses unsmoothed per-edge or per-point
+values:
+- water: W ≥ 0.5 or V_water ≥ 0.7. m = max(W, V_water)·(0.5 + 0.5·size).
+  size is the largest `water_size` within 450 m of the edge's points. Where
+  V_water ≥ 0.7, the size of the water the view lands on also counts.
+- vista: per sample point, open ≥ 0.6 and drop ≥ 150 m. A terrain viewshed
+  on dem90, over 16 azimuths out to 3 km, must see ground at least 75 m below
+  the eye at least 2 km away. m = clip(drop/300, 0.5, 1), from the edge's
+  largest drop.
+- gorge: an OSM waterfall or cliff within 150 m of a sample point (cliff
+  lines are densified to 50 m). Or an OSM bridge edge over areal water or a
+  mapped river or stream, where the DEM within 200 m is at least 30 m below
+  the deck end. m = 0.8.
+- osm: `tourism=viewpoint` within 100 m of a sample point. m = 0.7.
+
+An edge takes its best type. Clustering is greedy and does not chain:
+- Best m first, an unclaimed edge claims the unclaimed edges of the same road
+  key within 2 km.
+- Then each surviving cluster head absorbs the other heads within 1 km, with
+  their members.
+
+Names come from the OSM feature (gorge, osm), else the nearest named lake
+(≥ 0.2 km²) within 1.5 km, else a named river within 300 m. The place is the
+nearest city, town, village or hamlet within 15 km.
+
+Result: 3,820 moments. 2,276 water, 1,205 vista, 278 gorge, 61 osm.
+
+**Route score and search.** As in §4, with three additions, all in `[route]`:
+- The same named lake, river or falls earns credit again only 10 km further
+  along the route (`feature_spacing_km`). Without this, a loop round
+  Onondaga Lake earned six full moments.
+- Via seeds skip moments whose named feature the fastest route already
+  passes, and keep one seed per named feature.
+- Each via route is built twice, with λ = 1 legs and with fastest legs.
+
+The λ sweep uses λ ∈ {0.5, 1, 2, 3, 5, 8, 12, 20}. The alternatives are
+λ ∈ {1, 3, 8} with reused edges costing ×2, for two rounds. The search runs
+on the nodes with t(A→n) + t(n→B) ≤ 1.5·t0. A query takes 1–4 s after about
+3 s of loading.
+
+**Validation** (`route_validation.json`):
+
+| check | result | need |
+|---|---|---|
+| V1 corridors: best under +30 % passes | 7/8 (Rochester→Geneva: 7.1 scenic min) | 6/8 |
+| V1 bands +5–20, +20–30, +30–50 % all filled | 8/8 | 6/8 |
+| V2 paired contrast | not testable: 0 of 10 pairs non-trivial | 80 % |
+| V5 moments within 300 m of a moment point | 5/30 | 27/30 |
+| V5 non-moments within 300 m | 2/15 | ≤ 2/15 |
+| V5 by member edges (secondary) | 29/30 moments, 4/15 non-moments | |
+| holdout-2 V1 (run once) | 4/4, bands 4/4 | 3/4 |
+| holdout-2 V2 (run once) | 1 non-trivial pair, failed (NY-54A) | |
+
+- **V2.** A stretch's ends are the two farthest-apart nodes of its matched
+  edges. For nearly every stretch, the fastest route between those ends is
+  the stretch itself (shared ≥ 84 %). So the "fast alternative" the check
+  needs does not exist.
+- **V5.** The primary measure was fixed before results were seen: distance
+  to the moment's representative point. A 2 km cluster puts that point up
+  to about 1 km from the place a person would name, so most named moments
+  sit 300–1,900 m away even when one of their edges is a member.
+- **V5 misses.** By member edges, the only miss is the Thousand Islands
+  bridge (edge W 0.45, V_water 0.65). The I-90 and I-390 Genesee crossings,
+  which §1 names as non-moments, pass §4's water rule.
+
+**Rochester→Syracuse** (fastest 88.0 min, I-90):
+
+| budget | min | ratio | km | scenic min | moments credited | main roads |
+|---|---|---|---|---|---|---|
+| fastest | 88.0 | 1.00 | 141 | 4.4 | 6 | I-90, I-490, I-690 |
+| +15 % | 99.9 | 1.14 | 152 | 9.5 | 8 | I-90, NY-31, NY-34, River Rd (Cross Lake, Seneca River) |
+| +30 % | 105.6 | 1.20 | 157 | 10.9 | 8 | I-90, NY-31, Plainville Rd (Cross Lake, Seneca River) |
+| +50 % | 130.0 | 1.48 | 153 | 37.8 | 8 | NY-104, CR-101, Lake Road, NY-370 (Lake Ontario shore, Sodus Point) |
+
+Forced via routes measured on our own graph:
+- Skaneateles front: +26.5 % (§2 said +24 %), score 33.3.
+- Sodus Bay: +30 % with fastest legs (as §2 said); +40 % with λ = 1 legs,
+  mean S 0.54.
+
+Neither Skaneateles nor Sodus Bay wins its budget. Under the §4 score the
+Cross Lake / Seneca River detour wins the +15 % and +30 % budgets (47.9).
+The Lake Ontario shore wins +50 % (77.8).
+
+**Known issues.**
+- 35 % of water moments are on built-up edges (dev > 0.3), because §4 has no
+  town gate. Examples: the Hudson and Mohawk crossings at Albany, Troy and
+  Cohoes, Kingston's Main Street, and Front Street in Olean. Such moments
+  pull some +15 % picks into towns. Kingston→Oneonta +15 % has fewer scenic
+  minutes than the fastest route but more moment points.
+- The vista count (1,205) is well above §4's "a few hundred".
+
