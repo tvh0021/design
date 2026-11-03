@@ -7,6 +7,9 @@ Pipeline:
      or twice by the same way) or a way endpoint. Each edge keeps its full
      geometry and the attributes of its OSM way.
   4. Save edges as parquet (coordinates as list<double> columns) and nodes as npz.
+  5. Count traffic signals, stop signs, crossings and junctions per edge and
+     save them, with the delayed travel time, in edge_delays.parquet (same
+     row order as edges.parquet; see "Delays" below).
 
 Edges whose way is `oneway=-1` are stored reversed, so `oneway=True` always
 means "only u -> v".
@@ -388,7 +391,7 @@ def edge_table(ways: Ways, g: Graph):
 
     ew = g.edge_way
     speed = ways.speed_mph[ew]
-    time_s = g.length_m / (speed * MPH_TO_MS)
+    time_s = free_flow_time(ways, g)
 
     def pick(col):
         return pa.array([col[i] for i in ew], pa.string()).dictionary_encode()
@@ -430,6 +433,275 @@ def save_graph(ways: Ways, g: Graph, out_dir: Path) -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# Delays: traffic controls, junctions and built-up areas
+#
+# Kept in a separate file, edge_delays.parquet, one row per edges.parquet row
+# in the same order, so anything keyed to edge order stays valid. The travel
+# time model is
+#
+#   time = free_flow * f(group) + a*(signals + crossings/2) + b*stops + d*minor_ends
+#
+# with f = `motorway` on motorways, `rural` on other roads outside built-up
+# areas, `built_up` inside them. Six parameters, fitted by `scenic calibrate
+# --fit` (calibrate.py); the values below are its output.
+
+DELAY_PARAMS = {
+    "motorway": 1.006,    # time factor, motorway and motorway_link
+    "rural": 1.011,       # time factor, other roads outside built-up areas
+    "built_up": 1.002,    # time factor, other roads in built-up areas
+    "signal_s": 16.4,     # per traffic signal (a signalised crossing counts as half)
+    "stop_s": 8.1,        # per stop sign
+    "minor_end_s": 2.95,  # per junction entered from, or left onto, a lower-class road
+}
+# A signalised pedestrian crossing or a rail level crossing counts as this
+# many traffic signals (on demand / rarely closed, but you slow down).
+CROSSING_AS_SIGNALS = 0.5
+
+# Road class rank for the turn proxy, lower = more important. Links share
+# their parent's rank but never count as the major road at a junction.
+CLASS_RANK = {
+    "motorway": 0, "trunk": 1, "primary": 2, "secondary": 3, "tertiary": 4,
+    "unclassified": 5, "residential": 6, "living_street": 7,
+    "motorway_link": 0, "trunk_link": 1, "primary_link": 2, "secondary_link": 3, "tertiary_link": 4,
+}
+MOTORWAY_GROUP = frozenset({"motorway", "motorway_link"})
+
+# Built-up flag: at least this many junctions within this radius of the edge's
+# midpoint. A village grid of ~100 m blocks gives 20-30; open country 0-4.
+BUILT_UP_RADIUS_M = 300.0
+BUILT_UP_MIN_JUNCTIONS = 12
+# A signalised crossing this close to a traffic signal belongs to that signal.
+CROSSING_MERGE_M = 40.0
+
+
+@dataclass
+class Controls:
+    """Traffic-control nodes, sorted by OSM id. `weight` is 1, or 0.5 for a
+    sign that faces one direction only (it applies to half the traversals of a
+    two-way edge). `kind`: 0 signal, 1 stop, 2 crossing."""
+
+    node_id: np.ndarray  # int64
+    kind: np.ndarray  # int8
+    weight: np.ndarray  # float64
+    all_way: np.ndarray  # bool: stop=all, or a stop that is not at a junction node
+
+    KINDS = ("signal", "stop", "crossing")
+
+
+def control_kind(tags: dict) -> tuple[int, float, bool] | None:
+    """(kind, weight, all_way) for a node's tags, or None if it is not a control."""
+    hw = (tags.get("highway") or "").strip().lower()
+    directed = any(tags.get(k) not in (None, "", "both")
+                   for k in ("direction", "traffic_signals:direction", "stop:direction"))
+    w = 0.5 if directed else 1.0
+    if hw == "traffic_signals":
+        return 0, w, True
+    if hw == "stop":
+        return 1, w, (tags.get("stop") or "").strip().lower() == "all"
+    if hw == "crossing" and "traffic_signals" in (tags.get("crossing") or "").lower():
+        return 2, 1.0, True
+    if (tags.get("railway") or "").strip().lower() == "level_crossing":
+        return 2, 1.0, True
+    return None
+
+
+def make_controls(rows: list[tuple[int, float, float, int, float, bool]]) -> Controls:
+    """rows: (osm_id, lon, lat, kind, weight, all_way). Drops signalised
+    crossings within CROSSING_MERGE_M of a traffic signal (same intersection)."""
+    from scipy.spatial import cKDTree
+
+    if not rows:
+        z = np.zeros(0)
+        return Controls(z.astype(np.int64), z.astype(np.int8), z, z.astype(bool))
+    ids, lon, lat, kind, weight, all_way = (np.asarray(c) for c in zip(*rows))
+    keep = np.ones(len(ids), bool)
+    sig, cro = kind == 0, kind == 2
+    if sig.any() and cro.any():
+        lat0 = np.radians(lat.mean())
+        xy = np.column_stack([np.radians(lon) * np.cos(lat0), np.radians(lat)]) * EARTH_RADIUS_M
+        d, _ = cKDTree(xy[sig]).query(xy[cro], distance_upper_bound=CROSSING_MERGE_M)
+        keep[np.flatnonzero(cro)[np.isfinite(d)]] = False
+    ids, kind, weight, all_way = ids[keep], kind[keep], weight[keep], all_way[keep]
+    order = np.argsort(ids, kind="stable")
+    ids, kind, weight, all_way = ids[order], kind[order], weight[order], all_way[order]
+    first = np.ones(len(ids), bool)  # one control per node: first kind wins
+    first[1:] = ids[1:] != ids[:-1]
+    return Controls(ids[first].astype(np.int64), kind[first].astype(np.int8),
+                    weight[first].astype(np.float64), all_way[first].astype(bool))
+
+
+def read_controls(pbf: Path) -> Controls:
+    import osmium
+    from osmium.filter import KeyFilter
+
+    rows = []
+    proc = osmium.FileProcessor(str(pbf), osmium.osm.NODE).with_filter(KeyFilter("highway", "railway"))
+    for n in proc:
+        tags = {k: n.tags.get(k) for k in ("highway", "railway", "stop", "crossing", "direction",
+                                           "traffic_signals:direction", "stop:direction")}
+        ck = control_kind(tags)
+        if ck is not None:
+            rows.append((n.id, n.location.lon, n.location.lat, *ck))
+    return make_controls(rows)
+
+
+def edge_delay_features(ways: Ways, g: Graph, controls: Controls) -> dict[str, np.ndarray]:
+    """Per-edge counts for the delay model, aligned with the graph's edges.
+
+    A control on an interior point counts in full (times its weight). A
+    control on an end junction counts half on each edge touching it, so a
+    route passing through the junction pays it once. A two-way stop on a
+    junction node (not stop=all) only counts on edges below the junction's top
+    class. `minor_ends` adds 0.5 for each end at a junction (3+ edges) where
+    the edge meets a road of higher class (turning onto or off a bigger road,
+    or crossing it).
+    Motorway-group edges get no delays.
+    """
+    n_e = len(g.u)
+    npts = np.diff(g.geom_off)
+    edge_of_pt = np.repeat(np.arange(n_e), npts)
+    k = np.arange(len(g.geom_idx)) - np.repeat(g.geom_off[:-1], npts)
+    is_end = (k == 0) | (k == np.repeat(npts - 1, npts))
+    end_node = np.where(k == 0, np.repeat(g.u, npts), np.repeat(g.v, npts))
+
+    hw = np.asarray(ways.highway, dtype=object)[g.edge_way]
+    rank = np.array([CLASS_RANK.get(h, 7) for h in hw], dtype=np.int16)
+    is_link = np.array([h.endswith("_link") for h in hw])
+    no_delay = np.array([h in MOTORWAY_GROUP for h in hw])
+
+    # Top and bottom class (lowest and highest rank) of non-link edges at each junction.
+    n_nodes = len(g.node_osm_id)
+    top = np.full(n_nodes, 99, dtype=np.int16)
+    bottom = np.full(n_nodes, -1, dtype=np.int16)
+    main = ~is_link
+    for ends in (g.u[main], g.v[main]):
+        np.minimum.at(top, ends, rank[main])
+        np.maximum.at(bottom, ends, rank[main])
+
+    out = {name: np.zeros(n_e) for name in ("signals", "stops", "crossings")}
+    pt_node = ways.node_id[g.geom_idx]
+    if len(controls.node_id):
+        i = np.minimum(np.searchsorted(controls.node_id, pt_node), len(controls.node_id) - 1)
+        hit = np.flatnonzero(controls.node_id[i] == pt_node)
+        c = i[hit]
+        e = edge_of_pt[hit]
+        end = is_end[hit]
+        w = controls.weight[c] * np.where(end, 0.5, 1.0)
+        # Two-way stop on a junction: only the minor approaches stop (all of
+        # them if every road there has the same class).
+        n_hit = end_node[hit]
+        minor_here = rank[e] > top[n_hit]
+        all_same = bottom[n_hit] <= top[n_hit]
+        stop_ok = ~end | controls.all_way[c] | minor_here | all_same
+        w = np.where((controls.kind[c] == 1) & ~stop_ok, 0.0, w)
+        for kind, name in enumerate(Controls.KINDS):
+            m = controls.kind[c] == kind
+            out[name + "s"] = np.bincount(e[m], weights=w[m], minlength=n_e)
+
+    deg = np.bincount(g.u, minlength=n_nodes) + np.bincount(g.v, minlength=n_nodes)
+    minor_u = (rank > top[g.u]) & ~is_link & (deg[g.u] >= 3)
+    minor_v = (rank > top[g.v]) & ~is_link & (deg[g.v] >= 3)
+    out["minor_ends"] = 0.5 * minor_u + 0.5 * minor_v
+    for name in out:
+        out[name][no_delay] = 0.0
+
+    # Built-up: junction density around the edge's midpoint.
+    from scipy.spatial import cKDTree
+
+    lat0 = np.radians(g.node_lat.mean())
+
+    def proj(lon, lat):
+        return np.column_stack([np.radians(lon) * np.cos(lat0), np.radians(lat)]) * EARTH_RADIUS_M
+
+    mid = g.geom_idx[(g.geom_off[:-1] + g.geom_off[1:] - 1) // 2]
+    tree = cKDTree(proj(g.node_lon, g.node_lat))
+    density = tree.query_ball_point(proj(ways.lon[mid], ways.lat[mid]), BUILT_UP_RADIUS_M,
+                                    return_length=True, workers=-1)
+    out["junctions_300m"] = density.astype(np.int32)
+    out["built_up"] = density >= BUILT_UP_MIN_JUNCTIONS
+    out["motorway"] = no_delay
+    return out
+
+
+def delayed_time(free_s: np.ndarray, feats: dict[str, np.ndarray], params: dict | None = None) -> np.ndarray:
+    """Travel time in seconds per edge under the delay model."""
+    p = {**DELAY_PARAMS, **(params or {})}
+    mw = np.asarray(feats["motorway"], bool)
+    bu = np.asarray(feats["built_up"], bool)
+    factor = np.where(mw, p["motorway"], np.where(bu, p["built_up"], p["rural"]))
+    signals = np.asarray(feats["signals"]) + CROSSING_AS_SIGNALS * np.asarray(feats["crossings"])
+    return (np.asarray(free_s, dtype=np.float64) * factor + p["signal_s"] * signals
+            + p["stop_s"] * feats["stops"] + p["minor_end_s"] * feats["minor_ends"])
+
+
+DELAY_COLUMNS = ("signals", "stops", "crossings", "minor_ends", "junctions_300m", "built_up", "motorway")
+
+
+def delay_table(feats: dict[str, np.ndarray], free_s: np.ndarray, params: dict | None = None):
+    import pyarrow as pa
+
+    cols = {name: pa.array(feats[name]) for name in DELAY_COLUMNS}
+    cols["free_time_s"] = pa.array(np.asarray(free_s, dtype=np.float64))
+    cols["time_s"] = pa.array(delayed_time(free_s, feats, params))
+    return pa.table(cols)
+
+
+def write_edge_delays(feats: dict[str, np.ndarray], free_s: np.ndarray, out_dir: Path,
+                      params: dict | None = None) -> Path:
+    import pyarrow.parquet as pq
+
+    p = {**DELAY_PARAMS, **(params or {})}
+    table = delay_table(feats, free_s, p)
+    meta = {b"delay_params": json.dumps(p).encode()}
+    path = Path(out_dir) / "edge_delays.parquet"
+    pq.write_table(table.replace_schema_metadata(meta), path, compression="zstd")
+    return path
+
+
+def free_flow_time(ways: Ways, g: Graph) -> np.ndarray:
+    return g.length_m / (ways.speed_mph[g.edge_way] * MPH_TO_MS)
+
+
+def build_edge_delays(pbf: Path | None = None, graph_dir: Path | None = None,
+                      params: dict | None = None) -> dict[str, np.ndarray]:
+    """Compute delay features for an existing edges.parquet without rewriting
+    it: re-read and re-simplify the ways (deterministic), check the edges
+    match row for row, then write edge_delays.parquet. Returns the features
+    plus `free_time_s`."""
+    import pyarrow.parquet as pq
+
+    pbf = pbf or data_dir() / "raw" / "new-york-latest.osm.pbf"
+    graph_dir = Path(graph_dir or data_dir() / "graph")
+    ways, _ = read_ways(pbf)
+    g = simplify(ways)
+    t = pq.read_table(graph_dir / "edges.parquet", columns=["u", "v", "way_id", "time_s"])
+    if t.num_rows != len(g.u):
+        raise RuntimeError(f"edges.parquet has {t.num_rows} rows, rebuilt graph {len(g.u)}; rebuild the graph")
+    for name, mine in (("u", g.u), ("v", g.v), ("way_id", ways.way_id[g.edge_way])):
+        if not np.array_equal(t.column(name).to_numpy(), mine):
+            raise RuntimeError(f"edges.parquet column {name} differs from the PBF; rebuild the graph")
+    feats = edge_delay_features(ways, g, read_controls(pbf))
+    free_s = t.column("time_s").to_numpy()
+    write_edge_delays(feats, free_s, graph_dir, params)
+    return {**feats, "free_time_s": free_s}
+
+
+def reapply_edge_delays(graph_dir: Path | None = None, params: dict | None = None) -> Path:
+    """Recompute time_s in edge_delays.parquet from its stored features (no
+    PBF read), e.g. after DELAY_PARAMS changes."""
+    import pyarrow.parquet as pq
+
+    graph_dir = Path(graph_dir or data_dir() / "graph")
+    d = pq.read_table(graph_dir / "edge_delays.parquet")
+    n = pq.read_metadata(graph_dir / "edges.parquet").num_rows
+    if d.num_rows != n:
+        raise RuntimeError(f"edge_delays.parquet has {d.num_rows} rows, edges.parquet {n}; "
+                           "rerun with --features")
+    feats = {c: d.column(c).to_numpy() for c in DELAY_COLUMNS}
+    return write_edge_delays(feats, d.column("free_time_s").to_numpy(), graph_dir, params)
+
+
 def peak_rss_mb() -> float:
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return r / 1e6 if sys.platform == "darwin" else r / 1e3  # bytes on macOS, KiB on Linux
@@ -447,6 +719,8 @@ def build_graph(pbf: Path | None = None, out_dir: Path | None = None) -> dict:
     t2 = time.monotonic()
     print(f"  simplified to {len(g.node_osm_id):,} nodes, {len(g.u):,} edges ({t2 - t1:.1f} s)")
     stats = save_graph(ways, g, out_dir)
+    feats = edge_delay_features(ways, g, read_controls(pbf))
+    write_edge_delays(feats, free_flow_time(ways, g), out_dir)
     t3 = time.monotonic()
     report = {
         "pbf": str(pbf),

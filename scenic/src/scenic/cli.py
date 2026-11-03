@@ -1,4 +1,4 @@
-"""Command line: scenic fetch | build-graph | fastest."""
+"""Command line: scenic fetch | build-graph | fastest | calibrate."""
 
 from __future__ import annotations
 
@@ -56,6 +56,21 @@ def cmd_fastest(args) -> int:
     return 0
 
 
+def cmd_calibrate(args) -> int:
+    from .calibrate import run_fit
+    from . import data_dir
+    from .graph import build_edge_delays, reapply_edge_delays
+
+    graph_dir = args.graph or data_dir() / "graph"
+    if args.features or not (graph_dir / "edge_delays.parquet").exists():
+        build_edge_delays(args.pbf, graph_dir)
+    if args.fit:
+        run_fit(graph_dir, args.pbf)
+    else:
+        print(f"wrote {reapply_edge_delays(graph_dir)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="scenic", description="Scenic route planner (New York State)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -76,6 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--geojson", type=Path, help="write the route as GeoJSON")
     r.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     r.set_defaults(func=cmd_fastest)
+
+    c = sub.add_parser("calibrate", help="write edge_delays.parquet (signal, stop and junction delays)")
+    c.add_argument("--features", action="store_true", help="recount delay features from the PBF")
+    c.add_argument("--fit", action="store_true", help="refit the delay parameters (Google + OSRM demo server)")
+    c.add_argument("--pbf", type=Path, help="input .osm.pbf (default data/raw/new-york-latest.osm.pbf)")
+    c.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    c.set_defaults(func=cmd_calibrate)
 
     args = p.parse_args(argv)
     return args.func(args)

@@ -22,6 +22,18 @@ from .graph import EARTH_RADIUS_M, haversine_m
 MIN_COST = 1e-6  # csgraph needs strictly positive weights on stored entries
 
 
+def load_delay_time(path: Path, n_edges: int) -> np.ndarray:
+    """time_s from edge_delays.parquet, which must have one row per edge of
+    edges.parquet, in the same order."""
+    import pyarrow.parquet as pq
+
+    d = pq.read_table(path, columns=["time_s"])
+    if d.num_rows != n_edges:
+        raise ValueError(f"{path} has {d.num_rows} rows but edges.parquet has {n_edges}; "
+                         "rerun `scenic calibrate --features`")
+    return d.column("time_s").to_numpy()
+
+
 @dataclass
 class Route:
     nodes: np.ndarray  # node indices, source first
@@ -94,22 +106,37 @@ class RoadGraph:
     # ---- loading -----------------------------------------------------------
 
     @classmethod
-    def load(cls, graph_dir: Path | None = None) -> "RoadGraph":
+    def load(cls, graph_dir: Path | None = None, delays: bool = True) -> "RoadGraph":
+        """Load data/graph. Travel time comes from edge_delays.parquet (free
+        flow plus signal, stop and junction delays) when that file exists and
+        `delays` is true, else from the free-flow time_s in edges.parquet."""
         import pyarrow.parquet as pq
 
         graph_dir = Path(graph_dir or data_dir() / "graph")
         nodes = np.load(graph_dir / "nodes.npz")
         t = pq.read_table(graph_dir / "edges.parquet")
+        time_s = t.column("time_s").to_numpy()
+        delay_path = graph_dir / "edge_delays.parquet"
+        if delays and delay_path.exists():
+            time_s = load_delay_time(delay_path, t.num_rows)
         lon = t.column("lon").combine_chunks()
         lat = t.column("lat").combine_chunks()
         return cls(
             nodes["lon"], nodes["lat"],
             t.column("u").to_numpy(), t.column("v").to_numpy(), t.column("oneway").to_numpy(),
-            t.column("time_s").to_numpy(), t.column("length_m").to_numpy(),
+            time_s, t.column("length_m").to_numpy(),
             lcc=nodes["lcc"],
             geom_off=lon.offsets.to_numpy(), geom_lon=lon.values.to_numpy(), geom_lat=lat.values.to_numpy(),
             edges_table=t.drop_columns(["lon", "lat"]),
         )
+
+    def set_time(self, time_s: np.ndarray) -> None:
+        """Replace the per-edge travel time (and drop the cached matrix)."""
+        time_s = np.asarray(time_s, dtype=np.float64)
+        if time_s.shape != (self.n_edges,):
+            raise ValueError(f"time_s must have shape ({self.n_edges},)")
+        self.time_s = time_s
+        self._cache = None
 
     # ---- snapping ----------------------------------------------------------
 

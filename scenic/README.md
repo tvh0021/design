@@ -41,6 +41,18 @@ scenic fastest --from 43.1566,-77.6088 --to 43.0481,-76.1474 --geojson route.geo
 Prints the fastest route's minutes, km and main roads. `--geojson` also saves
 the route line.
 
+```
+scenic calibrate [--features] [--fit]
+```
+
+Writes `data/graph/edge_delays.parquet`: per-edge counts of traffic signals,
+stop signs, crossings and junctions, a built-up flag, and the travel time
+with delays. It has one row per `edges.parquet` row, in the same order, and
+`fastest` uses its `time_s` when the file is there. `build-graph` writes it
+too. `--features` recounts from the PBF (about 25 s). `--fit` refits the delay
+parameters against Google's phase 0 ETAs and the OSRM demo server, and writes
+`delay_fit.json`. OSRM replies are cached in `~/.cache/scenic-calibrate/`.
+
 ## Road model
 
 - Roads: motorway, trunk, primary, secondary, tertiary, unclassified,
@@ -55,7 +67,28 @@ the route line.
   US mappers often leave off the unit. With no usable tag, a
   default per class: motorway 65, trunk 55, primary 50, secondary 45,
   tertiary 40, unclassified 35, residential 25, living street 15, links 35.
-  No turn costs or traffic lights, so times are free-flow and optimistic.
+- Delays (`graph.DELAY_PARAMS`), added per edge:
+  `time = free_flow * f + 16.4 s * (signals + crossings / 2) + 8.1 s * stops + 2.95 s * minor_ends`.
+  `f` is 1.006 on motorways, 1.011 elsewhere and 1.002 in built-up areas, so
+  nearly all the extra time comes from the signals, stops and junctions.
+  Signals and stops come from OSM nodes (`highway=traffic_signals`,
+  `highway=stop`). A one-direction sign counts half. A two-way stop on a
+  junction only counts for the smaller road. Crossings are signalised
+  pedestrian crossings more than 40 m from a signal, plus rail level
+  crossings. A control at a junction counts half on each edge there, so
+  driving through pays it once. `minor_ends` counts junctions where the edge
+  meets a bigger road. Built-up means 12 or more junctions within 300 m.
+  Motorways get no delays.
+- Fit: against Google's phase 0 ETAs, ours / Google is 1.011 for the fastest
+  route, 1.002 for A, 1.026 for B and 0.961 for C (was 0.97, 0.87, 0.91,
+  0.88). Fitted on the fastest route alone, A, B and C come out at 1.02, 1.05
+  and 0.97. OSRM is not a direct check: its car profile drives at about 0.8x
+  the posted limit and charges about 2 s per signal. So OSRM trips (40
+  village-to-village trips with little motorway) only enter with a free scale
+  factor and OSRM's own signal cost. The per-signal, per-stop and per-junction
+  delays are held near traffic-engineering values (15, 8, 3 s) by weak
+  priors, because neither reference can tell signal delay from slower
+  driving in general.
 
 ## Tests
 
