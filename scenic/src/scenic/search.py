@@ -247,6 +247,69 @@ def _densify(x, y, step: float):
     return px, py, s
 
 
+def has_spur(route: Route, radius_m: float = 150.0, min_distance_m: float = 1500.0) -> bool:
+    """Repeated topology or a long return to within radius_m of the path.
+
+    Index short segment midpoints, then measure actual segment distances.
+    Sampling only points would miss parallel carriageways near the radius.
+    Distances along the path use the same projected geometry as proximity.
+    """
+    from scipy.spatial import cKDTree
+    import shapely
+
+    if len(np.unique(route.nodes)) < len(route.nodes) or len(np.unique(route.edges)) < len(route.edges):
+        return True
+    geo = np.asarray(route.geometry, dtype=np.float64)
+    if len(geo) < 2:
+        return False
+    x, y = _to5070(geo[:, 0], geo[:, 1])
+    px, py, along = _densify(x, y, radius_m / 2)
+    if along[-1] <= min_distance_m:
+        return False
+    points = np.column_stack([px, py])
+    segments = np.stack([points[:-1], points[1:]], axis=1)
+    # Each segment is <= radius/2 long. Midpoints within 1.5 * radius
+    # include every pair of segments whose actual separation is <= radius.
+    pairs = cKDTree(segments.mean(axis=1)).query_pairs(radius_m * 1.5, output_type="ndarray")
+    if not len(pairs):
+        return False
+    i, j = pairs.T
+    possible = along[j + 1] - along[i] > min_distance_m
+    i, j = i[possible], j[possible]
+    if not len(i):
+        return False
+    lines = shapely.linestrings(segments)
+    near = shapely.distance(lines[i], lines[j]) <= radius_m
+    i, j = i[near], j[near]
+    if not len(i):
+        return False
+    # Minimize spatial distance over the segment pair subject to the
+    # required separation along the route. Interior optima are the usual
+    # closest points; on the constraint boundary both positions move the
+    # same distance along their respective segments.
+    closest = shapely.get_coordinates(shapely.shortest_line(lines[i], lines[j])).reshape(-1, 2, 2)
+    si = along[i] + np.linalg.norm(closest[:, 0] - points[i], axis=1)
+    sj = along[j] + np.linalg.norm(closest[:, 1] - points[j], axis=1)
+    if np.any(sj - si > min_distance_m):
+        return True
+    li, lj = along[i + 1] - along[i], along[j + 1] - along[j]
+    gap = min_distance_m - (along[j] - along[i])
+    lo, hi = np.maximum(0, -gap), np.minimum(li, lj - gap)
+    valid = (hi > lo) & (li > 0) & (lj > 0)
+    if not valid.any():
+        return False
+    i, j, li, lj, gap, lo, hi = [v[valid] for v in (i, j, li, lj, gap, lo, hi)]
+    di = (points[i + 1] - points[i]) / li[:, None]
+    dj = (points[j + 1] - points[j]) / lj[:, None]
+    delta = points[j] + gap[:, None] * dj - points[i]
+    direction = dj - di
+    denom = np.sum(direction * direction, axis=1)
+    u = np.clip(-np.sum(delta * direction, axis=1) / np.maximum(denom, 1e-30), lo, hi)
+    # Strict spatial inequality leaves room to move beyond the along-path
+    # boundary, which itself is not an out-and-back.
+    return bool(np.any(np.linalg.norm(delta + u[:, None] * direction, axis=1) < radius_m))
+
+
 def passed_moments(route: Route, g: RoadGraph, mom: Moments, radius: float) -> tuple[np.ndarray, np.ndarray]:
     """Moments the route passes (ids) and their position along it (m): the
     route drives one of the moment's edges or comes within `radius` of its
@@ -333,11 +396,14 @@ class SearchResult:
     seconds: dict
     region_nodes: int
     via_candidates: int = 0
+    spur_rejections: int = 0
 
 
 class _Kept:
-    def __init__(self, cap_s: float):
+    def __init__(self, cap_s: float, cfg: dict):
         self.cap_s = cap_s
+        self.cfg = cfg
+        self.spur_rejections = 0
         self.routes: list[ScenicRoute] = []
         self._seen: set = set()
 
@@ -348,6 +414,10 @@ class _Kept:
         if k in self._seen:
             return False
         self._seen.add(k)
+        if origin != "fastest" and has_spur(route, self.cfg.get("spur_radius_m", 150.0),
+                                           self.cfg.get("spur_min_distance_m", 1500.0)):
+            self.spur_rejections += 1
+            return False
         self.routes.append(ScenicRoute(route=route, origin=origin, vias=tuple(vias)))
         return True
 
@@ -441,7 +511,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     fast = g.make_route(p, T.arcs_between(p[:-1], p[1:]), cost=t0)
     tt = g.time_s[fast.edges]
     s_fast = float(np.sum(tt * S[fast.edges]) / tt.sum())
-    kept = _Kept(cap * fast.time_s)
+    kept = _Kept(cap * fast.time_s, cfg)
     kept.add(fast, "fastest")
 
     # 2. lambda sweep
@@ -576,7 +646,8 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     secs["total"] = time.monotonic() - t_start
     return SearchResult(a=tuple(a_latlon), b=tuple(b_latlon), snap=snap, t0=t0, s_fast=s_fast, fastest=fastest,
                         kept=kept.routes, picks=picks, seconds={k: round(v, 2) for k, v in secs.items()},
-                        region_nodes=int(region.sum()), via_candidates=int(len(via_arcs)))
+                        region_nodes=int(region.sum()), via_candidates=int(len(via_arcs)),
+                        spur_rejections=kept.spur_rejections)
 
 
 # --------------------------------------------------------------------------
@@ -607,6 +678,7 @@ def result_json(ctx: Context, res: SearchResult) -> dict:
         "from": list(res.a), "to": list(res.b), "snap_m": [round(res.snap["from_snap_m"]), round(res.snap["to_snap_m"])],
         "t0_min": round(res.t0 / 60, 1), "S_fast": round(res.s_fast, 3), "kept": len(res.kept),
         "region_nodes": res.region_nodes, "via_candidates": res.via_candidates, "seconds": res.seconds,
+        "spur_rejections": res.spur_rejections,
         "fastest": describe(ctx, res.fastest),
         "picks": {f"+{round((b - 1) * 100)}%": describe(ctx, sr) for b, sr in res.picks.items()},
     }

@@ -203,6 +203,9 @@ lambdas = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]  # cost = t * (1 + lambda *
 alt_lambdas = [1.0, 3.0, 8.0]  # alternatives: edges of routes already kept cost more ...
 alt_rounds = 2
 reuse_penalty = 1.0       # ... cost * (1 + reuse_penalty) on a reused edge
+# Reject returns within 150 m after more than 1.5 km; short interchange ramps pass.
+spur_radius_m = 150.0
+spur_min_distance_m = 1500.0
 via_lambda = 1.0          # legs of via-moment routes (also built with lambda 0)
 via_top = 12              # moments ranked by m / extra minutes ...
 via_top_per_band = 4      # ... plus the best this many in each budget band

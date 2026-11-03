@@ -148,3 +148,112 @@ def test_top_distinct_takes_features_in_ranked_order():
     feat = np.array(["Lake", "Lake", "Falls"], dtype=object)
     order = np.array([2, 0, 1])
     assert _top_distinct(order, feat[order], 2) == [2, 0]
+
+
+def spur_context(repeat_node=False):
+    """A tempting moment north of a through road, plus a legitimate scenic alternative."""
+    ctx = ladder()
+    g = ctx.g
+    # Split the bottom road at node 8, 81 m east of node 1. The spur
+    # returns there on a distinct carriageway, without repeating topology.
+    lon = list(g.node_lon) + [-76.969, -76.970, -76.969]
+    lat = list(g.node_lat) + [43.0, 43.023, 43.023]
+    u = [0, 1, 8, 2, 3, 0, 5, 6, 7, 1, 9, 10]
+    v = [1, 8, 2, 3, 4, 5, 6, 7, 4, 9, 10, 1 if repeat_node else 8]
+    t = [60, 1, 59, 60, 60, 30, 120, 120, 30, 10, 10, 10]
+    ctx.g = RoadGraph(lon, lat, u, v, [True] * len(u), t, [1000] * len(u))
+    ctx.S = np.array([0.2] * 5 + [0.9] * 4 + [0.2] * 3)
+    mx, my = _to5070([-76.9695], [43.023])
+    ctx.moments = Moments(id=np.array([0]), m=np.array([1.]), x=mx, y=my,
+                          lon=np.array([-76.9695]), lat=np.array([43.023]), edge=np.array([10]),
+                          type=np.array(['water']), label=np.array(['Spur pond']),
+                          of_edge=np.array([-1] * 10 + [0, -1]), feature=np.array([None]))
+    ctx.cfg['alt_rounds'] = 0
+    return ctx
+
+
+@pytest.mark.parametrize('repeat_node', [False, True])
+def test_via_spur_is_rejected_and_budgets_keep_legitimate_routes(repeat_node):
+    from scenic.search import _build_via, has_spur
+
+    ctx = spur_context(repeat_node)
+    g = ctx.g
+    graph = CostGraph(g, np.arange(len(g.arc_edge)), g.time_s)
+    route = _build_via(g, graph, 0, 4, [(9, 10, 10, 0)])
+    assert route.time_s < 1.15 * 240
+    if not repeat_node:
+        assert len(np.unique(route.nodes)) == len(route.nodes)
+        assert len(np.unique(route.edges)) == len(route.edges)
+    assert has_spur(route)
+    res = search(ctx, latlon(g, 0), latlon(g, 4))
+    assert res.spur_rejections >= 1
+    assert all(not has_spur(sr.route) for sr in res.kept)
+    assert res.picks[1.15] is res.fastest
+    assert list(res.picks[1.30].nodes) == [0, 5, 6, 7, 4]
+    assert all(0 not in sr.moments for sr in res.picks.values())
+
+
+def test_short_cloverleaf_loop_is_kept():
+    from scenic.search import _Kept, has_spur
+
+    # A roughly 500 m ramp returns close to its entry on distinct nodes.
+    g = RoadGraph([-77, -77, -76.998, -76.998, -76.999],
+                  [43, 43.0015, 43.0015, 43, 43],
+                  [0, 1, 2, 3], [1, 2, 3, 4], [True] * 4, [10] * 4, [125] * 4)
+    route = g.route(0, 4)
+    assert not has_spur(route)
+    kept = _Kept(100, CFG)
+    assert kept.add(route, 'via 0 (fastest legs)')
+
+
+@pytest.mark.parametrize('origin', ['lambda 1', 'alt lambda 1 #1', 'via 0 (lambda 1)'])
+def test_all_candidate_sources_are_filtered_but_fastest_is_exempt(origin):
+    from scenic.search import _Kept, _build_via
+
+    ctx = spur_context()
+    g = ctx.g
+    graph = CostGraph(g, np.arange(len(g.arc_edge)), g.time_s)
+    route = _build_via(g, graph, 0, 4, [(9, 10, 10, 0)])
+    kept = _Kept(1000, CFG)
+    assert not kept.add(route, origin)
+    assert not kept.add(route, origin)  # count distinct rejected paths once
+    assert kept.spur_rejections == 1
+    assert _Kept(1000, CFG).add(route, 'fastest')
+
+
+def test_spur_thresholds_are_configurable_and_compare_segments():
+    from scenic.search import _Kept, _build_via, has_spur
+
+    ctx = spur_context()
+    g = ctx.g
+    graph = CostGraph(g, np.arange(len(g.arc_edge)), g.time_s)
+    route = _build_via(g, graph, 0, 4, [(9, 10, 10, 0)])
+    assert has_spur(route)
+    assert not has_spur(route, radius_m=10)
+    assert not has_spur(route, min_distance_m=100000)
+    kept = _Kept(1000, {**CFG, 'spur_radius_m': 10})
+    assert kept.add(route, 'via 0')
+
+
+def test_repeated_edge_is_rejected_even_without_repeated_node_ids():
+    from dataclasses import replace
+    from scenic.search import has_spur
+
+    route = ladder().g.route(0, 4)
+    # Defensive check for inconsistent topology supplied by another producer.
+    assert has_spur(replace(route, edges=np.array([0, 1, 0, 3])))
+
+
+@pytest.mark.parametrize('gap, expected', [(149.9, True), (150.1, False)])
+def test_geometric_spur_uses_segment_distance_near_radius(gap, expected):
+    from pyproj import Transformer
+    from scenic.route import Route
+    from scenic.search import has_spur
+
+    # Long sparse segments with offset sampling phases. Their nearest
+    # points are in segment interiors, not necessarily sampled vertices.
+    x0, y0 = _to5070([-77], [43])
+    xy = np.array([[0, 0], [0, 2600], [gap, 2625], [gap, 25], [1000, 25]])
+    lon, lat = Transformer.from_crs(5070, 4326, always_xy=True).transform(xy[:, 0]+x0[0], xy[:, 1]+y0[0])
+    route = Route(np.arange(5), np.arange(4), np.zeros(4, bool), 60, 6000, 60, list(zip(lon, lat)))
+    assert has_spur(route) is expected
