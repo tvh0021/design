@@ -449,6 +449,8 @@ class Stage:
 def stages(paths: Paths) -> list[Stage]:
     R = lambda n: paths.p("rasters", n)  # noqa: E731
     O = lambda n: paths.p("out", n)  # noqa: E731
+    from .boundary import boundary_path
+
     cfgd = Path(paths.config).parent
     edges = paths.p("graph", "edges.parquet")
     nlcd_in = sorted(Path(paths.raw, "nlcd").glob("Annual_NLCD_LndCov_*_CU_*.tif"))[-1:]
@@ -484,8 +486,8 @@ def stages(paths: Paths) -> list[Stage]:
         Stage("moments", st_moments,
               [edges, O("edge_signals.parquet"), O("samples.npz"), O("osm_features.parquet"), R("grid.json"),
                R("dem30.tif"), R("dem90.tif"), R("open90.tif"), R("min3k90.tif"), *water, R("bigwater_idx90.tif"),
-               R("wfrac90.tif")],
-              [O("moments.parquet")], ("moments", "score", "rasters", "graph", "water"),
+               R("wfrac90.tif"), boundary_path()],
+              [O("moments.parquet")], ("moments", "score", "rasters", "graph", "water", "boundary"),
               ("moments", "grid", "water")),
         Stage("validate", st_validate,
               [O("scores.parquet"), O("samples.npz"), O("edge_signals.parquet"), edges, *byway_in,

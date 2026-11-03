@@ -178,6 +178,29 @@ water and edges stages at about 9.6 GB. It writes these files to
 - `score_report.json`: inputs, versions, run time and peak memory per
   stage, deviations from the spec, and the validation results.
 
+Before scoring moments, fetch the state boundary once:
+
+```
+.venv/bin/python -m scenic.boundary
+```
+
+This downloads the public-domain [Census 2023 TIGER/Line state boundaries](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html)
+(the legal boundary, which runs out into Lake Ontario, Lake Champlain and
+the harbour, unlike the cartographic file clipped at the shoreline), unions
+New York with Pennsylvania, New Jersey, Connecticut, Massachusetts and
+Vermont, and saves WGS84 geometry to `data/boundary/new_york.geojson` (also
+respects `SCENIC_DATA`). The source ZIP and its SHA-256 recorded in the
+GeoJSON preserve provenance. Existing valid data is reused. The download
+sends no user identity. Moment generation fails if this file is missing or
+invalid. It drops moment clusters whose stop is outside the mask: the
+representative point must lie within 200 m of it, or the stop's own road
+edge must touch a node inside it (so the Peace, Ogdensburg-Prescott and
+Thousand Islands bridges keep their stop even when the cluster point lands
+on the far shore). Only the Canadian side is outside the mask: a drive may
+run through a neighbouring state and stop there. The road graph is not
+filtered. The moment stage fingerprints the boundary file and reports
+removed counts and labels in `score_report.json`.
+
 Known limitations of the score pipeline:
 
 - The water90 stage peaks at about 14.8 GB of memory (the 1 km and 3 km disk

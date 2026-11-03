@@ -14,7 +14,8 @@ GATE = {"water_min_size": 0.40, "water_named_min_size": 0.25, "water_storm_overr
         "water_broad_wfrac": 0.20}
 
 NAME = {"water_named_min_m2": 1e5, "water_name_m": 600.0, "name_slack_m": 300.0, "name_touch_m": 50.0,
-        "bay_node_parent_m2": 1e8, "bay_node_m": 800.0, "river_name_m": 300.0, "river_wide_name_m": 1500.0}
+        "bay_node_parent_m2": 1e8, "bay_node_m": 800.0, "river_name_m": 300.0, "river_wide_name_m": 1500.0,
+        "lake_wins_min_m2": 1e6, "lake_wins_m": 400.0}
 
 # toy coordinates: EPSG:5070 metres near Rochester
 X0, Y0 = 1_380_000.0, 2_380_000.0
@@ -123,11 +124,11 @@ def _wkb(poly_xy):
     return shapely.to_wkb(g)
 
 
-def name(features, hx, hy, wide=None):
-    return name_parent(features, hx, hy, wide)[0]
+def name(features, hx, hy, wide=None, mc=None):
+    return name_parent(features, hx, hy, wide, mc)[0]
 
 
-def name_parent(features, hx, hy, wide=None):
+def name_parent(features, hx, hy, wide=None, mc=None):
     kind = np.asarray([f[0] for f in features], dtype=object)
     fname = np.asarray([f[1] for f in features], dtype=object)
     fwkb = [_wkb(f[2]) if f[2] is not None else None for f in features]
@@ -143,7 +144,7 @@ def name_parent(features, hx, hy, wide=None):
             lon.append(lo[0]), lat.append(la[0])
     feature = np.full(len(hx), None, dtype=object)
     f, p = _name_water(feature, np.asarray(hx) + X0, np.asarray(hy) + Y0, kind, fname, fwkb, farea, ftag,
-                       np.asarray(lon), np.asarray(lat), NAME, wide=wide)
+                       np.asarray(lon), np.asarray(lat), mc or NAME, wide=wide)
     return list(f), list(p)
 
 
@@ -227,3 +228,127 @@ def test_unnamed_narrow_water_is_dropped_named_is_not():
     base = dict(highway=["secondary"] * 3, size=[1.0] * 3, wfrac=[0.03, 0.03, 0.2], dev=[0.0] * 3,
                 jdens=[0.0] * 3, named=[False, True, False], storm=[False] * 3)
     assert [WATER_DROP[i] for i in water_gate(**base, mc=mc)] == ["narrow", "kept", "kept"]
+
+
+def test_nearer_river_beats_detached_canal_area():
+    canal = ("water", "Power Canal", shapely.box(400, 0, 900, 1000), 5e5, "canal")
+    river = ("river", "Main River", shapely.LineString([(0, -1000), (0, 1000)]), np.nan, "river")
+    assert name([canal, river], [20.0], [200.0]) == ["Main River"]
+    assert name([canal, river], [500.0], [200.0]) == ["Power Canal"]
+
+
+def test_canal_name_propagates_only_through_connected_canal_endpoints():
+    from scenic.moments import propagate_canal_names
+    rows = dict(kind=["canal"] * 4 + ["river"], name=["Erie Canal", None, None, None, None],
+                wkb=[_wkb(shapely.LineString(p)) for p in
+                     [[(0, 0), (100, 0)], [(100, 0), (200, 0)], [(200, 0), (300, 0)],
+                      [(100, 10), (200, 10)], [(300, 0), (400, 0)]]])
+    propagate_canal_names(rows)
+    assert rows["name"] == ["Erie Canal", "Erie Canal", "Erie Canal", None, None]
+
+
+def test_motorway_near_big_water_still_needs_long_wet_bridge():
+    base = dict(highway=["motorway"] * 2, size=[1.0] * 2, wfrac=[0.5] * 2,
+                dev=[0.0] * 2, jdens=[0.0] * 2, named=[True] * 2, storm=[False] * 2)
+    assert list(water_gate(**base, mc=GATE, bridge=[False, True])) == [3, 0]
+
+
+def test_nearest_named_canal_can_label_a_crossing():
+    canal = ("canal", "Erie Canal", shapely.LineString([(-1000, 0), (1000, 0)]), np.nan, "canal")
+    assert name([canal], [0.0], [20.0]) == ["Erie Canal"]
+
+
+def test_long_bridge_requires_substantial_actual_water_crossing():
+    from scenic.moments import long_water_bridge
+    mc = {"water_bridge_min_m": 500, "water_bridge_wet_m": 200}
+    assert list(long_water_bridge([True, True, True, False], [1368, 1000, 300, 1368],
+                                  [0.1724, 0.1, 1.0, 0.9], mc)) == [True, False, False, False]
+
+
+def test_major_bridge_anchors_cluster_instead_of_shore_road():
+    from scenic.moments import anchored_value, cluster, representative_rank
+    m, bridge = np.array([1.0, 0.65, 0.9]), np.array([False, True, False])
+    heads, owner = cluster(representative_rank(m, bridge), np.array([0, 900, 1800]), np.zeros(3), np.ones(3),
+                           2000, 1000)
+    assert list(heads) == [1]
+    assert list(owner) == [1, 1, 1]
+    # the deck is the position; the value is the best member edge's
+    assert list(anchored_value(m, owner, heads, bridge)) == [1.0]
+
+
+def test_only_bridge_anchored_clusters_take_the_best_member_value():
+    from scenic.moments import anchored_value
+    # two clusters: a shore road headed by its own best edge, and a bridge
+    # head (0.6) with a 0.95 member
+    m = np.array([0.8, 0.5, 0.6, 0.95])
+    owner = np.array([0, 0, 2, 2])
+    bridge = np.array([False, False, True, False])
+    assert list(anchored_value(m, owner, np.array([0, 2]), bridge)) == [0.8, 0.95]
+    # without the bridge flag the head keeps its own value
+    assert list(anchored_value(m, owner, np.array([0, 2]), np.zeros(4, bool))) == [0.8, 0.6]
+
+
+def test_lake_beats_the_creek_crossed_on_a_lakeshore_road():
+    """Canadaway Creek on NY 5 at Dunkirk is Lake Erie: a lake of at least
+    lake_wins_min_m2 within lake_wins_m keeps the label even though the
+    crossed creek line is nearer."""
+    creek = ("river", "Toy Creek", shapely.LineString([(0, -3000), (0, 0)]), np.nan, "river")
+    mc = {**NAME, "water_name_m": 1500.0}
+    # 10 m from the creek, 300 m from the lake shore
+    assert name([LAKE, creek], [10.0], [-300.0], mc=mc) == ["Great Lake"]
+    # 1.4 km from the lake: the crossed creek names it
+    assert name([LAKE, creek], [10.0], [-1400.0], mc=mc) == ["Toy Creek"]
+    # a lake under lake_wins_min_m2 does not beat a nearer creek
+    small = ("water", "Toy Pond", shapely.box(-400, 0, 400, 600), 4.8e5, "lake")
+    assert name([small, creek], [10.0], [-300.0], mc=mc) == ["Toy Creek"]
+
+
+def test_canal_tagged_water_does_not_beat_a_nearer_river():
+    """Lewiston: the Chippawa-Queenston Power Canal (water=canal) does not
+    take the label from the Niagara River even when large and close."""
+    canal = ("water", "Power Canal", shapely.box(100, 0, 900, 3000), 2.4e6, "canal")
+    river = ("river", "Main River", shapely.LineString([(0, -1000), (0, 4000)]), np.nan, "river")
+    assert name([canal, river], [20.0], [200.0]) == ["Main River"]
+    lake = (*canal[:4], "reservoir")
+    assert name([lake, river], [20.0], [200.0]) == ["Power Canal"]
+
+
+def test_bridge_name_never_comes_from_a_plain_road_name():
+    from scenic.moments import _label, bridge_name
+    assert bridge_name({"name": "FDR Drive", "bridge": "yes"}) is None
+    assert bridge_name({"name": "Williamsburg Bridge"}) == "Williamsburg Bridge"
+    assert bridge_name({"name": "Robert Moses Causeway"}) == "Robert Moses Causeway"
+    assert bridge_name({"name": "Skyway Viaduct"}) == "Skyway Viaduct"
+    assert bridge_name({"name": "NY 17", "bridge:name": "Toy Memorial Span"}) == "Toy Memorial Span"
+    assert _label("Williamsburg Bridge", "Williamsburg Bridge", "New York") == "Williamsburg Bridge near New York"
+    assert _label("Toy Bridge", "NY 5", "Dunkirk") == "Toy Bridge on NY 5 near Dunkirk"
+
+
+def test_bridge_row_name_from_osm(tmp_path):
+    from scenic.moments import read_osm_features
+    source = tmp_path / "bridges.osm"
+    source.write_text('''<osm version="0.6">
+      <node id="1" lat="40.7" lon="-73.97"/><node id="2" lat="40.71" lon="-73.97"/>
+      <way id="10"><nd ref="1"/><nd ref="2"/><tag k="highway" v="motorway"/><tag k="bridge" v="yes"/>
+      <tag k="name" v="FDR Drive"/></way>
+      <way id="11"><nd ref="1"/><nd ref="2"/><tag k="highway" v="primary"/><tag k="bridge" v="yes"/>
+      <tag k="name" v="Williamsburg Bridge"/></way>
+      <way id="12"><nd ref="1"/><nd ref="2"/><tag k="highway" v="primary"/><tag k="bridge" v="yes"/>
+      <tag k="name" v="Toy Road"/><tag k="bridge:name" v="Toy Span"/></way></osm>''')
+    rows = read_osm_features(source, progress=False).to_pylist()
+    names = {r["way_id"]: r["name"] for r in rows if r["kind"] == "bridge"}
+    assert names == {10: None, 11: "Williamsburg Bridge", 12: "Toy Span"}
+
+
+def test_waterway_relation_names_unnamed_canal_member(tmp_path):
+    from scenic.moments import read_osm_features
+    source = tmp_path / "canal.osm"
+    source.write_text('''<osm version="0.6">
+      <node id="1" lat="43" lon="-77"/><node id="2" lat="43" lon="-76.999"/>
+      <way id="10"><nd ref="1"/><nd ref="2"/><tag k="waterway" v="canal"/></way>
+      <relation id="20"><member type="way" ref="10" role="main_stream"/>
+      <tag k="type" v="waterway"/><tag k="waterway" v="canal"/>
+      <tag k="name" v="Erie Canal"/></relation></osm>''')
+    rows = read_osm_features(source, progress=False).to_pylist()
+    canal = [r for r in rows if r["kind"] == "canal"]
+    assert len(canal) == 1 and canal[0]["name"] == "Erie Canal"
