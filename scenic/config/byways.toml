@@ -1,0 +1,64 @@
+# Fallback byway list, used only when no byway GeoJSON could be downloaded
+# (docs/SCORE_SPEC.md section 6). The spec asks for county sets; no county
+# polygons are on disk, so each byway has a lon/lat box instead
+# [lon_min, lat_min, lon_max, lat_max] around its counties.
+
+[[byway]]
+name = "Great Lakes Seaway Trail"
+refs = ["NY 18", "NY 104", "NY 3"]
+bbox = [-79.80, 42.00, -75.30, 44.90]
+
+[[byway]]
+name = "Adirondack Trail"
+refs = ["NY 30"]
+bbox = [-74.75, 43.00, -74.10, 44.95]
+
+[[byway]]
+name = "Central Adirondack Trail"
+refs = ["NY 28"]
+bbox = [-75.40, 43.20, -73.70, 43.95]
+
+[[byway]]
+name = "Olympic Trail"
+refs = ["NY 3"]
+bbox = [-75.95, 43.95, -73.40, 44.75]
+
+[[byway]]
+name = "High Peaks Byway"
+refs = ["NY 73"]
+bbox = [-74.00, 44.00, -73.55, 44.32]
+
+[[byway]]
+name = "Roosevelt-Marcy Trail"
+refs = ["NY 28N"]
+bbox = [-74.30, 43.70, -73.75, 44.05]
+
+[[byway]]
+name = "Upper Delaware Scenic Byway"
+refs = ["NY 97"]
+bbox = [-75.40, 41.35, -74.65, 42.00]
+
+[[byway]]
+name = "Catskill Mountains Scenic Byway"
+refs = ["NY 28", "NY 23A"]
+bbox = [-74.75, 41.95, -73.95, 42.35]
+
+[[byway]]
+name = "Shawangunk Mountains Scenic Byway"
+refs = ["US 44", "NY 55"]
+bbox = [-74.45, 41.60, -74.05, 41.85]
+
+[[byway]]
+name = "Lakes to Locks Passage"
+refs = ["NY 22", "US 9", "NY 4"]
+bbox = [-73.90, 42.70, -73.30, 45.02]
+
+[[byway]]
+name = "Cayuga Lake Scenic Byway"
+refs = ["NY 89", "NY 90"]
+bbox = [-76.90, 42.40, -76.40, 42.95]
+
+[[byway]]
+name = "Route 20 Scenic Byway (Duanesburg to LaFayette)"
+refs = ["US 20"]
+bbox = [-76.15, 42.70, -74.05, 42.95]

@@ -1,4 +1,4 @@
-"""Command line: scenic fetch | build-graph | fastest | calibrate."""
+"""Command line: scenic fetch | build-graph | fastest | calibrate | fetch-layers | score."""
 
 from __future__ import annotations
 
@@ -71,6 +71,21 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_fetch_layers(args) -> int:
+    from .layers import fetch_layers
+
+    only = set(args.only or ["dem", "nlcd", "byways"])
+    fetch_layers(args.raw, dem="dem" in only, nlcd="nlcd" in only, byways="byways" in only)
+    return 0
+
+
+def cmd_score(args) -> int:
+    from .score import run
+
+    run(graph_dir=args.graph, out_dir=args.out, force=args.force)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="scenic", description="Scenic route planner (New York State)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -98,6 +113,18 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--pbf", type=Path, help="input .osm.pbf (default data/raw/new-york-latest.osm.pbf)")
     c.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     c.set_defaults(func=cmd_calibrate)
+
+    fl = sub.add_parser("fetch-layers", help="download 3DEP elevation, NLCD land cover and byway lines")
+    fl.add_argument("--only", nargs="+", choices=["dem", "nlcd", "byways"], help="fetch only these layers")
+    fl.add_argument("--raw", type=Path, help="download directory (default data/raw)")
+    fl.set_defaults(func=cmd_fetch_layers)
+
+    s = sub.add_parser("score", help="compute the scenery score for every edge (data/score/)")
+    s.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    s.add_argument("--out", type=Path, help="output directory (default data/score)")
+    s.add_argument("--force", nargs="*", metavar="STAGE",
+                   help="rerun these stages (no names: all) even if their products are fresh")
+    s.set_defaults(func=cmd_score)
 
     args = p.parse_args(argv)
     return args.func(args)

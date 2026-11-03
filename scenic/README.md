@@ -4,7 +4,8 @@ A scenic route planner for New York State. See `docs/PLAN.md` for the full plan.
 
 So far it does phase 1 for OpenStreetMap only. It downloads the New York OSM
 extract, builds a statewide graph of drivable roads, and finds the fastest
-route between two points. Scenery scoring comes later.
+route between two points. It also gives every road edge a scenery score
+(v0, `docs/SCORE_SPEC.md`).
 
 ## Setup
 
@@ -53,6 +54,40 @@ too. `--features` recounts from the PBF (about 25 s). `--fit` refits the delay
 parameters against Google's phase 0 ETAs and the OSRM demo server, and writes
 `delay_fit.json`. OSRM replies are cached in `~/.cache/scenic-calibrate/`.
 
+```
+scenic fetch-layers [--only dem nlcd byways]
+```
+
+Downloads the score's input layers into `data/raw/`: the 53 USGS 3DEP
+1 arc-second DEM tiles that cover New York (2.6 GB, md5-checked against the
+S3 ETag), the Annual NLCD 2023 land cover zip from MRLC (1.4 GB, extracted
+to a 1.4 GB GeoTIFF) and the NYSDOT scenic byway lines (GeoJSON, used only
+to validate the score). Downloads resume from a `.part` file, and files
+already present are skipped. `data/raw/layers.json` records what was fetched.
+
+```
+scenic score [--force [STAGE ...]]
+```
+
+Scores every edge in `data/graph/edges.parquet`. Settings are in
+`config/score.toml`. The stages are grid, dem, nlcd, water, terrain90, land90,
+controls, edges, score, outputs and validate. Each one runs in its own
+process and caches its result in `data/rasters/` or `data/score/`. A stage
+is skipped when its outputs are newer than its inputs. `--force` reruns all
+stages, or just the ones named. A full run takes about 2.5 minutes, and the
+water stage peaks at about 9.4 GB of memory. It writes these files to
+`data/score/`:
+
+- `scores.parquet`: one row per edge, in the same order as `edges.parquet`,
+  with S, the six signals (W, H, V, L, Q, C), penalty, raw, smooth and
+  excluded.
+- `heatmap.png`: a statewide map of S.
+- `summary.md`: distributions of the signals and how they correlate.
+- `validation.json`: the byway, spot-check and Rochester to Syracuse checks.
+  The spot checks are listed in `config/spot_checks.toml`.
+- `score_report.json`: inputs, versions, run time and peak memory per
+  stage, deviations from the spec, and the validation results.
+
 ## Road model
 
 - Roads: motorway, trunk, primary, secondary, tertiary, unclassified,
@@ -96,4 +131,5 @@ parameters against Google's phase 0 ETAs and the OSRM demo server, and writes
 .venv/bin/python -m pytest
 ```
 
-The tests use small hand-made graphs and need no downloaded data.
+The tests use small hand-made graphs and synthetic rasters, and need no
+downloaded data or network.

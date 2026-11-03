@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scenic"
 version = "0.1.0"
-description = "Scenic route planner for New York State (OSM road graph and routing)"
+description = "Scenic route planner for New York State (OSM road graph, routing and scenery score)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,10 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "pyarrow>=15",
+    "rasterio>=1.4",
+    "pyproj>=3.6",
+    "shapely>=2.0",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]

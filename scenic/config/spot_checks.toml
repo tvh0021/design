@@ -1,0 +1,111 @@
+# Spot checks for the scenery score (docs/SCORE_SPEC.md section 6). Each
+# stretch: road by `ref` (matched against every ;-separated ref of an edge,
+# spaces and hyphens ignored) or `name`, plus a lon/lat box
+# [lon_min, lat_min, lon_max, lat_max] spanning the two named towns. An edge
+# matches when its middle vertex is inside the box. Result = length-weighted
+# mean S of the matched edges. These are checks only, never inputs.
+
+[thresholds]
+scenic = 0.70   # expected S >= this
+dull = 0.35     # expected S <= this
+need = 8        # of 10, per list
+
+[[scenic]]
+label = "NY-97 Hawk's Nest, Port Jervis to Barryville"
+ref = "NY 97"
+bbox = [-74.93, 41.37, -74.68, 41.49]
+
+[[scenic]]
+label = "NY-73 Keene Valley to Lake Placid"
+ref = "NY 73"
+bbox = [-73.99, 44.18, -73.77, 44.29]
+
+[[scenic]]
+label = "NY-30 Indian Lake to Long Lake"
+ref = "NY 30"
+bbox = [-74.47, 43.77, -74.25, 43.98]
+
+[[scenic]]
+label = "NY-23A Palenville to Haines Falls"
+ref = "NY 23A"
+bbox = [-74.11, 42.16, -74.01, 42.21]
+
+[[scenic]]
+label = "NY-18 Youngstown to Olcott"
+ref = "NY 18"
+bbox = [-79.06, 43.24, -78.70, 43.35]
+
+[[scenic]]
+label = "NY-89 Ithaca to Seneca Falls"
+ref = "NY 89"
+bbox = [-76.83, 42.44, -76.49, 42.92]
+
+[[scenic]]
+label = "NY-414 Watkins Glen to Lodi"
+ref = "NY 414"
+bbox = [-76.90, 42.37, -76.78, 42.62]
+
+[[scenic]]
+label = "NY-9N Bolton Landing to Hague"
+ref = "NY 9N"
+bbox = [-73.68, 43.55, -73.48, 43.75]
+
+[[scenic]]
+label = "NY-22 Westport to Essex"
+ref = "NY 22"
+bbox = [-73.47, 44.17, -73.34, 44.32]
+
+[[scenic]]
+label = "US-20 Skaneateles to LaFayette"
+ref = "US 20"
+bbox = [-76.44, 42.87, -76.10, 42.96]
+
+[[dull]]
+label = "I-490 Rochester, Inner Loop to I-590"
+ref = "I 490"
+bbox = [-77.605, 43.12, -77.55, 43.16]
+
+[[dull]]
+label = "NY-104 West Ridge Road, Greece, Lake Avenue to Long Pond Road"
+ref = "NY 104"
+bbox = [-77.70, 43.19, -77.62, 43.23]
+
+[[dull]]
+label = "NY-5 Erie Boulevard East, Syracuse to DeWitt"
+ref = "NY 5"
+bbox = [-76.15, 43.03, -76.06, 43.06]
+
+[[dull]]
+label = "NY-5 Central Avenue, Albany, Everett Road to Wolf Road"
+ref = "NY 5"
+bbox = [-73.82, 42.69, -73.78, 42.72]
+
+[[dull]]
+label = "NY-24 Hempstead Turnpike, Levittown"
+ref = "NY 24"
+bbox = [-73.55, 40.71, -73.48, 40.74]
+
+[[dull]]
+label = "I-495 Long Island Expressway, Queens"
+ref = "I 495"
+bbox = [-73.96, 40.72, -73.70, 40.76]
+
+[[dull]]
+label = "NY-78 Transit Road, Williamsville to Depew"
+ref = "NY 78"
+bbox = [-78.74, 42.89, -78.68, 42.97]
+
+[[dull]]
+label = "US-9 Wappingers Falls to Fishkill"
+ref = "US 9"
+bbox = [-73.94, 41.52, -73.88, 41.63]
+
+[[dull]]
+label = "US-62 Niagara Falls Boulevard, Tonawanda to Amherst"
+ref = "US 62"
+bbox = [-78.86, 42.96, -78.78, 43.05]
+
+[[dull]]
+label = "NY-5 Batavia to Le Roy"
+ref = "NY 5"
+bbox = [-78.17, 42.96, -78.00, 43.01]

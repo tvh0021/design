@@ -1,0 +1,109 @@
+# Scenery score v0 constants (docs/SCORE_SPEC.md). Loaded once by
+# scenic.score; code never hard-codes these values.
+
+[grid]
+crs = "EPSG:5070"
+res = 30.0
+origin_x = -2493045.0     # NLCD grid origin
+origin_y = 3310005.0
+pad_m = 2000.0            # around the bounding box of all edge vertices
+block = 3                 # 30 m -> 90 m block mean
+
+[sampling]
+step_m = 50.0
+short_edge_m = 20.0       # edges under this keep only their two endpoints
+min_points_shape = 4      # grade needs at least this many points
+
+[water]
+sources_area = ["natural=water", "landuse=reservoir", "waterway=riverbank"]
+exclude_water = ["wastewater", "basin", "reflecting_pool"]
+coastline_band_m = 60.0
+coastline_area_m2 = 1e9
+size_log10_lo = 4.0       # 1 ha -> 0
+size_log10_span = 4.0     # 100 km2 -> 1
+line_size = { river = 0.45, canal = 0.35, stream = 0.15 }
+prefilter_m = 300.0       # water cells this close to a road sample point
+road_dilate_cells = 10
+max_dist_m = 250.0        # f(d) = clip((max - d) / ramp, 0, 1)
+ramp_m = 200.0
+vis_fracs = [0.2, 0.4, 0.6, 0.8]
+vis_min_dist_m = 45.0     # closer than this: vis = 1
+
+[hills]
+disk_radius_cells = 11    # 1 km at 90 m
+relief_scale_m = 300.0
+grade_offset = 0.01
+grade_scale = 0.05
+w_relief = 0.7
+w_grade = 0.3
+
+[views]
+tpi_scale_m = 60.0
+open_window = 3           # cells of the 90 m grid
+base = 0.35
+tpi_weight = 0.65
+
+[landcover]
+window = 3                # 3x3 uniform filter on the 90 m grid (270 m)
+w_score = 0.8
+w_mix = 0.2
+# Per-class score; classes not listed (nodata 250) do not count.
+class_score = { 11 = 0.8, 12 = 0.8, 21 = 0.4, 22 = 0.2, 23 = 0.1, 24 = 0.0, 31 = 0.5, 41 = 0.7, 42 = 0.7, 43 = 0.7, 52 = 0.7, 71 = 0.8, 81 = 0.9, 82 = 0.7, 90 = 0.7, 95 = 0.9 }
+
+[groups]
+water = [11]
+developed = [21, 22, 23, 24]
+forest = [41, 42, 43, 90]
+open = [31, 52, 71, 81, 82, 95, 21]
+blocking = [22, 23, 24, 41, 42, 43, 90]
+town = [22, 23, 24]       # "dev" for the town-centre penalty
+
+[quiet]
+motorway = 0.00
+trunk = 0.10
+primary = 0.25
+secondary = 0.50
+tertiary = 0.75
+unclassified = 0.90
+residential = 0.60
+living_street = 0.50
+
+[curves]
+min_step_m = 5.0
+scale_deg_per_km = 200.0
+
+[combine]
+w_water = 0.35
+w_hills = 0.30
+w_views = 0.20
+w_land = 0.15
+bonus_quiet = 0.10
+bonus_curves = 0.05
+
+[penalty]
+cap = 0.5
+junction_weight = 0.15
+junction_lo_per_km = 4.0
+junction_span_per_km = 16.0
+signal_weight = 0.20
+signal_full_per_km = 3.0
+signal_match_m = 25.0
+town_weight = 0.25
+town_window = 7           # 7x7 on the 90 m grid, about 300 m
+town_lo = 0.3
+town_span = 0.5
+urban_speed_weight = 0.10
+urban_speed_mph = 30.0
+motorway_weight = 0.10
+
+[exclude]
+surfaces = ["unpaved", "gravel", "fine_gravel", "compacted", "dirt", "earth", "ground", "grass", "mud", "sand", "rock", "pebblestone", "woodchips"]
+name_regex = "seasonal"
+
+[smoothing]
+radius_m = 500.0
+max_rounds = 8
+
+[output]
+heatmap_cell_m = 500.0
+heatmap_width_px = 3000
