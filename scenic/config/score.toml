@@ -1,0 +1,264 @@
+# Scenery score v0.2 constants (docs/SCORE_SPEC.md, "v0.1 changes" and "v0.2 changes";
+# docs/SCORE_V02.md). Loaded once by
+# scenic.score; code never hard-codes these values.
+
+[grid]
+crs = "EPSG:5070"
+res = 30.0
+origin_x = -2493045.0     # NLCD grid origin
+origin_y = 3310005.0
+pad_m = 2000.0            # around the bounding box of all edge vertices
+block = 3                 # 30 m -> 90 m block mean
+
+[sampling]
+step_m = 50.0
+short_edge_m = 20.0       # edges under this keep only their two endpoints
+min_points_shape = 4      # grade needs at least this many points
+
+[water]
+sources_area = ["natural=water", "landuse=reservoir", "waterway=riverbank"]
+exclude_water = ["wastewater", "basin", "reflecting_pool"]
+coastline_band_m = 60.0
+coastline_area_m2 = 1e9
+size_log10_lo = 4.0       # 1 ha -> 0
+size_log10_span = 4.0     # 100 km2 -> 1
+line_size = { river = 0.45, canal = 0.35, stream = 0.15 }
+# v0.1: how far water counts scales with how much water is in view near the
+# shore, and visibility is a sight line over the DEM with tree and building
+# heights, not a 4-cell open/blocked vote.
+reach_radius_cells = 11   # local water fraction in a 1 km disk (90 m grid)
+reach_k = 1.2             # reach = k * sqrt(local water area), clipped
+reach_min_m = 150.0
+reach_max_m = 1500.0
+full_frac = 0.2           # full credit within max(full_min_m, full_frac * reach)
+full_min_m = 50.0
+line_reach_m = 250.0      # OSM river/canal/stream lines with no area: narrow water
+line_full_m = 50.0
+reach_bands_m = [400.0, 900.0, 1500.0]  # one KD-tree per reach band, best W wins
+vis_min_dist_m = 45.0     # closer than this: vis = 1
+fan_deg = [-60.0, -30.0, 30.0, 60.0]  # extra sight lines either side of the nearest shore
+eye_m = 1.2               # driver's eye above the road
+ray_step_m = 30.0
+# Sight lines to areal water aim this far past the nearest shore cell (open
+# water beyond the shore strip): clip(beyond_frac * d, 30 m, beyond_max_m),
+# at most beyond_reach_frac * reach so a narrow river is not overshot.
+beyond_frac = 0.5
+beyond_max_m = 500.0
+beyond_reach_frac = 0.25
+terrain_tol_m = 2.0       # bare ground this far above the sight line blocks it
+# Water surface height (sight-line target): the surface_shore_q quantile of the
+# DEM on shore land cells within surface_window_blocks x surface_window_blocks
+# 90 m blocks, not the DEM over the water (which may be bathymetry).
+surface_window_blocks = 5
+surface_shore_q = 0.10
+# Obstacle height (m) above bare ground per NLCD class, and the share of the
+# view that gets through one 30 m cell of it when it rises above the sight line.
+canopy_m = { 41 = 20.0, 42 = 20.0, 43 = 20.0, 90 = 12.0, 22 = 8.0, 23 = 10.0, 24 = 15.0, 52 = 3.0 }
+# v0.2: forest 0.4 -> 0.5, and only the first max_obstructed_cells obstructed
+# cells from the road multiply (the roadside screen), so a wooded shore strip
+# floors at 0.5^3 = 0.125 instead of 0.4^n -> 0.
+transmit = { 41 = 0.5, 42 = 0.5, 43 = 0.5, 90 = 0.5, 22 = 0.6, 23 = 0.4, 24 = 0.2, 52 = 0.8 }
+max_obstructed_cells = 3
+# v0.2 shore-road term: an areal water cell of size >= min_size within full_m
+# gives W_pt >= frac * size whatever the sight lines say, fading to 0 at zero_m.
+shore_road = { min_size = 0.4, frac = 0.5, full_m = 120.0, zero_m = 300.0 }
+
+[hills]
+disk_radius_cells = 11    # 1 km at 90 m
+relief_scale_m = 300.0
+grade_offset = 0.01
+grade_scale = 0.05
+w_relief = 0.7
+w_grade = 0.3
+
+[views]
+open_window = 3           # cells of the 90 m grid (open and forest fractions)
+base = 0.35               # open, flat, nothing in view
+forest_base = 0.25        # inside forest: short sight lines, all of it trees
+# Prospect: how much land lies below the driver (drop) or rises above an open
+# foreground (rise) within 3 km.
+far_radius_cells = 33     # 3 km at 90 m
+rise_weight = 0.5
+prospect_offset_m = 30.0
+prospect_scale_m = 200.0
+# Broad water in view: 90 m cells mostly water whose 1 km disk is at least
+# 25 % water (lakes and rivers over ~1 km wide), seen from above.
+bigwater_cell_frac = 0.5
+bigwater_disk_frac = 0.25
+# View range of broad water: wv_k * sqrt(water area within 3 km of it),
+# clipped; credit fades over the second half of the range. A 1.5 km wide
+# Finger Lake reads to ~4.5 km, Champlain and Ontario to 6 km.
+wv_radius_cells = 33
+wv_k = 1.5
+wv_min_m = 2000.0
+wv_max_m = 6000.0
+wv_angle_full_deg = 2.0   # depression angle to the water at which it fills the view
+wv_ray_step_m = 90.0
+# v0.2: weight of prospect in the view term. 0 = V counts broad water only
+# (prospect is 3 km relief, corr +0.84 with H, and saturates); 1 = v0.1.
+w_prospect = 0.0
+
+[landcover]
+window = 3                # 3x3 uniform filter on the 90 m grid (270 m)
+w_score = 0.8
+w_mix = 0.2
+# Per-class score; classes not listed (nodata 250) do not count.
+class_score = { 11 = 0.8, 12 = 0.8, 21 = 0.4, 22 = 0.2, 23 = 0.1, 24 = 0.0, 31 = 0.5, 41 = 0.7, 42 = 0.7, 43 = 0.7, 52 = 0.7, 71 = 0.8, 81 = 0.9, 82 = 0.7, 90 = 0.7, 95 = 0.9 }
+
+[groups]
+water = [11]
+developed = [21, 22, 23, 24]
+forest = [41, 42, 43, 90]
+open = [31, 52, 71, 81, 82, 95, 21]
+town = [22, 23, 24]       # "dev" for the town-centre penalty
+
+[quiet]
+motorway = 0.00
+trunk = 0.10
+primary = 0.25
+secondary = 0.50
+tertiary = 0.75
+unclassified = 0.90
+residential = 0.60
+living_street = 0.50
+
+[curves]
+# v0.1: turning per km over the smoothing window, not per edge.
+min_step_m = 5.0
+scale_deg_per_km = 200.0
+
+[combine]
+# v0.2: 0.40 / 0.30 / 0.15 / 0.15 (v0.1: 0.35 / 0.30 / 0.20 / 0.15).
+w_water = 0.40
+w_hills = 0.30
+w_views = 0.15
+w_land = 0.15
+bonus_quiet = 0.10
+bonus_curves = 0.05
+
+[penalty]
+# v0.2: pre = raw * bonus * (1 - P) ("multiply"); v0.1 subtracted P ("subtract").
+mode = "multiply"
+cap = 0.5
+junction_weight = 0.15
+junction_lo_per_km = 4.0
+junction_span_per_km = 16.0
+signal_weight = 0.20
+signal_full_per_km = 3.0
+signal_match_m = 25.0
+town_weight = 0.25
+town_window = 7           # 7x7 on the 90 m grid, about 300 m
+town_lo = 0.3
+town_span = 0.5
+town_water_gate = true    # v0.2: town term times (1 - max(W, V_water))
+urban_speed_weight = 0.10
+urban_speed_mph = 30.0
+motorway_weight = 0.0     # v0.2: duplicates Q = 0 and the junction term (v0.1: 0.10)
+
+[exclude]
+surfaces = ["unpaved", "gravel", "fine_gravel", "compacted", "dirt", "earth", "ground", "grass", "mud", "sand", "rock", "pebblestone", "woodchips"]
+name_regex = "seasonal"
+
+[smoothing]
+radius_m = 500.0
+max_rounds = 8
+# v0.2: smooth = (1 - pool_weight) * window mean + pool_weight * mean of pre
+# over the best pool_top_m metres of the window (its max if shorter).
+pool_weight = 0.5
+pool_top_m = 300.0
+
+[moments]
+# Route-level scenic moments (docs/SCORE_V02.md section 4). Candidates are
+# non-excluded edges of these classes; values come from unsmoothed signals.
+classes = ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified"]
+water_W = 0.5             # water: W >= water_W or V_water >= water_V
+water_V = 0.7
+size_radius_m = 450.0     # size = largest water size score within this of the edge
+vista_open = 0.6          # vista: open >= this at a sample point ...
+vista_drop_m = 150.0      # ... the lowest ground within 3 km at least this far below ...
+vista_drop_scale_m = 300.0  # m = clip(drop / scale, vista_m_min, 1)
+vista_m_min = 0.5
+vista_rays = 16           # ... and a terrain sight line (dem90) over this many azimuths
+vista_far_m = 3000.0
+vista_sight_m = 2000.0    # reaching ground at least this far away ...
+vista_seen_below_m = 75.0 # ... that lies at least this far below the eye
+gorge_feature_m = 150.0   # OSM waterfall or cliff within this of a sample point
+cliff_step_m = 50.0       # cliff lines densified to points this far apart
+gorge_bridge_drop_m = 30.0  # road bridge over water, ground this far below the deck ...
+gorge_bridge_radius_m = 200.0  # ... within this radius
+gorge_m = 0.8
+osm_viewpoint_m = 100.0   # tourism=viewpoint within this of a sample point
+osm_m = 0.7
+cluster_road_m = 2000.0   # one moment per 2 km of the same road key ...
+cluster_cross_m = 1000.0  # ... and per 1 km across roads
+water_name_m = 1500.0     # labels: named lake or bay within this, else river within river_name_m
+river_name_m = 300.0
+river_wide_name_m = 1500.0  # ... or within this where the water is broad (water_broad_wfrac)
+# Moments v0.3 (docs/SCORE_SPEC.md "Moments v0.3").
+# OSM layers (osm_features stage): named water areas from this size; unnamed
+# water=pond under pond_floor_m2 counts as stormwater with basins etc.
+osm_water_min_m2 = 1e4
+pond_floor_m2 = 4e4
+# Water gate. size is the water size score (log10 area: 0.25 = 10 ha,
+# 0.4 = 40 ha, 0.5 = 1 km2, 0.6 = 4 km2) within size_radius_m of the edge.
+water_min_size = 0.40          # unnamed water needs at least this ...
+water_named_min_size = 0.25    # ... a named lake, bay or river this
+water_named_min_m2 = 1e5       # named lake/bay areas this big within size_radius_m (rivers within river_name_m)
+water_storm_m = 100.0          # stormwater area this close ...
+water_storm_override_size = 0.5  # ... drops the edge unless size reaches this
+water_town_dev = 0.30          # built up: developed share (dev) at least this ...
+water_town_junctions_km2 = 30.0  # ... or this many junctions per km2 ...
+water_town_junction_radius_m = 400.0  # ... within this of the edge midpoint
+# Towns and motorways keep only big water: named, size >= water_big_size and
+# a 1 km disk water fraction >= water_broad_wfrac within water_broad_radius_m.
+water_big_size = 0.6
+water_broad_wfrac = 0.20
+water_broad_radius_m = 300.0
+water_unnamed_min_wfrac = 0.06  # unnamed water must fill this share of the 1 km disk (within 300 m)
+# Vistas: at least vista_min_rays of the vista_rays azimuths reach
+# vista_sight_m; at most one vista per vista_spacing_m.
+vista_min_rays = 3
+vista_spacing_m = 5000.0
+# Moment types allowed on motorway edges (water also needs big water, see
+# above; "gorge" = OSM cliff or waterfall, "gorge_bridge" = deep bridge).
+motorway_types = ["water", "vista", "gorge_bridge"]
+# Labels: named lakes of at least water_named_min_m2 and bays; a smaller lake
+# or bay within name_slack_m of the nearest one wins if it is a bay or
+# touches it.
+name_slack_m = 300.0
+name_touch_m = 50.0
+bay_node_parent_m2 = 1e8       # a named bay node within bay_node_m names a moment on a body this big
+bay_node_m = 800.0
+place_radius_m = 15000.0  # nearest city, town, village or hamlet
+
+[route]
+# A-to-B search (docs/PLAN.md section 2, docs/SCORE_V02.md section 4). Not a
+# score input; read by `scenic route` and the validate_routes stage.
+budgets = [1.15, 1.30, 1.50]  # ETA ratio vs our own fastest route; the last is the hard cap
+lambdas = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]  # cost = t * (1 + lambda * (1 - S))
+alt_lambdas = [1.0, 3.0, 8.0]  # alternatives: edges of routes already kept cost more ...
+alt_rounds = 2
+reuse_penalty = 1.0       # ... cost * (1 + reuse_penalty) on a reused edge
+# Reject returns within 150 m after more than 1.5 km; short interchange ramps pass.
+spur_radius_m = 150.0
+spur_min_distance_m = 1500.0
+via_lambda = 1.0          # legs of via-moment routes (also built with lambda 0)
+via_top = 12              # moments ranked by m / extra minutes ...
+via_top_per_band = 4      # ... plus the best this many in each budget band
+via_max_moments = 3       # greedy 2nd and 3rd moment
+via_min_extra_min = 1.0   # extra minutes floor when ranking m / extra minutes
+moment_radius_m = 100.0   # a moment counts when the route passes this close (or drives one of its edges)
+moment_spacing_km = 2.0   # at most one moment per 2 km of route
+feature_spacing_km = 10.0 # the same named lake/river/falls counts again only 10 km further on
+moments_per_hour = 8.0    # and 8 per hour of the fastest time ...
+moments_min_cap = 3       # ... but at least 3 on short trips
+moment_power = 2.0        # a moment earns m ** 2 points: m = 1 counts in full, a marginal m = 0.5 a quarter
+moment_minutes = 5.0      # a full moment (m = 1) is worth 5 scenic minutes
+# Picks: a larger budget whose best route shares more than this share of its
+# length with a smaller budget's pick takes the best route that does not ...
+pick_max_overlap = 0.8
+pick_min_score_frac = 0.85  # ... if it scores at least this share of the best; else it repeats the pick (shared)
+
+[output]
+heatmap_cell_m = 500.0
+heatmap_width_px = 3000
