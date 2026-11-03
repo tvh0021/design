@@ -7,10 +7,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from scenic import graph as G
-from scenic.calibrate import FREE_FLOW, PARAM_NAMES, PRIORS, fit_params, osrm_motorway_share, sample_pairs
+from scenic.calibrate import (
+    FREE_FLOW, OSRM_ROUTING, PARAM_NAMES, PRIORS, Model, Trip, evaluate, fit_params, osrm_motorway_share,
+    sample_pairs,
+)
 from scenic.graph import (
     WayCollector, build_edge_delays, build_graph, control_kind, delayed_time, edge_delay_features,
-    make_controls, save_graph, simplify, write_edge_delays,
+    make_controls, reapply_edge_delays, save_graph, simplify, write_edge_delays,
 )
 from scenic.route import RoadGraph
 
@@ -167,12 +170,37 @@ def test_load_uses_edge_delays(tmp_path, toy):
     assert r.time_s == pytest.approx(free[e["p1"]] + free[e["p2"]] + 20.0)
 
 
-def test_load_rejects_misaligned_edge_delays(tmp_path, toy):
+def test_load_rejects_edge_delays_without_fingerprint(tmp_path, toy):
     w, g, _ = toy
     save_graph(w, g, tmp_path)
     pq.write_table(pa.table({"time_s": pa.array([1.0, 2.0])}), tmp_path / "edge_delays.parquet")
-    with pytest.raises(ValueError, match="rows"):
+    with pytest.raises(ValueError, match="does not record which edges.parquet"):
         RoadGraph.load(tmp_path)
+
+
+@pytest.mark.parametrize("change", ["reorder", "length"])
+def test_load_rejects_edge_delays_for_other_edges_of_same_count(tmp_path, toy, change):
+    w, g, _ = toy
+    save_graph(w, g, tmp_path)
+    feats = edge_delay_features(w, g, make_controls([ctrl(3, {"highway": "traffic_signals"}, w)]))
+    edges = pq.read_table(tmp_path / "edges.parquet")
+    write_edge_delays(feats, edges.column("time_s").to_numpy(), tmp_path)
+    RoadGraph.load(tmp_path)  # matches
+    reapply_edge_delays(tmp_path)  # keeps the fingerprint
+    RoadGraph.load(tmp_path)
+    # Same row count, different edges: rows reordered, or one length changed.
+    if change == "reorder":
+        edges = edges.take(np.arange(edges.num_rows)[::-1])
+    else:
+        length = edges.column("length_m").to_numpy().copy()
+        length[0] += 1.0
+        edges = edges.set_column(edges.schema.get_field_index("length_m"), "length_m", pa.array(length))
+    pq.write_table(edges, tmp_path / "edges.parquet")
+    with pytest.raises(ValueError, match="different edges.parquet"):
+        RoadGraph.load(tmp_path)
+    with pytest.raises(ValueError, match="different edges.parquet"):
+        reapply_edge_delays(tmp_path)
+    assert RoadGraph.load(tmp_path, delays=False).n_edges == edges.num_rows
 
 
 def write_pbf(path, ways_spec, node_tags):
@@ -242,6 +270,31 @@ def test_fit_recovers_known_parameters():
     assert b == pytest.approx(beta, rel=1e-3)
     for k in PARAM_NAMES:
         assert fit[k] == pytest.approx(truth[k], rel=1e-2, abs=0.05), k
+
+
+def test_osrm_trips_are_routed_with_osrm_signal_cost(tmp_path):
+    """A short road through a signal and a signal-free detour: with the
+    fitted signal delay the detour wins, with OSRM's 2 s the direct road does.
+    The OSRM trip's features must come from the path OSRM's cost picks."""
+    c = WayCollector()
+    c.add(1, {"highway": "primary"}, [(n, -77 + (n - 1) * D, 43.0) for n in (1, 2, 3)])
+    c.add(2, {"highway": "primary"}, [(1, -77, 43.0), (10, -77, 43 + D), (11, -77 + 2 * D, 43 + D),
+                                      (3, -77 + 2 * D, 43.0)])
+    w = c.finish()
+    g = simplify(w)
+    save_graph(w, g, tmp_path)
+    feats = edge_delay_features(w, g, make_controls([ctrl(2, {"highway": "traffic_signals"}, w)]))
+    free = pq.read_table(tmp_path / "edges.parquet").column("time_s").to_numpy()
+    write_edge_delays(feats, free, tmp_path)
+    model = Model(tmp_path)
+    model.set_params({**FREE_FLOW, "signal_s": 16.0})
+    trip = [Trip("t", [(43.0, -77.0), (43.0, -77 + 2 * D)], 1.0, "osrm")]
+    k = PARAM_NAMES.index("signal_s")
+    X_fit, _ = evaluate(model, trip)
+    X_osrm, _ = evaluate(model, trip, OSRM_ROUTING)
+    assert X_fit[0, k] == 0.0  # detour
+    assert X_osrm[0, k] == pytest.approx(1.0)  # through the signal
+    assert model.params["signal_s"] == 16.0  # restored
 
 
 def test_osrm_motorway_share():

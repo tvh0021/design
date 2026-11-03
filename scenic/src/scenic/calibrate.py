@@ -11,7 +11,7 @@ OSRM's car profile drives at about 0.8x the posted limit and charges only
 ~2 s per traffic signal, so its absolute times and its signal cost are
 properties of the profile, not of real traffic. OSRM trips therefore enter
 the fit with a free scale factor `beta` (ours = beta * OSRM) and with signals
-priced at OSRM's own 2 s: they constrain how class, built-up areas, stop
+priced at OSRM's own 2 s, both when routing them and in their residual: they constrain how class, built-up areas, stop
 signs and junctions trade off against each other, while Google sets the
 absolute level. Neither source separates signal delay from a general
 slowdown (A, B, C and the fastest route have similar mixes), so the
@@ -42,7 +42,10 @@ from pathlib import Path
 import numpy as np
 
 from . import data_dir
-from .graph import CROSSING_AS_SIGNALS, DELAY_COLUMNS, DELAY_PARAMS, haversine_m, write_edge_delays
+from .graph import (
+    CROSSING_AS_SIGNALS, DELAY_COLUMNS, DELAY_PARAMS, edges_fingerprint, haversine_m, read_edge_delays,
+    write_edge_delays,
+)
 
 CACHE = Path(os.environ.get("SCENIC_CALIBRATE_CACHE", Path.home() / ".cache" / "scenic-calibrate"))
 USER_AGENT = "scenic-route-planner/0.1 (+https://github.com/tvh0021/design)"
@@ -67,6 +70,8 @@ PRIORS = {"signal_s": (15.0, 10.0), "stop_s": (8.0, 5.0), "minor_end_s": (3.0, 3
 PRIOR_WEIGHT = 0.1  # a 1-sd miss costs as much as a 10% miss on one trip
 GOOGLE_WEIGHT = 10.0  # per Google trip; each OSRM trip has weight 1
 OSRM_SIGNAL_PENALTY_S = 2.0  # traffic_signal_penalty in OSRM's car profile
+# OSRM trips are routed with these overrides, matching their residual in fit_params.
+OSRM_ROUTING = {"signal_s": OSRM_SIGNAL_PENALTY_S}
 BETA_BOUNDS = (0.6, 1.4)
 
 # Phase 0 Google Maps ETAs, 2026-11-02 around 7 pm (light traffic).
@@ -210,16 +215,12 @@ class Model:
     """The graph plus per-edge feature matrix X, so that edge time = X @ p."""
 
     def __init__(self, graph_dir: Path | None = None):
-        import pyarrow.parquet as pq
-
         from .route import RoadGraph
 
         graph_dir = Path(graph_dir or data_dir() / "graph")
         self.graph_dir = graph_dir
         self.g = RoadGraph.load(graph_dir, delays=False)
-        d = pq.read_table(graph_dir / "edge_delays.parquet")
-        if d.num_rows != self.g.n_edges:
-            raise ValueError("edge_delays.parquet is not aligned with edges.parquet")
+        d = read_edge_delays(graph_dir / "edge_delays.parquet", edges_fingerprint(self.g.edges_table))
         self.feats = {c: d.column(c).to_numpy() for c in DELAY_COLUMNS}
         self.free_s = d.column("free_time_s").to_numpy()
         mw = self.feats["motorway"].astype(bool)
@@ -286,13 +287,15 @@ def fit_params(Xg: np.ndarray, ref_g: np.ndarray, Xo: np.ndarray, ref_o: np.ndar
     of free flow per group, signals, stops, minor ends); ref_* are reference
     times in seconds. Residuals:
       Google: sqrt(GOOGLE_WEIGHT) * log(Xg @ p / ref)
-      OSRM:   log(Xo @ p_osrm / (beta * ref)), p_osrm = p with OSRM's signal cost
+      OSRM:   log(Xo @ p_osrm / (beta * ref)), p_osrm = p with OSRM_ROUTING
+              (OSRM's signal cost; route the OSRM trips with it too)
       priors: PRIOR_WEIGHT * (p - mean) / sd
     Returns (params, beta)."""
     from scipy.optimize import least_squares
 
     x0 = {**FREE_FLOW, **(x0 or {})}
-    k_sig = PARAM_NAMES.index("signal_s")
+    o_idx = [PARAM_NAMES.index(k) for k in OSRM_ROUTING]
+    o_val = np.array(list(OSRM_ROUTING.values()))
     lo = np.array([BOUNDS[k][0] for k in PARAM_NAMES] + [BETA_BOUNDS[0]])
     hi = np.array([BOUNDS[k][1] for k in PARAM_NAMES] + [BETA_BOUNDS[1]])
     start = np.clip([x0[k] for k in PARAM_NAMES] + [1.0], lo + 1e-9, hi - 1e-9)
@@ -303,7 +306,7 @@ def fit_params(Xg: np.ndarray, ref_g: np.ndarray, Xo: np.ndarray, ref_o: np.ndar
     def resid(x):
         p, beta = x[:-1], x[-1]
         po = p.copy()
-        po[k_sig] = OSRM_SIGNAL_PENALTY_S
+        po[o_idx] = o_val
         return np.concatenate([
             math.sqrt(GOOGLE_WEIGHT) * np.log(Xg @ p / ref_g),
             np.log(Xo @ po / (beta * ref_o)),
@@ -314,13 +317,21 @@ def fit_params(Xg: np.ndarray, ref_g: np.ndarray, Xo: np.ndarray, ref_o: np.ndar
     return dict(zip(PARAM_NAMES, (float(v) for v in res.x[:-1]))), float(res.x[-1])
 
 
-def evaluate(model: Model, trips: list[Trip]) -> tuple[np.ndarray, np.ndarray]:
-    """Route every trip under the model's current parameters. Returns the
-    feature matrix (trips x params) and our minutes."""
-    X = np.zeros((len(trips), len(PARAM_NAMES)))
-    mins = np.zeros(len(trips))
-    for i, t in enumerate(trips):
-        X[i], mins[i], _ = model.trip(t.points)
+def evaluate(model: Model, trips: list[Trip], overrides: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Route every trip under the model's current parameters, with
+    `overrides` applied while routing. Returns the feature matrix (trips x
+    params) and our minutes under the parameters used for routing."""
+    saved = dict(model.params)
+    if overrides:
+        model.set_params(overrides)
+    try:
+        X = np.zeros((len(trips), len(PARAM_NAMES)))
+        mins = np.zeros(len(trips))
+        for i, t in enumerate(trips):
+            X[i], mins[i], _ = model.trip(t.points)
+    finally:
+        if overrides:
+            model.set_params(saved)
     return X, mins
 
 
@@ -331,7 +342,7 @@ def calibrate(model: Model, google: list[Trip], osrm: list[Trip], iters: int = 8
     params, beta = dict(model.params), 1.0
     for it in range(iters):
         Xg, _ = evaluate(model, google)
-        Xo, _ = evaluate(model, osrm)
+        Xo, _ = evaluate(model, osrm, OSRM_ROUTING)  # same signal cost as their residual
         new, beta = fit_params(Xg, ref_g, Xo, ref_o, params)
         change = max(abs(new[k] - params[k]) / (abs(params[k]) + 1.0) for k in PARAM_NAMES)
         params = new
@@ -397,7 +408,8 @@ def run_fit(graph_dir: Path | None = None, pbf: Path | None = None, apply: bool 
     }
     print(format_report(report))
     if apply:
-        write_edge_delays(model.feats, model.free_s, model.graph_dir, params)
+        write_edge_delays(model.feats, model.free_s, model.graph_dir, params,
+                          edges_fingerprint(model.g.edges_table))
         (model.graph_dir / "delay_fit.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"wrote {model.graph_dir / 'edge_delays.parquet'} and delay_fit.json")
     return report

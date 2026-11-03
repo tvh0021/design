@@ -17,6 +17,7 @@ means "only u -> v".
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import resource
@@ -437,7 +438,8 @@ def save_graph(ways: Ways, g: Graph, out_dir: Path) -> dict:
 # Delays: traffic controls, junctions and built-up areas
 #
 # Kept in a separate file, edge_delays.parquet, one row per edges.parquet row
-# in the same order, so anything keyed to edge order stays valid. The travel
+# in the same order, so anything keyed to edge order stays valid; its
+# metadata holds a fingerprint of those edges (see `edges_fingerprint`). The travel
 # time model is
 #
 #   time = free_flow * f(group) + a*(signals + crossings/2) + b*stops + d*minor_ends
@@ -447,12 +449,12 @@ def save_graph(ways: Ways, g: Graph, out_dir: Path) -> dict:
 # --fit` (calibrate.py); the values below are its output.
 
 DELAY_PARAMS = {
-    "motorway": 1.006,    # time factor, motorway and motorway_link
-    "rural": 1.011,       # time factor, other roads outside built-up areas
-    "built_up": 1.002,    # time factor, other roads in built-up areas
-    "signal_s": 16.4,     # per traffic signal (a signalised crossing counts as half)
-    "stop_s": 8.1,        # per stop sign
-    "minor_end_s": 2.95,  # per junction entered from, or left onto, a lower-class road
+    "motorway": 1.007,    # time factor, motorway and motorway_link
+    "rural": 1.020,       # time factor, other roads outside built-up areas
+    "built_up": 0.954,    # time factor, other roads in built-up areas
+    "signal_s": 16.8,     # per traffic signal (a signalised crossing counts as half)
+    "stop_s": 8.2,        # per stop sign
+    "minor_end_s": 3.21,  # per junction entered from, or left onto, a lower-class road
 }
 # A signalised pedestrian crossing or a rail level crossing counts as this
 # many traffic signals (on demand / rarely closed, but you slow down).
@@ -647,13 +649,60 @@ def delay_table(feats: dict[str, np.ndarray], free_s: np.ndarray, params: dict |
     return pa.table(cols)
 
 
+# edge_delays.parquet records a fingerprint of the edges it was built for:
+# a hash over these edges.parquet columns, in row order. Readers compare it
+# with the current edges.parquet, so a rebuilt or reordered graph is caught
+# even when its row count is unchanged.
+FINGERPRINT_COLUMNS = ("u", "v", "way_id", "length_m")
+FINGERPRINT_KEY = b"edges_fingerprint"
+
+
+def edges_fingerprint(edges) -> str:
+    """Ordered fingerprint of an edges table (any object with .column(name),
+    e.g. a pyarrow Table holding FINGERPRINT_COLUMNS)."""
+    h = hashlib.sha256()
+    h.update(len(edges.column("u")).to_bytes(8, "little"))
+    for name, dtype in zip(FINGERPRINT_COLUMNS, ("<i8", "<i8", "<i8", "<f8")):
+        h.update(np.ascontiguousarray(edges.column(name).to_numpy(), dtype=dtype).tobytes())
+    return h.hexdigest()
+
+
+def read_edges_fingerprint(graph_dir: Path) -> str:
+    import pyarrow.parquet as pq
+
+    return edges_fingerprint(pq.read_table(Path(graph_dir) / "edges.parquet", columns=list(FINGERPRINT_COLUMNS)))
+
+
+def read_edge_delays(path: Path, fingerprint: str, columns: list[str] | None = None):
+    """Read edge_delays.parquet, checking it was built for the edges whose
+    fingerprint is given. Raises ValueError if not."""
+    import pyarrow.parquet as pq
+
+    path = Path(path)
+    stored = (pq.read_schema(path).metadata or {}).get(FINGERPRINT_KEY)
+    if stored is None:
+        raise ValueError(f"{path} does not record which edges.parquet it was built for; "
+                         "rerun `scenic calibrate --features`")
+    if stored.decode() != fingerprint:
+        raise ValueError(f"{path} was built for a different edges.parquet (rebuilt or reordered "
+                         "since); rerun `scenic calibrate --features`")
+    return pq.read_table(path, columns=columns)
+
+
 def write_edge_delays(feats: dict[str, np.ndarray], free_s: np.ndarray, out_dir: Path,
-                      params: dict | None = None) -> Path:
+                      params: dict | None = None, fingerprint: str | None = None) -> Path:
+    """Write edge_delays.parquet. `fingerprint` identifies the edges the
+    features were computed for; by default, the edges.parquet in `out_dir`."""
     import pyarrow.parquet as pq
 
     p = {**DELAY_PARAMS, **(params or {})}
     table = delay_table(feats, free_s, p)
-    meta = {b"delay_params": json.dumps(p).encode()}
+    if fingerprint is None:
+        edges = pq.read_table(Path(out_dir) / "edges.parquet", columns=list(FINGERPRINT_COLUMNS))
+        if edges.num_rows != table.num_rows:
+            raise ValueError(f"{table.num_rows} delay rows for {edges.num_rows} edges in {out_dir}")
+        fingerprint = edges_fingerprint(edges)
+    meta = {b"delay_params": json.dumps(p).encode(), FINGERPRINT_KEY: fingerprint.encode()}
     path = Path(out_dir) / "edge_delays.parquet"
     pq.write_table(table.replace_schema_metadata(meta), path, compression="zstd")
     return path
@@ -675,7 +724,7 @@ def build_edge_delays(pbf: Path | None = None, graph_dir: Path | None = None,
     graph_dir = Path(graph_dir or data_dir() / "graph")
     ways, _ = read_ways(pbf)
     g = simplify(ways)
-    t = pq.read_table(graph_dir / "edges.parquet", columns=["u", "v", "way_id", "time_s"])
+    t = pq.read_table(graph_dir / "edges.parquet", columns=[*FINGERPRINT_COLUMNS, "time_s"])
     if t.num_rows != len(g.u):
         raise RuntimeError(f"edges.parquet has {t.num_rows} rows, rebuilt graph {len(g.u)}; rebuild the graph")
     for name, mine in (("u", g.u), ("v", g.v), ("way_id", ways.way_id[g.edge_way])):
@@ -683,23 +732,18 @@ def build_edge_delays(pbf: Path | None = None, graph_dir: Path | None = None,
             raise RuntimeError(f"edges.parquet column {name} differs from the PBF; rebuild the graph")
     feats = edge_delay_features(ways, g, read_controls(pbf))
     free_s = t.column("time_s").to_numpy()
-    write_edge_delays(feats, free_s, graph_dir, params)
+    write_edge_delays(feats, free_s, graph_dir, params, edges_fingerprint(t))
     return {**feats, "free_time_s": free_s}
 
 
 def reapply_edge_delays(graph_dir: Path | None = None, params: dict | None = None) -> Path:
     """Recompute time_s in edge_delays.parquet from its stored features (no
     PBF read), e.g. after DELAY_PARAMS changes."""
-    import pyarrow.parquet as pq
-
     graph_dir = Path(graph_dir or data_dir() / "graph")
-    d = pq.read_table(graph_dir / "edge_delays.parquet")
-    n = pq.read_metadata(graph_dir / "edges.parquet").num_rows
-    if d.num_rows != n:
-        raise RuntimeError(f"edge_delays.parquet has {d.num_rows} rows, edges.parquet {n}; "
-                           "rerun with --features")
+    fp = read_edges_fingerprint(graph_dir)
+    d = read_edge_delays(graph_dir / "edge_delays.parquet", fp)
     feats = {c: d.column(c).to_numpy() for c in DELAY_COLUMNS}
-    return write_edge_delays(feats, d.column("free_time_s").to_numpy(), graph_dir, params)
+    return write_edge_delays(feats, d.column("free_time_s").to_numpy(), graph_dir, params, fp)
 
 
 def peak_rss_mb() -> float:

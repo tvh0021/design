@@ -17,21 +17,16 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
 from . import data_dir
-from .graph import EARTH_RADIUS_M, haversine_m
+from .graph import EARTH_RADIUS_M, edges_fingerprint, haversine_m, read_edge_delays
 
 MIN_COST = 1e-6  # csgraph needs strictly positive weights on stored entries
 
 
-def load_delay_time(path: Path, n_edges: int) -> np.ndarray:
-    """time_s from edge_delays.parquet, which must have one row per edge of
-    edges.parquet, in the same order."""
-    import pyarrow.parquet as pq
-
-    d = pq.read_table(path, columns=["time_s"])
-    if d.num_rows != n_edges:
-        raise ValueError(f"{path} has {d.num_rows} rows but edges.parquet has {n_edges}; "
-                         "rerun `scenic calibrate --features`")
-    return d.column("time_s").to_numpy()
+def load_delay_time(path: Path, edges) -> np.ndarray:
+    """time_s from edge_delays.parquet, which must have been built for
+    `edges` (the edges.parquet table): same rows in the same order, checked
+    by fingerprint."""
+    return read_edge_delays(path, edges_fingerprint(edges), columns=["time_s"]).column("time_s").to_numpy()
 
 
 @dataclass
@@ -118,7 +113,7 @@ class RoadGraph:
         time_s = t.column("time_s").to_numpy()
         delay_path = graph_dir / "edge_delays.parquet"
         if delays and delay_path.exists():
-            time_s = load_delay_time(delay_path, t.num_rows)
+            time_s = load_delay_time(delay_path, t)
         lon = t.column("lon").combine_chunks()
         lat = t.column("lat").combine_chunks()
         return cls(
