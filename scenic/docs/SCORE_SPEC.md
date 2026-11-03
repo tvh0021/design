@@ -4,7 +4,8 @@ Status: 2026-11-02. Follows PLAN.md section 1. Implements `python -m scenic.scor
 which reads `scenic/data/graph/edges.parquet` (826k edges, 212k km) and writes
 `scenic/data/score/`. All constants below live in `scenic/config/score.toml`
 and are loaded once; code never hard-codes them. Weights are the PLAN.md
-values; nothing changed.
+values; nothing changed. v0.1 (same weights) replaces the W, V and C
+definitions below; see "v0.1 changes" at the end.
 
 ## 1. Data sources
 
@@ -306,3 +307,86 @@ Each has a default; change only with a note in `score_report.json`.
   separate change.
 - Byway geometry source: default NYS GIS layer; fall back to the ref list
   without asking if the download is not reachable.
+
+## v0.1 changes
+
+v0 failed validation (designated byway median 0.51, scenic spot checks
+6/10). v0.1 keeps the weights (0.35/0.30/0.20/0.15), H, L, Q, the penalties,
+smoothing and rank, and changes how W, V and C are measured. Before any
+change, a holdout set (10 scenic, 5 dull, `[holdout]` in
+`config/spot_checks.toml`) was written and scored with v0
+(`data/score_v0/holdout_v0.json`); it was not looked at again until the
+v0.1 run was final. Each change has a reason in what a driver can see.
+
+**W, water.**
+
+- *Reach scales with the water.* A pond is seen from 150 m; a wide lake
+  from 1.5 km. `wfrac` = water fraction in a 1 km disk on the 90 m grid;
+  `reach = clip(1.2·sqrt(wfrac·π·(1 km)²), 150, 1500)` m. Full credit within
+  `max(50 m, 0.2·reach)`, then linear to 0 at `reach`. OSM river, canal and
+  stream lines with no area keep a 250 m reach (full to 50 m). A wide river
+  mapped as an area gets the reach of its area, so it is treated like a
+  lake of the same width.
+- *Shore cells, by band.* Areal water is represented by its shore cells.
+  They are split into reach bands (≤ 400, ≤ 900, > 900 m), each with its own
+  KD-tree, so a pond beside the road does not hide the lake behind it. Points
+  on water (bridges, causeways) score the water's size.
+- *Visibility is a sight line.* From eye height (1.2 m) to the water,
+  sampled every 30 m on dem30: bare ground more than 2 m above the line
+  blocks it (vis 0). Trees, wetland trees and buildings have a height per
+  NLCD class (forest 20 m, woody wetland 12 m, developed 8–15 m, shrub
+  3 m); each 30 m cell whose top rises above the line lets through a share
+  of the view (forest 0.4, developed medium 0.4, high 0.2). A road on a
+  slope therefore sees over the shore trees; a road behind them does not.
+  The line aims past the shore by `min(clip(0.5·d, 30, 500), 0.25·reach)`
+  so it looks at open water, not at the one cell behind the shore trees;
+  obstacles are checked up to the shore.
+- *A fan of sight lines.* Besides the line to the nearest shore cell, four
+  more go out at ±30° and ±60°, each to the first water cell within the
+  band's reach, scored with their own distance. W is the best of them: the
+  driver sees the lake through whichever gap opens, often at an angle.
+- `W_pt = max over bands and sight lines of size · falloff(d, reach) · vis`.
+
+**V, views.**
+
+```
+V = open·(0.35 + 0.65·(1 − (1 − prospect)(1 − water_view))) + forest·0.25
+```
+
+- *Prospect* (replaces the 1 km TPI): how much landscape is laid out in
+  front of an open viewpoint. `drop` = height above the lowest ground within
+  3 km, `rise` = the highest ground within 3 km above the point;
+  `prospect = clip((drop + 0.5·rise − 30) / 200, 0, 1)`. TPI only saw ridge
+  tops; a valley road with hills rising on both sides and a hillside road
+  looking over a valley both have a view.
+- *Broad water in view.* Broad water is a 90 m cell at least half water whose
+  1 km disk is at least 25 % water. The score is the angle the driver looks
+  down at it, `clip(θ / 2°, 0, 1)` (a lake 150 m below at 2 km fills the
+  view, one at road level is a line on the horizon), times a fade over the
+  second half of the water's view range `R = clip(1.5·sqrt(water area within
+  3 km), 2, 6) km`, times a terrain-only sight line on dem90. Sight lines go
+  to the nearest broad-water cell and along the same ±30°, ±60° fan.
+- *Forest baseline.* Inside forest the view is trees: 0.25 per unit forest
+  fraction instead of 0, so a forest road is not scored like a strip mall.
+  Forest is not scenic in itself here (L already scores it 0.7); this only
+  stops V from treating a wooded road as having no view at all.
+
+**C, curves.** Turning is summed per edge (degrees) and scored over the
+same 1 km smoothing window as the penalties:
+`C = clip(Σ_j w_ij·turn_j/length_j / (Σ_j w_ij / 1000) / 200, 0, 1)`. A curvy
+road split into many short edges no longer gets C = 0 on its straight
+pieces and 1 on its bends.
+
+**New products.** `water90` stage: `wfrac90`, `reach90`, `water_z90` (mean
+DEM over water cells), `bigwater_idx90` (nearest broad-water cell within
+6 km, from the EDT), `wv_reach90`. `terrain90` also writes `min3k90` and
+`max3k90`. `edge_signals.parquet` adds H_relief, H_grade, V_prospect,
+V_water, turn_deg and water_dist_m.
+
+**Results** (v0 → v0.1): designated byway median S 0.51 → 0.55 (share ≥ 0.5:
+0.52 → 0.57); scenic spot checks 6/10 → 8/10, dull 10/10 → 10/10; holdout
+scenic 3/10 → 6/10, holdout dull 3/5 → 4/5; Rochester to Syracuse fastest
+0.251 → 0.254, US-20 0.331 → 0.326. The byway check still fails: many
+designated byways are heritage routes through farmland and towns (Seaway
+Trail 837 km at median 0.44, Revolutionary Byway 0.37, Maple Traditions
+0.41).

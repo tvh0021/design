@@ -129,27 +129,40 @@ def designated(props: dict) -> bool:
     return "scenic byway" in vals.lower() or "all-american" in vals.lower()
 
 
-def spot_checks(cfg: dict, S, L, excluded, refs, names, mlon, mlat, diag: dict) -> dict:
+def _check_list(items_cfg, S, L, excluded, refs, names, mlon, mlat, diag, thr: float, want: str,
+                need: int) -> dict:
+    items = []
+    for it in items_cfg:
+        m = match_road(refs, names, it.get("ref"), it.get("name")) & in_bbox(mlon, mlat, it["bbox"]) & ~excluded
+        km = float(L[m].sum() / 1000)
+        s = wmean(S[m], L[m]) if m.any() else float("nan")
+        ok = bool(m.any() and (s >= thr if want == "ge" else s <= thr))
+        row = {"label": it["label"], "km": round(km, 2), "edges": int(m.sum()),
+               "S": round(s, 3) if m.any() else None, "pass": ok}
+        row["signals"] = {c: round(wmean(diag[c][m], L[m]), 3) for c in DIAG_COLUMNS} if m.any() else {}
+        items.append(row)
+    n_ok = sum(r["pass"] for r in items)
+    return {"threshold": thr, "passed": n_ok, "of": len(items), "need": need, "pass": n_ok >= need,
+            "items": items}
+
+
+def spot_checks(cfg: dict, S, L, excluded, refs, names, mlon, mlat, diag) -> dict:
+    """The scenic and dull lists (need cfg thresholds.need of 10 each) and,
+    when present, the held-out lists (need 80 % of each)."""
     out = {}
+    args = (S, L, excluded, refs, names, mlon, mlat, diag)
     for kind, want in (("scenic", "ge"), ("dull", "le")):
-        items = []
-        thr = cfg["thresholds"][kind]
-        for it in cfg[kind]:
-            m = match_road(refs, names, it.get("ref"), it.get("name")) & in_bbox(mlon, mlat, it["bbox"]) & ~excluded
-            km = float(L[m].sum() / 1000)
-            s = wmean(S[m], L[m]) if m.any() else float("nan")
-            ok = bool(m.any() and (s >= thr if want == "ge" else s <= thr))
-            row = {"label": it["label"], "km": round(km, 2), "edges": int(m.sum()),
-                   "S": round(s, 3) if m.any() else None, "pass": ok}
-            row["signals"] = {c: round(wmean(diag[c][m], L[m]), 3) for c in DIAG_COLUMNS} if m.any() else {}
-            items.append(row)
-        n_ok = sum(r["pass"] for r in items)
-        out[kind] = {"threshold": thr, "passed": n_ok, "of": len(items), "need": cfg["thresholds"]["need"],
-                     "pass": n_ok >= cfg["thresholds"]["need"], "items": items}
+        out[kind] = _check_list(cfg[kind], *args, cfg["thresholds"][kind], want, cfg["thresholds"]["need"])
     flat = next((r for r in out["dull"]["items"] if r["label"].startswith("NY-5 Batavia")), None)
     if flat and flat["S"] is not None:
         out["flat_farmland_calibration"] = {"S": flat["S"], "below_0.40": flat["S"] < 0.40,
                                             "not_under_0.15": flat["S"] >= 0.15}
+    if "holdout" in cfg:
+        out["holdout"] = {}
+        for kind, want in (("scenic", "ge"), ("dull", "le")):
+            lst = cfg["holdout"].get(kind, [])
+            out["holdout"][kind] = _check_list(lst, *args, cfg["thresholds"][kind], want,
+                                               int(np.ceil(0.8 * len(lst))))
     return out
 
 

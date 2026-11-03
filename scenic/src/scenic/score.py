@@ -1,4 +1,4 @@
-"""Scenery score v0 (docs/SCORE_SPEC.md): one score S in [0, 1] per edge of
+"""Scenery score v0.1 (docs/SCORE_SPEC.md): one score S in [0, 1] per edge of
 edges.parquet.
 
 Stages (each writes its product to disk and is skipped on rerun while the
@@ -8,8 +8,9 @@ product is newer than its inputs; `--force` reruns them):
   dem        3DEP mosaic warped to the grid             rasters/dem30.tif, dem90.tif
   nlcd       NLCD window                                rasters/nlcd30.tif
   water      OSM + NLCD water masks and size score      rasters/water_area.tif, water_line.tif, water_size.tif
-  terrain90  relief and TPI at 90 m                     rasters/relief90.tif, tpi90.tif
-  land90     land cover score, mix, open, developed     rasters/lscore90.tif, mix90.tif, open90.tif, dev90.tif
+  water90    water reach, surface height, broad water   rasters/wfrac90.tif, reach90.tif, water_z90.tif, bigwater_idx90.tif
+  terrain90  relief, TPI, 3 km min/max at 90 m          rasters/relief90.tif, tpi90.tif, min3k90.tif, max3k90.tif
+  land90     land cover score, mix, open, forest, dev   rasters/lscore90.tif, mix90.tif, open90.tif, forest90.tif, dev90.tif
   controls   traffic signal nodes from the PBF          score/signal_nodes.npy
   edges      sample points and per-edge signals         score/edge_signals.parquet, score/samples.npz
   score      penalties, smoothing, percentile rank      score/scores.parquet
@@ -159,48 +160,234 @@ def lookup(grid: Grid, arr: np.ndarray, px, py, fallback=0.0) -> np.ndarray:
 # Signals
 
 
-def water_points(s: Samples, grid: Grid, water_mask: np.ndarray, size_of_cells, blocking: np.ndarray,
-                 cfg: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Per-point W and nearest-water distance (inf when none within range).
+def sight_line(px, py, ze, tx, ty, zt, grid: Grid, dem: np.ndarray, step: float, tol: float,
+               cls: np.ndarray | None = None, canopy: np.ndarray | None = None, log_t: np.ndarray | None = None,
+               stop=None, dem_nodata: float = -32768, max_samples: int = 20_000_000) -> np.ndarray:
+    """Share of the view from (px, py, eye height ze) to (tx, ty, zt) that
+    gets through, per ray, in [0, 1].
 
-    water_mask: bool 30 m mask of water cells (areal or linear).
-    size_of_cells(flat_idx) -> size score of those cells.
-    blocking: bool 30 m mask of cells that block the view of water."""
+    The ray is sampled every `step` metres from `step` out to one step short
+    of `stop` (default: the target). Bare ground (`dem`) more than `tol`
+    above the straight sight line blocks it (0). With `cls`, a cell whose
+    obstacle top (ground + canopy[class]) rises above the sight line passes
+    exp(log_t[class]) of the view, and those shares multiply along the ray."""
+    px, py, ze, tx, ty, zt = (np.asarray(a, dtype=np.float64) for a in (px, py, ze, tx, ty, zt))
+    n = len(px)
+    vis = np.ones(n)
+    if n == 0:
+        return vis
+    d = np.hypot(tx - px, ty - py)
+    reach = d if stop is None else np.minimum(np.asarray(stop, dtype=np.float64), d)
+    K = np.maximum(np.floor((reach - step) / step), 0).astype(np.int64)
+    cum = np.cumsum(K)
+    a = 0
+    while a < n:
+        base = cum[a - 1] if a else 0
+        b = max(a + 1, int(np.searchsorted(cum, base + max_samples, side="right")))
+        k = K[a:b]
+        tot = int(k.sum())
+        if tot:
+            idx = np.repeat(np.arange(b - a), k)
+            j = np.arange(tot) - np.repeat(np.cumsum(k) - k, k) + 1
+            frac = j * step / d[a:b][idx]
+            qx = px[a:b][idx] + frac * (tx[a:b][idx] - px[a:b][idx])
+            qy = py[a:b][idx] + frac * (ty[a:b][idx] - py[a:b][idx])
+            r, c, inside = grid.rowcol(qx, qy)
+            g = dem[r, c].astype(np.float64)
+            g[~inside | (g <= dem_nodata) | ~np.isfinite(g)] = -np.inf
+            los = ze[a:b][idx] + (zt[a:b][idx] - ze[a:b][idx]) * frac
+            blocked = np.bincount(idx, weights=g > los + tol, minlength=b - a) > 0
+            lt = np.zeros(tot)
+            if cls is not None:
+                cc = cls[r, c]
+                h = canopy[cc]
+                lt = np.where((h > 0) & inside & (g + h > los), log_t[cc], 0.0)
+            vis[a:b] = np.where(blocked, 0.0, np.exp(np.bincount(idx, weights=lt, minlength=b - a)))
+        a = b
+    return vis
+
+
+def first_hit(px, py, ux, uy, maxd, grid: Grid, mask: np.ndarray, step: float):
+    """March each ray (px, py) + t * (ux, uy), t = step, 2 step, ... <= maxd,
+    to the first cell where `mask` is true. Returns (t, row, col); t = inf
+    when the ray finds none."""
+    n = len(px)
+    t_hit = np.full(n, np.inf)
+    hr = np.zeros(n, np.int64)
+    hc = np.zeros(n, np.int64)
+    act = np.arange(n)
+    maxd = np.broadcast_to(np.asarray(maxd, dtype=np.float64), (n,))
+    k = 1
+    while len(act):
+        t = k * step
+        act = act[t <= maxd[act]]
+        if len(act) == 0:
+            break
+        r, c, ins = grid.rowcol(px[act] + ux[act] * t, py[act] + uy[act] * t)
+        hit = ins & mask[r, c]
+        h = act[hit]
+        t_hit[h] = t
+        hr[h] = r[hit]
+        hc[h] = c[hit]
+        act = act[~hit]
+        k += 1
+    return t_hit, hr, hc
+
+
+def fan_directions(ux, uy, fan_deg) -> list[tuple[np.ndarray, np.ndarray]]:
+    """The unit vectors (ux, uy) rotated by each angle in `fan_deg`."""
+    out = []
+    for a in fan_deg:
+        ca, sa = np.cos(np.radians(a)), np.sin(np.radians(a))
+        out.append((ux * ca - uy * sa, ux * sa + uy * ca))
+    return out
+
+
+def obstacle_tables(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """(canopy height, log transmission) lookup tables over NLCD class codes."""
+    w = cfg["water"]
+    canopy = np.zeros(256)
+    log_t = np.zeros(256)
+    for k, h in w["canopy_m"].items():
+        canopy[int(k)] = h
+    for k, t in w["transmit"].items():
+        log_t[int(k)] = np.log(max(t, 1e-9))
+    return canopy, log_t
+
+
+def near_falloff(d, reach, full_min: float, full_frac: float) -> np.ndarray:
+    """1 within max(full_min, full_frac * reach), then linear to 0 at reach."""
+    reach = np.asarray(reach, dtype=np.float64)
+    full = np.minimum(np.maximum(full_min, full_frac * reach), reach - 1.0)
+    return np.clip((reach - np.asarray(d, dtype=np.float64)) / (reach - full), 0, 1)
+
+
+def view_score(px, py, ze, ux, uy, d, wr, wc, val, reach, beyond: bool, grid: Grid, dem, nlcd, canopy, log_t,
+               w: dict) -> np.ndarray:
+    """val * vis for rays from (px, py) along (ux, uy) to water cell (wr, wc)
+    at distance d. Closer than vis_min_dist_m: vis = 1. For areal water the
+    sight line aims past the shore (the open water beyond the shore strip,
+    not the water right behind it); obstacles are checked up to the shore."""
+    out = np.asarray(val, dtype=np.float64).copy()
+    far = np.flatnonzero(d >= w["vis_min_dist_m"])
+    if len(far) == 0:
+        return out
+    zt = dem[wr[far], wc[far]].astype(np.float64)
+    zt = np.where(zt <= -32768, ze[far] - w["eye_m"], zt)
+    ext = np.zeros(len(far))
+    if beyond:
+        ext = np.minimum(np.clip(w["beyond_frac"] * d[far], grid.res, w["beyond_max_m"]),
+                         w["beyond_reach_frac"] * reach[far])
+    tx = px[far] + ux[far] * (d[far] + ext)
+    ty = py[far] + uy[far] * (d[far] + ext)
+    out[far] *= sight_line(px[far], py[far], ze[far], tx, ty, zt, grid, dem, w["ray_step_m"], w["terrain_tol_m"],
+                           nlcd, canopy, log_t, stop=d[far])
+    return out
+
+
+def water_points(s: Samples, grid: Grid, area: np.ndarray, line: np.ndarray, size: np.ndarray, reach_of,
+                 z_pt: np.ndarray, dem: np.ndarray, nlcd: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Per-point W and nearest-water distance (inf when none in reach), v0.1.
+
+    area: bool 30 m areal-water mask; line: uint8 linear water (river, canal,
+    stream) outside it; size: size score per cell; reach_of(x, y) -> reach (m)
+    of areal water at those cell centres; z_pt: ground height at the points;
+    dem, nlcd: 30 m rasters for the sight lines.
+
+    Areal water is represented by its shore cells (a cell with a 4-neighbour
+    that is not water); points on water (bridges, causeways) get W = size.
+    Shore cells are split into bands by reach and each band has its own
+    KD-tree, so a pond next to the road cannot hide the lake behind it. From
+    each point, sight lines go to the nearest shore cell of the band and
+    along a fan (water.fan_deg) either side of it, to the first water cell
+    within the band's reach. W_pt = max over bands and sight lines of
+    size * falloff(d, reach) * vis."""
     from scipy import ndimage
     from scipy.spatial import cKDTree
 
     w = cfg["water"]
+    n = len(s.x)
+    W = np.zeros(n)
+    dmin = np.full(n, np.inf)
     r, c, inside = grid.rowcol(s.x, s.y)
+    onw = inside & area[r, c]
+    W[onw] = size[r[onw], c[onw]]
+    dmin[onw] = 0.0
+
+    bands = sorted(float(b) for b in w["reach_bands_m"])
+    rad = int(np.ceil(max(bands[-1], w["line_reach_m"]) / grid.res)) + 1
     near = np.zeros(grid.shape, dtype=np.uint8)
     near[r[inside], c[inside]] = 1
-    size = 2 * int(w["road_dilate_cells"]) + 1
-    near = ndimage.maximum_filter1d(near, size, axis=0)
-    near = ndimage.maximum_filter1d(near, size, axis=1)
-    cells = np.flatnonzero(water_mask.ravel() & near.ravel().astype(bool))
+    near = ndimage.maximum_filter1d(near, 2 * rad + 1, axis=0)
+    near = ndimage.maximum_filter1d(near, 2 * rad + 1, axis=1).astype(bool)
+    shore = area.copy()
+    inner = np.zeros_like(area)
+    inner[1:-1, 1:-1] = area[:-2, 1:-1] & area[2:, 1:-1] & area[1:-1, :-2] & area[1:-1, 2:]
+    shore &= ~inner
+    del inner
+    shore_cells = np.flatnonzero((shore & near).ravel())
+    del shore
+    line_cells = np.flatnonzero(((line > 0) & near).ravel())
     del near
-    d = np.full(len(s.x), np.inf)
-    W = np.zeros(len(s.x))
-    if len(cells) == 0:
-        return W, d
-    cr, cc = np.divmod(cells, grid.width)
-    cx, cy = grid.centres(cr, cc)
-    tree = cKDTree(np.column_stack([cx, cy]))
-    dist, idx = tree.query(np.column_stack([s.x, s.y]), distance_upper_bound=w["max_dist_m"], workers=-1)
-    hit = np.flatnonzero(np.isfinite(dist))
-    d[hit] = dist[hit]
-    ci = idx[hit]
-    sz = np.asarray(size_of_cells(cells[ci]), dtype=np.float64)
-    f = np.clip((w["max_dist_m"] - dist[hit]) / w["ramp_m"], 0, 1)
-    open_n = np.zeros(len(hit))
-    px, py = s.x[hit], s.y[hit]
-    for fr in w["vis_fracs"]:
-        qx = px + fr * (cx[ci] - px)
-        qy = py + fr * (cy[ci] - py)
-        qr, qc, qin = grid.rowcol(qx, qy)
-        open_n += ~(blocking[qr, qc] & qin)
-    vis = np.where(dist[hit] < w["vis_min_dist_m"], 1.0, open_n / len(w["vis_fracs"]))
-    W[hit] = sz * f * vis
-    return W, d
+
+    canopy, log_t = obstacle_tables(cfg)
+    groups = []
+    if len(line_cells):
+        groups.append((line_cells, np.full(len(line_cells), w["line_reach_m"]), w["line_reach_m"],
+                       w["line_full_m"], 0.0, False))
+    if len(shore_cells):
+        sr, sc = np.divmod(shore_cells, grid.width)
+        reach = np.asarray(reach_of(*grid.centres(sr, sc)), dtype=np.float64)
+        lo = 0.0
+        for hi in bands:
+            sel = (reach > lo) & (reach <= hi) if hi < bands[-1] else reach > lo
+            if sel.any():
+                groups.append((shore_cells[sel], reach[sel], hi, w["full_min_m"], w["full_frac"], True))
+            lo = hi
+    ze = z_pt + w["eye_m"]
+    q = np.flatnonzero(~onw)
+    qxy = np.column_stack([s.x[q], s.y[q]])
+    linemask = line > 0
+    for cells, reach, upper, full_min, full_frac, is_area in groups:
+        cr, cc = np.divmod(cells, grid.width)
+        cx, cy = grid.centres(cr, cc)
+        dist, idx = cKDTree(np.column_stack([cx, cy])).query(qxy, distance_upper_bound=upper, workers=-1)
+        hit = np.flatnonzero(np.isfinite(dist))
+        ci = idx[hit]
+        dh = dist[hit]
+        pi = q[hit]
+        dmin[pi] = np.minimum(dmin[pi], dh)
+        val = size[cr[ci], cc[ci]].astype(np.float64) * near_falloff(dh, reach[ci], full_min, full_frac)
+        go = np.flatnonzero(val > 0)
+        if len(go) == 0:
+            continue
+        pi, ci, dh, val = pi[go], ci[go], dh[go], val[go]
+        px, py = s.x[pi], s.y[pi]
+        ux = (cx[ci] - px) / np.maximum(dh, 1e-9)
+        uy = (cy[ci] - py) / np.maximum(dh, 1e-9)
+        best = view_score(px, py, ze[pi], ux, uy, dh, cr[ci], cc[ci], val, reach[ci], is_area, grid, dem, nlcd,
+                          canopy, log_t, w)
+        # A fan of sight lines either side of the nearest shore: the driver
+        # sees water through whichever gap there is, not only straight across.
+        mask = area if is_area else linemask
+        for fx, fy in fan_directions(ux, uy, w["fan_deg"]):
+            th, hr, hc = first_hit(px, py, fx, fy, upper, grid, mask, w["ray_step_m"])
+            ok = np.flatnonzero(np.isfinite(th))
+            if len(ok) == 0:
+                continue
+            hx, hy = grid.centres(hr[ok], hc[ok])
+            rch = (np.asarray(reach_of(hx, hy), dtype=np.float64) if is_area
+                   else np.full(len(ok), w["line_reach_m"]))
+            v = size[hr[ok], hc[ok]].astype(np.float64) * near_falloff(th[ok], rch, full_min, full_frac)
+            g2 = np.flatnonzero(v > best[ok])
+            if len(g2) == 0:
+                continue
+            o2 = ok[g2]
+            cand = view_score(px[o2], py[o2], ze[pi[o2]], fx[o2], fy[o2], th[o2], hr[o2], hc[o2], v[g2], rch[g2],
+                              is_area, grid, dem, nlcd, canopy, log_t, w)
+            best[o2] = np.maximum(best[o2], cand)
+        W[pi] = np.maximum(W[pi], best)  # one query per point: pi is unique
+    return W, dmin
 
 
 def hills_edges(s: Samples, relief_pt: np.ndarray, z_pt: np.ndarray, length_m: np.ndarray,
@@ -225,9 +412,75 @@ def hills_edges(s: Samples, relief_pt: np.ndarray, z_pt: np.ndarray, length_m: n
     return H, h_relief, h_grade
 
 
-def views_points(open_pt: np.ndarray, tpi_pt: np.ndarray, cfg: dict) -> np.ndarray:
+def prospect_points(z_pt: np.ndarray, min_far: np.ndarray, max_far: np.ndarray, cfg: dict) -> np.ndarray:
+    """How much landscape is laid out in front of an open viewpoint: the
+    drop to the lowest ground within 3 km plus half the rise to the highest,
+    less an offset for ordinary rolling ground, scaled to [0, 1]."""
     v = cfg["views"]
-    return open_pt * (v["base"] + v["tpi_weight"] * np.clip(tpi_pt / v["tpi_scale_m"], 0, 1))
+    drop = np.maximum(z_pt - min_far, 0)
+    rise = np.maximum(max_far - z_pt, 0)
+    return np.clip((drop + v["rise_weight"] * rise - v["prospect_offset_m"]) / v["prospect_scale_m"], 0, 1)
+
+
+def water_view_points(px, py, z_pt, grid90: Grid, big_idx: np.ndarray, water_z: np.ndarray, dem90: np.ndarray,
+                      wv_reach: np.ndarray, cfg: dict) -> np.ndarray:
+    """Broad water in view, in [0, 1]: broad water (lake or river over ~1 km
+    wide) seen from the road, scored by the angle the driver looks down at it
+    (a lake 150 m below at 2 km fills the view, one at road level 2 km off
+    is a line on the horizon), fading over the second half of the water's
+    view range wv_reach (wider water reads from farther), and 0 when bare
+    terrain is in the way. Sight lines go to the nearest broad-water cell
+    and along a fan (water.fan_deg) either side; the best one counts."""
+    v = cfg["views"]
+    px = np.asarray(px, dtype=np.float64)
+    py = np.asarray(py, dtype=np.float64)
+    out = np.zeros(len(px))
+    r, c, inside = grid90.rowcol(px, py)
+    ti = big_idx[r, c].astype(np.int64)
+    ok = np.flatnonzero(inside & (ti >= 0))
+    if len(ok) == 0:
+        return out
+    tr, tc = np.divmod(ti[ok], grid90.width)
+    tx, ty = grid90.centres(tr, tc)
+    ox, oy = px[ok], py[ok]
+    ze = np.asarray(z_pt, dtype=np.float64)[ok] + cfg["water"]["eye_m"]
+    d0 = np.hypot(tx - ox, ty - oy)
+    ux = np.where(d0 > 0, (tx - ox) / np.maximum(d0, 1e-9), 1.0)
+    uy = np.where(d0 > 0, (ty - oy) / np.maximum(d0, 1e-9), 0.0)
+
+    def score(sel, d, hr, hc):
+        R = wv_reach[hr, hc].astype(np.float64)
+        zw = water_z[hr, hc].astype(np.float64)
+        theta = np.degrees(np.arctan2(ze[sel] - zw, np.maximum(d, grid90.res / 2)))
+        a = np.clip(theta / v["wv_angle_full_deg"], 0, 1) * np.clip((R - d) / (0.5 * R), 0, 1)
+        a[~np.isfinite(a)] = 0
+        go = np.flatnonzero(a > 0)
+        if len(go):
+            hx, hy = grid90.centres(hr[go], hc[go])
+            a[go] *= sight_line(ox[sel][go], oy[sel][go], ze[sel][go], hx, hy, zw[go], grid90, dem90,
+                                v["wv_ray_step_m"], cfg["water"]["terrain_tol_m"])
+        return a
+
+    best = score(np.arange(len(ok)), d0, tr, tc)
+    big = big_idx == np.arange(big_idx.size, dtype=np.int64).reshape(big_idx.shape)
+    for fx, fy in fan_directions(ux, uy, cfg["water"]["fan_deg"]):
+        th, hr, hc = first_hit(ox, oy, fx, fy, v["wv_max_m"], grid90, big, v["wv_ray_step_m"])
+        sel = np.flatnonzero(np.isfinite(th))
+        if len(sel):
+            best[sel] = np.maximum(best[sel], score(sel, th[sel], hr[sel], hc[sel]))
+    out[ok] = best
+    return out
+
+
+def views_points(open_pt: np.ndarray, forest_pt: np.ndarray, prospect: np.ndarray, wv: np.ndarray,
+                 cfg: dict) -> np.ndarray:
+    """V = open * (base + (1 - base) * view) + forest * forest_base, where
+    view = 1 - (1 - prospect) * (1 - water_view). Open flat ground with
+    nothing in view scores `base`, an open slope over a valley or lake 1,
+    a road inside forest `forest_base`, a built-up street 0."""
+    v = cfg["views"]
+    view = 1 - (1 - np.clip(prospect, 0, 1)) * (1 - np.clip(wv, 0, 1))
+    return open_pt * (v["base"] + (1 - v["base"]) * view) + forest_pt * v["forest_base"]
 
 
 def land_points(lscore_pt: np.ndarray, mix_pt: np.ndarray, cfg: dict) -> np.ndarray:
@@ -242,10 +495,9 @@ def quiet(highway: np.ndarray, cfg: dict) -> np.ndarray:
     return vals[inv]
 
 
-def curvature(off: np.ndarray, x: np.ndarray, y: np.ndarray, length_m: np.ndarray,
-              min_step: float = 5.0, scale: float = 200.0) -> np.ndarray:
-    """C = clip(turn_deg / length_km / scale, 0, 1), turning summed over the
-    vertices kept after dropping those closer than `min_step` to the previous
+def turning(off: np.ndarray, x: np.ndarray, y: np.ndarray, min_step: float = 5.0) -> np.ndarray:
+    """Absolute heading change (degrees) summed over the vertices of each
+    edge kept after dropping those closer than `min_step` to the previous
     kept vertex; 0 for edges with fewer than 3 kept vertices.
 
     The drop rule is sequential along each edge, so this loops over vertex
@@ -277,9 +529,18 @@ def curvature(off: np.ndarray, x: np.ndarray, y: np.ndarray, length_m: np.ndarra
     both = same[:-1] & same[1:]
     dh = (np.diff(head) + 180.0) % 360.0 - 180.0
     turn = np.bincount(ke[1:-1][both], weights=np.abs(dh[both]), minlength=n_e)
+    return np.where(n_kept >= 3, turn, 0.0)
+
+
+def curvature(off: np.ndarray, x: np.ndarray, y: np.ndarray, length_m: np.ndarray,
+              min_step: float = 5.0, scale: float = 200.0) -> np.ndarray:
+    """Per-edge C = clip(turn_deg / length_km / scale, 0, 1) (v0). v0.1 scores
+    the window value instead (combine), so one bend on a 30 m edge no longer
+    saturates it; this stays as a per-edge diagnostic."""
+    turn = turning(off, x, y, min_step)
     with np.errstate(invalid="ignore", divide="ignore"):
         c = np.where(length_m > 0, turn / (length_m / 1000.0) / scale, 0.0)
-    return np.where(n_kept >= 3, np.clip(c, 0, 1), 0.0)
+    return np.clip(c, 0, 1)
 
 
 def excluded_mask(surface: np.ndarray, name: np.ndarray, cfg: dict) -> np.ndarray:
@@ -437,7 +698,7 @@ def percentile_rank(values: np.ndarray, length: np.ndarray, active: np.ndarray) 
 
 def combine(sig: dict, edges_extra: dict, active: np.ndarray, cfg: dict, pairs=None) -> dict:
     """Penalties, pre, smoothing and rank. `sig` holds per-edge W, H, V, L,
-    Q, C, dev, signals (count per edge), junction_halves; `edges_extra` holds
+    Q, turn_deg (or a ready C), dev, signals (count per edge), junction_halves; `edges_extra` holds
     u, v, length_m, highway, maxspeed_tagged, speed_mph, key."""
     cb, pen, sm = cfg["combine"], cfg["penalty"], cfg["smoothing"]
     n = len(active)
@@ -456,6 +717,13 @@ def combine(sig: dict, edges_extra: dict, active: np.ndarray, cfg: dict, pairs=N
         sig_km = window_sum(s, d, w, sig["signals"] / Lw, n) / (wsum / 1000.0)
     junc_km = np.nan_to_num(junc_km)
     sig_km = np.nan_to_num(sig_km)
+    # v0.1: curvature over the window (degrees per km of road around the edge).
+    if "turn_deg" in sig:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            turn_km = window_sum(s, d, w, sig["turn_deg"] / Lw, n) / (wsum / 1000.0)
+        C = np.clip(np.nan_to_num(turn_km) / cfg["curves"]["scale_deg_per_km"], 0, 1)
+    else:
+        C = np.asarray(sig["C"], dtype=np.float64)
     hw = np.asarray(edges_extra["highway"], dtype=object).astype(str)
     p = (pen["junction_weight"] * np.clip((junc_km - pen["junction_lo_per_km"]) / pen["junction_span_per_km"], 0, 1)
          + pen["signal_weight"] * np.clip(sig_km / pen["signal_full_per_km"], 0, 1)
@@ -464,13 +732,13 @@ def combine(sig: dict, edges_extra: dict, active: np.ndarray, cfg: dict, pairs=N
                                         & (np.asarray(edges_extra["speed_mph"]) <= pen["urban_speed_mph"]))
          + pen["motorway_weight"] * np.isin(hw, ["motorway", "motorway_link"]))
     P = np.minimum(p, pen["cap"])
-    pre = raw * (1 + cb["bonus_quiet"] * sig["Q"] + cb["bonus_curves"] * sig["C"]) - P
+    pre = raw * (1 + cb["bonus_quiet"] * sig["Q"] + cb["bonus_curves"] * C) - P
     pre = np.where(active, pre, np.nan)
     with np.errstate(invalid="ignore", divide="ignore"):
         smooth = window_sum(s, d, w, np.nan_to_num(pre), n) / wsum
     smooth = np.where(active, smooth, np.nan)
     S = percentile_rank(smooth, L, active)
-    return {"raw": raw, "penalty": P, "pre": pre, "smooth": smooth, "S": S,
+    return {"raw": raw, "penalty": P, "pre": pre, "smooth": smooth, "S": S, "C": C,
             "junctions_per_km": junc_km, "signals_per_km": sig_km, "window_m": wsum,
             "window_pairs": int(len(src)), "bfs_rounds": int(rounds)}
 

@@ -41,6 +41,11 @@ DEVIATIONS = [
     "Spot-check boxes in config/spot_checks.toml were set from the two named towns; an edge matches by ref "
     "(any of its ;-separated refs) with its middle vertex in the box.",
     "Stage children run with GDAL_CACHEMAX=256 MB; GDAL's default (5 % of RAM) added about 3.4 GB of RSS.",
+    "v0.1 replaces the spec's W, V and C definitions (docs/SCORE_SPEC.md, 'v0.1 changes'): W reach scales with "
+    "the water around the shore and visibility is a terrain-and-canopy sight line, with a fan of rays; V adds "
+    "prospect, broad water in view and a forest baseline; C is scored over the 1 km smoothing window.",
+    "Holdout spot checks (config/spot_checks.toml, [holdout]) were added before any v0.1 formula change and "
+    "their v0 results kept in data/score_v0/holdout_v0.json; they were not consulted while tuning.",
 ]
 
 
@@ -102,7 +107,7 @@ def heatmap(scores, samples, length_m: np.ndarray, out: Path, cell_m: float = 50
     ax.set_yticks([])
     for sp in ax.spines.values():
         sp.set_visible(False)
-    ax.set_title(f"Scenery score v0, New York State: length-weighted mean S per {cell_m:.0f} m cell "
+    ax.set_title(f"Scenery score v0.1, New York State: length-weighted mean S per {cell_m:.0f} m cell "
                  f"(run {date.today().isoformat()})", fontsize=6)
     cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
     cb.ax.tick_params(labelsize=5)
@@ -136,7 +141,7 @@ def summary_stats(scores, length_m: np.ndarray) -> dict:
 
 def summary_md(scores, length_m: np.ndarray, out: Path) -> Path:
     st = summary_stats(scores, length_m)
-    lines = [f"# Scenery score v0 summary ({date.today().isoformat()})", "",
+    lines = [f"# Scenery score v0.1 summary ({date.today().isoformat()})", "",
              f"{scores.num_rows:,} edges, {st['total_km']:,.0f} km; excluded (unpaved or seasonal) "
              f"{st['excluded_km']:,.0f} km. Statistics are length-weighted over non-excluded edges.", "",
              "| Column | Mean | p10 | p50 | p90 | Share of length at 0 |", "|---|---|---|---|---|---|"]

@@ -5,7 +5,7 @@ A scenic route planner for New York State. See `docs/PLAN.md` for the full plan.
 So far it does phase 1 for OpenStreetMap only. It downloads the New York OSM
 extract, builds a statewide graph of drivable roads, and finds the fastest
 route between two points. It also gives every road edge a scenery score
-(v0, `docs/SCORE_SPEC.md`).
+(v0.1, `docs/SCORE_SPEC.md`; the v0.1 changes are listed at its end).
 
 ## Setup
 
@@ -70,12 +70,14 @@ scenic score [--force [STAGE ...]]
 ```
 
 Scores every edge in `data/graph/edges.parquet`. Settings are in
-`config/score.toml`. The stages are grid, dem, nlcd, water, terrain90, land90,
-controls, edges, score, outputs and validate. Each one runs in its own
-process and caches its result in `data/rasters/` or `data/score/`. A stage
-is skipped when its outputs are newer than its inputs. `--force` reruns all
-stages, or just the ones named. A full run takes about 2.5 minutes, and the
-water stage peaks at about 9.4 GB of memory. It writes these files to
+`config/score.toml`. The stages are grid, dem, nlcd, water, water90,
+terrain90, land90, controls, edges, score, outputs and validate. Each one
+runs in its own process and caches its result in `data/rasters/` or
+`data/score/`. A stage is skipped when its outputs are newer than its inputs
+(`config/score.toml` counts as an input, so editing it reruns nearly every
+stage). `--force` reruns all stages, or just the ones named. A full run takes
+about 3.5 minutes; the water90 stage peaks at about 13.5 GB of memory and the
+water and edges stages at about 9.6 GB. It writes these files to
 `data/score/`:
 
 - `scores.parquet`: one row per edge, in the same order as `edges.parquet`,
@@ -84,7 +86,11 @@ water stage peaks at about 9.4 GB of memory. It writes these files to
 - `heatmap.png`: a statewide map of S.
 - `summary.md`: distributions of the signals and how they correlate.
 - `validation.json`: the byway, spot-check and Rochester to Syracuse checks.
-  The spot checks are listed in `config/spot_checks.toml`.
+  The spot checks are listed in `config/spot_checks.toml`, which also holds
+  a holdout set (10 scenic, 5 dull) that was fixed before v0.1 and is
+  not used for tuning.
+- `edge_signals.parquet`: per-edge signals and their parts (W, H_relief,
+  H_grade, V_prospect, V_water, turn_deg, water_dist_m and so on).
 - `score_report.json`: inputs, versions, run time and peak memory per
   stage, deviations from the spec, and the validation results.
 
@@ -103,9 +109,10 @@ water stage peaks at about 9.4 GB of memory. It writes these files to
   default per class: motorway 65, trunk 55, primary 50, secondary 45,
   tertiary 40, unclassified 35, residential 25, living street 15, links 35.
 - Delays (`graph.DELAY_PARAMS`), added per edge:
-  `time = free_flow * f + 16.4 s * (signals + crossings / 2) + 8.1 s * stops + 2.95 s * minor_ends`.
-  `f` is 1.006 on motorways, 1.011 elsewhere and 1.002 in built-up areas, so
-  nearly all the extra time comes from the signals, stops and junctions.
+  `time = free_flow * f + 16.8 s * (signals + crossings / 2) + 8.2 s * stops + 3.21 s * minor_ends`.
+  `f` is close to 1 (1.007 on motorways, 1.020 on other roads and 0.954 in
+  built-up areas), so nearly all the extra time comes from the signals, stops
+  and junctions.
   Signals and stops come from OSM nodes (`highway=traffic_signals`,
   `highway=stop`). A one-direction sign counts half. A two-way stop on a
   junction only counts for the smaller road. Crossings are signalised
@@ -114,16 +121,28 @@ water stage peaks at about 9.4 GB of memory. It writes these files to
   driving through pays it once. `minor_ends` counts junctions where the edge
   meets a bigger road. Built-up means 12 or more junctions within 300 m.
   Motorways get no delays.
-- Fit: against Google's phase 0 ETAs, ours / Google is 1.011 for the fastest
-  route, 1.002 for A, 1.026 for B and 0.961 for C (was 0.97, 0.87, 0.91,
-  0.88). Fitted on the fastest route alone, A, B and C come out at 1.02, 1.05
-  and 0.97. OSRM is not a direct check: its car profile drives at about 0.8x
+- Fit: against Google's phase 0 ETAs, ours / Google is 1.012 for the fastest
+  route, 1.002 for A, 1.027 for B and 0.960 for C (was 0.97, 0.87, 0.91,
+  0.88). OSRM is not a direct check: its car profile drives at about 0.8x
   the posted limit and charges about 2 s per signal. So OSRM trips (40
   village-to-village trips with little motorway) only enter with a free scale
-  factor and OSRM's own signal cost. The per-signal, per-stop and per-junction
-  delays are held near traffic-engineering values (15, 8, 3 s) by weak
-  priors, because neither reference can tell signal delay from slower
-  driving in general.
+  factor, and they are routed and scored with OSRM's own 2 s per signal. The
+  per-signal, per-stop and per-junction delays are held near
+  traffic-engineering values (15, 8, 3 s) by weak priors, because neither
+  reference can tell signal delay from slower driving in general.
+- Known limitations:
+  - A signal or stop sign tagged for one direction (forward or backward)
+    counts half in both directions, instead of in full in its own direction
+    and not at all in the other.
+  - A two-way stop at a junction charges half a stop to every edge of the
+    smaller road that touches it. It should charge a full stop when you
+    drive up to the junction on that road, and nothing when you drive away
+    from it.
+  - Fitted on Google's fastest route alone (a holdout check for A, B and C),
+    the fit does not settle. Without A, B and C, the speed on rural roads
+    and the OSRM scale factor can stand in for each other, and the fit cycles
+    through four states where A, B and C come out between 0.95 and 1.34 of
+    Google. `delay_fit.json` records whichever state the last pass ended on.
 
 ## Tests
 

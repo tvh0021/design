@@ -1,4 +1,4 @@
-# Scenery score v0 constants (docs/SCORE_SPEC.md). Loaded once by
+# Scenery score v0.1 constants (docs/SCORE_SPEC.md, including "v0.1 changes"). Loaded once by
 # scenic.score; code never hard-codes these values.
 
 [grid]
@@ -22,12 +22,33 @@ coastline_area_m2 = 1e9
 size_log10_lo = 4.0       # 1 ha -> 0
 size_log10_span = 4.0     # 100 km2 -> 1
 line_size = { river = 0.45, canal = 0.35, stream = 0.15 }
-prefilter_m = 300.0       # water cells this close to a road sample point
-road_dilate_cells = 10
-max_dist_m = 250.0        # f(d) = clip((max - d) / ramp, 0, 1)
-ramp_m = 200.0
-vis_fracs = [0.2, 0.4, 0.6, 0.8]
+# v0.1: how far water counts scales with how much water is in view near the
+# shore, and visibility is a sight line over the DEM with tree and building
+# heights, not a 4-cell open/blocked vote.
+reach_radius_cells = 11   # local water fraction in a 1 km disk (90 m grid)
+reach_k = 1.2             # reach = k * sqrt(local water area), clipped
+reach_min_m = 150.0
+reach_max_m = 1500.0
+full_frac = 0.2           # full credit within max(full_min_m, full_frac * reach)
+full_min_m = 50.0
+line_reach_m = 250.0      # OSM river/canal/stream lines with no area: narrow water
+line_full_m = 50.0
+reach_bands_m = [400.0, 900.0, 1500.0]  # one KD-tree per reach band, best W wins
 vis_min_dist_m = 45.0     # closer than this: vis = 1
+fan_deg = [-60.0, -30.0, 30.0, 60.0]  # extra sight lines either side of the nearest shore
+eye_m = 1.2               # driver's eye above the road
+ray_step_m = 30.0
+# Sight lines to areal water aim this far past the nearest shore cell (open
+# water beyond the shore strip): clip(beyond_frac * d, 30 m, beyond_max_m),
+# at most beyond_reach_frac * reach so a narrow river is not overshot.
+beyond_frac = 0.5
+beyond_max_m = 500.0
+beyond_reach_frac = 0.25
+terrain_tol_m = 2.0       # bare ground this far above the sight line blocks it
+# Obstacle height (m) above bare ground per NLCD class, and the share of the
+# view that gets through one 30 m cell of it when it rises above the sight line.
+canopy_m = { 41 = 20.0, 42 = 20.0, 43 = 20.0, 90 = 12.0, 22 = 8.0, 23 = 10.0, 24 = 15.0, 52 = 3.0 }
+transmit = { 41 = 0.4, 42 = 0.4, 43 = 0.4, 90 = 0.5, 22 = 0.6, 23 = 0.4, 24 = 0.2, 52 = 0.8 }
 
 [hills]
 disk_radius_cells = 11    # 1 km at 90 m
@@ -38,10 +59,28 @@ w_relief = 0.7
 w_grade = 0.3
 
 [views]
-tpi_scale_m = 60.0
-open_window = 3           # cells of the 90 m grid
-base = 0.35
-tpi_weight = 0.65
+open_window = 3           # cells of the 90 m grid (open and forest fractions)
+base = 0.35               # open, flat, nothing in view
+forest_base = 0.25        # inside forest: short sight lines, all of it trees
+# Prospect: how much land lies below the driver (drop) or rises above an open
+# foreground (rise) within 3 km.
+far_radius_cells = 33     # 3 km at 90 m
+rise_weight = 0.5
+prospect_offset_m = 30.0
+prospect_scale_m = 200.0
+# Broad water in view: 90 m cells mostly water whose 1 km disk is at least
+# 25 % water (lakes and rivers over ~1 km wide), seen from above.
+bigwater_cell_frac = 0.5
+bigwater_disk_frac = 0.25
+# View range of broad water: wv_k * sqrt(water area within 3 km of it),
+# clipped; credit fades over the second half of the range. A 1.5 km wide
+# Finger Lake reads to ~4.5 km, Champlain and Ontario to 6 km.
+wv_radius_cells = 33
+wv_k = 1.5
+wv_min_m = 2000.0
+wv_max_m = 6000.0
+wv_angle_full_deg = 2.0   # depression angle to the water at which it fills the view
+wv_ray_step_m = 90.0
 
 [landcover]
 window = 3                # 3x3 uniform filter on the 90 m grid (270 m)
@@ -55,7 +94,6 @@ water = [11]
 developed = [21, 22, 23, 24]
 forest = [41, 42, 43, 90]
 open = [31, 52, 71, 81, 82, 95, 21]
-blocking = [22, 23, 24, 41, 42, 43, 90]
 town = [22, 23, 24]       # "dev" for the town-centre penalty
 
 [quiet]
@@ -69,6 +107,7 @@ residential = 0.60
 living_street = 0.50
 
 [curves]
+# v0.1: turning per km over the smoothing window, not per edge.
 min_step_m = 5.0
 scale_deg_per_km = 200.0
 

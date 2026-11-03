@@ -164,8 +164,25 @@ def st_water(paths: Paths) -> dict:
             "coast_cells": int(coast.sum()), "line_cells": int((line > 0).sum())}
 
 
+def st_water90(paths: Paths) -> dict:
+    from .rasters import read_tif, water90_products, write_tif
+
+    cfg = _cfg(paths)
+    k = cfg["grid"]["block"]
+    g90 = _grid(paths).coarsen(k)
+    area = read_tif(paths.p("rasters", "water_area.tif")).astype(bool)
+    dem30 = read_tif(paths.p("rasters", "dem30.tif"))
+    prods = water90_products(area, dem30, k, g90.res, cfg)
+    for name, arr in prods.items():
+        write_tif(paths.p("rasters", f"{name}.tif"), arr, g90)
+    big = prods["bigwater_idx90"]
+    return {"reach90_p50_on_water": float(np.median(prods["reach90"][prods["wfrac90"] > 0.02][::5])),
+            "bigwater_cells": int(np.count_nonzero((big >= 0) & (big == np.arange(big.size).reshape(big.shape)))),
+            "share_within_wv_max": round(float((big >= 0).mean()), 4)}
+
+
 def st_terrain90(paths: Paths) -> dict:
-    from .rasters import read_tif, relief_tpi, write_tif
+    from .rasters import far_min_max, read_tif, relief_tpi, write_tif
 
     cfg = _cfg(paths)
     g90 = _grid(paths).coarsen(cfg["grid"]["block"])
@@ -173,6 +190,9 @@ def st_terrain90(paths: Paths) -> dict:
     relief, tpi = relief_tpi(dem90, cfg["hills"]["disk_radius_cells"])
     write_tif(paths.p("rasters", "relief90.tif"), relief, g90)
     write_tif(paths.p("rasters", "tpi90.tif"), tpi, g90)
+    lo, hi = far_min_max(dem90, cfg["views"]["far_radius_cells"])
+    write_tif(paths.p("rasters", "min3k90.tif"), lo, g90)
+    write_tif(paths.p("rasters", "max3k90.tif"), hi, g90)
     return {"shape_90m": list(g90.shape), "relief_p50": float(np.median(relief[::7, ::7])),
             "relief_p99": float(np.percentile(relief[::7, ::7], 99))}
 
@@ -203,46 +223,59 @@ def st_edges(paths: Paths) -> dict:
     import pyarrow.parquet as pq
     from scipy.spatial import cKDTree
 
-    from .rasters import class_mask, read_tif
-    from .score import (curvature, excluded_mask, hills_edges, land_points, lookup, project_lonlat, quiet,
-                        read_edges, road_keys, sample_points, views_points, water_points)
+    from .rasters import read_tif
+    from .score import (curvature, excluded_mask, hills_edges, land_points, lookup, project_lonlat,
+                        prospect_points, quiet, read_edges, road_keys, sample_points, turning, views_points,
+                        water_points, water_view_points)
 
     cfg = _cfg(paths)
     g30 = _grid(paths)
     g90 = g30.coarsen(cfg["grid"]["block"])
+    R = lambda n: read_tif(paths.p("rasters", n))  # noqa: E731
     t0 = time.monotonic()
     E = read_edges(Path(paths.graph))
     s = sample_points(E.off, E.x, E.y, E.length_m, cfg["sampling"]["step_m"])
     timing = {"sample_s": round(time.monotonic() - t0, 1)}
     _log(f"{len(s.x):,} sample points on {E.n:,} edges")
 
-    t = time.monotonic()
-    area = read_tif(paths.p("rasters", "water_area.tif")).astype(bool)
-    area |= read_tif(paths.p("rasters", "water_line.tif")) > 0
-    blocking = class_mask(read_tif(paths.p("rasters", "nlcd30.tif")), cfg["groups"]["blocking"])
-    size = read_tif(paths.p("rasters", "water_size.tif"))
-    W_pt, d_pt = water_points(s, g30, area, lambda idx: size.ravel()[idx], blocking, cfg)
-    del area, blocking, size
-    timing["water_s"] = round(time.monotonic() - t, 1)
-
-    t = time.monotonic()
-    dem90 = read_tif(paths.p("rasters", "dem90.tif"))
-    dem30 = read_tif(paths.p("rasters", "dem30.tif"))
+    dem90 = R("dem90.tif")
+    dem30 = R("dem30.tif")
     z = lookup(g30, dem30, s.x, s.y, fallback=-32768)
-    del dem30
     bad = z <= -32768
     z[bad] = lookup(g90, dem90, s.x[bad], s.y[bad], fallback=0.0)
-    del dem90
-    relief_pt = lookup(g90, read_tif(paths.p("rasters", "relief90.tif")), s.x, s.y)
+
+    t = time.monotonic()
+    area = R("water_area.tif").astype(bool)
+    line = R("water_line.tif")
+    size = R("water_size.tif")
+    reach90 = R("reach90.tif")
+    W_pt, d_pt = water_points(s, g30, area, line, size, lambda x, y: lookup(g90, reach90, x, y,
+                                                                              cfg["water"]["reach_min_m"]),
+                              z, dem30, R("nlcd30.tif"), cfg)
+    del area, line, size, reach90, dem30
+    timing["water_s"] = round(time.monotonic() - t, 1)
+    _log(f"W: {timing['water_s']} s")
+
+    t = time.monotonic()
+    wv_pt = water_view_points(s.x, s.y, z, g90, R("bigwater_idx90.tif"), R("water_z90.tif"), dem90,
+                              R("wv_reach90.tif"), cfg)
+    timing["water_view_s"] = round(time.monotonic() - t, 1)
+
+    t = time.monotonic()
+    relief_pt = lookup(g90, R("relief90.tif"), s.x, s.y)
     H, h_relief, h_grade = hills_edges(s, relief_pt, z, E.length_m, cfg)
-    V_pt = views_points(lookup(g90, read_tif(paths.p("rasters", "open90.tif")), s.x, s.y),
-                        lookup(g90, read_tif(paths.p("rasters", "tpi90.tif")), s.x, s.y), cfg)
-    L_pt = land_points(lookup(g90, read_tif(paths.p("rasters", "lscore90.tif")), s.x, s.y),
-                       lookup(g90, read_tif(paths.p("rasters", "mix90.tif")), s.x, s.y), cfg)
-    dev_pt = lookup(g90, read_tif(paths.p("rasters", "dev90.tif")), s.x, s.y)
+    prospect = prospect_points(z, lookup(g90, R("min3k90.tif"), s.x, s.y, np.nan),
+                               lookup(g90, R("max3k90.tif"), s.x, s.y, np.nan), cfg)
+    prospect = np.nan_to_num(prospect)
+    V_pt = views_points(lookup(g90, R("open90.tif"), s.x, s.y), lookup(g90, R("forest90.tif"), s.x, s.y),
+                        prospect, wv_pt, cfg)
+    L_pt = land_points(lookup(g90, R("lscore90.tif"), s.x, s.y), lookup(g90, R("mix90.tif"), s.x, s.y), cfg)
+    dev_pt = lookup(g90, R("dev90.tif"), s.x, s.y)
+    del dem90
     timing["rasters_s"] = round(time.monotonic() - t, 1)
 
     t = time.monotonic()
+    turn = turning(E.off, E.x, E.y, cfg["curves"]["min_step_m"])
     C = curvature(E.off, E.x, E.y, E.length_m, cfg["curves"]["min_step_m"], cfg["curves"]["scale_deg_per_km"])
     timing["curvature_s"] = round(time.monotonic() - t, 1)
 
@@ -264,7 +297,8 @@ def st_edges(paths: Paths) -> dict:
     wd = np.where(np.isfinite(d_pt), d_pt, 9999.0)
     cols = {
         "W": s.mean(W_pt), "H": H, "H_relief": h_relief, "H_grade": h_grade,
-        "V": s.mean(V_pt), "L": s.mean(L_pt), "Q": quiet(E.highway, cfg), "C": C, "dev": s.mean(dev_pt),
+        "V": s.mean(V_pt), "V_prospect": s.mean(prospect), "V_water": s.mean(wv_pt),
+        "L": s.mean(L_pt), "Q": quiet(E.highway, cfg), "C_edge": C, "turn_deg": turn, "dev": s.mean(dev_pt),
         "signals": sig, "junction_halves": junction_halves,
         "n_samples": s.n.astype(np.int32), "water_dist_m": s.mean(wd),
         "excluded": excluded_mask(E.surface, E.name, cfg),
@@ -274,7 +308,8 @@ def st_edges(paths: Paths) -> dict:
                    compression="zstd")
     np.savez(paths.p("out", "samples.npz"), x=s.x.astype(np.float32), y=s.y.astype(np.float32), edge=s.edge)
     return {"sample_points": int(len(s.x)), "signal_nodes_matched": matched,
-            "points_with_water_hit": round(float(np.isfinite(d_pt).mean()), 4), **timing}
+            "points_with_water_hit": round(float(np.isfinite(d_pt).mean()), 4),
+            "points_with_water_view": round(float((wv_pt > 0).mean()), 4), **timing}
 
 
 def st_score(paths: Paths) -> dict:
@@ -294,7 +329,7 @@ def st_score(paths: Paths) -> dict:
     extra["key"] = sig["key"]
     active = ~sig["excluded"]
     res = combine(sig, extra, active, cfg)
-    res.update({c: sig[c] for c in ("W", "H", "V", "L", "Q", "C", "n_samples", "water_dist_m", "excluded")})
+    res.update({c: sig[c] for c in ("W", "H", "V", "L", "Q", "n_samples", "water_dist_m", "excluded")})
     table = scores_table(extra, res)
     write_scores(table, paths.p("graph", "edges.parquet"), paths.p("out", "scores.parquet"))
     L = extra["length_m"]
@@ -345,17 +380,21 @@ def stages(paths: Paths) -> list[tuple[str, object, list[Path], list[Path]]]:
     edges = paths.p("graph", "edges.parquet")
     nlcd_in = sorted(Path(paths.raw, "nlcd").glob("Annual_NLCD_LndCov_*_CU_*.tif"))[-1:]
     byway_in = sorted(Path(paths.raw, "byways").glob("*.geojson"))
-    rasters90 = [R(n) for n in ("relief90.tif", "tpi90.tif", "lscore90.tif", "mix90.tif", "open90.tif", "dev90.tif")]
+    terrain90 = [R(n) for n in ("relief90.tif", "tpi90.tif", "min3k90.tif", "max3k90.tif")]
+    land90 = [R(n) for n in ("lscore90.tif", "mix90.tif", "open90.tif", "forest90.tif", "dev90.tif")]
     water = [R(n) for n in ("water_area.tif", "water_line.tif", "water_size.tif")]
+    water90 = [R(n) for n in ("wfrac90.tif", "reach90.tif", "water_z90.tif", "bigwater_idx90.tif", "wv_reach90.tif")]
     return [
         ("grid", st_grid, [edges, cfgp], [R("grid.json")]),
         ("dem", st_dem, [R("grid.json"), *dem_tiles(paths)], [R("dem30.tif"), R("dem90.tif")]),
         ("nlcd", st_nlcd, [R("grid.json"), *nlcd_in], [R("nlcd30.tif")]),
         ("water", st_water, [R("grid.json"), R("nlcd30.tif"), paths.pbf, cfgp], water),
-        ("terrain90", st_terrain90, [R("dem90.tif"), cfgp], rasters90[:2]),
-        ("land90", st_land90, [R("nlcd30.tif"), cfgp], rasters90[2:]),
+        ("water90", st_water90, [R("water_area.tif"), R("dem30.tif"), cfgp], water90),
+        ("terrain90", st_terrain90, [R("dem90.tif"), cfgp], terrain90),
+        ("land90", st_land90, [R("nlcd30.tif"), cfgp], land90),
         ("controls", st_controls, [paths.pbf], [O("signal_nodes.npy")]),
-        ("edges", st_edges, [edges, R("dem30.tif"), R("nlcd30.tif"), *water, *rasters90, O("signal_nodes.npy"), cfgp],
+        ("edges", st_edges, [edges, R("dem30.tif"), R("dem90.tif"), R("nlcd30.tif"), *water, *water90, *terrain90,
+                             *land90, O("signal_nodes.npy"), cfgp],
          [O("edge_signals.parquet"), O("samples.npz")]),
         ("score", st_score, [O("edge_signals.parquet"), edges, cfgp], [O("scores.parquet")]),
         ("outputs", st_outputs, [O("scores.parquet"), O("samples.npz"), cfgp], [O("heatmap.png"), O("summary.md")]),

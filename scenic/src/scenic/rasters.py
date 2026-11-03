@@ -212,7 +212,7 @@ def water_size(area: np.ndarray, line: np.ndarray, coast: np.ndarray, cell_area:
 
 
 def landcover_products(nlcd30: np.ndarray, cfg: dict) -> dict[str, np.ndarray]:
-    """lscore90, mix90, open90 and dev90 from the 30 m class raster.
+    """lscore90, mix90, open90, forest90 and dev90 from the 30 m class raster.
 
     Cells outside the class table (NLCD nodata 250, e.g. Canada) do not
     count: every fraction and mean is over valid cells only, and a window
@@ -241,14 +241,63 @@ def landcover_products(nlcd30: np.ndarray, cfg: dict) -> dict[str, np.ndarray]:
     p_o = window_mean(frac_sum([c for c in g["open"] if c != 21]), wl)
     mix = (4 * p_f * p_o).astype(np.float32)
     open90 = window_mean(frac_sum(list(g["open"]) + list(g["water"])), cfg["views"]["open_window"])
+    forest90 = window_mean(frac_sum(g["forest"]), cfg["views"]["open_window"])
     dev90 = window_mean(frac_sum(g["town"]), cfg["penalty"]["town_window"])
-    return {"lscore90": lscore, "mix90": mix, "open90": open90, "dev90": dev90}
+    return {"lscore90": lscore, "mix90": mix, "open90": open90, "forest90": forest90, "dev90": dev90}
 
 
 def relief_tpi(dem90: np.ndarray, r: int) -> tuple[np.ndarray, np.ndarray]:
     relief = (disk_max(dem90, r) - disk_min(dem90, r)).astype(np.float32)
     tpi = (dem90 - disk_mean(dem90, r)).astype(np.float32)
     return relief, tpi
+
+
+def far_min_max(dem90: np.ndarray, r: int) -> tuple[np.ndarray, np.ndarray]:
+    """Lowest and highest ground within `r` cells (disk): what lies below
+    and above a viewpoint at the scale of a long view (v0.1 prospect)."""
+    return disk_min(dem90, r).astype(np.float32), disk_max(dem90, r).astype(np.float32)
+
+
+def reach_from_frac(wfrac: np.ndarray, r_cells: int, res: float, w: dict) -> np.ndarray:
+    """How far (m) a water cell counts for W, from the water fraction of the
+    disk of `r_cells` around it: reach = k * sqrt(local water area), clipped.
+    A shore of a broad lake (half the 1 km disk is water) reaches ~1.5 km, a
+    100 m wide river ~0.5 km, a pond the minimum."""
+    area = np.asarray(wfrac, dtype=np.float64) * np.pi * (r_cells * res) ** 2
+    return np.clip(w["reach_k"] * np.sqrt(area), w["reach_min_m"], w["reach_max_m"]).astype(np.float32)
+
+
+def water90_products(area30: np.ndarray, dem30: np.ndarray, k: int, res90: float, cfg: dict,
+                     dem_nodata: int = -32768) -> dict[str, np.ndarray]:
+    """90 m water products for v0.1:
+
+    - wfrac90: water fraction of the 1 km disk around each 90 m cell.
+    - reach90: W reach (m) of water in that cell (reach_from_frac).
+    - water_z90: mean DEM over the water cells of the block (NaN: no water),
+      i.e. the water surface without the shore land a plain block mean mixes in.
+    - bigwater_idx90: flat index of the nearest broad-water 90 m cell (cell at
+      least bigwater_cell_frac water, disk at least bigwater_disk_frac water),
+      -1 when none within views.wv_max_m.
+    - wv_reach90: how far broad water reads as a view (m), from the water
+      area within views.wv_radius_cells: wv_k * sqrt(area), clipped to
+      [wv_min_m, wv_max_m]."""
+    w, v = cfg["water"], cfg["views"]
+    frac = block_count(area30, k).astype(np.float32) / (k * k)
+    wfrac = disk_mean(frac, w["reach_radius_cells"])
+    reach = reach_from_frac(wfrac, w["reach_radius_cells"], res90, w)
+    valid = area30 & (dem30 > dem_nodata)
+    wz = block_mean(dem30, k, valid=valid)
+    big = (frac >= v["bigwater_cell_frac"]) & (wfrac >= v["bigwater_disk_frac"]) & np.isfinite(wz)
+    idx = np.full(frac.shape, -1, dtype=np.int32)
+    if big.any():
+        dist, (ir, ic) = ndimage.distance_transform_edt(~big, return_indices=True)
+        ok = dist * res90 <= v["wv_max_m"]
+        idx[ok] = (ir[ok].astype(np.int64) * frac.shape[1] + ic[ok]).astype(np.int32)
+    rv = v["wv_radius_cells"]
+    far_area = disk_mean(frac, rv).astype(np.float64) * np.pi * (rv * res90) ** 2
+    wv_reach = np.clip(v["wv_k"] * np.sqrt(far_area), v["wv_min_m"], v["wv_max_m"]).astype(np.float32)
+    return {"wfrac90": wfrac, "reach90": reach, "water_z90": wz.astype(np.float32), "bigwater_idx90": idx,
+            "wv_reach90": wv_reach}
 
 
 # --------------------------------------------------------------------------

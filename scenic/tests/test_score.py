@@ -1,4 +1,4 @@
-"""Scenery score v0 on tiny synthetic rasters and edges (no network, no statewide data)."""
+"""Scenery score v0.1 on tiny synthetic rasters and edges (no network, no statewide data)."""
 
 import numpy as np
 import pyarrow as pa
@@ -7,10 +7,11 @@ import pytest
 from scipy import ndimage
 
 from scenic.rasters import (Grid, block_mean, disk_footprint, disk_max, disk_mean, disk_min, landcover_products,
-                            make_grid, relief_tpi, size_score, water_size)
+                            make_grid, reach_from_frac, relief_tpi, size_score, water90_products, water_size)
 from scenic.score import (Samples, check_alignment, combine, curvature, excluded_mask, hills_edges, land_points,
-                          load, load_config, percentile_rank, quiet, road_keys, sample_points, scores_table,
-                          views_points, water_points, window_pairs, write_scores)
+                          load, load_config, near_falloff, percentile_rank, prospect_points, quiet, road_keys,
+                          sample_points, scores_table, sight_line, turning, views_points, water_points,
+                          water_view_points, window_pairs, write_scores)
 from scenic.validate import byway_edge_mask, match_road
 from scenic.water import is_areal_water, is_signal_node, line_code
 
@@ -124,26 +125,129 @@ def pts(xy):
     return Samples(xy[:, 0], xy[:, 1], np.zeros(k, np.int32), np.array([k]), np.array([0, k]))
 
 
-def test_water_signal_decay_size_and_visibility():
-    g = tiny_grid()
-    water = np.zeros(g.shape, bool)
-    water[:, 30:] = True                       # water from x = 900 m
-    size = np.where(water, 0.8, 0.0).astype(np.float32)
-    blocking = np.zeros(g.shape, bool)
+def lake_scene(n=40, nlcd_class=81):
+    """Water from x = 900 m (column 30) eastwards, flat ground at 100 m,
+    lake surface at 100 m, pasture between road and shore."""
+    g = tiny_grid(n)
+    area = np.zeros(g.shape, bool)
+    area[:, 30:] = True
+    size = np.where(area, 0.8, 0.0).astype(np.float32)
+    line = np.zeros(g.shape, np.uint8)
+    dem = np.full(g.shape, 100, np.int16)
+    nlcd = np.full(g.shape, nlcd_class, np.uint8)
+    nlcd[area] = 11
+    return g, area, line, size, dem, nlcd
+
+
+def run_w(s, g, area, line, size, dem, nlcd, reach=1000.0, z=100.0, cfg=CFG):
+    return water_points(s, g, area, line, size, lambda x, y: np.full(len(x), reach), np.full(len(s.x), z),
+                        dem, nlcd, cfg)
+
+
+def test_near_falloff_scales_with_reach():
+    assert near_falloff([0, 50, 150, 250], 250.0, 50, 0.2).tolist() == pytest.approx([1, 1, 0.5, 0])
+    big = near_falloff([300, 900, 1500], 1500.0, 50, 0.2)   # full credit to 300 m
+    assert big.tolist() == pytest.approx([1, 0.5, 0])
+
+
+def test_reach_from_local_water_fraction():
+    w = CFG["water"]
+    r = reach_from_frac(np.array([0.0, 0.003, 0.06, 0.6]), 11, 90.0, w)
+    assert r[0] == w["reach_min_m"]
+    assert r[3] == w["reach_max_m"]                                 # shore of a broad lake
+    assert r[2] == pytest.approx(1.2 * np.sqrt(0.06 * np.pi * 990 ** 2), rel=1e-5)  # ~100 m wide river: ~0.5 km
+    assert 450 < r[2] < 550
+
+
+def test_water_signal_decay_and_size():
+    g, area, line, size, dem, nlcd = lake_scene()
     cy = 600.0
-    # Points at distance ~ 15, 85, 165, 300 m from the nearest water cell centre (x = 915).
-    s = pts([[900, cy - 15], [830, cy - 15], [750, cy - 15], [615, cy - 15]])
-    W, d = water_points(s, g, water, lambda i: size.ravel()[i], blocking, CFG)
-    assert d[0] == pytest.approx(15, abs=1) and W[0] == pytest.approx(0.8)
-    assert W[1] == pytest.approx(0.8 * np.clip((250 - d[1]) / 200, 0, 1))
-    assert W[2] == pytest.approx(0.8 * (250 - d[2]) / 200)
-    assert np.isinf(d[3]) and W[3] == 0
-    # Forest between road and shore hides the water partly.
-    blocking[:, 28:30] = True                  # x = 840..900
-    W2, _ = water_points(s, g, water, lambda i: size.ravel()[i], blocking, CFG)
-    assert W2[0] == pytest.approx(0.8)         # d < 45 m: always visible
-    assert W2[2] == pytest.approx(0.5 * W[2])  # sight line cells at x 783, 816 open; 849, 882 forest
-    assert W2[1] == 0                          # 847..898: all forest
+    # Distances to the nearest shore cell centre (x = 915): 30, 95, 315, 515 m.
+    s = pts([[885, cy - 15], [820, cy - 15], [600, cy - 15], [400, cy - 15]])
+    W, d = run_w(s, g, area, line, size, dem, nlcd, reach=1000.0)
+    assert d[0] == pytest.approx(30, abs=1) and W[0] == pytest.approx(0.8)
+    assert W[1] == pytest.approx(0.8)                                 # inside the 200 m full-credit zone
+    assert W[2] == pytest.approx(0.8 * near_falloff(d[2], 1000.0, 50, 0.2), rel=1e-6)
+    assert W[3] == pytest.approx(0.8 * (1000 - d[3]) / 800, rel=1e-6)
+    # A pond (short reach) at the same distances counts only close by.
+    Wp, dp = run_w(s, g, area, line, size, dem, nlcd, reach=150.0)
+    assert Wp[0] == pytest.approx(0.8) and Wp[2] == 0 and np.isinf(dp[3])
+
+
+def test_point_on_water_scores_its_size():
+    g, area, line, size, dem, nlcd = lake_scene()
+    W, d = run_w(pts([[1000, 600]]), g, area, line, size, dem, nlcd)
+    assert d[0] == 0 and W[0] == pytest.approx(0.8)
+
+
+def test_water_visibility_trees_cottages_and_height():
+    g, area, line, size, dem, nlcd = lake_scene()
+    s = pts([[600, 585]])                                            # 315 m from the shore
+    W_open, _ = run_w(s, g, area, line, size, dem, nlcd)
+    # One 30 m cell of forest along the shore: 40 % of the view gets through.
+    nlcd[:, 29] = 41
+    W1, _ = run_w(s, g, area, line, size, dem, nlcd)
+    assert W1[0] == pytest.approx(0.4 * W_open[0])
+    # Four cells of forest: almost nothing.
+    nlcd[:, 26:30] = 41
+    W4, _ = run_w(s, g, area, line, size, dem, nlcd)
+    assert W4[0] == pytest.approx(0.4 ** 4 * W_open[0])
+    # A road 60 m above the lake on a slope looks over a row of 20 m trees at the shore.
+    nlcd[:, 26:29] = 81
+    dem2 = dem.copy()
+    cols = np.arange(g.width)
+    slope = np.clip((900 - (cols + 0.5) * 30) / 300 * 60, 0, None)   # 60 m at x = 600, 0 at the shore
+    dem2[:, :] = (100 + slope).astype(np.int16)
+    Wh, _ = run_w(s, g, area, line, size, dem2, nlcd, z=160.0)
+    assert Wh[0] > 0.9 * W_open[0]
+
+
+def test_water_seen_through_a_gap_off_to_the_side():
+    g, area, line, size, dem, nlcd = lake_scene()
+    s = pts([[600, 585]])                                            # row 20, 315 m from the shore
+    W_open, _ = run_w(s, g, area, line, size, dem, nlcd)
+    nlcd[:, 29] = 41                                                  # trees all along the shore
+    W1, _ = run_w(s, g, area, line, size, dem, nlcd)
+    # A gap in the trees about 30 degrees off the straight line to the shore:
+    # the driver sees the lake through it, a little farther away.
+    nlcd[12:17, 29] = 81
+    nlcd[24:29, 29] = 81
+    Wg, _ = run_w(s, g, area, line, size, dem, nlcd)
+    assert W1[0] == pytest.approx(0.4 * W_open[0])
+    assert 0.8 * W_open[0] < Wg[0] < W_open[0]
+
+
+def test_water_hidden_behind_a_ridge():
+    g, area, line, size, dem, nlcd = lake_scene()
+    dem[:, 25] = 140                                                  # 40 m bank between road and lake
+    W, _ = run_w(pts([[600, 585]]), g, area, line, size, dem, nlcd)
+    assert W[0] == pytest.approx(0, abs=1e-12)
+
+
+def test_pond_does_not_hide_the_lake_behind_it():
+    g, area, line, size, dem, nlcd = lake_scene()
+    area[18, 22] = True                                               # a one-cell pond 60 m from the road
+    size[18, 22] = 0.05
+    reach = lambda x, y: np.where(x < 800, 150.0, 1000.0)            # noqa: E731
+    s = pts([[600, 585]])
+    W, _ = water_points(s, g, area, line, size, reach, np.full(1, 100.0), dem, nlcd, CFG)
+    assert W[0] > 0.5                                                 # the lake 315 m away, not the pond
+
+
+def test_sight_line_terrain_and_canopy():
+    g = tiny_grid()
+    dem = np.full(g.shape, 100.0, np.float32)
+    cls = np.zeros(g.shape, np.uint8)
+    canopy = np.zeros(256)
+    log_t = np.zeros(256)
+    canopy[41], log_t[41] = 20.0, np.log(0.5)
+    args = (np.array([45.0]), np.array([600.0]), np.array([101.2]), np.array([1005.0]), np.array([600.0]),
+            np.array([100.0]), g)
+    assert sight_line(*args, dem, 30.0, 2.0, cls, canopy, log_t)[0] == 1.0
+    cls[:, 10] = 41
+    assert sight_line(*args, dem, 30.0, 2.0, cls, canopy, log_t)[0] == pytest.approx(0.5)
+    dem[:, 20] = 110.0
+    assert sight_line(*args, dem, 30.0, 2.0, cls, canopy, log_t)[0] == pytest.approx(0, abs=1e-12)
 
 
 def test_hills_relief_grade_and_short_edge_fallback():
@@ -169,10 +273,71 @@ def test_flat_road_has_no_grade_score():
     assert hg[0] == 0.0
 
 
-def test_views_and_land_formulas():
-    assert views_points(np.array([1.0, 1.0, 0.0, 0.5]), np.array([0.0, 60.0, 60.0, 30.0]), CFG).tolist() == \
-        pytest.approx([0.35, 1.0, 0.0, 0.5 * (0.35 + 0.65 * 0.5)])
+def test_views_land_and_prospect_formulas():
+    zero = np.zeros(5)
+    open_ = np.array([1.0, 1.0, 0.0, 0.0, 0.5])
+    forest = np.array([0.0, 0.0, 1.0, 0.0, 0.5])
+    prospect = np.array([0.0, 1.0, 1.0, 0.0, 0.5])
+    V = views_points(open_, forest, prospect, zero, CFG)
+    assert V.tolist() == pytest.approx([0.35, 1.0, 0.25, 0.0, 0.5 * (0.35 + 0.65 * 0.5) + 0.5 * 0.25])
+    # Water in view and prospect combine as independent chances of a view.
+    assert views_points(np.ones(1), np.zeros(1), np.array([0.5]), np.array([0.5]), CFG)[0] == \
+        pytest.approx(0.35 + 0.65 * 0.75)
+    p = prospect_points(np.array([100.0, 300.0, 100.0]), np.array([90.0, 100.0, 100.0]),
+                        np.array([120.0, 300.0, 900.0]), CFG)
+    assert p.tolist() == pytest.approx([0.0, (200 - 30) / 200, 1.0])
     assert land_points(np.array([0.9]), np.array([1.0]), CFG)[0] == pytest.approx(0.8 * 0.9 + 0.2)
+
+
+def test_water_view_angle_distance_and_ridge():
+    g90 = Grid(0.0, 90 * 60.0, 90.0, 60, 60)
+    big = np.zeros(g90.shape, bool)
+    big[:, 50:] = True                                                # broad lake from x = 4500 m
+    from scipy import ndimage as ndi
+    _, (ir, ic) = ndi.distance_transform_edt(~big, return_indices=True)
+    idx = (ir * g90.width + ic).astype(np.int32)
+    wz = np.full(g90.shape, 100.0, np.float32)
+    dem = np.full(g90.shape, 100.0, np.float32)
+    y = np.array([2700.0, 2700.0, 2700.0])
+    x = np.array([4500 - 1000.0, 4500 - 1000.0, 4500 - 3500.0])
+    z = np.array([200.0, 110.0, 200.0])                               # high and close, low and close, high and far
+    R = np.full(g90.shape, 4000.0, np.float32)                        # view range 4 km: fades from 2 km
+    wv = water_view_points(x, y, z, g90, idx, wz, dem, R, CFG)
+    assert wv[0] == pytest.approx(1.0)
+    theta = np.degrees(np.arctan2(11.2, 1045.0))
+    assert wv[1] == pytest.approx(theta / 2.0, rel=1e-3)
+    assert 0 < wv[2] < 0.5                                            # 3.5 km: fading out
+    # Wider water reads from farther away.
+    assert water_view_points(x[2:], y[2:], z[2:], g90, idx, wz, dem, R * 1.5, CFG)[0] > wv[2]
+    ridge = dem.copy()
+    ridge[:, 45] = 300.0                                              # a ridge in between
+    assert water_view_points(x[:1], y[:1], z[:1], g90, idx, wz, ridge, R, CFG)[0] == 0.0
+    # A hill blocks the straight line to the nearest water, but the driver
+    # still sees the lake obliquely past it: a fan ray finds it.
+    hill = dem.copy()
+    hill[25:36, 42:48] = 300.0
+    v = water_view_points(x[:1], y[:1], z[:1], g90, idx, wz, hill, R, CFG)[0]
+    assert 0.5 < v <= 1.0
+
+
+def test_water90_products_reach_and_broad_water():
+    k = 3
+    area = np.zeros((90, 90), bool)
+    area[:, 60:] = True                                               # broad water, 900 m wide
+    area[30:33, 10:13] = True                                         # 90 m pond
+    dem = np.full(area.shape, 150, np.int16)
+    dem[area] = 100
+    p = water90_products(area, dem, k, 90.0, CFG)
+    assert p["reach90"][15, 25] == pytest.approx(CFG["water"]["reach_max_m"])  # lake shore cell
+    assert p["reach90"][10, 3] < 400                                  # the pond
+    assert p["water_z90"][15, 25] == 100 and np.isnan(p["water_z90"][0, 0])
+    # Nearest broad water from the west side is the lake, not the pond.
+    i = int(p["bigwater_idx90"][10, 3])
+    assert i >= 0 and i % 30 == 20
+    # View range grows with the water area around it, within the clip.
+    wv = p["wv_reach90"]
+    assert CFG["views"]["wv_min_m"] <= wv.min() and wv.max() <= CFG["views"]["wv_max_m"]
+    assert wv[15, 25] > wv[15, 3]
 
 
 def test_landcover_products_scores_mix_and_nodata():
@@ -186,6 +351,7 @@ def test_landcover_products_scores_mix_and_nodata():
     assert p["lscore90"][1, 1] == pytest.approx((27 * 0.9 + 45 * 0.7) / 72, rel=1e-5)
     assert p["mix90"][1, 1] == pytest.approx(4 * pf * po, rel=1e-5)
     assert p["open90"][1, 1] == pytest.approx(po, rel=1e-5)
+    assert p["forest90"][1, 1] == pytest.approx(pf, rel=1e-5)
     assert p["dev90"].max() == 0
 
 
@@ -205,6 +371,22 @@ def test_curvature_straight_bend_and_jitter():
     assert c[2] == 0.0                         # 1 m wiggle dropped: only 2 kept vertices
     off2, x2, y2 = one_edge([0, 500, 500, 1000], [0, 0, 20, 20])
     assert curvature(off2, x2, y2, np.array([1020.0]))[0] == pytest.approx(180 / 1.02 / 200)
+    assert turning(off, x, y).tolist() == pytest.approx([0, 90, 0])
+
+
+def test_curvature_is_scored_over_the_window():
+    # Lake Rd chain of 200 m edges; edge 2 has one 90-degree bend, which on its
+    # own would saturate C (450 deg/km); over its 1000 m window it is 90 deg/km.
+    u, v, key, L = chain()
+    n = 6
+    sig = {k: np.zeros(n) for k in ("W", "H", "V", "L", "Q", "dev", "signals", "junction_halves")}
+    sig["turn_deg"] = np.array([0, 0, 90.0, 0, 0, 0])
+    extra = {"u": u, "v": v, "key": key, "length_m": L, "highway": np.array(["tertiary"] * n, object),
+             "maxspeed_tagged": np.zeros(n, bool), "speed_mph": np.full(n, 45.0)}
+    r = combine(sig, extra, np.ones(n, bool), CFG)
+    assert r["C"][2] == pytest.approx(90 / 1.0 / 200)
+    assert r["C"][0] == pytest.approx(90 * 200 / 200 / 0.7 / 200)  # edge 0 window: 700 m, edge 2 weight 200
+    assert r["C"][5] == 0
 
 
 def test_exclusions():
