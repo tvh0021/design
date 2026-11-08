@@ -4,7 +4,7 @@
 //! (`apps/server/src/provider/*UsageLimits.ts` in t3code-dev), using the
 //! credentials each tool already stores locally:
 //!
-//! - Claude: Claude Code's OAuth token in the macOS keychain
+//! - Claude: Claude Code's OAuth token in the macOS keychain or `~/.claude/.credentials.json`
 //! - Codex: `~/.codex/auth.json` (ChatGPT login)
 //! - Antigravity: T3's `acp_token.json` (Google OAuth refresh token)
 //! - ChatLLM (Abacus): T3's stored `ABACUS_API_KEY`, or the env var
@@ -13,7 +13,8 @@
 //! Claude and Codex tokens are never refreshed here: their refresh tokens
 //! rotate, so refreshing would sign the real CLI out. Run the CLI once if
 //! its token has expired. Antigravity's short-lived access token is cached
-//! in the user cache directory (`~/Library/Caches/ai-usage` on macOS).
+//! in the user cache directory (`~/Library/Caches/ai-usage` on macOS,
+//! `$XDG_CACHE_HOME/ai-usage` or `~/.cache/ai-usage` on Linux).
 
 mod output;
 mod providers;
