@@ -81,31 +81,54 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 
+fn non_empty(val: Option<&str>) -> Option<&str> {
+    val.map(str::trim).filter(|v| !v.is_empty())
+}
+
 fn cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home().join("Library/Caches/ai-usage")
+    cache_dir_for(cfg!(target_os = "macos"), std::env::var("XDG_CACHE_HOME").ok().as_deref(), &home())
+}
+
+fn cache_dir_for(is_macos: bool, xdg_cache_home: Option<&str>, home: &Path) -> PathBuf {
+    if is_macos {
+        home.join("Library/Caches/ai-usage")
     } else {
-        std::env::var("XDG_CACHE_HOME")
+        non_empty(xdg_cache_home)
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home().join(".cache"))
+            .unwrap_or_else(|| home.join(".cache"))
             .join("ai-usage")
     }
 }
 
-/// T3 Code's userdata directory: `$T3_USERDATA`, else the personal build, else the stock one.
+/// T3 Code's userdata directory: `$T3_USERDATA`, `$T3CODE_HOME/userdata`, else the personal or stock build.
 fn t3_userdata() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("T3_USERDATA") {
+    t3_userdata_from(
+        std::env::var("T3_USERDATA").ok().as_deref(),
+        std::env::var("T3CODE_HOME").ok().as_deref(),
+        &home(),
+    )
+}
+
+fn t3_userdata_from(t3_userdata: Option<&str>, t3code_home: Option<&str>, home: &Path) -> Option<PathBuf> {
+    if let Some(dir) = non_empty(t3_userdata) {
         return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = non_empty(t3code_home) {
+        return Some(PathBuf::from(dir).join("userdata"));
     }
     [".t3-personal/userdata", ".t3/userdata"]
         .iter()
-        .map(|p| home().join(p))
+        .map(|p| home.join(p))
         .find(|p| p.is_dir())
 }
 
 /// A secret T3 stores in plaintext under `userdata/secrets/`.
 fn t3_secret(file: &str) -> Option<String> {
-    let text = std::fs::read_to_string(t3_userdata()?.join("secrets").join(file)).ok()?;
+    t3_secret_in(&t3_userdata()?, file)
+}
+
+fn t3_secret_in(userdata: &Path, file: &str) -> Option<String> {
+    let text = std::fs::read_to_string(userdata.join("secrets").join(file)).ok()?;
     let text = text.trim().to_string();
     (!text.is_empty()).then_some(text)
 }
@@ -149,7 +172,19 @@ fn reset_credit_note(count: i64, details: &[String], expires_at: Option<DateTime
 /// model's own weekly limit before suggesting a change in that model's use.
 const MODEL_ADVICE_GAP: f64 = 20.0;
 
-fn claude() -> Res<Report> {
+fn claude_config_dir_from(claude_config_dir: Option<&str>, home: &Path) -> PathBuf {
+    non_empty(claude_config_dir)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"))
+}
+
+fn claude_credentials_file(config_dir: &Path) -> Res<Value> {
+    let text = std::fs::read_to_string(config_dir.join(".credentials.json"))
+        .map_err(|_| "no Claude Code login (~/.claude/.credentials.json)".to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn claude_keychain_credentials() -> Res<Value> {
     let out = Command::new("security")
         .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
         .output()
@@ -157,20 +192,52 @@ fn claude() -> Res<Report> {
     if !out.status.success() {
         return Err("no Claude Code login in the keychain".into());
     }
-    let creds: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+fn claude_credentials_with(
+    is_macos: bool,
+    claude_config_dir: Option<&str>,
+    home: &Path,
+    keychain: impl FnOnce() -> Res<Value>,
+) -> Res<(Value, &'static str)> {
+    let dir = claude_config_dir_from(claude_config_dir, home);
+    if !is_macos || (non_empty(claude_config_dir).is_some() && dir.join(".credentials.json").is_file()) {
+        claude_credentials_file(&dir).map(|v| (v, "credentials file"))
+    } else {
+        keychain().map(|v| (v, "keychain entry"))
+    }
+}
+
+fn claude_oauth_from_creds(creds: &Value, now_ms: i64, source: &str) -> Res<(String, Option<String>)> {
     let oauth = &creds["claudeAiOauth"];
-    let token = oauth["accessToken"].as_str().ok_or("keychain entry has no access token")?;
+    let token = oauth["accessToken"]
+        .as_str()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| format!("{source} has no access token"))?;
     if let Some(exp) = oauth["expiresAt"].as_i64() {
-        if exp <= Utc::now().timestamp_millis() {
+        if exp <= now_ms {
             return Err("access token expired; run `claude` once to refresh it".into());
         }
     }
+    let plan = oauth["subscriptionType"].as_str().map(str::to_string);
+    Ok((token.to_string(), plan))
+}
 
-    let (usage, stale_note) = claude_usage(token)?;
+fn claude() -> Res<Report> {
+    let (creds, source) = claude_credentials_with(
+        cfg!(target_os = "macos"),
+        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        &home(),
+        claude_keychain_credentials,
+    )?;
+    let (token, plan) = claude_oauth_from_creds(&creds, Utc::now().timestamp_millis(), source)?;
+
+    let (usage, stale_note) = claude_usage(&token)?;
 
     let mut report = Report {
         provider: "Claude",
-        plan: oauth["subscriptionType"].as_str().map(str::to_string),
+        plan,
         ..Default::default()
     };
     report.notes.extend(stale_note);
@@ -334,7 +401,11 @@ fn claude_cli_version() -> Option<String> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();
     VERSION
         .get_or_init(|| {
-            let out = Command::new("claude").arg("--version").output().ok()?;
+            let out = Command::new("claude")
+                .arg("--version")
+                .output()
+                .or_else(|_| Command::new(home().join(".local/bin/claude")).arg("--version").output())
+                .ok()?;
             let text = String::from_utf8_lossy(&out.stdout);
             let version = text.split_whitespace().next()?;
             version.starts_with(|c: char| c.is_ascii_digit()).then(|| version.to_string())
@@ -392,20 +463,35 @@ fn claude_reset_credits(
 
 // ---------- Codex (codexUsageLimits.ts) ----------
 
-fn codex() -> Res<Report> {
-    let codex_home = std::env::var("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|_| home().join(".codex"));
+fn codex_home_from(codex_home: Option<&str>, home: &Path) -> PathBuf {
+    non_empty(codex_home)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
+}
+
+fn codex_auth_from_dir(codex_home: &Path) -> Res<(String, Option<String>)> {
     let text = std::fs::read_to_string(codex_home.join("auth.json"))
         .map_err(|_| "no Codex login (~/.codex/auth.json)".to_string())?;
     let auth: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let tokens = &auth["tokens"];
-    let token = tokens["access_token"].as_str().ok_or("Codex is not signed in with ChatGPT")?;
+    let token = tokens["access_token"]
+        .as_str()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or("Codex is not signed in with ChatGPT")?;
+    let account = tokens["account_id"].as_str().map(str::to_string);
+    Ok((token.to_string(), account))
+}
+
+fn codex() -> Res<Report> {
+    let codex_home = codex_home_from(std::env::var("CODEX_HOME").ok().as_deref(), &home());
+    let (token, account_id) = codex_auth_from_dir(&codex_home)?;
 
     let mut headers = vec![
         ("Authorization", format!("Bearer {token}")),
         ("User-Agent", "codex-cli".to_string()),
     ];
-    if let Some(account) = tokens["account_id"].as_str() {
-        headers.push(("ChatGPT-Account-Id", account.to_string()));
+    if let Some(account) = account_id {
+        headers.push(("ChatGPT-Account-Id", account));
     }
     let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
     // The usage endpoint reports only credit counts; the expiries come from
@@ -466,7 +552,11 @@ const ANTIGRAVITY_ENDPOINTS: [&str; 2] = [
 ];
 
 fn find_antigravity_token() -> Option<PathBuf> {
-    let root = t3_userdata()?.join("providers/antigravity");
+    find_antigravity_token_in(&t3_userdata()?)
+}
+
+fn find_antigravity_token_in(userdata: &Path) -> Option<PathBuf> {
+    let root = userdata.join("providers/antigravity");
     std::fs::read_dir(root)
         .ok()?
         .flatten()
@@ -819,5 +909,193 @@ mod tests {
     fn no_advice_for_small_gaps() {
         assert!(model_advice(7.0, &scoped(3.0)).is_empty());
         assert!(model_advice(50.0, &scoped(65.0)).is_empty());
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ai-usage-test-{name}-{}-{}",
+                std::process::id(),
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn claude_linux_reads_default_and_custom_config_dir() {
+        let tmp = TempDir::new("claude-linux");
+        let default_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        write_private(
+            &default_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"linux-default-tok","expiresAt":4102444800000,"subscriptionType":"max"}}"#,
+        );
+
+        let (creds, source) = claude_credentials_with(false, None, tmp.path(), || {
+            Err("keychain should not run on Linux".into())
+        })
+        .unwrap();
+        assert_eq!(source, "credentials file");
+        let (tok, plan) = claude_oauth_from_creds(&creds, 1_700_000_000_000, source).unwrap();
+        assert_eq!(tok, "linux-default-tok");
+        assert_eq!(plan.as_deref(), Some("max"));
+
+        let custom_dir = tmp.path().join("custom-claude");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        write_private(
+            &custom_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"linux-custom-tok","subscriptionType":"pro"}}"#,
+        );
+        let (creds, source) = claude_credentials_with(
+            false,
+            Some(custom_dir.to_str().unwrap()),
+            tmp.path(),
+            || Err("keychain should not run on Linux".into()),
+        )
+        .unwrap();
+        let (tok, plan) = claude_oauth_from_creds(&creds, 1_700_000_000_000, source).unwrap();
+        assert_eq!(tok, "linux-custom-tok");
+        assert_eq!(plan.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn claude_macos_uses_keychain_by_default_and_honors_config_dir_file() {
+        let tmp = TempDir::new("claude-macos");
+        let (creds, source) = claude_credentials_with(true, None, tmp.path(), || {
+            Ok(json!({"claudeAiOauth":{"accessToken":"mac-kc-tok","subscriptionType":"max"}}))
+        })
+        .unwrap();
+        assert_eq!(source, "keychain entry");
+        let (tok, plan) = claude_oauth_from_creds(&creds, 1_700_000_000_000, source).unwrap();
+        assert_eq!(tok, "mac-kc-tok");
+        assert_eq!(plan.as_deref(), Some("max"));
+
+        let custom_dir = tmp.path().join("custom-claude");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        write_private(
+            &custom_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"mac-file-tok","subscriptionType":"pro"}}"#,
+        );
+        let (creds, source) = claude_credentials_with(
+            true,
+            Some(custom_dir.to_str().unwrap()),
+            tmp.path(),
+            || Err("keychain should not be called when CLAUDE_CONFIG_DIR has credentials".into()),
+        )
+        .unwrap();
+        assert_eq!(source, "credentials file");
+        let (tok, _) = claude_oauth_from_creds(&creds, 1_700_000_000_000, source).unwrap();
+        assert_eq!(tok, "mac-file-tok");
+    }
+
+    #[test]
+    fn claude_credentials_error_cases() {
+        let tmp = TempDir::new("claude-errors");
+        let missing = claude_credentials_with(false, None, tmp.path(), || unreachable!()).unwrap_err();
+        assert_eq!(missing, "no Claude Code login (~/.claude/.credentials.json)");
+
+        let no_token = claude_oauth_from_creds(&json!({"claudeAiOauth":{}}), 1000, "keychain entry").unwrap_err();
+        assert_eq!(no_token, "keychain entry has no access token");
+
+        let expired = claude_oauth_from_creds(
+            &json!({"claudeAiOauth":{"accessToken":"tok","expiresAt":1000}}),
+            1000,
+            "credentials file",
+        )
+        .unwrap_err();
+        assert_eq!(expired, "access token expired; run `claude` once to refresh it");
+    }
+
+    #[test]
+    fn codex_reads_default_and_codex_home() {
+        let tmp = TempDir::new("codex");
+        let default_dir = codex_home_from(None, tmp.path());
+        assert_eq!(default_dir, tmp.path().join(".codex"));
+        assert_eq!(
+            codex_auth_from_dir(&default_dir).unwrap_err(),
+            "no Codex login (~/.codex/auth.json)"
+        );
+
+        let custom = tmp.path().join("custom-codex");
+        std::fs::create_dir_all(&custom).unwrap();
+        write_private(
+            &custom.join("auth.json"),
+            r#"{"tokens":{"access_token":"codex-tok","account_id":"acct-42"}}"#,
+        );
+        let resolved = codex_home_from(Some(custom.to_str().unwrap()), tmp.path());
+        let (tok, acct) = codex_auth_from_dir(&resolved).unwrap();
+        assert_eq!(tok, "codex-tok");
+        assert_eq!(acct.as_deref(), Some("acct-42"));
+    }
+
+    #[test]
+    fn t3_userdata_and_antigravity_lookup_respect_t3code_home() {
+        let tmp = TempDir::new("t3-userdata");
+        let personal = tmp.path().join(".t3-personal/userdata");
+        std::fs::create_dir_all(&personal).unwrap();
+        assert_eq!(t3_userdata_from(None, None, tmp.path()).as_deref(), Some(personal.as_path()));
+
+        let t3_home = tmp.path().join("custom-t3-home");
+        let expected_ud = t3_home.join("userdata");
+        assert_eq!(
+            t3_userdata_from(None, Some(t3_home.to_str().unwrap()), tmp.path()).as_deref(),
+            Some(expected_ud.as_path())
+        );
+
+        let explicit_ud = tmp.path().join("explicit-userdata");
+        assert_eq!(
+            t3_userdata_from(
+                Some(explicit_ud.to_str().unwrap()),
+                Some(t3_home.to_str().unwrap()),
+                tmp.path()
+            )
+            .as_deref(),
+            Some(explicit_ud.as_path())
+        );
+
+        let ag_file = expected_ud.join("providers/antigravity/inst-1/antigravity-acp/acp_token.json");
+        std::fs::create_dir_all(ag_file.parent().unwrap()).unwrap();
+        write_private(&ag_file, r#"{"client_id":"cid"}"#);
+        assert_eq!(find_antigravity_token_in(&expected_ud).as_deref(), Some(ag_file.as_path()));
+
+        let secret_file = expected_ud.join("secrets/test.bin");
+        std::fs::create_dir_all(secret_file.parent().unwrap()).unwrap();
+        write_private(&secret_file, "  secret-val \n");
+        assert_eq!(t3_secret_in(&expected_ud, "test.bin").as_deref(), Some("secret-val"));
+    }
+
+    #[test]
+    fn cache_dir_respects_os_and_xdg_cache_home() {
+        let home = Path::new("/home/tvha");
+        assert_eq!(
+            cache_dir_for(true, Some("/custom/cache"), home),
+            PathBuf::from("/home/tvha/Library/Caches/ai-usage")
+        );
+        assert_eq!(
+            cache_dir_for(false, None, home),
+            PathBuf::from("/home/tvha/.cache/ai-usage")
+        );
+        assert_eq!(
+            cache_dir_for(false, Some("  "), home),
+            PathBuf::from("/home/tvha/.cache/ai-usage")
+        );
+        assert_eq!(
+            cache_dir_for(false, Some("/custom/cache"), home),
+            PathBuf::from("/custom/cache/ai-usage")
+        );
     }
 }
