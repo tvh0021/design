@@ -331,8 +331,11 @@ reset time, and pool of every 5-hour and weekly window in `live_limits`. One
 reading prints one line, such as `limits: 10 readings at
 2026-10-23T01:25:12Z (antigravity 5, claude-code 3, codex 2)`. `--every`
 keeps sampling until interrupted (at least every 30 seconds) and reports a
-failed sample on stderr without stopping. `--from` reads saved `ai-usage`
-output instead. Set `USAGE_HABIT_REPORT_AI_USAGE` to the binary's path when
+failed sample on stderr without stopping. A provider that `ai-usage` could
+not read, or that it shows an earlier reading for while rate limited, is left
+out and named at the end of the line with the reason, such as `; skipped
+claude-code: access token expired; run `claude` once to refresh it`. `--from`
+reads saved `ai-usage` output instead. Set `USAGE_HABIT_REPORT_AI_USAGE` to the binary's path when
 `ai-usage` is not on `PATH`.
 
 Claude Code and Antigravity leave no usable limit series in their logs, so a

@@ -24,6 +24,21 @@ struct Provider {
     provider: String,
     #[serde(default)]
     windows: Vec<Window>,
+    /// Set when the provider could not be read, e.g. an expired login.
+    error: Option<String>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+/// The note `ai-usage` adds when a rate limit makes it show an earlier
+/// reading. Storing that reading under the current time would fake a flat
+/// stretch, so the provider is skipped instead.
+const STALE_NOTE: &str = "showing data from";
+
+/// One sample's readings, plus the providers left out and why.
+pub struct Parsed {
+    pub readings: Vec<LiveLimit>,
+    pub skipped: Vec<(&'static str, String)>,
 }
 
 #[derive(Deserialize)]
@@ -46,16 +61,27 @@ fn tool_of(provider: &str) -> Option<&'static str> {
 }
 
 /// Every session or weekly window in `ai-usage --json` output, stamped `ts_ms`.
-/// Monthly windows and unknown providers are skipped. Reset times are rounded
-/// to the second: providers report them with jitter between calls.
-pub fn parse(json: &str, ts_ms: i64) -> Result<Vec<LiveLimit>> {
+/// Monthly windows and unknown providers are skipped. A provider that reports
+/// an error or an earlier reading is skipped and listed with the reason. Reset
+/// times are rounded to the second: providers report them with jitter between
+/// calls.
+pub fn parse(json: &str, ts_ms: i64) -> Result<Parsed> {
     let providers: Vec<Provider> =
         serde_json::from_str(json).context("ai-usage output is not a JSON array of providers")?;
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for p in providers {
         let Some(tool) = tool_of(&p.provider) else {
             continue;
         };
+        if let Some(err) = p.error.filter(|e| !e.trim().is_empty()) {
+            skipped.push((tool, err.trim().to_owned()));
+            continue;
+        }
+        if let Some(note) = p.notes.iter().find(|n| n.contains(STALE_NOTE)) {
+            skipped.push((tool, note.trim().to_owned()));
+            continue;
+        }
         for w in p.windows {
             let Some(pct) = w.used_percent.filter(|p| p.is_finite()) else {
                 continue;
@@ -80,7 +106,10 @@ pub fn parse(json: &str, ts_ms: i64) -> Result<Vec<LiveLimit>> {
             });
         }
     }
-    Ok(out)
+    Ok(Parsed {
+        readings: out,
+        skipped,
+    })
 }
 
 /// The `ai-usage` binary: `$USAGE_HABIT_REPORT_AI_USAGE`, else `ai-usage` on PATH.
@@ -115,9 +144,10 @@ pub fn fetch() -> Result<String> {
 }
 
 /// Store one sample; returns a one-line summary such as
-/// `limits: 10 readings (antigravity 5, claude-code 3, codex 2)`.
+/// `limits: 10 readings (antigravity 5, claude-code 3, codex 2)`, followed by
+/// `; skipped claude-code: <reason>` for each provider left out.
 pub fn record(store: &mut Store, json: &str, ts_ms: i64) -> Result<String> {
-    let readings = parse(json, ts_ms)?;
+    let Parsed { readings, skipped } = parse(json, ts_ms)?;
     let tx = store.conn.transaction()?;
     let n = store::record_live_limits(&tx, &readings)?;
     tx.commit()?;
@@ -126,7 +156,7 @@ pub fn record(store: &mut Store, json: &str, ts_ms: i64) -> Result<String> {
         *by_tool.entry(r.tool.as_str()).or_default() += 1;
     }
     let parts: Vec<String> = by_tool.iter().map(|(t, n)| format!("{t} {n}")).collect();
-    Ok(format!(
+    let mut line = format!(
         "limits: {n} readings at {} ({})",
         crate::query::rfc3339(ts_ms),
         if parts.is_empty() {
@@ -134,7 +164,11 @@ pub fn record(store: &mut Store, json: &str, ts_ms: i64) -> Result<String> {
         } else {
             parts.join(", ")
         }
-    ))
+    );
+    for (tool, why) in &skipped {
+        line.push_str(&format!("; skipped {tool}: {why}"));
+    }
+    Ok(line)
 }
 
 #[cfg(test)]
@@ -155,6 +189,8 @@ mod tests {
     #[test]
     fn parses_session_and_weekly_windows_with_pools() {
         let r = parse(SAMPLE, 1_000).unwrap();
+        assert!(r.skipped.is_empty());
+        let r = r.readings;
         let got: Vec<(&str, &str, &str, f64, Option<i64>)> = r
             .iter()
             .map(|l| {
@@ -207,5 +243,26 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM live_limits", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn skips_providers_with_errors_or_earlier_readings() {
+        let json = r#"[
+          {"provider":"Claude","windows":[],"error":"access token expired; run `claude` once to refresh it"},
+          {"provider":"Codex","windows":[{"label":"Weekly","used_percent":40.0,"window_seconds":604800}],
+           "notes":["Anthropic is rate limiting usage checks: showing data from 2h ago, retrying in 3m"]},
+          {"provider":"Antigravity","windows":[{"label":"Gemini · Weekly","used_percent":5.0,"window_seconds":604800,"pool":"Gemini"}],
+           "notes":["Extra usage: 1.00 of 5.00 this month"]},
+          {"provider":"Zed","windows":[],"error":"not signed in"}
+        ]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("usage.db")).unwrap();
+        let line = record(&mut store, json, 5_000).unwrap();
+        assert_eq!(
+            line,
+            "limits: 1 readings at 1970-01-01T00:00:05Z (antigravity 1); \
+             skipped claude-code: access token expired; run `claude` once to refresh it; \
+             skipped codex: Anthropic is rate limiting usage checks: showing data from 2h ago, retrying in 3m"
+        );
     }
 }
