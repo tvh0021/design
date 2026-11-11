@@ -101,6 +101,21 @@ How it searches (`scenic.search`):
    none, the pick is marked shared.
 
 ```
+scenic loop --from 43.1566,-77.6088 [--minutes 120] \
+    [--direction N|NE|E|SE|S|SW|W|NW | --anchor LAT,LNG | --feature "Lake Ontario"] \
+    [--geojson loops.geojson] [--png loops.png] [--json loops.json]
+```
+
+Finds up to three scenic drive-around loops starting and ending at `--from`
+within `--minutes` (30 to 360, default 120; `docs/LOOP_SPEC.md`). Without a
+steer flag it spreads loops across compass directions (`any`); `--direction`
+steers into an 8-point compass cone, `--feature` anchors the trip on a named
+lake, river or scenic feature, and `--anchor` passes a coordinate pin (a pin on
+open water snaps to the nearest mapped shore). Settings live under `[loop]` in
+`config/score.toml`, and `scenic serve` exposes the same controls on its
+Drive-around tab (`docs/WEB.md`).
+
+```
 scenic calibrate [--features] [--fit]
 ```
 
@@ -346,11 +361,18 @@ through or within max(30 s, 5%) of it. Merely driving back over the
 waypoint's own edge doesn't count as turning round.
 
 A dynamic program then drops greedy waypoints that a later one made
-redundant, and keeps at most `max_waypoints` (default 9). When more are
-needed, it keeps the subset that loses the least overlap. The coordinates
-are rounded to 5 decimals and snapped back to the nearest road, and the
-report comes from that: overall overlap with the target, ETA, and per-leg
-times next to the target's.
+redundant, penalises joins that would force a U-turn along a waypoint's own
+edge, and keeps at most `max_waypoints` (default 9). When more are needed, it
+keeps the subset that loses the least overlap without introducing U-turns.
+Google Maps counts stop boxes (origin, waypoints, and destination, even on a
+closed loop where start equals finish) and locks route editing at 10 stops
+(more than 7 intermediate waypoints). In the web app, `split_waypoints` caps
+single links at 7 intermediate waypoints and splits longer routes and loops
+into balanced `Part 1`, `Part 2`, ... links of at most 7 intermediate waypoints
+each, joined at a shared mid-road handoff waypoint. The coordinates are rounded
+to 5 decimals and snapped back to the nearest road, and the report comes from
+that: overall overlap with the target, ETA, and per-leg times next to the
+target's.
 
 Google weighs roads a little differently from our router, so by default
 each leg is checked with the target's own roads 10% slower
@@ -358,11 +380,11 @@ each leg is checked with the target's own roads 10% slower
 grids where parallel streets tie. Waypoints are also at most 15 km of scenic
 road apart (`max_gap_m=15_000`). Scenic road is any part of the target the
 plain fastest route doesn't use; pass `scenic=S, s_fast=...` to count only
-roads scenier than the fastest route, as the web app does. When 9 waypoints
-can't meet both rules, the reducer keeps the ones that leave the least scenic
-road at risk. The notes then list each leg still at risk, worst first, with
-its main road and how much scenic road it leaves uncovered or a slightly
-different router could skip. `summary()` reports `risk_legs` and
+roads scenier than the fastest route, as the web app does. When a single link's
+waypoint cap can't meet both rules, the reducer keeps the waypoints that leave
+the least scenic road at risk. The notes then list each leg still at risk,
+worst first, with its main road and how much scenic road it leaves uncovered or
+a slightly different router could skip. `summary()` reports `risk_legs` and
 `max_scenic_gap_km`.
 
 `route_via(g, points)` builds a target through (lat, lon) points. Each inner

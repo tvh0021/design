@@ -7,10 +7,12 @@ background thread and serves a single-page Leaflet app from `static/`.
 
 API (JSON in and out; POST bodies must be application/json):
 
-    GET  /api/health     {"status": "loading" | "ready" | "error", ...}
-    POST /api/geocode    {"q": "Watkins Glen"} -> {"results": [{name, lat, lon, type}]}
-    POST /api/route      {"from": [lat, lon], "to": [lat, lon]} -> routes, picks, moments
-    POST /api/waypoints  {"id": search id, "key": route key} -> Google Maps link
+    GET  /api/health         {"status": "loading" | "ready" | "error", ...}
+    POST /api/geocode        {"q": "Watkins Glen"} -> {"results": [{name, lat, lon, type}]}
+    POST /api/route          {"from": [lat, lon], "to": [lat, lon]} -> routes, picks, moments
+    POST /api/loop           {"start": [lat, lon], "minutes": 120, "steer": ...} -> loops, moments
+    POST /api/loop/features  {"start": [lat, lon], "minutes": 120, "q": ...} -> local scenic features
+    POST /api/waypoints      {"id": search id, "key": route key} -> Google Maps link
 
 Searches and waypoint reductions share one lock: `Context` and the
 waypoint index cache are not known to be thread-safe.
@@ -55,7 +57,9 @@ USER_AGENT = "maps-for-wanderers/0.1 (personal research project)"
 GEOCODE_INTERVAL_S = 1.0  # Nominatim usage policy: at most 1 request per second
 MAX_QUERY = 200
 
-WAYPOINT_OPTS = {"max_waypoints": 9, "follow_target": 0.9}
+# Single-link cap comes from `waypoints.editable_waypoint_cap` (7 intermediate
+# waypoints = 9 stops, keeping every link below Google Maps' 10-stop edit lock).
+WAYPOINT_OPTS = {"max_waypoints": 7, "follow_target": 0.9}
 
 
 class ApiError(Exception):
@@ -382,14 +386,38 @@ def _label(budget: float) -> str:
     return f"+{round((budget - 1) * 100)}%"
 
 
+def _route_entry(ctx, key: str, labels: list[str], role: int, sr, breaks: list[float],
+                 grid: np.ndarray | None = None, max_points: int = MAX_POINTS) -> dict:
+    from ..search import describe
+
+    d = describe(ctx, sr)
+    disp = route_display(ctx.g, ctx.S, sr, breaks, max_points=max_points)
+    at = moment_minutes(ctx, sr) if d["moments"] else {}
+    feat = getattr(ctx.moments, "feature", None)
+    body = getattr(ctx.moments, "body", feat)
+    moments = [{**m, "min_along": round(at[m["id"]], 1) if m["id"] in at else None,
+                "feature": (str(feat[m["id"]]) if feat is not None and feat[m["id"]] else None),
+                "parent_feature": (str(body[m["id"]]) if body is not None and body[m["id"]] else None)}
+               for m in d["moments"]]
+    # drive order: projected minutes, stops without a time keep their place at the end
+    moments.sort(key=lambda m: (m["min_along"] is None, m["min_along"] or 0.0))
+    return {
+        "key": key, "labels": labels, "role": role, "origin": d["origin"],
+        "minutes": d["minutes"], "ratio": d["ratio"], "km": d["km"],
+        "scenic_minutes": d["scenic_minutes"], "mean_S": d["mean_S"],
+        "mean_S_pct": s_percentile(grid, d["mean_S"]), "moment_points": d["moment_points"],
+        "score": d["score"], "roads": [[lab, km] for lab, km in d["roads"]],
+        "moments": moments, "stop_groups": stop_groups(moments), "moments_passed": d["moments_passed"],
+        "line": disp["line"], "runs": disp["runs"], "points_raw": disp["points_raw"],
+    }
+
+
 def route_payload(ctx, res, breaks: list[float], grid: np.ndarray | None = None,
                   max_points: int = MAX_POINTS) -> tuple[dict, dict]:
     """The fastest route and the budget picks, one entry per distinct edge
     path (identical picks share an entry and list every label). `role` is
     the index of the entry's first label: 0 for the fastest route, k for
     the k-th budget. Also returns {key: ScenicRoute}."""
-    from ..search import describe
-
     rows = [("fastest", res.fastest)] + [(_label(b), sr) for b, sr in sorted(res.picks.items())]
     by_key: dict[bytes, dict] = {}
     routes: list[dict] = []
@@ -399,34 +427,42 @@ def route_payload(ctx, res, breaks: list[float], grid: np.ndarray | None = None,
         if k in by_key:
             by_key[k]["labels"].append(label)
             continue
-        d = describe(ctx, sr)
-        disp = route_display(ctx.g, ctx.S, sr, breaks, max_points=max_points)
-        at = moment_minutes(ctx, sr) if d["moments"] else {}
-        feat = getattr(ctx.moments, "feature", None)
-        body = getattr(ctx.moments, "body", feat)
-        moments = [{**m, "min_along": round(at[m["id"]], 1) if m["id"] in at else None,
-                    "feature": (str(feat[m["id"]]) if feat is not None and feat[m["id"]] else None),
-                    "parent_feature": (str(body[m["id"]]) if body is not None and body[m["id"]] else None)}
-                   for m in d["moments"]]
-        # drive order: projected minutes, stops without a time keep their place at the end
-        moments.sort(key=lambda m: (m["min_along"] is None, m["min_along"] or 0.0))
-        entry = {
-            "key": f"r{len(routes)}", "labels": [label], "role": role, "origin": d["origin"],
-            "minutes": d["minutes"], "ratio": d["ratio"], "km": d["km"],
-            "scenic_minutes": d["scenic_minutes"], "mean_S": d["mean_S"],
-            "mean_S_pct": s_percentile(grid, d["mean_S"]), "moment_points": d["moment_points"],
-            "score": d["score"], "roads": [[lab, km] for lab, km in d["roads"]],
-            "moments": moments, "stop_groups": stop_groups(moments), "moments_passed": d["moments_passed"],
-            "line": disp["line"], "runs": disp["runs"], "points_raw": disp["points_raw"],
-        }
+        entry = _route_entry(ctx, f"r{len(routes)}", [label], role, sr, breaks, grid, max_points)
         by_key[k] = entry
         routes.append(entry)
         srs[entry["key"]] = sr
     return {"routes": routes}, srs
 
 
+def loop_payload(ctx, res, breaks: list[float], grid: np.ndarray | None = None,
+                 max_points: int = MAX_POINTS) -> tuple[dict, dict]:
+    """Up to 3 scenic loops, best first (`role` 1..3, never 0)."""
+    routes: list[dict] = []
+    srs: dict = {}
+    for idx, lr in enumerate(res.picks):
+        key = f"r{idx}"
+        entry = _route_entry(ctx, key, [lr.label], idx + 1, lr, breaks, grid, max_points)
+        entry.update({
+            "direction": lr.direction,
+            "bearing": round(lr.bearing, 1) if lr.bearing is not None else None,
+            "off_deg": round(lr.off_deg, 1) if lr.off_deg is not None else None,
+            "stem_km": round(lr.stem_km, 1),
+            "tier": int(lr.tier),
+        })
+        routes.append(entry)
+        srs[key] = lr
+    return {"routes": routes}, srs
+
+
 # --------------------------------------------------------------------------
 # Application state and handlers
+
+_POINT_WORDS = {
+    "from": ("start", "A"),
+    "to": ("end", "B"),
+    "start": ("start", "the start pin"),
+    "anchor": ("anchor", "the anchor pin"),
+}
 
 
 class App:
@@ -434,7 +470,10 @@ class App:
     last few searches, waypoint results and the geocoder."""
 
     def __init__(self, ctx=None, loader: Callable[[], object] | None = None, geocoder: Geocoder | None = None,
-                 search_fn=None, waypoints_fn=None, max_points: int = MAX_POINTS):
+                 search_fn=None, loops_fn=None, waypoints_fn=None, max_points: int = MAX_POINTS,
+                 loop_cfg: dict | None = None):
+        from ..loop import loop_config
+
         self.ctx = ctx
         self.loader = loader
         self.geocoder = geocoder or Geocoder()
@@ -447,8 +486,10 @@ class App:
         self.results: OrderedDict[str, dict] = OrderedDict()
         self._rlock = threading.Lock()  # guards `results`
         self._search = search_fn
+        self._loops = loops_fn
         self._waypoints = waypoints_fn
         self.max_points = max_points  # per route in the payload (the static demo uses fewer)
+        self.loop_cfg = loop_config(loop_cfg)
 
     # ---- loading -----------------------------------------------------------
 
@@ -468,16 +509,18 @@ class App:
         self.warm_waypoints()
 
     def warm_waypoints(self) -> None:
-        """Build the waypoint module's spatial index now (about 3 s on the
-        statewide graph) instead of on the first "Open in Google Maps".
-        `waypoints._index` is private; if it goes away the first link is
-        just slower."""
-        try:
-            from ..waypoints import _index
-        except ImportError:
-            return
+        """Build the waypoint module's spatial index and reverse time matrix now
+        instead of on the first request."""
         with self.lock:
             try:
+                from ..loop import _rev_time_matrix
+
+                _rev_time_matrix(self.ctx.g)
+            except Exception:
+                pass
+            try:
+                from ..waypoints import _index
+
                 _index(self.ctx.g)
             except Exception:  # never fatal: reduce_to_waypoints builds it on demand
                 pass
@@ -498,11 +541,26 @@ class App:
     # ---- handlers ------------------------------------------------------------
 
     def health(self) -> dict:
+        from ..loop import DIRECTIONS
+
         out = {"status": self.status, "bbox": list(NY_BBOX), "max_snap_m": MAX_SNAP_M}
         if self.status == "ready":
-            out.update({"edges": int(self.ctx.g.n_edges), "moments": int(len(self.ctx.moments.id)),
-                        "s_breaks": self.breaks, "budgets": [_label(b) for b in sorted(self.ctx.cfg["budgets"])],
-                        "load_s": self.load_s})
+            lc = self.loop_cfg
+            out.update({
+                "edges": int(self.ctx.g.n_edges),
+                "moments": int(len(self.ctx.moments.id)),
+                "s_breaks": self.breaks,
+                "budgets": [_label(b) for b in sorted(self.ctx.cfg["budgets"])],
+                "load_s": self.load_s,
+                "loop": {
+                    "budgets_min": [int(m) for m in lc["budgets_min"]],
+                    "default_min": int(lc["default_min"]),
+                    "min_minutes": int(lc["min_minutes"]),
+                    "max_minutes": int(lc["max_minutes"]),
+                    "directions": list(DIRECTIONS),
+                    "n_loops": int(lc["n_loops"]),
+                },
+            })
         if self.error:
             out["error"] = self.error
         return out
@@ -516,18 +574,36 @@ class App:
     @staticmethod
     def _point(body: dict, name: str) -> tuple[float, float]:
         p = body.get(name)
+        if not isinstance(p, (list, tuple)) or len(p) != 2 or isinstance(p[0], bool) or isinstance(p[1], bool):
+            raise ApiError(400, f"'{name}' must be [lat, lon].", name)
         try:
-            lat, lon = (float(x) for x in p)
+            lat, lon = float(p[0]), float(p[1])
         except (TypeError, ValueError):
             raise ApiError(400, f"'{name}' must be [lat, lon].", name)
         if not (math.isfinite(lat) and math.isfinite(lon)):
             raise ApiError(400, f"'{name}' must be finite numbers.", name)
         s, w, n, e = NY_BBOX
         if not (s <= lat <= n and w <= lon <= e):
-            which, pin = ("start", "A") if name == "from" else ("end", "B")
+            which, pin = _POINT_WORDS.get(name, (name, name))
             raise ApiError(422, f"The {which} point ({lat:.4f}, {lon:.4f}) is outside New York State. "
                                 f"Drag {pin} into New York.", name)
         return lat, lon
+
+    def _minutes(self, body: dict) -> float:
+        raw = body.get("minutes")
+        min_m, max_m = int(self.loop_cfg["min_minutes"]), int(self.loop_cfg["max_minutes"])
+        if raw is None or isinstance(raw, bool):
+            raise ApiError(400, f"'minutes' must be between {min_m} and {max_m}.",
+                           code="bad_minutes", min=min_m, max=max_m)
+        try:
+            m = float(raw)
+        except (TypeError, ValueError):
+            raise ApiError(400, f"'minutes' must be between {min_m} and {max_m}.",
+                           code="bad_minutes", min=min_m, max=max_m)
+        if not (math.isfinite(m) and min_m <= m <= max_m):
+            raise ApiError(400, f"'minutes' must be between {min_m} and {max_m}.",
+                           code="bad_minutes", min=min_m, max=max_m)
+        return m
 
     def route(self, body: dict) -> dict:
         if not isinstance(body, dict):
@@ -564,6 +640,121 @@ class App:
             "search_s": round(search_s, 2), "seconds": res.seconds, "s_breaks": self.breaks, **payload,
         }
 
+    def loop(self, body: dict) -> dict:
+        if not isinstance(body, dict):
+            raise ApiError(400, "Expected a JSON object.")
+        start = self._point(body, "start")
+        minutes = self._minutes(body)
+        from ..loop import DIRECTIONS, LoopError, Steer, loops, steer_json
+
+        raw_steer = body.get("steer", "any")
+        if not isinstance(raw_steer, str) or raw_steer not in ("any", "compass", "anchor"):
+            raise ApiError(400, "'steer' must be 'any', 'compass', or 'anchor'.")
+        if raw_steer == "compass":
+            d = body.get("direction")
+            if not isinstance(d, str) or d.strip().upper() not in DIRECTIONS:
+                raise ApiError(400, "'direction' must be one of N, NE, E, SE, S, SW, W, NW.")
+            st_obj = Steer(mode="compass", direction=d.strip().upper())
+        elif raw_steer == "anchor":
+            has_anc = body.get("anchor") is not None
+            raw_feat = body.get("feature")
+            if raw_feat is not None and not isinstance(raw_feat, str):
+                raise ApiError(400, "'feature' must be a string.")
+            has_feat = bool(raw_feat and raw_feat.strip())
+            if has_anc == has_feat:
+                raise ApiError(400, "Anchor steer requires either 'anchor' or 'feature' (not both).")
+            if has_anc:
+                anc_pt = self._point(body, "anchor")
+                st_obj = Steer(mode="anchor", point=anc_pt)
+            else:
+                st_obj = Steer(mode="anchor", feature=raw_feat.strip())
+        else:
+            st_obj = Steer(mode="any")
+
+        ctx = self._ready()
+        loops_fn = self._loops or loops
+        with self.lock:
+            _, snap_d = ctx.g.snap(*start)
+            if snap_d > MAX_SNAP_M:
+                raise ApiError(
+                    422,
+                    "The start point is too far from the nearest road in the graph. Drag the start pin onto a road.",
+                    "start",
+                    code="snap_far",
+                    snap_m=round(snap_d),
+                    limit_m=round(MAX_SNAP_M),
+                )
+            t0 = time.monotonic()
+            try:
+                res = loops_fn(ctx, start, minutes, steer=st_obj, cfg=self.loop_cfg)
+            except LoopError as exc:
+                pt = (
+                    "anchor"
+                    if exc.code in ("unknown_feature", "anchor_far", "anchor_out_of_reach")
+                    else ("start" if exc.code == "snap_far" else None)
+                )
+                raise ApiError(422, exc.message, pt, code=exc.code, **exc.numbers)
+            search_s = time.monotonic() - t0
+
+        payload, sr_by_key = loop_payload(ctx, res, self.breaks, self.grid, self.max_points)
+        rid = uuid.uuid4().hex[:12]
+        with self._rlock:
+            self.results[rid] = {"res": res, "routes": sr_by_key, "waypoints": {}}
+            while len(self.results) > KEEP_RESULTS:
+                self.results.popitem(last=False)
+        min_val: int | float = int(minutes) if float(minutes).is_integer() else round(float(minutes), 1)
+        return {
+            "id": rid,
+            "mode": "loop",
+            "start": [round(start[0], 5), round(start[1], 5)],
+            "snap_m": [round(res.snap_m)],
+            "minutes": min_val,
+            "steer": steer_json(res.steer, res.anchor),
+            "s_base": round(res.s_fast, 3),
+            "kept": res.kept,
+            "built": res.built,
+            "search_s": round(search_s, 2),
+            "seconds": res.seconds,
+            "s_breaks": self.breaks,
+            "note": res.note,
+            **payload,
+        }
+
+    def loop_features(self, body: dict) -> dict:
+        if not isinstance(body, dict):
+            raise ApiError(400, "Expected a JSON object.")
+        start = self._point(body, "start")
+        minutes = self._minutes(body)
+        q = body.get("q")
+        if q is not None and not isinstance(q, str):
+            raise ApiError(400, "'q' must be a string.")
+        if isinstance(q, str) and len(q) > MAX_QUERY:
+            raise ApiError(400, "'q' is too long.")
+        raw_lim = body.get("limit", 8)
+        if isinstance(raw_lim, bool) or not isinstance(raw_lim, (int, float)) or not math.isfinite(raw_lim) or raw_lim < 1:
+            raise ApiError(400, "'limit' must be a positive integer.")
+        limit = min(int(raw_lim), 30)
+
+        ctx = self._ready()
+        from ..loop import LoopError, features_in_reach
+
+        with self.lock:
+            _, snap_d = ctx.g.snap(*start)
+            if snap_d > MAX_SNAP_M:
+                raise ApiError(
+                    422,
+                    "The start point is too far from the nearest road in the graph. Drag the start pin onto a road.",
+                    "start",
+                    code="snap_far",
+                    snap_m=round(snap_d),
+                    limit_m=round(MAX_SNAP_M),
+                )
+            try:
+                feats = features_in_reach(ctx, start, minutes, q=q, limit=limit, cfg=self.loop_cfg)
+            except LoopError as exc:
+                raise ApiError(422, exc.message, "start" if exc.code == "snap_far" else None, code=exc.code, **exc.numbers)
+        return {"features": feats}
+
     def waypoints(self, body: dict) -> dict:
         if not isinstance(body, dict):
             raise ApiError(400, "Expected a JSON object.")
@@ -571,36 +762,69 @@ class App:
         ctx = self._ready()
         with self._rlock:
             stored = self.results.get(rid) if isinstance(rid, str) else None
+            if stored is not None and key in stored["waypoints"]:
+                return stored["waypoints"][key]
         if stored is None:
-            raise ApiError(404, "That search has expired. Press Find routes again.")
+            raise ApiError(404, "That search has expired. Search again.")
         sr = stored["routes"].get(key)
         if sr is None:
-            raise ApiError(404, f"No route '{key}' in that search. Press Find routes again.")
-        if key in stored["waypoints"]:
-            return stored["waypoints"][key]
-        from ..waypoints import reduce_to_waypoints
+            raise ApiError(404, f"No route '{key}' in that search. Search again.")
+        from ..waypoints import split_waypoints
 
-        fn = self._waypoints or reduce_to_waypoints
+        edges = np.asarray(sr.edges, dtype=np.int64)
         with self.lock:
             t0 = time.monotonic()
-            # only roads scenier than the fastest route count toward the waypoint spacing limit
-            wr = fn(ctx.g, edge_path=np.asarray(sr.edges, dtype=np.int64), scenic=ctx.S,
-                    s_fast=stored["res"].s_fast, **WAYPOINT_OPTS)
+            # only roads scenier than the fastest route (or s_base on loops) count toward spacing
+            if self._waypoints is not None:
+                wr = self._waypoints(ctx.g, edge_path=edges, scenic=ctx.S,
+                                     s_fast=stored["res"].s_fast, **WAYPOINT_OPTS)
+                full, parts = wr, []
+            else:
+                wr, full, parts = split_waypoints(
+                    ctx.g, edge_path=edges, scenic=ctx.S,
+                    s_fast=stored["res"].s_fast, follow_target=WAYPOINT_OPTS["follow_target"],
+                )
             secs = time.monotonic() - t0
+        if wr.origin == wr.destination and len(wr.waypoints) == 0 and not parts:
+            raise ApiError(500, "Could not place waypoints for this loop. Try another loop.")
         try:
             url = wr.url
+            part_urls = [p.url for p in parts]
         except AssertionError as exc:  # maps_url refuses links over the length limit
             raise ApiError(500, f"Could not build a Google Maps link ({exc}). Try another route.")
+        active = full if parts else wr
+        handoffs = {p.handoff_n for p in parts if p.handoff_n is not None}
         out = {
             "key": key, "url": url, "url_length": len(url),
-            "origin": [round(wr.origin[0], 5), round(wr.origin[1], 5)],
-            "destination": [round(wr.destination[0], 5), round(wr.destination[1], 5)],
-            "waypoints": [{"n": i + 1, "lat": round(w.lat, 5), "lon": round(w.lon, 5), "road": w.road,
-                           "tier": int(w.tier)} for i, w in enumerate(wr.waypoints)],
-            "meets_target": bool(wr.meets_target), "follow_target": wr.follow_target,
-            "summary": wr.summary(), "notes": list(wr.notes), "seconds": round(secs, 2),
+            "origin": [round(active.origin[0], 5), round(active.origin[1], 5)],
+            "destination": [round(active.destination[0], 5), round(active.destination[1], 5)],
+            "waypoints": [
+                {"n": i + 1, "lat": round(w.lat, 5), "lon": round(w.lon, 5), "road": w.road,
+                 "tier": int(w.tier), **({"split": True} if (i + 1) in handoffs else {})}
+                for i, w in enumerate(active.waypoints)
+            ],
+            "meets_target": bool(active.meets_target), "follow_target": active.follow_target,
+            "summary": active.summary(), "notes": list(active.notes),
+            "parts": [
+                {
+                    "part": p.part, "url": p_url, "url_length": len(p_url),
+                    "origin": [round(p.origin[0], 5), round(p.origin[1], 5)],
+                    "destination": [round(p.destination[0], 5), round(p.destination[1], 5)],
+                    "waypoints": len(p.waypoints), "first_n": p.first_n, "last_n": p.last_n,
+                    "handoff_n": p.handoff_n, "handoff_road": p.handoff_road,
+                    "eta_min": round(p.eta_s / 60, 1), "km": round(p.length_m / 1000, 2),
+                }
+                for p, p_url in zip(parts, part_urls)
+            ],
+            "seconds": round(secs, 2),
         }
-        stored["waypoints"][key] = out
+        if parts:
+            out["single"] = {
+                "url": url, "waypoints": len(wr.waypoints),
+                "overlap": round(wr.overlap, 4), "meets_target": bool(wr.meets_target),
+            }
+        with self._rlock:
+            stored["waypoints"][key] = out
         return out
 
     # ---- dispatch ------------------------------------------------------------
@@ -609,6 +833,8 @@ class App:
         routes = {("GET", "/api/health"): lambda: self.health(),
                   ("POST", "/api/geocode"): lambda: self.geocode(body),
                   ("POST", "/api/route"): lambda: self.route(body),
+                  ("POST", "/api/loop"): lambda: self.loop(body),
+                  ("POST", "/api/loop/features"): lambda: self.loop_features(body),
                   ("POST", "/api/waypoints"): lambda: self.waypoints(body)}
         fn = routes.get((method, path))
         if fn is None:

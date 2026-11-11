@@ -1,5 +1,6 @@
 import http.client
 import json
+import math
 import re
 import threading
 
@@ -211,7 +212,8 @@ def test_waypoints_for_a_route(app):
     assert wp["url"].startswith("https://www.google.com/maps/dir/?api=1&origin=43.00000,-77.00000")
     assert wp["url_length"] == len(wp["url"]) < 2048
     assert wp["meets_target"] is True
-    assert 1 <= len(wp["waypoints"]) <= 9
+    assert 1 <= len(wp["waypoints"]) <= 7
+    assert wp["parts"] == [] and "single" not in wp
     assert [w["n"] for w in wp["waypoints"]] == list(range(1, len(wp["waypoints"]) + 1))
     w = wp["waypoints"][0]
     assert 43.0 < w["lat"] <= 43.03 + 1e-9  # on the top road
@@ -788,7 +790,7 @@ def test_demo_refuses_to_clear_a_folder_it_did_not_make(tmp_path):
 
 
 def test_demo_presets_file_is_valid():
-    from scenic.web.demo import load_presets
+    from scenic.web.demo import load_loop_preset, load_presets
 
     ps = load_presets()
     assert len(ps) == 5 and len({p["id"] for p in ps}) == 5
@@ -796,6 +798,14 @@ def test_demo_presets_file_is_valid():
     for p in ps:
         for lat, lon in (p["from"], p["to"]):
             assert s <= lat <= n and w <= lon <= e
+
+    lp = load_loop_preset()
+    assert lp is not None and lp["id"] == "auburn" and "Auburn" in lp["name"]
+    assert lp["budgets"] == [60, 120, 180] and lp["default_min"] == 120
+    assert lp["directions"] == ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    slat, slon = lp["start"]
+    assert s <= slat <= n and w <= slon <= e
+
 
 
 def _js_function(js: str, head: str) -> str:
@@ -871,3 +881,522 @@ def test_demo_site_carries_the_fonts(demo_site):
     for u in re.findall(r'url\(\s*"?([^")]+)"?\s*\)', css):
         assert (demo_site / "static" / u).is_file(), u
     assert (demo_site / "static/vendor/spectral/OFL.txt").is_file()
+
+
+# ---- Mode 2: /api/loop and /api/loop/features -------------------------------------
+
+
+def _loop_grid_ctx(east_only: bool = False) -> Context:
+    """9x9 (or 9x5 east-only) grid centered at (43.0, -77.0) with ~3.9 km edges
+    (~215 s each) and named scenic features near H plus one far feature."""
+    lat0, lon0 = 43.0, -77.0
+    dlat, dlon, half = 0.035, 0.048, 4
+    coords: dict[tuple[int, int], int] = {}
+    lons: list[float] = []
+    lats: list[float] = []
+    j_range = range(0, half + 1) if east_only else range(-half, half + 1)
+    for i in range(-half, half + 1):
+        for j in j_range:
+            coords[(i, j)] = len(lons)
+            lats.append(lat0 + i * dlat)
+            lons.append(lon0 + j * dlon)
+
+    us, vs, lengths, times, scores = [], [], [], [], []
+    edge_map: dict[tuple[tuple[int, int], tuple[int, int]], int] = {}
+
+    def add_edge(a: tuple[int, int], b: tuple[int, int], s_val: float) -> None:
+        if a not in coords or b not in coords:
+            return
+        u, v = coords[a], coords[b]
+        dx = (lons[v] - lons[u]) * 111_320.0 * math.cos(math.radians(lat0))
+        dy = (lats[v] - lats[u]) * 110_540.0
+        dist = math.hypot(dx, dy)
+        eid = len(us)
+        us.append(u)
+        vs.append(v)
+        lengths.append(dist)
+        times.append(dist / 18.0)
+        scores.append(s_val)
+        edge_map[(a, b)] = eid
+        edge_map[(b, a)] = eid
+
+    for i in range(-half, half + 1):
+        for j in j_range:
+            if (i + 1, j) in coords:
+                ring = max(abs(i), abs(j))
+                add_edge((i, j), (i + 1, j), 0.85 if ring >= 2 else 0.35)
+            if (i, j + 1) in coords:
+                ring = max(abs(i), abs(j))
+                add_edge((i, j), (i, j + 1), 0.85 if ring >= 2 else 0.35)
+
+    # Add a long eastern spur so "Far Peak" has ~40 min round trip (> 0.88 * 30 min).
+    spur_prev = coords[(0, half)]
+    for step in range(1, 5):
+        nid = len(lons)
+        lats.append(lat0)
+        lons.append(lon0 + (half + step) * dlon)
+        dist = dlon * 111_320.0 * math.cos(math.radians(lat0))
+        us.append(spur_prev)
+        vs.append(nid)
+        lengths.append(dist)
+        times.append(dist / 12.0)  # ~324 s each way -> ~55 min round trip from (0,0)
+        scores.append(0.9)
+        spur_prev = nid
+    far_edge = len(us) - 1
+
+    g = RoadGraph(lons, lats, us, vs, [False] * len(us), times, lengths)
+    specs: list[tuple[int, str, str, float, str | None, str | None]] = []
+    candidates = [
+        ((2, 0), (2, 1), "water", "North Bay Overlook", 1.0, "North Bay", "North Lake"),
+        ((3, 0), (3, 1), "water", "North Lake Shore", 0.95, "North Lake", "North Lake"),
+        ((0, 2), (1, 2), "water", "East Creek Bend", 0.9, "East Creek", "East Creek"),
+        ((-2, 0), (-2, 1), "vista", "South Ridge Crest", 0.88, "South Ridge", None),
+        ((0, -2), (1, -2), "gorge", "West Gorge Rim", 0.92, "West Gorge", None),
+    ]
+    for a, b, mtype, label, mval, feat, grp in candidates:
+        if (a, b) in edge_map:
+            specs.append((edge_map[(a, b)], mtype, label, mval, feat, grp))
+    specs.append((far_edge, "peak", "Far Peak Summit", 0.95, "Far Peak", None))
+
+    edges_arr = np.array([s[0] for s in specs], dtype=np.int64)
+    mlon = 0.5 * (g.node_lon[g.u[edges_arr]] + g.node_lon[g.v[edges_arr]])
+    mlat = 0.5 * (g.node_lat[g.u[edges_arr]] + g.node_lat[g.v[edges_arr]])
+    mx, my = _to5070(mlon, mlat)
+    of_edge = np.full(g.n_edges, -1, dtype=np.int64)
+    for mid, e in enumerate(edges_arr):
+        of_edge[e] = mid
+    mom = Moments(
+        id=np.arange(len(specs), dtype=np.int64),
+        m=np.array([s[3] for s in specs], dtype=np.float64),
+        x=mx,
+        y=my,
+        lon=mlon,
+        lat=mlat,
+        edge=edges_arr,
+        type=np.array([s[1] for s in specs], dtype=object),
+        label=np.array([s[2] for s in specs], dtype=object),
+        of_edge=of_edge,
+        feature=np.array([s[4] for s in specs], dtype=object),
+        group=np.array([s[5] for s in specs], dtype=object),
+    )
+    return Context(g=g, S=np.asarray(scores, dtype=np.float64), moments=mom, cfg=dict(CFG))
+
+
+@pytest.fixture
+def loop_app():
+    return App(ctx=_loop_grid_ctx(), geocoder=FakeGeocoder())
+
+
+def test_loop_payload_roles_labels_and_compact_json(loop_app):
+    st, out = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "any"})
+    assert st == 200, out
+    assert out["mode"] == "loop" and out["minutes"] == 60
+    assert out["start"] == [43.0, -77.0] and len(out["snap_m"]) == 1
+    assert out["steer"] == {"mode": "any"}
+    assert out["s_base"] == pytest.approx(0.5)
+    assert out["kept"] >= len(out["routes"]) >= 1
+    assert out["built"] >= out["kept"]
+    assert len(out["s_breaks"]) == 4 and out["id"]
+
+    roles = [r["role"] for r in out["routes"]]
+    assert roles == list(range(1, len(out["routes"]) + 1)) and 0 not in roles
+    labels = [r["labels"] for r in out["routes"]]
+    assert all(len(lab) == 1 and isinstance(lab[0], str) for lab in labels)
+    assert len({lab[0] for lab in labels}) == len(labels)
+
+    req_keys = {
+        "key", "labels", "role", "origin", "minutes", "ratio", "km", "scenic_minutes",
+        "mean_S", "mean_S_pct", "moment_points", "score", "roads", "moments",
+        "stop_groups", "moments_passed", "line", "runs", "points_raw",
+        "direction", "bearing", "off_deg", "stem_km", "tier",
+    }
+    for r in out["routes"]:
+        assert req_keys <= set(r)
+        assert r["line"][0] == r["line"][-1] == [43.0, -77.0]
+
+    raw = json.dumps(out, allow_nan=False)
+    assert "edge_path" not in raw
+
+    # Compass and shore-anchor shapes
+    st_c, out_c = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                                     "steer": "compass", "direction": "N"})
+    assert st_c == 200 and out_c["steer"] == {"mode": "compass", "direction": "N", "bearing": 0}
+    assert all(r["off_deg"] is not None for r in out_c["routes"])
+
+    # Pin > 2 km north of the grid (lat 43.18 is ~4.4 km north of i=4 at 43.14) resolves to North Lake shore
+    st_s, out_s = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                                     "steer": "anchor", "anchor": [43.18, -76.97]})
+    assert st_s == 200, out_s
+    assert out_s["steer"]["mode"] == "anchor" and out_s["steer"]["kind"] == "shore"
+    assert out_s["steer"]["name"] == "North Lake" and out_s["steer"]["moved_m"] > 2000
+
+
+def test_loop_errors_cover_validation_and_domain_codes(loop_app):
+    # 400 validation errors
+    assert loop_app.api("POST", "/api/loop", [])[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"minutes": 60})[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"start": "bad", "minutes": 60})[0] == 400
+    for bad_min in (None, True, "abc", 15, 500):
+        st, err = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": bad_min})
+        assert st == 400 and err["code"] == "bad_minutes" and err["min"] == 30 and err["max"] == 360
+    assert loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "up"})[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "compass"})[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                              "steer": "compass", "direction": "NNE"})[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "anchor"})[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "anchor",
+                                              "anchor": [43.05, -77.0], "feature": "North Lake"})[0] == 400
+    assert loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                              "steer": "anchor", "feature": 123})[0] == 400
+
+    # 422 outside New York bbox names the pin
+    st, err = loop_app.api("POST", "/api/loop", {"start": [40.7, -80.6], "minutes": 60})
+    assert st == 422 and err["point"] == "start" and "the start pin" in err["error"]
+    st, err = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                                 "steer": "anchor", "anchor": [40.7, -80.6]})
+    assert st == 422 and err["point"] == "anchor" and "the anchor pin" in err["error"]
+
+    # 422 snap_far on start
+    st, err = loop_app.api("POST", "/api/loop", {"start": [44.5, -74.0], "minutes": 60})
+    assert st == 422 and err["code"] == "snap_far" and err["point"] == "start"
+    assert err["snap_m"] > err["limit_m"] == 2000
+
+    # 422 unknown_feature, anchor_far, anchor_out_of_reach (all point == "anchor")
+    st, err = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                                 "steer": "anchor", "feature": "Atlantis"})
+    assert st == 422 and err["code"] == "unknown_feature" and err["point"] == "anchor"
+
+    st, err = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                                 "steer": "anchor", "anchor": [44.5, -74.0]})
+    assert st == 422 and err["code"] == "anchor_far" and err["point"] == "anchor"
+
+    st, err = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 30,
+                                                 "steer": "anchor", "feature": "Far Peak"})
+    assert st == 422 and err["code"] == "anchor_out_of_reach" and err["point"] == "anchor"
+    assert err["round_trip_min"] > 30 and err["needed_min"] > 30
+
+    # 422 no_loop_that_way on an east-only graph when asking for W
+    east_app = App(ctx=_loop_grid_ctx(east_only=True), geocoder=FakeGeocoder())
+    st, err = east_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60,
+                                                 "steer": "compass", "direction": "W"})
+    assert st == 422 and err["code"] == "no_loop_that_way" and "point" not in err
+
+    # 422 no_loop on a tiny single-edge graph with no ring
+    tiny_g = RoadGraph([-77.0, -76.99], [43.0, 43.0], [0], [1], [False], [60.0], [800.0])
+    empty = np.zeros(0, dtype=np.float64)
+    empty_i = np.zeros(0, dtype=np.int64)
+    empty_o = np.zeros(0, dtype=object)
+    tiny_mom = Moments(id=empty_i, m=empty, x=empty, y=empty, lon=empty, lat=empty,
+                       edge=empty_i, type=empty_o, label=empty_o,
+                       of_edge=np.array([-1], dtype=np.int64), feature=empty_o, group=empty_o)
+    tiny_app = App(ctx=Context(g=tiny_g, S=np.array([0.5]), moments=tiny_mom, cfg=dict(CFG)),
+                   geocoder=FakeGeocoder())
+    st, err = tiny_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60})
+    assert st == 422 and err["code"] == "no_loop"
+
+    # 503 while loading
+    loading = App(loader=lambda: _loop_grid_ctx(), geocoder=FakeGeocoder())
+    assert loading.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60})[0] == 503
+
+
+def test_loop_features_endpoint(loop_app):
+    st, out = loop_app.api("POST", "/api/loop/features", {"start": [43.0, -77.0], "minutes": 30})
+    assert st == 200, out
+    names = [f["name"] for f in out["features"]]
+    assert "North Lake" in names and "Far Peak" not in names
+    assert all(f["fits"] is True for f in out["features"])
+
+    # Query match surfaces out-of-reach features with fits=False
+    st, q_out = loop_app.api("POST", "/api/loop/features", {"start": [43.0, -77.0], "minutes": 30, "q": "far"})
+    assert st == 200
+    assert len(q_out["features"]) == 1
+    fp = q_out["features"][0]
+    assert fp["name"] == "Far Peak" and fp["fits"] is False and fp["needed_min"] > 30
+
+    # Limit cap and validation errors
+    st, lim = loop_app.api("POST", "/api/loop/features", {"start": [43.0, -77.0], "minutes": 60, "limit": 1})
+    assert st == 200 and len(lim["features"]) == 1
+    assert loop_app.api("POST", "/api/loop/features", {"start": [43.0, -77.0], "minutes": 60, "q": 5})[0] == 400
+    assert loop_app.api("POST", "/api/loop/features", {"start": [43.0, -77.0], "minutes": 60, "limit": 0})[0] == 400
+    st, far = loop_app.api("POST", "/api/loop/features", {"start": [44.5, -74.0], "minutes": 60})
+    assert st == 422 and far["code"] == "snap_far" and far["point"] == "start"
+
+
+def test_waypoints_on_stored_loop_and_zero_waypoint_guard(loop_app):
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlparse
+
+    _, out = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "any"})
+    r0 = out["routes"][0]
+    st, wp = loop_app.api("POST", "/api/waypoints", {"id": out["id"], "key": r0["key"]})
+    assert st == 200, wp
+    assert len(wp["waypoints"]) >= 1
+    assert wp["origin"] == wp["destination"] == [43.0, -77.0]
+    q = parse_qs(urlparse(wp["url"]).query)
+    assert q["origin"] == q["destination"] and "waypoints" in q
+
+    # Zero-waypoint safety guard when origin == destination
+    guarded = App(
+        ctx=_loop_grid_ctx(),
+        geocoder=FakeGeocoder(),
+        waypoints_fn=lambda *a, **k: SimpleNamespace(
+            origin=(43.0, -77.0),
+            destination=(43.0, -77.0),
+            waypoints=(),
+            url="https://www.google.com/maps/dir/?api=1&origin=43,77&destination=43,77&travelmode=driving",
+            meets_target=False,
+            follow_target=0.9,
+            summary=lambda: {},
+            notes=[],
+        ),
+    )
+    _, out2 = guarded.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60, "steer": "any"})
+    st2, err2 = guarded.api("POST", "/api/waypoints", {"id": out2["id"], "key": "r0"})
+    assert st2 == 500 and "Could not place waypoints for this loop" in err2["error"]
+
+
+def test_health_loop_block_shared_lock_and_expiry(loop_app):
+    h = loop_app.health()
+    assert h["loop"] == {
+        "budgets_min": [60, 120, 180],
+        "default_min": 120,
+        "min_minutes": 30,
+        "max_minutes": 360,
+        "directions": list(web.App.health.__globals__["__builtins__"] and ("N", "NE", "E", "SE", "S", "SW", "W", "NW")),
+        "n_loops": 3,
+    }
+
+    # Route and loop requests serialize on the same search lock
+    active, peak = [0], [0]
+    from scenic.loop import loops as real_loops
+    from scenic.search import search as real_search
+
+    def slow_search(ctx, a, b):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        threading.Event().wait(0.04)
+        try:
+            return real_search(ctx, a, b)
+        finally:
+            active[0] -= 1
+
+    def slow_loops(ctx, start, minutes, steer=None, cfg=None):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        threading.Event().wait(0.04)
+        try:
+            return real_loops(ctx, start, minutes, steer=steer, cfg=cfg)
+        finally:
+            active[0] -= 1
+
+    loop_app._search = slow_search
+    loop_app._loops = slow_loops
+    t1 = threading.Thread(target=loop_app.api, args=("POST", "/api/route", {"from": [43.0, -77.0], "to": [43.0, -76.904]}))
+    t2 = threading.Thread(target=loop_app.api, args=("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60}))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert peak[0] == 1
+
+    # Loop and route results share KEEP_RESULTS expiry
+    loop_app._search = None
+    loop_app._loops = None
+    first_loop = loop_app.api("POST", "/api/loop", {"start": [43.0, -77.0], "minutes": 60})[1]["id"]
+    for _ in range(web.KEEP_RESULTS):
+        loop_app.api("POST", "/api/route", {"from": [43.0, -77.0], "to": [43.0, -76.904]})
+    st_exp, err_exp = loop_app.api("POST", "/api/waypoints", {"id": first_loop, "key": "r0"})
+    assert st_exp == 404 and "Search again." in err_exp["error"]
+
+
+def test_loop_static_markup_demo_hiding_and_live_wiring():
+    html = (web.STATIC_DIR / "index.html").read_text()
+    css = (web.STATIC_DIR / "app.css").read_text()
+    js = (web.STATIC_DIR / "app.js").read_text()
+
+    tab_loop = re.search(r'<button[^>]*id="tab-loop"[^>]*>.*?</button>', html, re.S)
+    assert tab_loop is not None
+    tag = tab_loop.group(0)
+    assert "disabled" not in tag and "soon" not in tag.lower() and "Drive-around" in tag
+    assert 'aria-controls="panel-ab"' in html and 'aria-controls="panel-loop"' in html
+    assert re.search(r'<section[^>]*id="panel-loop"[^>]*hidden', html)
+
+    assert 'html[data-mode="demo"] #panel-loop' in css
+
+    demo_branch = js[js.index("if (DEMO) {\n    startDemo();"):]
+    live = demo_branch[demo_branch.index("} else {"):]
+    for call in ('wireSearch("h");', "wireAnchorSearch();", 'addEventListener("click", findLoops)'):
+        assert js.count(call) == 1 and call in live, call
+
+
+def test_find_loops_js_sends_flat_request_matching_server_contract(loop_app):
+    """Regression guard: app.js findLoops() must send steer as a flat string
+    ('any' | 'compass' | 'anchor') with top-level direction/feature/anchor keys,
+    matching App.loop()."""
+    js = (web.STATIC_DIR / "app.js").read_text()
+    body = _js_function(js, "async function findLoops(")
+    assert "steer: state.loop.steer" in body
+    assert "body.direction = state.loop.dir" in body
+    assert "body.feature = state.loop.feature" in body
+    assert "body.anchor = state.x" in body
+    assert not re.search(r"body\.steer\s*=\s*\{", body)
+
+    # Every payload shape constructed by findLoops succeeds against App.loop
+    for req in (
+        {"start": [43.0, -77.0], "minutes": 60, "steer": "any"},
+        {"start": [43.0, -77.0], "minutes": 60, "steer": "compass", "direction": "N"},
+        {"start": [43.0, -77.0], "minutes": 60, "steer": "anchor", "feature": "North Lake"},
+        {"start": [43.0, -77.0], "minutes": 60, "steer": "anchor", "anchor": [43.07, -77.0]},
+    ):
+        st, out = loop_app.api("POST", "/api/loop", req)
+        assert st == 200, (req, out)
+
+
+def test_waypoints_splits_long_route_into_editable_parts_and_marks_handoff():
+    """Routes/loops needing more waypoints than Google Maps keeps editable in one
+    link (7 open, 8 closed) return multi-part links in `parts` with <= 7 waypoints
+    each and `"split": True` on handoff waypoint(s)."""
+    import math
+    from urllib.parse import parse_qs, urlparse
+
+    lat0, lon0 = 43.0, -77.5
+    km_lat = 1 / 111.195
+    km_lon = km_lat / math.cos(math.radians(lat0))
+
+    pts = {"J0": (0.0, 0.0)}
+    edges_spec = []
+    for k in range(10):
+        x0, x1 = 6.0 * k, 6.0 * (k + 1)
+        n1, n2, j1 = f"N{k}", f"P{k}", f"J{k + 1}"
+        pts[n1] = (x0 + 1.5, 1.2)
+        pts[n2] = (x1 - 1.5, 1.2)
+        pts[j1] = (x1, 0.0)
+        edges_spec.append((f"J{k}", j1, 30.0, 0.05))
+        edges_spec.extend([
+            (f"J{k}", n1, 27.0, 0.90),
+            (n1, n2, 27.0, 0.90),
+            (n2, j1, 27.0, 0.90),
+        ])
+
+    names = list(pts)
+    idx = {n: i for i, n in enumerate(names)}
+    lon = [lon0 + pts[n][0] * km_lon for n in names]
+    lat = [lat0 + pts[n][1] * km_lat for n in names]
+    u = [idx[a] for a, _, _, _ in edges_spec]
+    v = [idx[b] for _, b, _, _ in edges_spec]
+    length = [1000 * math.dist(pts[a], pts[b]) for a, b, _, _ in edges_spec]
+    time_s = [L / spd for L, (_, _, spd, _) in zip(length, edges_spec)]
+    S = np.array([sc for *_, sc in edges_spec], dtype=np.float64)
+    g = RoadGraph(lon, lat, u, v, [False] * len(edges_spec), time_s, length)
+    mom = Moments(
+        id=np.array([], dtype=np.int64), m=np.array([], dtype=np.float64),
+        x=np.array([], dtype=np.float64), y=np.array([], dtype=np.float64),
+        lon=np.array([], dtype=np.float64), lat=np.array([], dtype=np.float64),
+        edge=np.array([], dtype=np.int64), type=np.array([], dtype=object),
+        label=np.array([], dtype=object), of_edge=np.array([], dtype=np.int64),
+        feature=np.array([], dtype=object),
+    )
+    chain_app = App(ctx=Context(g=g, S=S, moments=mom, cfg=CFG), geocoder=FakeGeocoder())
+    a_pt = [lat[idx["J0"]], lon[idx["J0"]]]
+    b_pt = [lat[idx["J10"]], lon[idx["J10"]]]
+
+    st_r, out = chain_app.api("POST", "/api/route", {"from": a_pt, "to": b_pt})
+    assert st_r == 200, out
+    scenic_pick = out["routes"][-1]
+    st_w, wp = chain_app.api("POST", "/api/waypoints", {"id": out["id"], "key": scenic_pick["key"]})
+    assert st_w == 200, wp
+    json.dumps(wp, allow_nan=False)
+
+    assert len(wp["waypoints"]) >= 10
+    assert len(wp["parts"]) >= 2
+    assert "single" in wp and wp["single"]["url"] == wp["url"] and wp["single"]["waypoints"] <= 7
+    assert wp["meets_target"] is True
+    assert wp["summary"]["overlap"] >= 0.99
+
+    split_ns = [w["n"] for w in wp["waypoints"] if w.get("split")]
+    assert split_ns == [p["handoff_n"] for p in wp["parts"][:-1]]
+
+    for k, p in enumerate(wp["parts"]):
+        assert p["part"] == k + 1
+        assert 1 <= p["waypoints"] <= 7
+        assert p["url"].startswith("https://www.google.com/maps/dir/?api=1&")
+        assert p["url_length"] == len(p["url"]) < 2048
+        assert p["eta_min"] > 0 and p["km"] > 0
+        q = parse_qs(urlparse(p["url"]).query)
+        assert q["origin"] != q["destination"]
+        assert len(q["waypoints"][0].split("|")) == p["waypoints"] <= 7
+        if k + 1 < len(wp["parts"]):
+            assert p["destination"] == wp["parts"][k + 1]["origin"]
+
+    js = (web.STATIC_DIR / "app.js").read_text()
+    mb = _js_function(js, "function mapsBlock(")
+    dw = _js_function(js, "function drawWaypoints(")
+    assert "x.parts" in mb and "Open Part " in mb and "dist(p.km)" in mb
+    assert "p.split" in dw and "wp.split" not in dw
+
+
+def test_demo_builds_loop_recommendations_with_directions_and_features(tmp_path):
+    from scenic.web.demo import build_site
+
+    cfg_toml = tmp_path / "demo_loop.toml"
+    cfg_toml.write_text(
+        """
+[[preset]]
+id = "grid-ab"
+name = "Grid A to B"
+from = [43.0, -77.0]
+to = [43.0, -76.904]
+
+[loop]
+id = "grid-center"
+name = "Grid Center"
+start = [43.0, -77.0]
+budgets = [45, 90]
+default_min = 90
+directions = ["N", "E", "W"]
+max_features = 4
+"""
+    )
+    out = tmp_path / "site"
+    # East-only grid: W has no loops (422 skipped cleanly), Far Peak (~55m round trip) doesn't fit in 45m
+    build_site(out=out, presets_path=cfg_toml, ctx=_loop_grid_ctx(east_only=True), log=lambda s: None)
+
+    meta = json.loads((out / "data" / "presets.json").read_text())
+    assert "loop" in meta
+    lp = meta["loop"]
+    assert lp["id"] == "grid-center" and lp["name"] == "Grid Center"
+    assert lp["budgets"] == [45, 90] and lp["default_min"] == 90
+    assert set(lp["by_min"]) == {"45", "90"}
+
+    b45 = lp["by_min"]["45"]
+    assert "W" not in b45["compass"] and "E" in b45["compass"]
+    assert "Far Peak" not in {f["name"] for f in b45["features"]}
+    assert {f["name"] for f in b45["features"]}  # fitting features included
+
+    checked_files = set()
+    for m_key, entry in lp["by_min"].items():
+        rels = [entry["any"], *entry["compass"].values(), *(f["file"] for f in entry["features"])]
+        for rel in rels:
+            assert rel.startswith("data/loop-") and not rel.startswith("/")
+            fpath = out / rel
+            assert fpath.is_file(), rel
+            d = json.loads(fpath.read_text())
+            assert d["search"]["mode"] == "loop" and d["search"]["minutes"] == int(m_key)
+            assert "seconds" not in d["search"]
+            routes = d["search"]["routes"]
+            assert routes and set(d["waypoints"]) == {r["key"] for r in routes}
+            for r in routes:
+                assert "points_raw" not in r
+                assert r["line"][0] == r["line"][-1] == [43.0, -77.0]
+                wp = d["waypoints"][r["key"]]
+                assert wp["key"] == r["key"]
+                assert wp["url"].startswith("https://www.google.com/maps/dir/?api=1&")
+            checked_files.add(rel)
+    assert len(checked_files) >= 6
+
+    html = (out / "index.html").read_text()
+    js = (out / "static" / "app.js").read_text()
+    assert 'id="demo-loop-origin"' in html and 'id="mode-tabs"' in html
+    assert "async function loadDemoLoop(" in js and "function syncDemoLoopControls(" in js
+
+

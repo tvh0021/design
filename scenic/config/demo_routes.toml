@@ -42,3 +42,16 @@ from = [43.4262, -73.7123]
 from_label = "Lake George"
 to = [44.2795, -73.9799]
 to_label = "Lake Placid"
+
+# Drive-around loops for the public demo (`[loop]` is optional).
+# Precomputes Any way, all 8 compass directions, and up to `max_features`
+# nearby scenic features for each duration in `budgets`.
+[loop]
+id = "auburn"
+name = "Auburn, Finger Lakes"
+start = [42.9318, -76.5661]
+budgets = [60, 120, 180]
+default_min = 120
+directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+max_features = 8
+
