@@ -1,4 +1,4 @@
-//! Live subscription readings sampled from `ai-usage --json`.
+//! Live subscription readings sampled from `ai-usage --local --json`.
 //!
 //! Codex writes its limit readings into every rollout, but Claude Code only
 //! records the moment a window is exhausted and Antigravity records nothing.
@@ -8,7 +8,9 @@
 //! Antigravity's Gemini, Argon, and Claude & GPT pools).
 //!
 //! Readings land in `live_limits`, which no log can rebuild, so `rebuild`
-//! leaves the table alone.
+//! leaves the table alone. `--local` keeps them to this machine's accounts:
+//! with a hosts config, plain `ai-usage` also lists other machines, whose
+//! accounts (a second Antigravity sign-in, say) would mix into one series.
 
 use crate::store::{self, LiveLimit, Store};
 use anyhow::{Context, Result, bail};
@@ -60,7 +62,7 @@ fn tool_of(provider: &str) -> Option<&'static str> {
     }
 }
 
-/// Every session or weekly window in `ai-usage --json` output, stamped `ts_ms`.
+/// Every session or weekly window in `ai-usage --local --json` output, stamped `ts_ms`.
 /// Monthly windows and unknown providers are skipped. A provider that reports
 /// an error or an earlier reading is skipped and listed with the reason. Reset
 /// times are rounded to the second: providers report them with jitter between
@@ -119,11 +121,11 @@ pub fn ai_usage_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ai-usage"))
 }
 
-/// Run `ai-usage --json claude codex antigravity` and return its stdout.
+/// Run `ai-usage --local --json claude codex antigravity` and return its stdout.
 pub fn fetch() -> Result<String> {
     let bin = ai_usage_bin();
     let out = std::process::Command::new(&bin)
-        .arg("--json")
+        .args(["--local", "--json"])
         .args(PROVIDERS)
         .output()
         .with_context(|| {
@@ -226,6 +228,22 @@ mod tests {
         );
         assert!(r.iter().all(|l| l.ts_ms == 1_000));
         assert!(parse("{}", 0).is_err());
+    }
+
+    #[test]
+    fn tolerates_account_and_host_fields() {
+        let json = r#"[
+          {"provider":"Codex","account":"0123456789ab","signed_in":true,
+           "hosts":[{"name":"mac","t3_environment":"MacBook Pro"}],
+           "windows":[{"label":"Weekly","used_percent":5.0,"window_seconds":604800,"blocked":false}]},
+          {"provider":"Host","hosts":[{"name":"rpi5","t3_environment":null}],"windows":[],
+           "error":"unreachable","account":null,"signed_in":true}
+        ]"#;
+        let r = parse(json, 0).unwrap();
+        assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+        let r = r.readings;
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].tool.as_str(), r[0].window), ("codex", "weekly"));
     }
 
     #[test]

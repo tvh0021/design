@@ -137,14 +137,14 @@ enum Command {
 #[derive(Subcommand)]
 enum LimitsCommand {
     /// Store the current used share of every Claude, Codex, and Antigravity
-    /// window from `ai-usage --json`. Claude Code and Antigravity write no
+    /// window from `ai-usage --local --json`. Claude Code and Antigravity write no
     /// limit readings to their logs, so a schedule of these samples is what
     /// lets `query value` measure their windows.
     Record {
         /// Keep sampling every SECS seconds until interrupted.
         #[arg(long, value_name = "SECS")]
         every: Option<u64>,
-        /// Read `ai-usage --json` output from a file instead of running it.
+        /// Read `ai-usage --local --json` output from a file instead of running it.
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
     },

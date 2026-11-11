@@ -54,7 +54,32 @@ ai-usage              # all providers
 ai-usage claude       # one provider
 ai-usage --compact    # one line
 ai-usage --json
+ai-usage --local      # this machine only
 ```
+
+It can also read other machines over ssh, each running its own `ai-usage`.
+List them in `~/.config/ai-usage/hosts.json` (or
+`$XDG_CONFIG_HOME/ai-usage/hosts.json`), on macOS and Linux alike:
+
+```json
+{
+  "self": { "name": "mac", "t3_environment": "MacBook Pro" },
+  "hosts": [
+    { "name": "rpi5", "ssh": "rpi5", "t3_environment": "rpi5", "command": "ai-usage" }
+  ]
+}
+```
+
+`self.name` defaults to the short host name, `ssh` to the host's `name`, and
+`command` to `ai-usage`; `t3_environment` is optional. Each host runs
+`<command> --local --json` with a 25-second limit. Every report carries
+`account`, a 12-digit fingerprint of the signed-in account (never the id
+itself), and `hosts`, the machines signed in to it. One account on several
+machines shows once; an account not on every machine is tagged with its
+machines, as `Antigravity @rpi5: ...`. A machine that cannot be read shows as
+`rpi5: unreachable (...)`, and in `--json` as an element with `"provider":
+"Host"`. A provider a machine is merely not signed in to is left out when
+another machine has it. Without the file, output is as on one machine.
 
 ## cli/scix_arxiv_radar
 

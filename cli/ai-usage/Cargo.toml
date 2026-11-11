@@ -8,4 +8,5 @@ description = "Show current usage limits for Claude, Codex, Antigravity, ChatLLM
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 ureq = { version = "3", features = ["json"] }

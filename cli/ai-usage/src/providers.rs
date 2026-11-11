@@ -1,5 +1,7 @@
 //! One fetcher per provider. Each mirrors the T3 Code reader named in its
-//! section and returns a `Report`, or an error string shown as "unavailable".
+//! section and returns a `Report`, or a `Failure` shown as "unavailable".
+//! Every report carries a fingerprint of the signed-in account, so readings
+//! from several machines can be matched up without revealing who it is.
 
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -11,14 +13,42 @@ use std::time::Duration;
 use chrono::{DateTime, Local, Months, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use crate::report::{Report, Window, ago, until};
+use crate::report::{Report, Window, ago, fingerprint, until};
 
 type Res<T> = Result<T, String>;
+
+/// Why a provider has no reading.
+#[derive(Debug)]
+pub struct Failure {
+    pub message: String,
+    /// False when this machine simply has no sign-in for the provider.
+    pub signed_in: bool,
+}
+
+impl Failure {
+    fn signed_out(message: impl Into<String>) -> Self {
+        Failure { message: message.into(), signed_in: false }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Failure { message, signed_in: true }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+type Probe = fn() -> Result<Report, Failure>;
 
 const HOUR: i64 = 3600;
 const WEEK: i64 = 7 * 24 * HOUR;
 
-pub const PROVIDERS: [(&str, fn() -> Res<Report>); 5] = [
+pub const PROVIDERS: [(&str, Probe); 5] = [
     ("Claude", claude),
     ("Codex", codex),
     ("Antigravity", antigravity),
@@ -123,21 +153,49 @@ fn t3_userdata_from(t3_userdata: Option<&str>, t3code_home: Option<&str>, home: 
 }
 
 /// A secret T3 stores in plaintext under `userdata/secrets/`.
-fn t3_secret(file: &str) -> Option<String> {
-    t3_secret_in(&t3_userdata()?, file)
+fn t3_secret(file: &str) -> Res<Option<String>> {
+    match t3_userdata() {
+        Some(userdata) => t3_secret_in(&userdata, file),
+        None => Ok(None),
+    }
 }
 
-fn t3_secret_in(userdata: &Path, file: &str) -> Option<String> {
-    let text = std::fs::read_to_string(userdata.join("secrets").join(file)).ok()?;
+/// `None` when the secret file is missing or empty; any other read failure is an error.
+fn t3_secret_in(userdata: &Path, file: &str) -> Res<Option<String>> {
+    let path = userdata.join("secrets").join(file);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
     let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+    Ok((!text.is_empty()).then_some(text))
 }
 
-fn env_or_t3_secret(var: &str, file: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| t3_secret(file))
+fn env_or_t3_secret(var: &str, file: &str) -> Res<Option<String>> {
+    match std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
+        Some(v) => Ok(Some(v)),
+        None => t3_secret(file),
+    }
+}
+
+/// A credential file's text. Only a missing file means "not signed in";
+/// a file that exists but cannot be read is a real failure.
+fn read_credential(path: &Path, missing: &str) -> Result<String, Failure> {
+    std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Failure::signed_out(missing),
+        _ => format!("could not read {}: {e}", path.display()).into(),
+    })
+}
+
+/// `security` exits 44 when the keychain has no such item; anything else
+/// (a locked keychain, a denied prompt) is a real failure.
+fn keychain_failure(code: Option<i32>) -> Failure {
+    match code {
+        Some(44) => Failure::signed_out("no Claude Code login in the keychain"),
+        Some(c) => format!("could not read the keychain (`security` exit {c})").into(),
+        None => "could not read the keychain (`security` was killed)".into(),
+    }
 }
 
 fn duration_label(secs: i64) -> &'static str {
@@ -178,29 +236,31 @@ fn claude_config_dir_from(claude_config_dir: Option<&str>, home: &Path) -> PathB
         .unwrap_or_else(|| home.join(".claude"))
 }
 
-fn claude_credentials_file(config_dir: &Path) -> Res<Value> {
-    let text = std::fs::read_to_string(config_dir.join(".credentials.json"))
-        .map_err(|_| "no Claude Code login (~/.claude/.credentials.json)".to_string())?;
-    serde_json::from_str(&text).map_err(|e| e.to_string())
+fn claude_credentials_file(config_dir: &Path) -> Result<Value, Failure> {
+    let text = read_credential(
+        &config_dir.join(".credentials.json"),
+        "no Claude Code login (~/.claude/.credentials.json)",
+    )?;
+    Ok(serde_json::from_str(&text).map_err(|e| e.to_string())?)
 }
 
-fn claude_keychain_credentials() -> Res<Value> {
+fn claude_keychain_credentials() -> Result<Value, Failure> {
     let out = Command::new("security")
         .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
         .output()
         .map_err(|e| format!("could not run `security`: {e}"))?;
     if !out.status.success() {
-        return Err("no Claude Code login in the keychain".into());
+        return Err(keychain_failure(out.status.code()));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+    Ok(serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?)
 }
 
 fn claude_credentials_with(
     is_macos: bool,
     claude_config_dir: Option<&str>,
     home: &Path,
-    keychain: impl FnOnce() -> Res<Value>,
-) -> Res<(Value, &'static str)> {
+    keychain: impl FnOnce() -> Result<Value, Failure>,
+) -> Result<(Value, &'static str), Failure> {
     let dir = claude_config_dir_from(claude_config_dir, home);
     if !is_macos || (non_empty(claude_config_dir).is_some() && dir.join(".credentials.json").is_file()) {
         claude_credentials_file(&dir).map(|v| (v, "credentials file"))
@@ -209,12 +269,16 @@ fn claude_credentials_with(
     }
 }
 
-fn claude_oauth_from_creds(creds: &Value, now_ms: i64, source: &str) -> Res<(String, Option<String>)> {
+fn claude_oauth_from_creds(
+    creds: &Value,
+    now_ms: i64,
+    source: &str,
+) -> Result<(String, Option<String>), Failure> {
     let oauth = &creds["claudeAiOauth"];
     let token = oauth["accessToken"]
         .as_str()
         .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| format!("{source} has no access token"))?;
+        .ok_or_else(|| Failure::signed_out(format!("{source} has no access token")))?;
     if let Some(exp) = oauth["expiresAt"].as_i64() {
         if exp <= now_ms {
             return Err("access token expired; run `claude` once to refresh it".into());
@@ -224,10 +288,32 @@ fn claude_oauth_from_creds(creds: &Value, now_ms: i64, source: &str) -> Res<(Str
     Ok((token.to_string(), plan))
 }
 
-fn claude() -> Res<Report> {
+/// Claude Code's account record: `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`.
+fn claude_account_file(claude_config_dir: Option<&str>, home: &Path) -> PathBuf {
+    match non_empty(claude_config_dir) {
+        Some(dir) => PathBuf::from(dir).join(".claude.json"),
+        None => home.join(".claude.json"),
+    }
+}
+
+/// The account fingerprint from `.claude.json`: the account within its organization.
+fn claude_account_from(config: &Value) -> Option<String> {
+    let account = &config["oauthAccount"];
+    let id = non_empty(account["accountUuid"].as_str())?;
+    let org = account["organizationUuid"].as_str().unwrap_or("");
+    Some(fingerprint("claude", &format!("{id}:{org}")))
+}
+
+fn claude_account(claude_config_dir: Option<&str>) -> Option<String> {
+    let text = std::fs::read_to_string(claude_account_file(claude_config_dir, &home())).ok()?;
+    claude_account_from(&serde_json::from_str(&text).ok()?)
+}
+
+fn claude() -> Result<Report, Failure> {
+    let config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
     let (creds, source) = claude_credentials_with(
         cfg!(target_os = "macos"),
-        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        config_dir.as_deref(),
         &home(),
         claude_keychain_credentials,
     )?;
@@ -236,10 +322,12 @@ fn claude() -> Res<Report> {
     let (usage, stale_note) = claude_usage(&token)?;
 
     let mut report = Report {
-        provider: "Claude",
+        provider: "Claude".into(),
         plan,
+        account: claude_account(config_dir.as_deref()),
         ..Default::default()
     };
+    report.stale = stale_note.is_some();
     report.notes.extend(stale_note);
 
     // `limits` lists every active window, including model-scoped weekly ones.
@@ -469,22 +557,69 @@ fn codex_home_from(codex_home: Option<&str>, home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".codex"))
 }
 
-fn codex_auth_from_dir(codex_home: &Path) -> Res<(String, Option<String>)> {
-    let text = std::fs::read_to_string(codex_home.join("auth.json"))
-        .map_err(|_| "no Codex login (~/.codex/auth.json)".to_string())?;
+struct CodexAuth {
+    token: String,
+    account_id: Option<String>,
+    /// Fingerprint of the ChatGPT user within the workspace.
+    account: Option<String>,
+}
+
+fn codex_auth_from_dir(codex_home: &Path) -> Result<CodexAuth, Failure> {
+    let text = read_credential(&codex_home.join("auth.json"), "no Codex login (~/.codex/auth.json)")?;
     let auth: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let tokens = &auth["tokens"];
     let token = tokens["access_token"]
         .as_str()
         .filter(|t| !t.trim().is_empty())
-        .ok_or("Codex is not signed in with ChatGPT")?;
-    let account = tokens["account_id"].as_str().map(str::to_string);
-    Ok((token.to_string(), account))
+        .ok_or_else(|| Failure::signed_out("Codex is not signed in with ChatGPT"))?;
+    let account_id = tokens["account_id"].as_str().map(str::to_string);
+    let account = tokens["id_token"]
+        .as_str()
+        .and_then(codex_user_from_id_token)
+        .map(|user| fingerprint("codex", &format!("{user}:{}", account_id.as_deref().unwrap_or(""))));
+    Ok(CodexAuth { token: token.to_string(), account_id, account })
 }
 
-fn codex() -> Res<Report> {
+/// The ChatGPT user in an ID token: the OpenAI auth claim's `chatgpt_user_id`,
+/// else its `user_id`, else the token subject. The signature is not checked:
+/// the token only names the account, it grants nothing here.
+fn codex_user_from_id_token(jwt: &str) -> Option<String> {
+    let payload = base64url_decode(jwt.split('.').nth(1)?)?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    let auth = &claims["https://api.openai.com/auth"];
+    [&auth["chatgpt_user_id"], &auth["user_id"], &claims["sub"]]
+        .into_iter()
+        .find_map(|v| non_empty(v.as_str()))
+        .map(str::to_string)
+}
+
+/// Unpadded base64url, as used in JWTs.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn codex() -> Result<Report, Failure> {
     let codex_home = codex_home_from(std::env::var("CODEX_HOME").ok().as_deref(), &home());
-    let (token, account_id) = codex_auth_from_dir(&codex_home)?;
+    let CodexAuth { token, account_id, account } = codex_auth_from_dir(&codex_home)?;
 
     let mut headers = vec![
         ("Authorization", format!("Bearer {token}")),
@@ -505,7 +640,7 @@ fn codex() -> Res<Report> {
     })?;
 
     let plan = usage["plan_type"].as_str().map(str::to_string);
-    let mut report = Report { provider: "Codex", plan: plan.clone(), ..Default::default() };
+    let mut report = Report { provider: "Codex".into(), plan: plan.clone(), account, ..Default::default() };
 
     // Primary with no duration is 5h on paid plans and 30 days on Free/Go.
     let primary_fallback = if matches!(plan.as_deref(), Some("free" | "go")) { 30 * 24 * HOUR } else { 5 * HOUR };
@@ -551,21 +686,29 @@ const ANTIGRAVITY_ENDPOINTS: [&str; 2] = [
     "https://cloudcode-pa.googleapis.com",
 ];
 
-fn find_antigravity_token() -> Option<PathBuf> {
-    find_antigravity_token_in(&t3_userdata()?)
+fn find_antigravity_token() -> Res<Option<PathBuf>> {
+    match t3_userdata() {
+        Some(userdata) => find_antigravity_token_in(&userdata),
+        None => Ok(None),
+    }
 }
 
-fn find_antigravity_token_in(userdata: &Path) -> Option<PathBuf> {
+/// `None` when T3 has no Antigravity provider directory or no token in it.
+fn find_antigravity_token_in(userdata: &Path) -> Res<Option<PathBuf>> {
     let root = userdata.join("providers/antigravity");
-    std::fs::read_dir(root)
-        .ok()?
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", root.display())),
+    };
+    Ok(entries
         .flatten()
         .map(|e| e.path().join("antigravity-acp/acp_token.json"))
-        .find(|p| p.is_file())
+        .find(|p| p.is_file()))
 }
 
-fn antigravity() -> Res<Report> {
-    let path = find_antigravity_token().ok_or("no Antigravity sign-in found in T3 Code")?;
+fn antigravity() -> Result<Report, Failure> {
+    let path = find_antigravity_token()?.ok_or_else(|| Failure::signed_out("no Antigravity sign-in found in T3 Code"))?;
     let token: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let body = match token["project_id"].as_str() {
@@ -573,18 +716,55 @@ fn antigravity() -> Res<Report> {
         _ => json!({}),
     };
 
-    let (access, cached) = antigravity_access_token(&token, &path, false)?;
+    let (mut access, cached) = antigravity_access_token(&token, &path, false)?;
     let mut windows = antigravity_windows(&access, &body);
     // A cached token Google has revoked early: get a fresh one and retry once.
     if windows.is_empty() && cached {
-        let (access, _) = antigravity_access_token(&token, &path, true)?;
+        access = antigravity_access_token(&token, &path, true)?.0;
         windows = antigravity_windows(&access, &body);
     }
     if windows.is_empty() {
         return Err("Antigravity returned no quota information".into());
     }
     windows.sort_by(|a, b| a.label.cmp(&b.label));
-    Ok(Report { provider: "Antigravity", windows, ..Default::default() })
+    let account = antigravity_account(&access, &antigravity_key(&token, &path)?);
+    Ok(Report { provider: "Antigravity".into(), windows, account, ..Default::default() })
+}
+
+/// Cache key for one sign-in: a hash of its client id and refresh token.
+fn antigravity_key(token: &Value, path: &Path) -> Res<String> {
+    let field = |k: &str| token[k].as_str().ok_or(format!("{} is missing {k}", path.display()));
+    let mut hasher = DefaultHasher::new();
+    (field("client_id")?, field("refresh_token")?).hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+/// The Google account's fingerprint, from Google's user id. The project id in
+/// the token file is shared between accounts, so it cannot tell them apart.
+/// Asked once per sign-in and cached as the fingerprint only; `None` if Google
+/// does not answer.
+fn antigravity_account(access: &str, key: &str) -> Option<String> {
+    let cache_file = cache_dir().join("antigravity-account.json");
+    let cached = std::fs::read_to_string(&cache_file)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|c| c["key"].as_str() == Some(key))
+        .and_then(|c| c["account"].as_str().map(str::to_string));
+    if cached.is_some() {
+        return cached;
+    }
+    let info = get_json(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        &[("Authorization", &format!("Bearer {access}"))],
+    )
+    .ok()?;
+    let account = antigravity_account_from(&info)?;
+    write_private(&cache_file, &json!({ "key": key, "account": account }).to_string());
+    Some(account)
+}
+
+fn antigravity_account_from(userinfo: &Value) -> Option<String> {
+    non_empty(userinfo["id"].as_str()).map(|id| fingerprint("antigravity", id))
 }
 
 /// An access token, from the cache while it has over a minute left, else
@@ -595,9 +775,7 @@ fn antigravity_access_token(token: &Value, path: &Path, force_refresh: bool) -> 
     let (client_id, client_secret, refresh_token) =
         (field("client_id")?, field("client_secret")?, field("refresh_token")?);
 
-    let mut hasher = DefaultHasher::new();
-    (client_id, refresh_token).hash(&mut hasher);
-    let key = format!("{:016x}", hasher.finish());
+    let key = antigravity_key(token, path)?;
     let cache_file = cache_dir().join("antigravity-token.json");
     let now = Utc::now().timestamp();
 
@@ -775,9 +953,9 @@ fn antigravity_model_windows(models: &Value) -> Vec<(String, Window)> {
 
 // ---------- ChatLLM / Abacus (abacusUsageLimits.ts) ----------
 
-fn abacus() -> Res<Report> {
-    let key = env_or_t3_secret("ABACUS_API_KEY", "provider-env-YWJhY3Vz-QUJBQ1VTX0FQSV9LRVk.bin")
-        .ok_or("no ABACUS_API_KEY (env or T3 Code secret)")?;
+fn abacus() -> Result<Report, Failure> {
+    let key = env_or_t3_secret("ABACUS_API_KEY", "provider-env-YWJhY3Vz-QUJBQ1VTX0FQSV9LRVk.bin")?
+        .ok_or_else(|| Failure::signed_out("no ABACUS_API_KEY (env or T3 Code secret)"))?;
     let bearer = format!("Bearer {key}");
     let headers = [("apiKey", key.as_str()), ("Authorization", bearer.as_str()), ("Accept", "application/json")];
 
@@ -793,7 +971,7 @@ fn abacus() -> Res<Report> {
     );
     let points = points?;
     if let Some(err) = points["error"].as_str() {
-        return Err(err.to_string());
+        return Err(err.into());
     }
     let billing = billing.unwrap_or(Value::Null);
 
@@ -817,11 +995,22 @@ fn abacus() -> Res<Report> {
         None => format!("{} left", thousands(left)),
     };
     Ok(Report {
-        provider: "ChatLLM",
+        provider: "ChatLLM".into(),
         plan: billing["result"]["currentTier"].as_str().map(str::to_string),
+        account: Some(abacus_account_from(&billing, &key)),
         windows: vec![Window::new("Monthly credits", used, resets_at, period).detail(detail)],
         ..Default::default()
     })
+}
+
+/// Abacus shows an API key no account id, and each machine may hold its own
+/// key, so the subscription's start time names the account; the key stands
+/// in when billing could not be read.
+fn abacus_account_from(billing: &Value, key: &str) -> String {
+    match non_empty(billing["result"]["subscriptionStartTime"].as_str()) {
+        Some(start) => fingerprint("chatllm", &format!("subscription:{start}")),
+        None => fingerprint("chatllm", &format!("key:{key}")),
+    }
 }
 
 fn thousands(n: f64) -> String {
@@ -838,9 +1027,9 @@ fn thousands(n: f64) -> String {
 
 // ---------- Zed (zedAccountUsage.ts) ----------
 
-fn zed() -> Res<Report> {
-    let session = env_or_t3_secret("ZED_DASHBOARD_SESSION", "provider-config-emVk-emVk-ZGFzaGJvYXJkU2Vzc2lvbg.bin")
-        .ok_or("no Zed dashboard session (env or T3 Code secret)")?;
+fn zed() -> Result<Report, Failure> {
+    let session = env_or_t3_secret("ZED_DASHBOARD_SESSION", "provider-config-emVk-emVk-ZGFzaGJvYXJkU2Vzc2lvbg.bin")?
+        .ok_or_else(|| Failure::signed_out("no Zed dashboard session (env or T3 Code secret)"))?;
     let headers = [
         ("Accept", "application/json"),
         ("Cookie", session.as_str()),
@@ -876,11 +1065,21 @@ fn zed() -> Res<Report> {
     };
     let used = limit.map_or(0.0, |l| spent / l * 100.0);
     Ok(Report {
-        provider: "Zed",
+        provider: "Zed".into(),
         plan: sub["subscription"]["name"].as_str().map(str::to_string),
+        account: Some(zed_account_from(&sub, &session)),
         windows: vec![Window::new("Monthly token spend", used, end, period).detail(detail)],
         ..Default::default()
     })
+}
+
+/// The subscription id names the account; the session cookie stands in when it is missing.
+fn zed_account_from(sub: &Value, session: &str) -> String {
+    match &sub["subscription"]["id"] {
+        Value::String(id) if !id.trim().is_empty() => fingerprint("zed", id.trim()),
+        Value::Number(id) => fingerprint("zed", &id.to_string()),
+        _ => fingerprint("zed", &format!("session:{session}")),
+    }
 }
 
 #[cfg(test)]
@@ -1006,10 +1205,12 @@ mod tests {
     fn claude_credentials_error_cases() {
         let tmp = TempDir::new("claude-errors");
         let missing = claude_credentials_with(false, None, tmp.path(), || unreachable!()).unwrap_err();
-        assert_eq!(missing, "no Claude Code login (~/.claude/.credentials.json)");
+        assert_eq!(missing.message, "no Claude Code login (~/.claude/.credentials.json)");
+        assert!(!missing.signed_in);
 
         let no_token = claude_oauth_from_creds(&json!({"claudeAiOauth":{}}), 1000, "keychain entry").unwrap_err();
-        assert_eq!(no_token, "keychain entry has no access token");
+        assert_eq!(no_token.message, "keychain entry has no access token");
+        assert!(!no_token.signed_in);
 
         let expired = claude_oauth_from_creds(
             &json!({"claudeAiOauth":{"accessToken":"tok","expiresAt":1000}}),
@@ -1017,7 +1218,8 @@ mod tests {
             "credentials file",
         )
         .unwrap_err();
-        assert_eq!(expired, "access token expired; run `claude` once to refresh it");
+        assert_eq!(expired.message, "access token expired; run `claude` once to refresh it");
+        assert!(expired.signed_in, "an expired token is a real failure, not a missing sign-in");
     }
 
     #[test]
@@ -1025,10 +1227,9 @@ mod tests {
         let tmp = TempDir::new("codex");
         let default_dir = codex_home_from(None, tmp.path());
         assert_eq!(default_dir, tmp.path().join(".codex"));
-        assert_eq!(
-            codex_auth_from_dir(&default_dir).unwrap_err(),
-            "no Codex login (~/.codex/auth.json)"
-        );
+        let missing = codex_auth_from_dir(&default_dir).err().unwrap();
+        assert_eq!(missing.message, "no Codex login (~/.codex/auth.json)");
+        assert!(!missing.signed_in);
 
         let custom = tmp.path().join("custom-codex");
         std::fs::create_dir_all(&custom).unwrap();
@@ -1037,9 +1238,77 @@ mod tests {
             r#"{"tokens":{"access_token":"codex-tok","account_id":"acct-42"}}"#,
         );
         let resolved = codex_home_from(Some(custom.to_str().unwrap()), tmp.path());
-        let (tok, acct) = codex_auth_from_dir(&resolved).unwrap();
-        assert_eq!(tok, "codex-tok");
-        assert_eq!(acct.as_deref(), Some("acct-42"));
+        let auth = codex_auth_from_dir(&resolved).ok().unwrap();
+        assert_eq!(auth.token, "codex-tok");
+        assert_eq!(auth.account_id.as_deref(), Some("acct-42"));
+        assert_eq!(auth.account, None, "no id token, no account");
+    }
+
+    /// An unsigned JWT with these claims.
+    fn jwt(claims: Value) -> String {
+        let b64 = |bytes: &[u8]| {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+                for i in 0..=chunk.len() {
+                    out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+                }
+            }
+            out
+        };
+        format!("{}.{}.sig", b64(br#"{"alg":"none"}"#), b64(claims.to_string().as_bytes()))
+    }
+
+    #[test]
+    fn codex_user_prefers_chatgpt_user_id_then_user_id_then_sub() {
+        let auth = "https://api.openai.com/auth";
+        let full = jwt(json!({"sub": "s-1", auth: {"chatgpt_user_id": "cu-1", "user_id": "u-1"}}));
+        assert_eq!(codex_user_from_id_token(&full).as_deref(), Some("cu-1"));
+        let user = jwt(json!({"sub": "s-1", auth: {"user_id": "u-1"}}));
+        assert_eq!(codex_user_from_id_token(&user).as_deref(), Some("u-1"));
+        assert_eq!(codex_user_from_id_token(&jwt(json!({"sub": "s-1"}))).as_deref(), Some("s-1"));
+        assert_eq!(codex_user_from_id_token("not-a-jwt"), None);
+        assert_eq!(base64url_decode("aGk_-w").as_deref(), Some(&[b'h', b'i', 0x3f, 0xfb][..]));
+    }
+
+    #[test]
+    fn codex_account_combines_user_and_workspace() {
+        let tmp = TempDir::new("codex-account");
+        let id = jwt(json!({"https://api.openai.com/auth": {"chatgpt_user_id": "cu-1"}}));
+        let write = |acct: &str| {
+            let auth = json!({"tokens": {"access_token": "t", "account_id": acct, "id_token": id}});
+            write_private(&tmp.path().join("auth.json"), &auth.to_string());
+            codex_auth_from_dir(tmp.path()).ok().unwrap().account.unwrap()
+        };
+        let (a, b) = (write("ws-1"), write("ws-2"));
+        assert_eq!(a, fingerprint("codex", "cu-1:ws-1"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn account_ids_for_claude_antigravity_and_zed() {
+        let claude = json!({"oauthAccount": {"accountUuid": "acc-1", "organizationUuid": "org-1"}});
+        assert_eq!(claude_account_from(&claude), Some(fingerprint("claude", "acc-1:org-1")));
+        assert_eq!(claude_account_from(&json!({})), None);
+        assert_eq!(
+            claude_account_file(Some("/cfg"), Path::new("/home/u")),
+            PathBuf::from("/cfg/.claude.json")
+        );
+        assert_eq!(claude_account_file(None, Path::new("/home/u")), PathBuf::from("/home/u/.claude.json"));
+
+        assert_eq!(antigravity_account_from(&json!({"id": "123"})), Some(fingerprint("antigravity", "123")));
+        assert_eq!(antigravity_account_from(&json!({})), None);
+
+        let billing = json!({"result": {"subscriptionStartTime": "2026-01-02T03:04:05+00:00"}});
+        let by_start = fingerprint("chatllm", "subscription:2026-01-02T03:04:05+00:00");
+        assert_eq!(abacus_account_from(&billing, "key-a"), by_start);
+        assert_eq!(abacus_account_from(&billing, "key-b"), by_start, "one account, two keys");
+        assert_eq!(abacus_account_from(&Value::Null, "key-a"), fingerprint("chatllm", "key:key-a"));
+
+        let sub = json!({"subscription": {"id": "sub-1"}});
+        assert_eq!(zed_account_from(&sub, "cookie"), fingerprint("zed", "sub-1"));
+        assert_eq!(zed_account_from(&json!({}), "cookie"), fingerprint("zed", "session:cookie"));
     }
 
     #[test]
@@ -1070,12 +1339,34 @@ mod tests {
         let ag_file = expected_ud.join("providers/antigravity/inst-1/antigravity-acp/acp_token.json");
         std::fs::create_dir_all(ag_file.parent().unwrap()).unwrap();
         write_private(&ag_file, r#"{"client_id":"cid"}"#);
-        assert_eq!(find_antigravity_token_in(&expected_ud).as_deref(), Some(ag_file.as_path()));
+        assert_eq!(find_antigravity_token_in(&expected_ud).unwrap().as_deref(), Some(ag_file.as_path()));
+        assert_eq!(find_antigravity_token_in(tmp.path()), Ok(None), "no provider dir: not signed in");
 
         let secret_file = expected_ud.join("secrets/test.bin");
         std::fs::create_dir_all(secret_file.parent().unwrap()).unwrap();
         write_private(&secret_file, "  secret-val \n");
-        assert_eq!(t3_secret_in(&expected_ud, "test.bin").as_deref(), Some("secret-val"));
+        assert_eq!(t3_secret_in(&expected_ud, "test.bin").unwrap().as_deref(), Some("secret-val"));
+        assert_eq!(t3_secret_in(&expected_ud, "missing.bin"), Ok(None));
+        // A secret path that cannot be read (here a directory) is an error, not a missing sign-in.
+        std::fs::create_dir_all(expected_ud.join("secrets/dir.bin")).unwrap();
+        assert!(t3_secret_in(&expected_ud, "dir.bin").is_err());
+    }
+
+    #[test]
+    fn only_a_missing_credential_means_not_signed_in() {
+        let tmp = TempDir::new("cred-errors");
+        let missing = read_credential(&tmp.path().join("nope.json"), "no login").unwrap_err();
+        assert_eq!((missing.message.as_str(), missing.signed_in), ("no login", false));
+        // Exists but unreadable (a directory stands in for a permission error).
+        let unreadable = read_credential(tmp.path(), "no login").unwrap_err();
+        assert!(unreadable.signed_in && unreadable.message.starts_with("could not read"), "{unreadable:?}");
+        // Codex: an unparsable auth.json is a real failure too.
+        write_private(&tmp.path().join("auth.json"), "{not json");
+        assert!(codex_auth_from_dir(tmp.path()).err().unwrap().signed_in);
+
+        assert!(!keychain_failure(Some(44)).signed_in, "item not found");
+        assert!(keychain_failure(Some(51)).signed_in);
+        assert!(keychain_failure(None).signed_in);
     }
 
     #[test]
