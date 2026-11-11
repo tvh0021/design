@@ -2,12 +2,13 @@
 //! which windows are blocked and when a window runs out at its current pace.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A window with less than this much left counts as blocked.
 pub const BLOCKED_BELOW_REMAINING: f64 = 3.0;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Window {
     pub label: String,
     pub used_percent: f64,
@@ -20,6 +21,7 @@ pub struct Window {
     pub pool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default)]
     pub blocked: bool,
     /// When the window hits its limit at the current pace, if before the reset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,18 +78,71 @@ impl Window {
     }
 }
 
-#[derive(Serialize, Default)]
+/// A machine a report was read on. `t3_environment` names it in T3 Code.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HostRef {
+    pub name: String,
+    #[serde(default)]
+    pub t3_environment: Option<String>,
+}
+
+/// The `provider` of an element that reports a host it could not read.
+pub const HOST_PROVIDER: &str = "Host";
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Report {
-    pub provider: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    #[serde(default)]
     pub windows: Vec<Window>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advice: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `fingerprint` of the signed-in account; `None` when it is unknown.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// False when the error is only that this machine has no sign-in.
+    #[serde(default = "yes")]
+    pub signed_in: bool,
+    /// True when the provider refused a fresh reading and this is an earlier one.
+    #[serde(default)]
+    pub stale: bool,
+    /// The machines signed in to this account, this one first.
+    #[serde(default)]
+    pub hosts: Vec<HostRef>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Report {
+    fn default() -> Self {
+        Report {
+            provider: String::new(),
+            plan: None,
+            windows: Vec::new(),
+            notes: Vec::new(),
+            advice: Vec::new(),
+            error: None,
+            account: None,
+            signed_in: true,
+            stale: false,
+            hosts: Vec::new(),
+        }
+    }
+}
+
+/// A short, stable id for an account: the first 12 hex digits of
+/// sha256("<provider>:<id>"). Only this is ever shown, never the id itself,
+/// and every machine computes the same value for the same account.
+pub fn fingerprint(provider: &str, id: &str) -> String {
+    let digest = Sha256::digest(format!("{provider}:{id}").as_bytes());
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 impl Report {
@@ -107,7 +162,8 @@ pub struct Status {
     pub usable: Option<String>,
 }
 
-pub fn status(r: &Report) -> Status {
+/// `name` is how the provider is shown, e.g. "Antigravity @rpi5".
+pub fn status(r: &Report, name: &str) -> Status {
     let blocked: Vec<&Window> = r.windows.iter().filter(|w| w.blocked).collect();
     if r.error.is_some() || r.windows.is_empty() {
         return Status { usable: None };
@@ -127,17 +183,16 @@ pub fn status(r: &Report) -> Status {
     let usable = if !wide_blocked.is_empty() {
         None
     } else if has_wide && blocked_pools.is_empty() {
-        Some(r.provider.to_string())
+        Some(name.to_string())
     } else if has_wide {
-        Some(format!("{} (not {})", r.provider, blocked_pools.join(", ")))
+        Some(format!("{name} (not {})", blocked_pools.join(", ")))
     } else if open_pools.is_empty() {
         None
     } else {
-        Some(format!("{} ({})", r.provider, open_pools.join(", ")))
+        Some(format!("{name} ({})", open_pools.join(", ")))
     };
 
     Status { usable }
-
 }
 
 /// Time from now until `t`: "45m", "3h 10m", "4d 18h".
@@ -173,7 +228,7 @@ mod tests {
     }
 
     fn report(windows: Vec<Window>) -> Report {
-        Report { provider: "P", windows, ..Default::default() }.finish(Utc::now())
+        Report { provider: "P".into(), windows, ..Default::default() }.finish(Utc::now())
     }
 
     #[test]
@@ -203,14 +258,14 @@ mod tests {
     #[test]
     fn provider_wide_block_makes_nothing_usable() {
         let r = report(vec![win("Session", 100.0, 4, 5), win("Weekly", 10.0, 24, 168)]);
-        let s = status(&r);
+        let s = status(&r, "P");
         assert!(s.usable.is_none());
     }
 
     #[test]
     fn blocked_scoped_pool_is_excluded() {
         let r = report(vec![win("Weekly", 10.0, 24, 168), win("Weekly · Fable", 99.0, 24, 168).pool("Fable")]);
-        let s = status(&r);
+        let s = status(&r, "P");
         assert_eq!(s.usable.as_deref(), Some("P (not Fable)"));
     }
 
@@ -220,7 +275,27 @@ mod tests {
             win("Gemini · Weekly", 82.0, 48, 168).pool("Gemini"),
             win("Claude & GPT · Session", 100.0, 3, 5).pool("Claude & GPT"),
         ]);
-        let s = status(&r);
+        let s = status(&r, "P");
         assert_eq!(s.usable.as_deref(), Some("P (Gemini)"));
+        assert_eq!(status(&r, "P @rpi5").usable.as_deref(), Some("P @rpi5 (Gemini)"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_short() {
+        // sha256("claude:test-account") starts with these digits on every machine.
+        assert_eq!(fingerprint("claude", "test-account"), "953b5665cc1e");
+        assert_ne!(fingerprint("codex", "test-account"), fingerprint("claude", "test-account"));
+    }
+
+    #[test]
+    fn report_json_keeps_old_fields_and_reads_back() {
+        let r = Report { provider: "Zed".into(), ..Default::default() };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["account"], serde_json::Value::Null);
+        assert_eq!(v["signed_in"], true);
+        assert!(v.get("plan").is_none() && v.get("error").is_none());
+        // An element without the new fields still parses, as signed in.
+        let old: Report = serde_json::from_str(r#"{"provider":"Codex","windows":[]}"#).unwrap();
+        assert!(old.signed_in && old.account.is_none() && old.hosts.is_empty());
     }
 }

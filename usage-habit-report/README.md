@@ -326,7 +326,7 @@ JSON shape: see [docs/json-shapes.md](docs/json-shapes.md#query-value).
 usage-habit-report limits record [--every SECS] [--from FILE]
 ```
 
-Runs `ai-usage --json claude codex antigravity` and stores the used share,
+Runs `ai-usage --local --json claude codex antigravity` and stores the used share,
 reset time, and pool of every 5-hour and weekly window in `live_limits`. One
 reading prints one line, such as `limits: 10 readings at
 2026-10-23T01:25:12Z (antigravity 5, claude-code 3, codex 2)`. `--every`
@@ -336,7 +336,9 @@ not read, or that it shows an earlier reading for while rate limited, is left
 out and named at the end of the line with the reason, such as `; skipped
 claude-code: access token expired; run `claude` once to refresh it`. `--from`
 reads saved `ai-usage` output instead. Set `USAGE_HABIT_REPORT_AI_USAGE` to the binary's path when
-`ai-usage` is not on `PATH`.
+`ai-usage` is not on `PATH`. `--local` keeps the series to this machine's
+accounts when `ai-usage` is also set up to read other hosts, so it needs an
+`ai-usage` built with that flag.
 
 Claude Code and Antigravity leave no usable limit series in their logs, so a
 schedule of these samples is what lets `query value` measure their windows.

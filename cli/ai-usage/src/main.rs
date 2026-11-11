@@ -1,4 +1,5 @@
-//! Show current usage limits for every AI subscription on this machine.
+//! Show current usage limits for every AI subscription on this machine and,
+//! with a hosts config, on other machines reached over ssh.
 //!
 //! Reads the same sources the T3 Code usage dashboard does
 //! (`apps/server/src/provider/*UsageLimits.ts` in t3code-dev), using the
@@ -15,7 +16,15 @@
 //! its token has expired. Antigravity's short-lived access token is cached
 //! in the user cache directory (`~/Library/Caches/ai-usage` on macOS,
 //! `$XDG_CACHE_HOME/ai-usage` or `~/.cache/ai-usage` on Linux).
+//!
+//! Other machines are listed in `$XDG_CONFIG_HOME/ai-usage/hosts.json`
+//! (default `~/.config/ai-usage/hosts.json`, on macOS too). Each one runs
+//! `ai-usage --local --json` over ssh, in parallel with the local probes.
+//! Every report carries a fingerprint of its account, so an account signed in
+//! on several machines shows once, listing them all, and different accounts
+//! of one provider show separately, tagged with their machine.
 
+mod hosts;
 mod output;
 mod providers;
 mod report;
@@ -26,9 +35,10 @@ use std::time::Duration;
 
 use chrono::{Local, Utc};
 
+use hosts::Config;
 use output::Painter;
 use providers::PROVIDERS;
-use report::Report;
+use report::{HostRef, Report};
 
 const USAGE: &str = "\
 Usage: ai-usage [options] [provider ...]
@@ -37,22 +47,33 @@ Providers: claude, codex, antigravity, chatllm, zed (default: all)
 
 Options:
   --compact          one line per provider with every window's usage
-  --json             machine-readable output
+  --json             machine-readable output: an array of reports, each with
+                     its account fingerprint and the hosts signed in to it
+  --local            read this machine only, not the hosts in the config
   --watch [SECS]     refresh every SECS seconds (default 60) until Ctrl-C;
                      terminal only
   --fail-above PCT   exit with status 1 if any window is more than PCT% used
-  -h, --help         show this help";
+  -h, --help         show this help
+
+Hosts: ~/.config/ai-usage/hosts.json (or $XDG_CONFIG_HOME/ai-usage/hosts.json)
+lists other machines to read over ssh, e.g.
+  {\"self\": {\"name\": \"mac\", \"t3_environment\": \"MacBook Pro\"},
+   \"hosts\": [{\"name\": \"rpi5\", \"ssh\": \"rpi5\", \"t3_environment\": \"rpi5\"}]}
+Each host runs `ai-usage --local --json` there. An account signed in on
+several hosts shows once; one that is not on every host is tagged with its
+hosts, as `Antigravity @rpi5`.";
 
 struct Options {
     json: bool,
     compact: bool,
+    local: bool,
     watch: Option<u64>,
     fail_above: Option<f64>,
     providers: Vec<String>,
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut opts = Options { json: false, compact: false, watch: None, fail_above: None, providers: Vec::new() };
+    let mut opts = Options { json: false, compact: false, local: false, watch: None, fail_above: None, providers: Vec::new() };
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -62,6 +83,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--json" => opts.json = true,
             "--compact" => opts.compact = true,
+            "--local" => opts.local = true,
             "--watch" => {
                 let secs = args.next_if(|a| a.parse::<u64>().is_ok()).map(|a| a.parse().unwrap());
                 opts.watch = Some(secs.unwrap_or(60).max(10));
@@ -89,8 +111,8 @@ fn parse_args() -> Result<Options, String> {
     Ok(opts)
 }
 
-/// Runs the selected providers in parallel, keeping their order.
-fn collect(wanted: &[String]) -> Vec<Report> {
+/// Runs the selected providers on this machine in parallel, keeping their order.
+fn collect_local(wanted: &[String], me: &HostRef) -> Vec<Report> {
     let selected: Vec<_> = PROVIDERS
         .iter()
         .filter(|(name, _)| wanted.is_empty() || wanted.contains(&name.to_lowercase()))
@@ -102,24 +124,48 @@ fn collect(wanted: &[String]) -> Vec<Report> {
             .into_iter()
             .map(|(name, h)| {
                 let result = h.join().unwrap_or_else(|_| Err("probe panicked".into()));
-                result
-                    .unwrap_or_else(|error| Report { provider: name, error: Some(error), ..Default::default() })
-                    .finish(now)
+                let mut report = result
+                    .unwrap_or_else(|f| Report {
+                        provider: name.into(),
+                        error: Some(f.message),
+                        signed_in: f.signed_in,
+                        ..Default::default()
+                    })
+                    .finish(now);
+                report.hosts = vec![me.clone()];
+                report
             })
             .collect()
     })
 }
 
-fn render(reports: &[Report], opts: &Options, painter: &Painter) {
+/// Reads this machine and every configured host at once, then merges them.
+/// Returns the reports and the names of the hosts that could be read.
+fn collect(wanted: &[String], config: &Config) -> (Vec<Report>, Vec<String>) {
+    let (local, remotes) = std::thread::scope(|s| {
+        let remote: Vec<_> = config.hosts.iter().map(|h| (h.host_ref(), s.spawn(|| hosts::fetch(h, wanted)))).collect();
+        let local = collect_local(wanted, &config.me);
+        let remotes: Vec<_> = remote
+            .into_iter()
+            .map(|(host, h)| (host, h.join().unwrap_or_else(|_| Err("fetch panicked".into()))))
+            .collect();
+        (local, remotes)
+    });
+    let mut reachable = vec![config.me.name.clone()];
+    reachable.extend(remotes.iter().filter(|(_, r)| r.is_ok()).map(|(h, _)| h.name.clone()));
+    (hosts::merge(local, remotes), reachable)
+}
+
+fn render(reports: &[Report], reachable: &[String], opts: &Options, painter: &Painter) {
     if opts.json {
         println!("{}", serde_json::to_string_pretty(reports).unwrap());
     } else if opts.compact {
-        output::print_compact(reports, painter);
+        output::print_compact(reports, reachable, painter);
     } else {
-        output::print_summary(reports, painter);
+        output::print_summary(reports, reachable, painter);
         for r in reports {
             println!();
-            output::print_report(r, painter);
+            output::print_report(r, reachable, painter);
         }
     }
 }
@@ -140,10 +186,22 @@ fn main() -> ExitCode {
         eprintln!("ai-usage: --watch needs a terminal; run ai-usage once per check instead");
         return ExitCode::from(2);
     }
+    // `--local` never reads the hosts config, so a broken one cannot stop it.
+    let config = if opts.local {
+        hosts::local_config()
+    } else {
+        match hosts::load_config() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ai-usage: bad hosts config {e}");
+                return ExitCode::from(2);
+            }
+        }
+    };
 
     if let Some(secs) = opts.watch {
         loop {
-            let reports = collect(&opts.providers);
+            let (reports, reachable) = collect(&opts.providers, &config);
             if !opts.json {
                 print!("\x1b[2J\x1b[H");
             }
@@ -151,14 +209,14 @@ fn main() -> ExitCode {
                 let header = format!("Updated {} · every {secs}s · Ctrl-C to stop\n", Local::now().format("%H:%M:%S"));
                 println!("{}", if painter.color { format!("\x1b[2m{header}\x1b[0m") } else { header });
             }
-            render(&reports, &opts, &painter);
+            render(&reports, &reachable, &opts, &painter);
             let _ = std::io::stdout().flush();
             std::thread::sleep(Duration::from_secs(secs));
         }
     }
 
-    let reports = collect(&opts.providers);
-    render(&reports, &opts, &painter);
+    let (reports, reachable) = collect(&opts.providers, &config);
+    render(&reports, &reachable, &opts, &painter);
     match opts.fail_above {
         Some(limit) if reports.iter().flat_map(|r| &r.windows).any(|w| w.used_percent > limit) => ExitCode::from(1),
         _ => ExitCode::SUCCESS,
