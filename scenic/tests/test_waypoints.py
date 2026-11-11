@@ -6,8 +6,9 @@ import pytest
 
 from scenic.route import RoadGraph
 from scenic.waypoints import (
-    GAP_TOL_M, JUNCTION_CLEAR_M, MAX_GAP_M, MAX_URL, PARALLEL_M, TIME_MARGIN, _slowed_matrix,
-    maps_url, reduce_to_waypoints, route_via,
+    EDITABLE_STOPS, GAP_TOL_M, JUNCTION_CLEAR_M, MAX_GAP_M, MAX_URL, PARALLEL_M, TIME_MARGIN,
+    UTURN_PENALTY_M, _slowed_matrix, editable_waypoint_cap, maps_url, reduce_to_waypoints, route_via,
+    split_waypoints,
 )
 
 LAT0, LON0 = 43.0, -77.0
@@ -381,3 +382,144 @@ def test_slowed_matrix_matches_a_full_rebuild(which, factor):
     got, gsel, _ = _slowed_matrix(g, edges, factor)
     assert np.allclose(got.toarray(), want.toarray())
     assert np.array_equal(g.arc_edge[gsel], g.arc_edge[wsel])
+
+
+def test_closed_loop_edge_path_reduces_to_waypoints_with_same_origin_and_destination():
+    pts = {"H": (0, 0), "E": (12, 0), "N": (12, 10), "W": (0, 10)}
+    ring = [("H", "E", SLOW), ("E", "N", SLOW), ("N", "W", SLOW), ("W", "H", SLOW)]
+    # Add an interior chord so there are junctions and alternative paths.
+    g, idx = build(pts, ring + [("H", "N", FAST)])
+    edge_path = [edge_id(g, idx, a, b) for a, b, _ in ring]
+    res = reduce_to_waypoints(g, edge_path=edge_path)
+    assert res.count >= 1
+    assert res.overlap == pytest.approx(1.0, abs=1e-6)
+    assert res.meets_target
+    q = parse_qs(urlparse(res.url).query)
+    assert q["origin"] == q["destination"]
+    assert "waypoints" in q and q["waypoints"][0]
+
+
+def test_editable_waypoint_cap_is_seven_for_open_and_closed_routes():
+    assert EDITABLE_STOPS == 9
+    assert editable_waypoint_cap(False) == 7
+    assert editable_waypoint_cap(True) == 7
+
+
+def test_pruning_penalises_uturn_joins():
+    # Three greedy waypoints on A -> B:
+    # - Detour 1 (A-D1-D2-M, bypassed by A-M) loses ~3.8 km if w0 is dropped, with no U-turn.
+    # - Detour 2 (M-U-V, bypassed by M-V) needs w1 on U-V, and V-B (~2.2 km slow) is bypassed by
+    #   a fast highway U-B so it needs w2 on V-B. Dropping w2 makes leg w1 -> B reverse back along
+    #   U-V to U (`exit_back`, a U-turn) with only ~2.2 km of plain miss. UTURN_PENALTY_M must
+    #   outweigh Detour 1's ~3.8 km plain miss so max_waypoints=2 keeps {w1, w2} with 0 U-turns.
+    assert UTURN_PENALTY_M >= 5_000.0
+    pts = {
+        "A": (0, 0), "D1": (0, 1.2), "D2": (1.4, 1.2), "M": (1.4, 0),
+        "U": (4.0, 2.5), "V": (7.2, 2.5), "B": (8.0, 0.5),
+    }
+    edges = [
+        ("A", "M", FAST),
+        ("A", "D1", SLOW), ("D1", "D2", SLOW), ("D2", "M", SLOW),
+        ("M", "V", FAST),
+        ("M", "U", SLOW), ("U", "V", SLOW),
+        ("U", "B", 45.0),
+        ("V", "B", 4.0),
+    ]
+    g, idx = build(pts, edges)
+    nodes = [idx[n] for n in ("A", "D1", "D2", "M", "U", "V", "B")]
+
+    full = reduce_to_waypoints(g, nodes, max_gap_m=None)
+    assert full.count == 3 and full.summary()["uturn_legs"] == 0
+
+    capped = reduce_to_waypoints(g, nodes, max_waypoints=2, max_gap_m=None)
+    assert capped.count == 2
+    assert capped.summary()["uturn_legs"] == 0
+    kept_edges = {w.edge for w in capped.waypoints}
+    assert edge_id(g, idx, "V", "B") in kept_edges
+
+
+def _chain_detour_graph(n_detours: int = 10):
+    """Chain of n_detours independent scenic bows, each needing its own waypoint."""
+    pts = {}
+    edges = []
+    open_names = ["J0"]
+    pts["J0"] = (0.0, 0.0)
+    for k in range(n_detours):
+        x0, x1 = 8.0 * k, 8.0 * (k + 1)
+        n1, n2, j1 = f"N{k}", f"P{k}", f"J{k + 1}"
+        pts[n1] = (x0 + 2.0, 2.5)
+        pts[n2] = (x1 - 2.0, 2.5)
+        pts[j1] = (x1, 0.0)
+        edges.append((f"J{k}", j1, FAST))
+        edges.extend([(f"J{k}", n1, SLOW), (n1, n2, SLOW), (n2, j1, SLOW)])
+        open_names.extend([n1, n2, j1])
+    # Closing scenic south bow from J{n} back to J0 for closed-loop tests
+    end = f"J{n_detours}"
+    x_end = 8.0 * n_detours
+    pts["S1"] = (x_end - 2.0, -3.0)
+    pts["S2"] = (2.0, -3.0)
+    edges.append((end, "J0", FAST))
+    edges.extend([(end, "S1", SLOW), ("S1", "S2", SLOW), ("S2", "J0", SLOW)])
+    g, idx = build(pts, edges)
+    open_nodes = [idx[n] for n in open_names]
+    loop_names = open_names + ["S1", "S2", "J0"]
+    loop_edges = [edge_id(g, idx, a, b) for a, b in zip(loop_names[:-1], loop_names[1:])]
+    return g, idx, open_nodes, loop_edges
+
+
+def test_split_waypoints_returns_empty_parts_when_single_link_fits():
+    g, _, nodes = two_detour_graph()
+    single, full, parts = split_waypoints(g, nodes)
+    assert parts == []
+    assert single.count == full.count == 4
+    assert not single.capped
+
+
+def test_split_waypoints_splits_open_routes_and_closed_loops_under_editable_cap():
+    g, _, open_nodes, loop_edges = _chain_detour_graph(10)
+
+    # Open route needing >= 10 waypoints (editable single-link cap = 7)
+    single, full, parts = split_waypoints(g, open_nodes)
+    assert single.count <= editable_waypoint_cap(False) == 7
+    assert single.capped
+    assert len(parts) >= 2
+    assert full.overlap == pytest.approx(1.0, abs=1e-6)
+    assert full.summary()["uturn_legs"] == 0
+    for k, p in enumerate(parts):
+        assert len(p.waypoints) <= editable_waypoint_cap(False)
+        q = parse_qs(urlparse(p.url).query)
+        assert q["origin"] != q["destination"]
+        if p.waypoints:
+            assert len(q["waypoints"][0].split("|")) == len(p.waypoints) <= 7
+        if k + 1 < len(parts):
+            assert p.handoff_n is not None
+            assert p.destination == parts[k + 1].origin
+            assert full.waypoints[p.handoff_n - 1].latlon == p.destination
+        else:
+            assert p.handoff_n is None
+            assert p.destination == full.destination
+
+    # Closed loop needing >= 11 waypoints (editable single-link cap = 7, split part cap = 7)
+    single_l, full_l, parts_l = split_waypoints(g, edge_path=loop_edges)
+    assert single_l.origin == single_l.destination
+    assert single_l.count <= editable_waypoint_cap(True) == 7
+    assert len(parts_l) >= 2
+    assert full_l.overlap == pytest.approx(1.0, abs=1e-6)
+    assert full_l.summary()["uturn_legs"] == 0
+    assert parts_l[0].origin == full_l.origin
+    assert parts_l[-1].destination == full_l.destination
+    for k, p in enumerate(parts_l):
+        assert p.origin != p.destination
+        assert len(p.waypoints) <= editable_waypoint_cap(False) == 7
+        if k + 1 < len(parts_l):
+            assert p.destination == parts_l[k + 1].origin
+
+    # Closed loop needing exactly 8 waypoints must ALSO split so no link has 10 stops
+    g8, _, _, loop8 = _chain_detour_graph(7)
+    single8, full8, parts8 = split_waypoints(g8, edge_path=loop8, max_gap_m=None)
+    assert full8.count == 8
+    assert single8.count <= 7 and single8.capped
+    assert len(parts8) == 2
+    assert all(len(p.waypoints) <= 7 for p in parts8)
+
+

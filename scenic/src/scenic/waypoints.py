@@ -62,6 +62,7 @@ COST_EPS = 1e-6
 UTURN_MARGIN_S = 30.0    # a turning-round alternative must be at least this much slower ...
 UTURN_MARGIN = 0.05      # ... and this share of the leg, so Google's different timings don't flip it
 RISK_PENALTY_M = 500.0   # pruning: a leg with a U-turn risk counts as this much off the target
+UTURN_PENALTY_M = 5_000.0  # pruning: a leg that actually turns round or arrives from the far side
 WAYPOINT_COST_M = 50.0   # pruning: a waypoint is worth keeping if it saves more than this off the target
 TIME_MARGIN = 0.1        # default: place waypoints as if the target's own roads were 10% slower
 MAX_GAP_M = 15_000.0     # default: at most this much scenic road between two waypoints
@@ -69,6 +70,13 @@ EXPOSURE_WEIGHT = 0.5    # pruning: cost per metre of scenic road a leg leaves e
 ROW_SLACK_S = 300.0      # Dijkstra rows search this much past what a leg check can use
 GAP_TOL_M = 2 * MIN_END_M  # a leg may run this far over max_gap_m (waypoints keep MIN_END_M off edge ends)
 HORIZON_GAPS = 4         # pruning joins legs over at most this many max_gap_m of scenic road
+# Google Maps' URL parser accepts up to 9 intermediate waypoints (11 stops),
+# whereas its desktop Directions UI counts stop boxes (origin + waypoints +
+# destination, even when origin == destination on a closed loop) and locks route
+# editing at 10 stops ("Maximum number of destinations reached" / "Route cannot
+# be modified further"). Keeping at most 9 stops (7 intermediate waypoints) per
+# link leaves every generated link editable.
+EDITABLE_STOPS = 9
 
 _INDEX: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
@@ -112,6 +120,26 @@ class Leg:
     # scenic road a router that rates roads differently could skip here: the
     # larger of margin_skip_m and the scenic road beyond max_gap_m
     exposure_m: float = 0.0
+
+
+@dataclass
+class WaypointPart:
+    """One editable Google Maps link in a multi-link split of a long route."""
+
+    part: int  # 1-based part number
+    origin: tuple[float, float]
+    destination: tuple[float, float]
+    waypoints: list[Waypoint]
+    first_n: int  # 1-based index of first intermediate waypoint in the full chain (0 if none)
+    last_n: int   # 1-based index of last intermediate waypoint in the full chain (0 if none)
+    handoff_n: int | None  # 1-based index in the full chain of the split waypoint where this part ends
+    handoff_road: str | None
+    eta_s: float
+    length_m: float
+
+    @property
+    def url(self) -> str:
+        return maps_url(self.origin, self.destination, [w.latlon for w in self.waypoints])
 
 
 @dataclass
@@ -165,6 +193,14 @@ class WaypointResult:
             "scenic_km": round(self.scenic_m / 1000, 2),
             "time_margin": self.time_margin,
         }
+
+
+def editable_waypoint_cap(closed: bool = False) -> int:
+    """Most intermediate waypoints per link (7 = 9 stops minus origin and
+    destination) that keep Google Maps editable on both A-to-B routes and closed
+    loops."""
+    _ = closed
+    return EDITABLE_STOPS - 2
 
 
 def uturn_margin(leg_s: float) -> float:
@@ -929,12 +965,17 @@ class _Reducer:
                 ev = plain.leg(plocs[i], plocs[j])
                 if ev is None:
                     continue
-                cost[i, j] = ev.target_m + ev.path_m - 2 * ev.shared + ev.skipped_scenic + RISK_PENALTY_M * ev.risk
+                uturn = ev.exit_back or ev.entry_back
+                cost[i, j] = (ev.target_m + ev.path_m - 2 * ev.shared + ev.skipped_scenic
+                              + UTURN_PENALTY_M * uturn + RISK_PENALTY_M * (ev.risk and not uturn))
                 if exposure:
                     skip = ev.skipped_scenic
                     if plain is not self:
                         em = self.leg(locs[i], locs[j])
-                        skip = self.scenic_between(locs[i], locs[j]) if em is None else em.skipped_scenic
+                        if em is None:
+                            skip = self.scenic_between(locs[i], locs[j])
+                        else:
+                            skip = em.skipped_scenic + RISK_PENALTY_M * ((em.exit_back or em.entry_back) and not uturn)
                     cost[i, j] += EXPOSURE_WEIGHT * max(skip, self.spacing_cost(locs[i], locs[j]))
         # best[c, j]: least cost to reach loc j through c waypoints (j itself counted if it is one)
         n = len(wps)
@@ -1035,6 +1076,87 @@ def _overlap(target_pieces, path_pieces, scenic_edges=frozenset()) -> tuple[floa
 # Entry points
 
 
+def _build_reducers(graph, target: _Target, leg_follow: float, leg_slack_m: float,
+                    time_margin: float, gap: float, scenic, s_fast: float | None
+                    ) -> tuple[_Reducer, _Reducer]:
+    base, pot = _corridor(graph, target, time_margin)
+    r = _Reducer(graph, target, leg_follow, leg_slack_m, matrix=base, max_gap_m=gap, potential=pot)
+    target.set_scenic(_scenic_mask(graph, target, r, scenic, s_fast))
+    search = r
+    if time_margin > 0:
+        edges = np.unique(target.edges)
+        cost = np.array(graph.time_s, dtype=np.float64)
+        cost[edges] *= 1 + time_margin
+        search = _Reducer(graph, target, leg_follow, leg_slack_m, cost=cost,
+                          matrix=_slowed_matrix(graph, edges, 1 + time_margin, base), max_gap_m=gap,
+                          potential=pot)
+    return r, search
+
+
+def _finish_result(graph, target: _Target, r: _Reducer, search: _Reducer,
+                   max_waypoints: int, follow_target: float, time_margin: float,
+                   gap: float, init_notes: list[str] | None = None) -> WaypointResult:
+    notes = list(init_notes or ())
+    # When the spacing rule alone needs more than the budget, space the
+    # greedy pass evenly over the budget instead: pruning picks from its
+    # waypoints, and a grid at max_gap_m would leave legs of 2 or 3 gaps.
+    scen = float(target.cum_scen[-1])
+    search.place_gap_m = gap
+    if math.isfinite(gap) and scen > gap * (max_waypoints + 1):
+        search.place_gap_m = scen / (max_waypoints + 1)
+    if math.isfinite(gap):
+        r.horizon_m = search.horizon_m = max(HORIZON_GAPS * gap, 2 * scen / (max_waypoints + 1))
+    else:
+        r.horizon_m = search.horizon_m = math.inf
+    greedy = search.greedy()
+    best, wps = search.prune(greedy, max_waypoints, plain=r) if greedy else ([], [])
+    needed = len(best)
+    if math.isfinite(gap) and scen > gap:  # the spacing rule alone needs this many
+        needed = max(needed, math.ceil(scen / (gap + GAP_TOL_M)) - 1)
+    capped = needed > max_waypoints
+    if capped:
+        # Over budget. The robust pass's waypoints may not include the ones
+        # our own router needs most, so add those (found as before the
+        # robustness rules: plain time, no spacing) and choose from both.
+        r.place_gap_m = math.inf
+        plain_best, plain_cap = r.prune(r.greedy(), max_waypoints, exposure=False)
+        if len(plain_best) > max_waypoints:
+            notes.append(f"our own router alone needs {_n_waypoints(len(plain_best))}")
+        pool = sorted({(w.index, w.offset_m): w for w in plain_best + plain_cap + greedy}.values(),
+                      key=lambda w: (w.index, w.offset_m))
+        _, wps = search.prune(pool, max_waypoints, plain=r)
+        notes.append(f"needed {_n_waypoints(needed)}; kept the {len(wps)} that leave the least scenic road at risk")
+    legs, pieces, _ = r.evaluate(wps, notes)
+    shared, tm, pm, _ = _overlap(target.pieces(r.origin.pos, r.dest.pos), pieces)
+    _flag_risks(r, search, wps, legs, time_margin, notes)
+    for i, leg in enumerate(legs):
+        if leg.uturn:
+            notes.append(f"leg {i + 1} turns round at a waypoint or arrives from the far side")
+        elif leg.uturn_risk:
+            notes.append(f"leg {i + 1}: turning round at a waypoint is within the U-turn margin")
+    for w in wps:
+        if w.tier > 1:
+            why = {2: "closer than the junction clearance or to the other carriageway", 3: "another road within the parallel radius",
+                   4: "no spot passes the leg check"}[w.tier]
+            notes.append(f"waypoint {_fmt(w.latlon)} on {w.road}: {why}")
+        if w.divided:
+            notes.append(f"waypoint {_fmt(w.latlon)} on {w.road} is on one carriageway of a divided road "
+                         f"(other carriageway {w.carriageway_m:.0f} m away)")
+    t0 = target.nodes[0]
+    t1 = target.nodes[-1]
+    return WaypointResult(
+        waypoints=wps,
+        origin=(round(float(graph.node_lat[t0]), 5), round(float(graph.node_lon[t0]), 5)),
+        destination=(round(float(graph.node_lat[t1]), 5), round(float(graph.node_lon[t1]), 5)),
+        overlap=float(shared / max(tm, pm)) if max(tm, pm) > 0 else 1.0,
+        eta_s=float(sum(leg.our_s for leg in legs)),
+        target_eta_s=float(target.cum_time[-1]),
+        stitched_m=float(pm), target_m=float(tm), needed=needed, capped=capped,
+        follow_target=follow_target, legs=legs, notes=notes,
+        time_margin=float(time_margin), max_gap_m=gap, scenic_m=float(target.cum_scen[-1]),
+    )
+
+
 def reduce_to_waypoints(graph, path=None, *, edge_path=None, max_waypoints: int = 9,
                         follow_target: float = 0.9, leg_follow: float = LEG_FOLLOW,
                         leg_slack_m: float = LEG_SLACK_M, time_margin: float = TIME_MARGIN,
@@ -1073,78 +1195,138 @@ def reduce_to_waypoints(graph, path=None, *, edge_path=None, max_waypoints: int 
     if target.n == 0:
         raise ValueError("empty target route")
     gap = math.inf if max_gap_m is None else float(max_gap_m)
-    notes: list[str] = []
+    init_notes: list[str] = []
     url_cap = _url_cap()
     if max_waypoints > url_cap:
-        notes.append(f"at most {url_cap} waypoints fit in a {MAX_URL}-character link")
+        init_notes.append(f"at most {url_cap} waypoints fit in a {MAX_URL}-character link")
         max_waypoints = url_cap
     time_margin = max(float(time_margin), 0.0)
-    base, pot = _corridor(graph, target, time_margin)
-    r = _Reducer(graph, target, leg_follow, leg_slack_m, matrix=base, max_gap_m=gap, potential=pot)
-    target.set_scenic(_scenic_mask(graph, target, r, scenic, s_fast))
-    search = r
-    if time_margin > 0:
-        edges = np.unique(target.edges)
-        cost = np.array(graph.time_s, dtype=np.float64)
-        cost[edges] *= 1 + time_margin
-        search = _Reducer(graph, target, leg_follow, leg_slack_m, cost=cost,
-                          matrix=_slowed_matrix(graph, edges, 1 + time_margin, base), max_gap_m=gap,
-                          potential=pot)
-    # When the spacing rule alone needs more than the budget, space the
-    # greedy pass evenly over the budget instead: pruning picks from its
-    # waypoints, and a grid at max_gap_m would leave legs of 2 or 3 gaps.
-    scen = float(target.cum_scen[-1])
-    if math.isfinite(gap) and scen > gap * (max_waypoints + 1):
-        search.place_gap_m = scen / (max_waypoints + 1)
-    if math.isfinite(gap):
-        r.horizon_m = search.horizon_m = max(HORIZON_GAPS * gap, 2 * scen / (max_waypoints + 1))
-    greedy = search.greedy()
-    best, wps = search.prune(greedy, max_waypoints, plain=r) if greedy else ([], [])
-    needed = len(best)
-    if math.isfinite(gap) and scen > gap:  # the spacing rule alone needs this many
-        needed = max(needed, math.ceil(scen / (gap + GAP_TOL_M)) - 1)
-    capped = needed > max_waypoints
-    if capped:
-        # Over budget. The robust pass's waypoints may not include the ones
-        # our own router needs most, so add those (found as before the
-        # robustness rules: plain time, no spacing) and choose from both.
-        r.place_gap_m = math.inf
-        plain_best, _ = r.prune(r.greedy(), max_waypoints, exposure=False)
-        if len(plain_best) >= max_waypoints:
-            notes.append(f"our own router alone needs {_n_waypoints(len(plain_best))}")
-        pool = sorted({(w.index, w.offset_m): w for w in plain_best + greedy}.values(),
-                      key=lambda w: (w.index, w.offset_m))
-        _, wps = search.prune(pool, max_waypoints, plain=r)
-        notes.append(f"needed {_n_waypoints(needed)}; kept the {len(wps)} that leave the least scenic road at risk")
-    legs, pieces, _ = r.evaluate(wps, notes)
-    shared, tm, pm, _ = _overlap(target.pieces(r.origin.pos, r.dest.pos), pieces)
-    _flag_risks(r, search, wps, legs, time_margin, notes)
-    for i, leg in enumerate(legs):
-        if leg.uturn:
-            notes.append(f"leg {i + 1} turns round at a waypoint or arrives from the far side")
-        elif leg.uturn_risk:
-            notes.append(f"leg {i + 1}: turning round at a waypoint is within the U-turn margin")
-    for w in wps:
-        if w.tier > 1:
-            why = {2: "closer than the junction clearance or to the other carriageway", 3: "another road within the parallel radius",
-                   4: "no spot passes the leg check"}[w.tier]
-            notes.append(f"waypoint {_fmt(w.latlon)} on {w.road}: {why}")
-        if w.divided:
-            notes.append(f"waypoint {_fmt(w.latlon)} on {w.road} is on one carriageway of a divided road "
-                         f"(other carriageway {w.carriageway_m:.0f} m away)")
-    t0 = target.nodes[0]
-    t1 = target.nodes[-1]
-    return WaypointResult(
-        waypoints=wps,
-        origin=(round(float(graph.node_lat[t0]), 5), round(float(graph.node_lon[t0]), 5)),
-        destination=(round(float(graph.node_lat[t1]), 5), round(float(graph.node_lon[t1]), 5)),
-        overlap=float(shared / max(tm, pm)) if max(tm, pm) > 0 else 1.0,
-        eta_s=float(sum(leg.our_s for leg in legs)),
-        target_eta_s=float(target.cum_time[-1]),
-        stitched_m=float(pm), target_m=float(tm), needed=needed, capped=capped,
-        follow_target=follow_target, legs=legs, notes=notes,
-        time_margin=float(time_margin), max_gap_m=gap, scenic_m=float(target.cum_scen[-1]),
+    r, search = _build_reducers(graph, target, leg_follow, leg_slack_m, time_margin, gap, scenic, s_fast)
+    return _finish_result(graph, target, r, search, max_waypoints, follow_target, time_margin, gap, init_notes)
+
+
+def _partition_parts(full: WaypointResult, n_parts: int, per_part: int) -> list[WaypointPart]:
+    wps = full.waypoints
+    m = len(wps)
+    cum_s = [0.0]
+    for leg in full.legs:
+        cum_s.append(cum_s[-1] + (leg.our_s if math.isfinite(leg.our_s) else leg.target_s))
+    total_s = cum_s[-1] or 1.0
+    endpoints = {full.origin, full.destination}
+    splits: list[int] = []
+    prev = -1
+    for k in range(1, n_parts):
+        rem = n_parts - k
+        lo = max(prev + 1, m - rem * (per_part + 1))
+        hi = min(prev + per_part + 1, m - rem)
+        goal_s = total_s * k / n_parts
+        best_i = min(
+            range(lo, hi + 1),
+            key=lambda i: (
+                wps[i].latlon in endpoints,
+                wps[i].tier >= 4,
+                abs(cum_s[i + 1] - goal_s)
+                + (600.0 if wps[i].tier > 1 else 0.0)
+                + (600.0 if wps[i].divided else 0.0),
+            ),
+        )
+        splits.append(best_i)
+        prev = best_i
+    bounds = [-1] + splits + [m]
+    parts: list[WaypointPart] = []
+    for idx in range(n_parts):
+        a, b = bounds[idx], bounds[idx + 1]
+        sub_wps = wps[a + 1 : b]
+        sub_legs = full.legs[a + 1 : b + 1]
+        orig = full.origin if a == -1 else wps[a].latlon
+        dest = full.destination if b == m else wps[b].latlon
+        parts.append(
+            WaypointPart(
+                part=idx + 1,
+                origin=orig,
+                destination=dest,
+                waypoints=sub_wps,
+                first_n=(a + 2) if sub_wps else 0,
+                last_n=b if sub_wps else 0,
+                handoff_n=(b + 1) if b < m else None,
+                handoff_road=wps[b].road if b < m else None,
+                eta_s=float(sum(leg.our_s if math.isfinite(leg.our_s) else leg.target_s for leg in sub_legs)),
+                length_m=float(sum(leg.our_m if math.isfinite(leg.our_m) else leg.target_m for leg in sub_legs)),
+            )
+        )
+    return parts
+
+
+def split_waypoints(graph, path=None, *, edge_path=None, single_cap: int | None = None,
+                    per_part: int | None = None, max_parts: int = 3,
+                    follow_target: float = 0.9, leg_follow: float = LEG_FOLLOW,
+                    leg_slack_m: float = LEG_SLACK_M, time_margin: float = TIME_MARGIN,
+                    max_gap_m: float | None = MAX_GAP_M, scenic=None,
+                    s_fast: float | None = None) -> tuple[WaypointResult, WaypointResult, list[WaypointPart]]:
+    """Reduce `path` for Google Maps both as a single editable link (`single`)
+    and, when a single link is capped or misses the route, as 2..`max_parts`
+    editable links (`full`, `parts`) whose boundary waypoints double as the
+    destination of part k and the origin of part k + 1.
+
+    Every returned link stays within `editable_waypoint_cap`, so Google Maps
+    opens it without the 'Route cannot be modified further' lock. Returns
+    `(single, single, [])` when one editable link already suffices.
+    """
+    if (path is None) == (edge_path is None):
+        raise ValueError("pass exactly one of path and edge_path")
+    target = _target_from(graph, path, edge_path)
+    if target.n == 0:
+        raise ValueError("empty target route")
+    closed = int(target.nodes[0]) == int(target.nodes[-1])
+    if single_cap is None:
+        single_cap = editable_waypoint_cap(closed)
+    if per_part is None:
+        per_part = editable_waypoint_cap(closed=False)
+    if max_parts < 1:
+        raise ValueError("max_parts must be at least 1")
+    gap = math.inf if max_gap_m is None else float(max_gap_m)
+    time_margin = max(float(time_margin), 0.0)
+    url_cap = _url_cap()
+    single_cap = min(int(single_cap), url_cap)
+    per_part = min(int(per_part), url_cap)
+
+    r, search = _build_reducers(graph, target, leg_follow, leg_slack_m, time_margin, gap, scenic, s_fast)
+    single = _finish_result(graph, target, r, search, single_cap, follow_target, time_margin, gap)
+    single_ok = (
+        single.meets_target
+        and not any(leg.uturn for leg in single.legs)
+        and (
+            not single.capped
+            or (
+                single.overlap >= max(follow_target, 0.995)
+                and all(leg.margin_skip_m <= r.leg_slack_m for leg in single.legs)
+                and (not math.isfinite(gap) or max((leg.scenic_m for leg in single.legs), default=0.0) <= 1.5 * gap)
+            )
+        )
     )
+    if max_parts == 1 or single_ok:
+        return single, single, []
+
+    chain_cap = min(url_cap, max_parts * (per_part + 1) - 1)
+    if chain_cap <= single_cap:
+        return single, single, []
+    full = _finish_result(graph, target, r, search, chain_cap, follow_target, time_margin, gap)
+    if full.count <= single_cap:
+        return single, single, []
+
+    n_parts = min(max_parts, max(2, math.ceil((full.count + 1) / (per_part + 1))))
+    if n_parts > 2:
+        # Prefer 2 links when 2 * (per_part + 1) - 1 waypoints already hold >= 99% with no U-turn
+        two_cap = min(url_cap, 2 * (per_part + 1) - 1)
+        two = _finish_result(graph, target, r, search, two_cap, follow_target, time_margin, gap)
+        if two.count > single_cap and two.overlap >= max(follow_target, 0.99) and not any(leg.uturn for leg in two.legs):
+            full, n_parts = two, 2
+    part_cap = min(url_cap, n_parts * (per_part + 1) - 1)
+    if full.count > part_cap:
+        full = _finish_result(graph, target, r, search, part_cap, follow_target, time_margin, gap)
+    if full.count < n_parts - 1:
+        return single, single, []
+    return single, full, _partition_parts(full, n_parts, per_part)
 
 
 def _n_waypoints(k: int) -> str:
