@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from sglance.models import ClusterEntry, ClusterStatus, PartitionStatus
-from sglance.runner import CommandRunner
+from sglance.runner import (
+    CommandRunner,
+    TransportError,
+    format_ssh_exit_255,
+    format_transport_error,
+)
 
 _SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
 
@@ -17,22 +22,41 @@ class SlurmAdapter:
         self._runner = runner
 
     def query_status(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
+        cluster_flag = (
+            ["-M", cluster_entry.slurm_cluster]
+            if cluster_entry.slurm_cluster is not None
+            else []
+        )
         argv = [
             "env",
             "SLURM_TIME_FORMAT=%s",
             "sinfo",
+            *cluster_flag,
             "-h",
             "-N",
             "-O",
             _SINFO_FIELDS,
         ]
-        result = self._runner.run(cluster_entry, argv)
-        if result.returncode != 0:
-            first_stderr = next(
-                (line.strip() for line in result.stderr.splitlines() if line.strip()),
-                "",
+        try:
+            result = self._runner.run(cluster_entry, argv)
+        except (TransportError, OSError) as exc:
+            return ClusterStatus(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=format_transport_error(exc),
+                partitions=(),
             )
-            error_msg = first_stderr or f"sinfo exited {result.returncode}"
+        if result.returncode != 0:
+            if not cluster_entry.local and result.returncode == 255:
+                error_msg = format_ssh_exit_255(result.stderr)
+            else:
+                first_stderr = next(
+                    (line.strip() for line in result.stderr.splitlines() if line.strip()),
+                    "",
+                )
+                error_msg = first_stderr or f"sinfo exited {result.returncode}"
             return ClusterStatus(
                 cluster=cluster_entry.name,
                 fetched_at=None,

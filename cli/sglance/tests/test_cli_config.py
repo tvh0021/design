@@ -274,3 +274,136 @@ class ConfigCliTests(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), "")
                 self.assertNotEqual(stderr.getvalue().strip(), "")
                 self.assertEqual(runner.calls, [])
+
+    def test_duplicate_cluster_names_exit_two_with_stderr_diagnostic(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            exit_code = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("cluster-a", stderr.getvalue())
+            self.assertEqual(runner.calls, [])
+
+    def test_invalid_cluster_transport_and_slurm_cluster_configs_exit_two(self) -> None:
+        bad_configs = [
+            (
+                "local-with-ssh",
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\nssh = "login.example.edu"\n',
+            ),
+            (
+                "non-bool-local",
+                '[[clusters]]\nname = "cluster-a"\nlocal = "true"\n',
+            ),
+            ("ssh-empty", '[[clusters]]\nname = "cluster-a"\nssh = ""\n'),
+            ("ssh-non-string", '[[clusters]]\nname = "cluster-a"\nssh = 123\n'),
+            (
+                "ssh-leading-dash",
+                '[[clusters]]\nname = "cluster-a"\nssh = "-oProxyCommand=evil"\n',
+            ),
+            (
+                "ssh-space",
+                '[[clusters]]\nname = "cluster-a"\nssh = "login example.edu"\n',
+            ),
+            (
+                "ssh-tab",
+                '[[clusters]]\nname = "cluster-a"\nssh = "login\\texample.edu"\n',
+            ),
+            (
+                "ssh-newline",
+                '[[clusters]]\nname = "cluster-a"\nssh = "login\\nexample.edu"\n',
+            ),
+            (
+                "ssh-comma",
+                '[[clusters]]\nname = "cluster-a"\nssh = "login,example.edu"\n',
+            ),
+            (
+                "ssh-control-bell",
+                '[[clusters]]\nname = "cluster-a"\nssh = "login\\u0007.example.edu"\n',
+            ),
+            (
+                "ssh-control-del",
+                '[[clusters]]\nname = "cluster-a"\nssh = "login\\u007f.example.edu"\n',
+            ),
+            (
+                "slurm-cluster-empty",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = ""\n',
+            ),
+            (
+                "slurm-cluster-non-string",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = true\n',
+            ),
+            (
+                "slurm-cluster-leading-dash",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "-prod"\n',
+            ),
+            (
+                "slurm-cluster-space",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod dev"\n',
+            ),
+            (
+                "slurm-cluster-comma",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod,dev"\n',
+            ),
+            (
+                "slurm-cluster-control-bell",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod\\u0007"\n',
+            ),
+            (
+                "slurm-cluster-control-del",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod\\u007f"\n',
+            ),
+        ]
+        for label, toml_body in bad_configs:
+            with self.subTest(case=label), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(toml_body, encoding="utf-8")
+                env = {
+                    "XDG_CONFIG_HOME": str(root / "config"),
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "HOME": str(root / "home"),
+                }
+                runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                exit_code = main(
+                    ["status"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotEqual(stderr.getvalue().strip(), "")
+                self.assertEqual(runner.calls, [])
+
+

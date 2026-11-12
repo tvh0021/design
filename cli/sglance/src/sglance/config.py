@@ -54,6 +54,7 @@ def load_config(env: Mapping[str, str]) -> tuple[ClusterEntry, ...]:
         raise ConfigError(f"{config_path} must define at least one [[clusters]] entry")
 
     entries: list[ClusterEntry] = []
+    seen_names: set[str] = set()
     for idx, item in enumerate(raw_clusters):
         if not isinstance(item, dict):
             raise ConfigError(f"clusters[{idx}] in {config_path} must be a table")
@@ -65,15 +66,22 @@ def load_config(env: Mapping[str, str]) -> tuple[ClusterEntry, ...]:
         if "name" not in item:
             raise ConfigError(f"clusters[{idx}] in {config_path} is missing required key 'name'")
         name = validate_safe_token(item["name"], field_name=f"clusters[{idx}].name")
+        if name in seen_names:
+            raise ConfigError(f"duplicate cluster name {name!r} in {config_path}")
+        seen_names.add(name)
 
         local = item.get("local", False)
         if not isinstance(local, bool):
             raise ConfigError(f"clusters[{idx}].local in {config_path} must be a boolean")
 
-        if "ssh" in item:
-            ssh: str | None = validate_safe_token(item["ssh"], field_name=f"clusters[{idx}].ssh")
-        elif local:
-            ssh = None
+        if local and "ssh" in item:
+            raise ConfigError(
+                f"clusters[{idx}] ({name!r}) in {config_path} cannot set both local = true and ssh"
+            )
+        if local:
+            ssh: str | None = None
+        elif "ssh" in item:
+            ssh = validate_safe_token(item["ssh"], field_name=f"clusters[{idx}].ssh")
         else:
             ssh = name
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 import os
 import sys
@@ -9,8 +10,13 @@ from typing import NoReturn, TextIO
 
 from sglance.config import ConfigError, load_config
 from sglance.formatters import format_status_json, format_status_table
-from sglance.models import StatusReport
-from sglance.runner import AllowlistedRunner, CommandRunner
+from sglance.models import ClusterEntry, ClusterStatus, StatusReport
+from sglance.runner import (
+    AllowlistError,
+    AllowlistedRunner,
+    CommandRunner,
+    TransportDispatcher,
+)
 from sglance.slurm import SlurmAdapter
 
 
@@ -41,8 +47,22 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         prog="sglance",
         description="Read-only inspection of Slurm cluster capacity, queues, and wait times.",
     )
+    parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=None,
+        metavar="NAME",
+        help="Query only the named configured cluster entry.",
+    )
     subparsers = parser.add_subparsers(dest="subcommand", required=True, parser_class=_CliParser)
     status_parser = subparsers.add_parser("status", help="Show partition CPU, GPU, and node utilization.")
+    status_parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=argparse.SUPPRESS,
+        metavar="NAME",
+        help="Query only the named configured cluster entry.",
+    )
     status_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
     return parser
 
@@ -74,15 +94,25 @@ def main(
         err.write(f"sglance: error: {exc}\n")
         return 2
 
-    if runner is None:
-        err.write("sglance: error: no transport adapter available yet\n")
-        return 2
+    if parsed.cluster is not None:
+        selected_entries = tuple(
+            entry for entry in cluster_entries if entry.name == parsed.cluster
+        )
+        if not selected_entries:
+            configured = ", ".join(entry.name for entry in cluster_entries)
+            err.write(
+                f"sglance: error: unknown cluster {parsed.cluster!r} (configured: {configured})\n"
+            )
+            return 2
+    else:
+        selected_entries = cluster_entries
 
+    effective_runner: CommandRunner = TransportDispatcher() if runner is None else runner
     # Single production enforcement point for the read-only Slurm allowlist.
-    safe_runner = AllowlistedRunner(runner)
+    safe_runner = AllowlistedRunner(effective_runner)
     adapter = SlurmAdapter(safe_runner)
     now = effective_clock()
-    clusters = tuple(adapter.query_status(entry, now=now) for entry in cluster_entries)
+    clusters = _query_clusters_status(adapter, selected_entries, now=now)
     report = StatusReport(clusters=clusters)
 
     if parsed.json_output:
@@ -90,3 +120,35 @@ def main(
     else:
         out.write(format_status_table(report))
     return 0
+
+
+def _query_clusters_status(
+    adapter: SlurmAdapter,
+    entries: Sequence[ClusterEntry],
+    *,
+    now: datetime,
+) -> tuple[ClusterStatus, ...]:
+    with ThreadPoolExecutor(max_workers=len(entries)) as executor:
+        futures = [
+            (entry, executor.submit(adapter.query_status, entry, now=now))
+            for entry in entries
+        ]
+        results: list[ClusterStatus] = []
+        for entry, future in futures:
+            try:
+                results.append(future.result())
+            except (AllowlistError, KeyError):
+                raise
+            except Exception as exc:
+                results.append(
+                    ClusterStatus(
+                        cluster=entry.name,
+                        fetched_at=None,
+                        stale=False,
+                        user_scoped=False,
+                        error=str(exc).strip() or type(exc).__name__,
+                        partitions=(),
+                    )
+                )
+    return tuple(results)
+

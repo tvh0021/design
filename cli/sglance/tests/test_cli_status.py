@@ -5,10 +5,12 @@ import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
+import time
 import unittest
 
 import sglance
-from sglance import CommandResult, main
+from sglance import CommandResult, TransportError, main
 from tests.fakes import FakeRunner
 
 FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
@@ -275,38 +277,6 @@ class StatusCliTests(unittest.TestCase):
                     if len(rest) >= 2 and rest[0] == "-M":
                         rest = rest[2:]
                     self.assertEqual(rest, ["show", "config"])
-
-    def test_no_injected_runner_prints_stderr_error_and_exits_two(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config_dir = root / "config" / "sglance"
-            config_dir.mkdir(parents=True)
-            (config_dir / "config.toml").write_text(
-                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
-                encoding="utf-8",
-            )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            exit_code = main(
-                ["status"],
-                env=env,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(
-                stderr.getvalue(),
-                "sglance: error: no transport adapter available yet\n",
-            )
 
     def test_nonzero_sinfo_returncode_reports_inline_cluster_error(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -578,7 +548,383 @@ class StatusCliTests(unittest.TestCase):
             self.assertIn("cluster-a", str(ctx.exception))
             self.assertIn("sinfo", str(ctx.exception))
 
+    def test_slurm_cluster_entry_passes_dash_m_immediately_after_binary(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-b"\nssh = "login.example.edu"\nslurm_cluster = "prod"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner({("cluster-b", "sinfo"): SYNTHETIC_SINFO_SINGLE_PARTITION})
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            exit_code = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                runner.calls,
+                [
+                    (
+                        "cluster-b",
+                        "ssh",
+                        "login.example.edu",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "sinfo",
+                            "-M",
+                            "prod",
+                            "-h",
+                            "-N",
+                            "-O",
+                            "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|",
+                        ],
+                    )
+                ],
+            )
+
+    def test_cluster_filter_queries_only_selected_entry_and_rejects_unknown_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nlocal = true\n\n'
+                '[[clusters]]\nname = "cluster-c"\nssh = "cluster-c"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner({("cluster-b", "sinfo"): SYNTHETIC_SINFO_SINGLE_PARTITION})
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+
+            exit_code = main(
+                ["status", "--cluster", "cluster-b", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                runner.calls,
+                [
+                    (
+                        "cluster-b",
+                        "local",
+                        None,
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "sinfo",
+                            "-h",
+                            "-N",
+                            "-O",
+                            "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|",
+                        ],
+                    )
+                ],
+            )
+            payload = json.loads(json_out.getvalue())
+            self.assertEqual([c["cluster"] for c in payload["clusters"]], ["cluster-b"])
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            prefix_rc = main(
+                ["--cluster", "cluster-b", "status"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(prefix_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-b\n"
+                "  PARTITION  CPUS           GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                "  cpu        112/256 (44%)  -     4      1      1      2     0     0        0         0\n",
+            )
+
+            unknown_runner = FakeRunner()
+            unknown_out = io.StringIO()
+            unknown_err = io.StringIO()
+            unknown_rc = main(
+                ["status", "--cluster", "cluster-unknown"],
+                env=env,
+                runner=unknown_runner,
+                clock=lambda: FIXED_NOW,
+                stdout=unknown_out,
+                stderr=unknown_err,
+            )
+
+            self.assertEqual(unknown_rc, 2)
+            self.assertEqual(unknown_out.getvalue(), "")
+            self.assertIn("cluster-unknown", unknown_err.getvalue())
+            self.assertEqual(unknown_runner.calls, [])
+
+    def test_three_clusters_isolate_ssh_timeout_and_exit_255_preserving_config_order(self) -> None:
+        sinfo_cluster_a = (
+            "cpu*|node01|allocated|64/0/0/64|(null)|(null)|\n"
+            "cpu*|node02|idle|0/64/0/64|(null)|(null)|\n"
+        )
+        sinfo_cluster_c = "debug|node10|mixed|16/16/0/32|(null)|(null)|\n"
+        expected_sinfo_argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "sinfo",
+            "-h",
+            "-N",
+            "-O",
+            "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|",
+        ]
+
+        failure_cases = [
+            (
+                "ssh-timeout",
+                TransportError("timed out after 25s"),
+                "unreachable (timed out after 25s)",
+            ),
+            (
+                "ssh-exit-255",
+                CommandResult(255, "", "ssh: Connection timed out\n"),
+                "unreachable (ssh: Connection timed out)",
+            ),
+        ]
+
+        for label, cluster_b_response, expected_error in failure_cases:
+            with self.subTest(case=label), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                    '[[clusters]]\nname = "cluster-b"\nssh = "cluster-b"\n\n'
+                    '[[clusters]]\nname = "cluster-c"\nlocal = true\n',
+                    encoding="utf-8",
+                )
+                env = {
+                    "XDG_CONFIG_HOME": str(root / "config"),
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "HOME": str(root / "home"),
+                }
+                runner = FakeRunner(
+                    {
+                        ("cluster-a", "sinfo"): sinfo_cluster_a,
+                        ("cluster-b", "sinfo"): cluster_b_response,
+                        ("cluster-c", "sinfo"): sinfo_cluster_c,
+                    }
+                )
+
+                json_out = io.StringIO()
+                json_err = io.StringIO()
+                json_rc = main(
+                    ["status", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=json_out,
+                    stderr=json_err,
+                )
+
+                self.assertEqual(json_rc, 0)
+                self.assertEqual(json_err.getvalue(), "")
+                self.assertEqual(
+                    sorted(runner.calls, key=lambda c: c[0]),
+                    [
+                        ("cluster-a", "ssh", "login.example.edu", expected_sinfo_argv),
+                        ("cluster-b", "ssh", "cluster-b", expected_sinfo_argv),
+                        ("cluster-c", "local", None, expected_sinfo_argv),
+                    ],
+                )
+                self.assertEqual(
+                    json.loads(json_out.getvalue()),
+                    {
+                        "schema_version": 1,
+                        "command": "status",
+                        "clusters": [
+                            {
+                                "cluster": "cluster-a",
+                                "fetched_at": "2026-11-12T20:00:00Z",
+                                "stale": False,
+                                "user_scoped": False,
+                                "error": None,
+                                "partitions": [
+                                    {
+                                        "partition": "cpu",
+                                        "default": True,
+                                        "cpus_alloc": 64,
+                                        "cpus_total": 128,
+                                        "cpus_utilization": 0.5,
+                                        "gpus_alloc": 0,
+                                        "gpus_total": 0,
+                                        "gpus_utilization": None,
+                                        "nodes_alloc": 1,
+                                        "nodes_mixed": 0,
+                                        "nodes_idle": 1,
+                                        "nodes_down": 0,
+                                        "nodes_drained": 0,
+                                        "nodes_draining": 0,
+                                        "nodes_other": 0,
+                                        "nodes_total": 2,
+                                    }
+                                ],
+                            },
+                            {
+                                "cluster": "cluster-b",
+                                "fetched_at": None,
+                                "stale": False,
+                                "user_scoped": False,
+                                "error": expected_error,
+                                "partitions": [],
+                            },
+                            {
+                                "cluster": "cluster-c",
+                                "fetched_at": "2026-11-12T20:00:00Z",
+                                "stale": False,
+                                "user_scoped": False,
+                                "error": None,
+                                "partitions": [
+                                    {
+                                        "partition": "debug",
+                                        "default": False,
+                                        "cpus_alloc": 16,
+                                        "cpus_total": 32,
+                                        "cpus_utilization": 0.5,
+                                        "gpus_alloc": 0,
+                                        "gpus_total": 0,
+                                        "gpus_utilization": None,
+                                        "nodes_alloc": 0,
+                                        "nodes_mixed": 1,
+                                        "nodes_idle": 0,
+                                        "nodes_down": 0,
+                                        "nodes_drained": 0,
+                                        "nodes_draining": 0,
+                                        "nodes_other": 0,
+                                        "nodes_total": 1,
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                )
+
+                table_out = io.StringIO()
+                table_err = io.StringIO()
+                table_rc = main(
+                    ["status"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=table_out,
+                    stderr=table_err,
+                )
+
+                self.assertEqual(table_rc, 0)
+                self.assertEqual(table_err.getvalue(), "")
+                self.assertEqual(
+                    table_out.getvalue(),
+                    "cluster-a\n"
+                    "  PARTITION  CPUS          GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                    "  cpu*       64/128 (50%)  -     2      1      0      1     0     0        0         0\n"
+                    "\n"
+                    f"cluster-b: {expected_error}\n"
+                    "\n"
+                    "cluster-c\n"
+                    "  PARTITION  CPUS         GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                    "  debug      16/32 (50%)  -     1      0      1      0     0     0        0         0\n",
+                )
+
+    def test_multi_cluster_queries_execute_in_parallel_and_preserve_config_order(self) -> None:
+        barrier = threading.Barrier(3, timeout=0.5)
+
+        class _ConcurrentFakeRunner(FakeRunner):
+            def run(self, cluster_entry: object, argv: list[str]) -> CommandResult:  # type: ignore[override]
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError as exc:
+                    raise TransportError("clusters were not queried concurrently") from exc
+                if getattr(cluster_entry, "name", "") == "cluster-c":
+                    time.sleep(0.02)
+                return super().run(cluster_entry, argv)  # type: ignore[arg-type]
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-c"\nssh = "login.example.edu"\n\n'
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n\n'
+                '[[clusters]]\nname = "cluster-b"\nssh = "cluster-b"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = _ConcurrentFakeRunner(
+                {
+                    ("cluster-c", "sinfo"): "cpu|node01|allocated|32/0/0/32|(null)|(null)|\n",
+                    ("cluster-a", "sinfo"): "cpu|node02|idle|0/64/0/64|(null)|(null)|\n",
+                    ("cluster-b", "sinfo"): "cpu|node03|mixed|16/16/0/32|(null)|(null)|\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            exit_code = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(len(runner.calls), 3)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                [(c["cluster"], c["error"], c["partitions"][0]["cpus_alloc"]) for c in payload["clusters"]],
+                [
+                    ("cluster-c", None, 32),
+                    ("cluster-a", None, 0),
+                    ("cluster-b", None, 16),
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
 
