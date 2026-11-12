@@ -97,28 +97,57 @@ def _parse_gres_gpus(raw: str) -> int:
     without_null_type = re.sub(r":\(null\):", "::", cleaned, flags=re.IGNORECASE)
     if "(" in without_null_type or ")" in without_null_type:
         raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-    untyped_total = 0
-    has_untyped = False
-    typed_total = 0
+    def _is_count(value: str) -> bool:
+        return value.isascii() and value.isdigit()
+
+    def _is_gpu_type(value: str) -> bool:
+        lowered = value.lower()
+        if lowered in {"no_consume", "(null)"}:
+            return False
+        if re.fullmatch(r"\d+[kmgtp]", lowered):
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value)) and any(
+            ch.isascii() and ch.isalpha() for ch in value
+        )
+
+    total_gpus = 0
     for token in cleaned.split(","):
         item = token.strip()
         if not item:
             raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
         parts = [part.strip() for part in item.split(":")]
-        if len(parts) < 2 or any(not part for part in parts):
+        if not parts[0]:
             raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
         if parts[0].lower() != "gpu":
             continue
-        count_str = parts[-1]
-        if len(parts) not in (2, 3) or not (count_str.isascii() and count_str.isdigit()):
+        if any(not part for part in parts):
             raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-        count = int(count_str)
-        if len(parts) == 2 or parts[1].lower() == "(null)":
-            has_untyped = True
-            untyped_total += count
+        if len(parts) == 1:
+            total_gpus += 1
+        elif len(parts) == 2:
+            if _is_count(parts[1]):
+                total_gpus += int(parts[1])
+            elif _is_gpu_type(parts[1]):
+                total_gpus += 1
+            else:
+                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+        elif len(parts) == 3:
+            if not _is_count(parts[2]):
+                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+            if parts[1].lower() not in {"(null)", "no_consume"} and not _is_gpu_type(parts[1]):
+                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+            total_gpus += int(parts[2])
+        elif len(parts) == 4:
+            if (
+                not _is_gpu_type(parts[1])
+                or parts[2].lower() != "no_consume"
+                or not _is_count(parts[3])
+            ):
+                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+            total_gpus += int(parts[3])
         else:
-            typed_total += count
-    return untyped_total if has_untyped else typed_total
+            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+    return total_gpus
 
 
 def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
@@ -136,7 +165,7 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
         is_default = partition_name.endswith("*")
         if is_default:
             partition_name = partition_name[:-1]
-        normalized_state = state_long.rstrip("*~#!%$@^-").lower()
+        normalized_state = state_long.rstrip("*~#!%$@^?+-").lower()
         if not partition_name or not node_host or not normalized_state:
             raise _SlurmParseError(f"malformed sinfo row: {stripped}")
 
