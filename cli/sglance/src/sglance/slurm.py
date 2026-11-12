@@ -5,6 +5,7 @@ import re
 
 from sglance.models import ClusterEntry, ClusterStatus, PartitionStatus
 from sglance.runner import (
+    AllowlistedRunner,
     CommandRunner,
     TransportError,
     format_ssh_exit_255,
@@ -20,7 +21,7 @@ class _SlurmParseError(Exception):
 
 class SlurmAdapter:
     def __init__(self, runner: CommandRunner) -> None:
-        self._runner = runner
+        self._runner = runner if isinstance(runner, AllowlistedRunner) else AllowlistedRunner(runner)
 
     def query_status(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
         cluster_flag = (
@@ -53,11 +54,11 @@ class SlurmAdapter:
             if not cluster_entry.local and result.returncode == 255:
                 error_msg = format_ssh_exit_255(result.stderr)
             else:
-                first_stderr = next(
-                    (line.strip() for line in result.stderr.splitlines() if line.strip()),
+                last_stderr = next(
+                    (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
                     "",
                 )
-                error_msg = first_stderr or f"sinfo exited {result.returncode}"
+                error_msg = last_stderr or f"sinfo exited {result.returncode}"
             return ClusterStatus(
                 cluster=cluster_entry.name,
                 fetched_at=None,

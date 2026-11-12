@@ -137,7 +137,7 @@ def _query_clusters_status(
         for entry, future in futures:
             try:
                 results.append(future.result())
-            except (AllowlistError, KeyError):
+            except AllowlistError:
                 raise
             except Exception as exc:
                 results.append(

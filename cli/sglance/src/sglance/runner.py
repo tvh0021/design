@@ -11,7 +11,19 @@ if TYPE_CHECKING:
 
 _ALLOWED_BINARIES = frozenset({"sinfo", "squeue", "sacct", "scontrol"})
 CLUSTER_TIMEOUT_SECONDS = 25.0
-_SSH_BASE_ARGS = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--")
+_SSH_BASE_ARGS = (
+    "ssh",
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "RemoteCommand=none",
+    "-o",
+    "LogLevel=ERROR",
+    "--",
+)
 
 
 class AllowlistError(ValueError):
@@ -64,9 +76,12 @@ def validate_allowlist(argv: Sequence[str]) -> None:
     binary = argv[2]
     if binary not in _ALLOWED_BINARIES:
         raise AllowlistError(f"Command binary {binary!r} is not on the read-only allowlist.")
+    rest = list(argv[3:])
+    for idx, token in enumerate(rest):
+        if token == "-M" and (idx + 1 >= len(rest) or rest[idx + 1].startswith("-")):
+            raise AllowlistError("Flag '-M' requires a cluster name not starting with '-'.")
     if binary == "scontrol":
-        rest = list(argv[3:])
-        if len(rest) >= 2 and rest[0] == "-M" and not rest[1].startswith("-"):
+        if len(rest) >= 2 and rest[0] == "-M":
             rest = rest[2:]
         if rest != ["show", "config"]:
             raise AllowlistError("Only 'scontrol show config' is permitted.")

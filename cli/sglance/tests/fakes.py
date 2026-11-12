@@ -23,6 +23,10 @@ LookupKey = tuple[str, ...]
 RecordedCall = tuple[str, str, str | None, list[str]]
 
 
+class UnmatchedFakeRequest(BaseException):
+    """Raised when FakeRunner receives a command with no configured response."""
+
+
 class FakeRunner:
     """In-memory command runner test double for CLI seam tests."""
 
@@ -68,7 +72,7 @@ class FakeRunner:
                 if isinstance(outcome, CommandResult):
                     return outcome
                 return CommandResult(returncode=0, stdout=outcome, stderr="")
-        raise KeyError(
+        raise UnmatchedFakeRequest(
             f"Unmatched FakeRunner request for cluster={cluster_name!r}, "
             f"binary={binary!r}, argv={argv_list!r}; "
             f"configured keys={list(self._responses)!r}"
