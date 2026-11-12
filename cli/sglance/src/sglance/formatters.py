@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import UTC, datetime
 import json
 
 from sglance.models import ClusterStatus, StatusReport
@@ -29,17 +30,42 @@ def format_status_json(report: StatusReport) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
-def format_status_table(report: StatusReport) -> str:
-    sections = [_format_cluster_status_section(cluster) for cluster in report.clusters]
+def format_cluster_header(
+    cluster_name: str,
+    *,
+    user_scoped: bool = False,
+    stale: bool = False,
+    fetched_at: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    header = cluster_name
+    if user_scoped:
+        header = f"{header} [user-scoped]"
+    if stale:
+        if now is not None and fetched_at is not None:
+            fetched_dt = datetime.fromisoformat(fetched_at).astimezone(UTC)
+            age_seconds = max(0, int((now.astimezone(UTC) - fetched_dt).total_seconds()))
+            header = f"{header} [cached {age_seconds}s ago]"
+        else:
+            header = f"{header} [cached]"
+    return header
+
+
+def format_status_table(report: StatusReport, *, now: datetime | None = None) -> str:
+    sections = [_format_cluster_status_section(cluster, now=now) for cluster in report.clusters]
     return "\n\n".join(sections) + "\n"
 
 
-def _format_cluster_status_section(cluster: ClusterStatus) -> str:
+def _format_cluster_status_section(cluster: ClusterStatus, *, now: datetime | None = None) -> str:
     if cluster.error is not None:
         return f"{cluster.cluster}: {cluster.error}"
-    header = cluster.cluster
-    if cluster.user_scoped:
-        header = f"{header} [user-scoped]"
+    header = format_cluster_header(
+        cluster.cluster,
+        user_scoped=cluster.user_scoped,
+        stale=cluster.stale,
+        fetched_at=cluster.fetched_at,
+        now=now,
+    )
     if not cluster.partitions:
         return f"{header}\n  (no partitions)"
 

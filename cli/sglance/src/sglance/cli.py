@@ -8,6 +8,7 @@ import os
 import sys
 from typing import NoReturn, TextIO
 
+from sglance.cache import cached_cluster_fetch
 from sglance.config import ConfigError, load_config
 from sglance.formatters import format_status_json, format_status_table
 from sglance.models import ClusterEntry, ClusterStatus, StatusReport
@@ -54,6 +55,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         metavar="NAME",
         help="Query only the named configured cluster entry.",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        dest="refresh",
+        default=False,
+        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+    )
     subparsers = parser.add_subparsers(dest="subcommand", required=True, parser_class=_CliParser)
     status_parser = subparsers.add_parser("status", help="Show partition CPU, GPU, and node utilization.")
     status_parser.add_argument(
@@ -62,6 +70,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         metavar="NAME",
         help="Query only the named configured cluster entry.",
+    )
+    status_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        dest="refresh",
+        default=argparse.SUPPRESS,
+        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
     )
     status_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
     return parser
@@ -112,13 +127,19 @@ def main(
     safe_runner = AllowlistedRunner(effective_runner)
     adapter = SlurmAdapter(safe_runner)
     now = effective_clock()
-    clusters = _query_clusters_status(adapter, selected_entries, now=now)
+    clusters = _query_clusters_status(
+        adapter,
+        selected_entries,
+        env=effective_env,
+        now=now,
+        refresh=parsed.refresh,
+    )
     report = StatusReport(clusters=clusters)
 
     if parsed.json_output:
         out.write(format_status_json(report))
     else:
-        out.write(format_status_table(report))
+        out.write(format_status_table(report, now=now))
     return 0
 
 
@@ -126,11 +147,25 @@ def _query_clusters_status(
     adapter: SlurmAdapter,
     entries: Sequence[ClusterEntry],
     *,
+    env: Mapping[str, str],
     now: datetime,
+    refresh: bool = False,
 ) -> tuple[ClusterStatus, ...]:
     with ThreadPoolExecutor(max_workers=len(entries)) as executor:
         futures = [
-            (entry, executor.submit(adapter.query_status, entry, now=now))
+            (
+                entry,
+                executor.submit(
+                    cached_cluster_fetch,
+                    entry,
+                    command="status",
+                    result_type=ClusterStatus,
+                    fetch=lambda target: adapter.query_status(target, now=now),
+                    env=env,
+                    now=now,
+                    refresh=refresh,
+                ),
+            )
             for entry in entries
         ]
         results: list[ClusterStatus] = []
