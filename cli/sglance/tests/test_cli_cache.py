@@ -5,7 +5,10 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 from tempfile import TemporaryDirectory
+import threading
+import time
 import unittest
 
 from sglance import CommandResult, TransportError, main
@@ -375,10 +378,9 @@ class CacheCliTests(unittest.TestCase):
             self.assertEqual(len(runner.calls), 1)
 
             cache_sglance_dir = root / "cache" / "sglance"
-            cache_files = list(cache_sglance_dir.iterdir())
+            cache_files = [p for p in cache_sglance_dir.iterdir() if p.suffix == ".json"]
             self.assertEqual(len(cache_files), 1)
             cache_file = cache_files[0]
-            self.assertEqual(cache_file.suffix, ".json")
 
             # Cache file must not contain anything beyond what --json prints.
             cli_cluster_json = json.loads(out1.getvalue())["clusters"][0]
@@ -668,3 +670,474 @@ class CacheCliTests(unittest.TestCase):
             self.assertEqual(err3.getvalue(), "")
             self.assertEqual(len(runner.calls), 3)
             self.assertFalse(json.loads(out3.getvalue())["clusters"][0]["stale"])
+
+    def test_deeply_nested_and_oversized_cache_files_recover_as_miss(self) -> None:
+        expected_healthy_table = (
+            "cluster-a\n"
+            "  PARTITION  CPUS          GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+            "  cpu        64/128 (50%)  -     2      1      0      1     0     0        0         0\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner({("cluster-a", "sinfo"): SINFO_INITIAL})
+
+            # First run populates the cache entry.
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(err1.getvalue(), "")
+            self.assertEqual(len(runner.calls), 1)
+            self.assertEqual(out1.getvalue(), expected_healthy_table)
+
+            cache_sglance_dir = root / "cache" / "sglance"
+            json_files = [p for p in cache_sglance_dir.iterdir() if p.suffix == ".json"]
+            self.assertEqual(len(json_files), 1)
+            cache_file = json_files[0]
+            valid_snapshot_text = cache_file.read_text(encoding="utf-8")
+
+            # Deeply nested JSON triggers RecursionError in json.loads -> treated as miss.
+            cache_file.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME + timedelta(seconds=15),
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(out2.getvalue(), expected_healthy_table)
+
+            # Valid JSON padded past 4 MB cap is skipped without parsing -> treated as miss.
+            oversized_padding = " " * (4 * 1024 * 1024 + 1)
+            cache_file.write_text(oversized_padding + valid_snapshot_text, encoding="utf-8")
+            out3, err3 = io.StringIO(), io.StringIO()
+            rc3 = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME + timedelta(seconds=30),
+                stdout=out3,
+                stderr=err3,
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(err3.getvalue(), "")
+            self.assertEqual(len(runner.calls), 3)
+            self.assertEqual(out3.getvalue(), expected_healthy_table)
+
+    def test_concurrent_cold_misses_coalesce_to_single_runner_call(self) -> None:
+        num_threads = 6
+        start_barrier = threading.Barrier(num_threads, timeout=5.0)
+
+        class _SlowFakeRunner(FakeRunner):
+            def run(self, cluster_entry: object, argv: list[str]) -> CommandResult:  # type: ignore[override]
+                time.sleep(0.08)
+                return super().run(cluster_entry, argv)  # type: ignore[arg-type]
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = _SlowFakeRunner({("cluster-a", "sinfo"): SINFO_INITIAL})
+
+            results: list[tuple[int, str, str]] = [(-1, "", "")] * num_threads
+            errors: list[BaseException] = []
+            errors_lock = threading.Lock()
+
+            def worker(idx: int) -> None:
+                try:
+                    start_barrier.wait()
+                    out, err = io.StringIO(), io.StringIO()
+                    rc = main(
+                        ["status", "--json"],
+                        env=env,
+                        runner=runner,
+                        clock=lambda: BASE_TIME,
+                        stdout=out,
+                        stderr=err,
+                    )
+                    results[idx] = (rc, out.getvalue(), err.getvalue())
+                except BaseException as exc:  # noqa: BLE001
+                    with errors_lock:
+                        errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15.0)
+                self.assertFalse(t.is_alive())
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(runner.calls), 1)
+
+            stale_flags: list[bool] = []
+            for rc, raw_out, raw_err in results:
+                self.assertEqual(rc, 0)
+                self.assertEqual(raw_err, "")
+                payload = json.loads(raw_out)
+                cluster_payload = payload["clusters"][0]
+                stale_flags.append(cluster_payload["stale"])
+                self.assertEqual(
+                    {k: v for k, v in cluster_payload.items() if k != "stale"},
+                    {
+                        "cluster": "cluster-a",
+                        "fetched_at": "2026-11-12T20:00:00Z",
+                        "user_scoped": False,
+                        "error": None,
+                        "partitions": [
+                            {
+                                "partition": "cpu",
+                                "default": False,
+                                "cpus_alloc": 64,
+                                "cpus_total": 128,
+                                "cpus_utilization": 0.5,
+                                "gpus_alloc": 0,
+                                "gpus_total": 0,
+                                "gpus_utilization": None,
+                                "nodes_alloc": 1,
+                                "nodes_mixed": 0,
+                                "nodes_idle": 1,
+                                "nodes_down": 0,
+                                "nodes_drained": 0,
+                                "nodes_draining": 0,
+                                "nodes_other": 0,
+                                "nodes_total": 2,
+                            }
+                        ],
+                    },
+                )
+            # Exactly one caller performed the live fetch (stale=False); the other 5 hit the cache (stale=True).
+            self.assertEqual(sorted(stale_flags), [False] + [True] * (num_threads - 1))
+
+            # If locking fails for any reason (e.g., <digest>.lock is a directory), cold fetch still succeeds.
+            cache_sglance_dir = root / "cache" / "sglance"
+            for item in list(cache_sglance_dir.iterdir()):
+                if item.suffix == ".json":
+                    item.unlink()
+                elif item.suffix == ".lock":
+                    item.unlink()
+                    item.mkdir()
+            fallback_out, fallback_err = io.StringIO(), io.StringIO()
+            fallback_rc = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME + timedelta(seconds=10),
+                stdout=fallback_out,
+                stderr=fallback_err,
+            )
+            self.assertEqual(fallback_rc, 0)
+            self.assertEqual(fallback_err.getvalue(), "")
+            self.assertEqual(len(runner.calls), 2)
+            self.assertFalse(json.loads(fallback_out.getvalue())["clusters"][0]["stale"])
+
+    def test_cache_write_and_serialization_failures_preserve_live_result_and_clean_temp_files(
+        self,
+    ) -> None:
+        from sglance.cache import cached_cluster_fetch
+        from sglance.models import ClusterEntry, ClusterStatus, PartitionStatus
+
+        expected_healthy_table = (
+            "cluster-a\n"
+            "  PARTITION  CPUS          GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+            "  cpu        64/128 (50%)  -     2      1      0      1     0     0        0         0\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner({("cluster-a", "sinfo"): SINFO_INITIAL})
+
+            # Populate initial cache file to locate its exact digest path.
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            cache_sglance_dir = root / "cache" / "sglance"
+            json_files = [p for p in cache_sglance_dir.iterdir() if p.suffix == ".json"]
+            self.assertEqual(len(json_files), 1)
+            cache_file = json_files[0]
+
+            # Replace <digest>.json with a directory so os.replace fails after writing .tmp.
+            cache_file.unlink()
+            cache_file.mkdir()
+
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME + timedelta(seconds=15),
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(out2.getvalue(), expected_healthy_table)
+            tmp_files = [p for p in cache_sglance_dir.iterdir() if p.suffix == ".tmp"]
+            self.assertEqual(tmp_files, [])
+            cache_file.rmdir()
+
+            # Serialization failures (ValueError on NaN, TypeError on unserializable field)
+            # must also preserve the live result without raising or leaving .tmp files.
+            entry = ClusterEntry(name="cluster-a", ssh="login.example.edu")
+            nan_status = ClusterStatus(
+                cluster="cluster-a",
+                fetched_at="2026-11-12T20:00:30Z",
+                stale=False,
+                user_scoped=False,
+                error=None,
+                partitions=(
+                    PartitionStatus(
+                        partition="cpu",
+                        default=False,
+                        cpus_alloc=64,
+                        cpus_total=128,
+                        cpus_utilization=float("nan"),
+                        gpus_alloc=0,
+                        gpus_total=0,
+                        gpus_utilization=None,
+                        nodes_alloc=1,
+                        nodes_mixed=0,
+                        nodes_idle=1,
+                        nodes_down=0,
+                        nodes_drained=0,
+                        nodes_draining=0,
+                        nodes_other=0,
+                        nodes_total=2,
+                    ),
+                ),
+            )
+            got_nan = cached_cluster_fetch(
+                entry,
+                command="status",
+                result_type=ClusterStatus,
+                fetch=lambda _target: nan_status,
+                env=env,
+                now=BASE_TIME + timedelta(seconds=30),
+                schema_version=1,
+            )
+            self.assertEqual(got_nan.cluster, "cluster-a")
+            self.assertIsNone(got_nan.error)
+            self.assertEqual([p for p in cache_sglance_dir.iterdir() if p.suffix == ".tmp"], [])
+
+            unserializable_status = ClusterStatus(
+                cluster="cluster-a",
+                fetched_at="2026-11-12T20:00:45Z",
+                stale=False,
+                user_scoped=False,
+                error=None,
+                partitions=(object(),),  # type: ignore[arg-type]
+            )
+            got_type_err = cached_cluster_fetch(
+                entry,
+                command="status",
+                result_type=ClusterStatus,
+                fetch=lambda _target: unserializable_status,
+                env=env,
+                now=BASE_TIME + timedelta(seconds=45),
+                schema_version=1,
+            )
+            self.assertEqual(got_type_err.cluster, "cluster-a")
+            self.assertIsNone(got_type_err.error)
+            self.assertEqual([p for p in cache_sglance_dir.iterdir() if p.suffix == ".tmp"], [])
+
+    def test_cached_cluster_fetch_requires_explicit_schema_version_and_isolates_versions(
+        self,
+    ) -> None:
+        from sglance.cache import cached_cluster_fetch
+        from sglance.models import ClusterEntry, ClusterStatus
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            entry = ClusterEntry(name="cluster-a", ssh="login.example.edu")
+
+            # Omitting schema_version must raise TypeError (no default allowed).
+            with self.assertRaises(TypeError):
+                cached_cluster_fetch(  # type: ignore[call-arg]
+                    entry,
+                    command="status",
+                    result_type=ClusterStatus,
+                    fetch=lambda _target: ClusterStatus(
+                        cluster="cluster-a",
+                        fetched_at="2026-11-12T20:00:00Z",
+                        stale=False,
+                        user_scoped=False,
+                        error=None,
+                        partitions=(),
+                    ),
+                    env=env,
+                    now=BASE_TIME,
+                )
+
+            # Seed schema_version=2 for status; CLI status (schema_version=1) must miss and fetch live.
+            v2_calls = 0
+
+            def fetch_v2(_target: ClusterEntry) -> ClusterStatus:
+                nonlocal v2_calls
+                v2_calls += 1
+                return ClusterStatus(
+                    cluster="cluster-a",
+                    fetched_at="2026-11-12T20:00:00Z",
+                    stale=False,
+                    user_scoped=False,
+                    error=None,
+                    partitions=(),
+                )
+
+            cached_cluster_fetch(
+                entry,
+                command="status",
+                result_type=ClusterStatus,
+                fetch=fetch_v2,
+                env=env,
+                now=BASE_TIME,
+                schema_version=2,
+            )
+            self.assertEqual(v2_calls, 1)
+
+            runner = FakeRunner({("cluster-a", "sinfo"): SINFO_INITIAL})
+            out, err = io.StringIO(), io.StringIO()
+            rc = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME + timedelta(seconds=10),
+                stdout=out,
+                stderr=err,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(len(runner.calls), 1)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertFalse(payload["clusters"][0]["stale"])
+            self.assertEqual(len(payload["clusters"][0]["partitions"]), 1)
+
+    @unittest.skipIf(os.name != "posix", "POSIX permissions are not enforced on non-POSIX systems")
+    def test_cache_directory_and_files_enforce_0700_and_0600_modes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner({("cluster-a", "sinfo"): SINFO_INITIAL})
+
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(err1.getvalue(), "")
+
+            cache_sglance_dir = root / "cache" / "sglance"
+            self.assertEqual(stat.S_IMODE(cache_sglance_dir.stat().st_mode), 0o700)
+
+            entries = list(cache_sglance_dir.iterdir())
+            self.assertTrue(any(p.suffix == ".json" for p in entries))
+            for path in entries:
+                self.assertEqual(
+                    stat.S_IMODE(path.stat().st_mode),
+                    0o600,
+                    f"expected 0o600 for {path.name}",
+                )
+
+            # Even if existing permissions were widened externally, refreshing restores 0o700 / 0o600.
+            cache_sglance_dir.chmod(0o755)
+            for path in entries:
+                path.chmod(0o644)
+
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["status", "--refresh", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME + timedelta(seconds=30),
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            self.assertEqual(stat.S_IMODE(cache_sglance_dir.stat().st_mode), 0o700)
+            for path in cache_sglance_dir.iterdir():
+                self.assertEqual(
+                    stat.S_IMODE(path.stat().st_mode),
+                    0o600,
+                    f"expected 0o600 after refresh for {path.name}",
+                )
+
+
+
+
+

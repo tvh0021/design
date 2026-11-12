@@ -3,18 +3,28 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import dataclasses
 from datetime import UTC, datetime
+import errno
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import stat
 import tempfile
+import time
 import types
 from typing import Any, NoReturn, Protocol, TypeVar, Union, get_args, get_origin, get_type_hints
 
 from sglance.models import ClusterEntry
 
 CACHE_TTL_SECONDS = 300
+MAX_CACHE_FILE_BYTES = 4 * 1024 * 1024
+CACHE_LOCK_TIMEOUT_SECONDS = 10.0
+CACHE_LOCK_POLL_SECONDS = 0.01
 
 
 class CacheableClusterResult(Protocol):
@@ -38,31 +48,98 @@ def cached_cluster_fetch(
     entry: ClusterEntry,
     *,
     command: str,
+    schema_version: int,
     result_type: type[T],
     fetch: Callable[[ClusterEntry], T],
     env: Mapping[str, str],
     now: datetime,
     refresh: bool = False,
     options: Mapping[str, str | int | float | bool | None] | None = None,
-    schema_version: int = 1,
 ) -> T:
     """Fetch a per-cluster result through the 5-minute XDG response cache."""
     cache_dir = _resolve_cache_dir(env)
-    cache_path = (
-        cache_dir / f"{_cache_key_digest(entry, command=command, options=options, schema_version=schema_version)}.json"
-        if cache_dir is not None
-        else None
-    )
+    if cache_dir is None:
+        return fetch(entry)
 
-    if not refresh and cache_path is not None:
+    digest = _cache_key_digest(
+        entry,
+        command=command,
+        options=options,
+        schema_version=schema_version,
+    )
+    cache_path = cache_dir / f"{digest}.json"
+
+    if not refresh:
         cached = _read_valid_snapshot(cache_path, entry=entry, result_type=result_type, now=now)
         if cached is not None:
             return cached
 
-    live_result = fetch(entry)
-    if cache_path is not None and live_result.error is None and live_result.fetched_at is not None:
-        _write_snapshot_atomic(cache_path, live_result)
-    return live_result
+    lock_fd = _acquire_cache_lock(cache_dir / f"{digest}.lock")
+    try:
+        if lock_fd is not None and not refresh:
+            cached = _read_valid_snapshot(cache_path, entry=entry, result_type=result_type, now=now)
+            if cached is not None:
+                return cached
+
+        live_result = fetch(entry)
+        if live_result.error is None and live_result.fetched_at is not None:
+            _write_snapshot_atomic(cache_path, live_result)
+        return live_result
+    finally:
+        if lock_fd is not None:
+            _release_cache_lock(lock_fd)
+
+
+def _ensure_cache_dir(cache_dir: Path) -> None:
+    cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(cache_dir, 0o700)
+
+
+def _acquire_cache_lock(lock_path: Path) -> int | None:
+    if fcntl is None:
+        return None
+    fd: int | None = None
+    try:
+        _ensure_cache_dir(lock_path.parent)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover
+            os.chmod(lock_path, 0o600)
+        deadline = time.monotonic() + CACHE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fd_to_close = fd
+                    fd = None
+                    os.close(fd_to_close)
+                    return None
+                time.sleep(min(CACHE_LOCK_POLL_SECONDS, remaining))
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
+def _release_cache_lock(lock_fd: int) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
 
 
 def _resolve_cache_dir(env: Mapping[str, str]) -> Path | None:
@@ -115,7 +192,14 @@ def _read_valid_snapshot(
     now: datetime,
 ) -> T | None:
     try:
-        raw_text = cache_path.read_text(encoding="utf-8")
+        with cache_path.open("rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_CACHE_FILE_BYTES:
+                return None
+            raw_bytes = fh.read(MAX_CACHE_FILE_BYTES + 1)
+        if len(raw_bytes) > MAX_CACHE_FILE_BYTES:
+            return None
+        raw_text = raw_bytes.decode("utf-8")
         raw_payload = json.loads(raw_text, parse_constant=_reject_json_constant)
         loaded = _decode_value(result_type, raw_payload)
         if loaded.cluster != entry.name or loaded.error is not None or loaded.fetched_at is None:
@@ -129,16 +213,16 @@ def _read_valid_snapshot(
         if not (0 <= age_seconds < CACHE_TTL_SECONDS):
             return None
         return dataclasses.replace(loaded, stale=True)  # type: ignore[type-var]
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+    except Exception:
         return None
 
 
 def _write_snapshot_atomic(cache_path: Path, result: T) -> None:
-    snapshot = dataclasses.replace(result, stale=False)  # type: ignore[type-var]
-    serialized = json.dumps(dataclasses.asdict(snapshot), indent=2, allow_nan=False) + "\n"
     tmp_path: str | None = None
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = dataclasses.replace(result, stale=False)  # type: ignore[type-var]
+        serialized = json.dumps(dataclasses.asdict(snapshot), indent=2, allow_nan=False) + "\n"
+        _ensure_cache_dir(cache_path.parent)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -149,9 +233,12 @@ def _write_snapshot_atomic(cache_path: Path, result: T) -> None:
         ) as fh:
             tmp_path = fh.name
             fh.write(serialized)
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, cache_path)
         tmp_path = None
-    except OSError:
+    except (OSError, ValueError, TypeError):
+        return
+    finally:
         if tmp_path is not None:
             try:
                 os.unlink(tmp_path)
