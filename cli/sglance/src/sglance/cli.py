@@ -106,6 +106,46 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
     )
     queue_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+
+    def _parse_days(raw: str) -> int:
+        has_digits = (
+            raw[1:].isascii() and raw[1:].isdigit()
+            if raw[:1] in {"+", "-"}
+            else raw.isascii() and raw.isdigit()
+        )
+        if not raw or not has_digits:
+            raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
+        value = int(raw, 10)
+        if value < 1:
+            raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
+        return value
+
+    wait_parser = subparsers.add_parser(
+        "wait",
+        help="Show historical wait-time percentiles and oldest eligible pending job age per partition.",
+    )
+    wait_parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=argparse.SUPPRESS,
+        metavar="NAME",
+        help="Query only the named configured cluster entry.",
+    )
+    wait_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        dest="refresh",
+        default=argparse.SUPPRESS,
+        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+    )
+    wait_parser.add_argument(
+        "--days",
+        type=_parse_days,
+        default=7,
+        metavar="N",
+        help="Lookback window in days for historical wait times (integer >= 1, default: 7).",
+    )
+    wait_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
     return parser
 
 
@@ -168,6 +208,39 @@ def main(
             out.write(format_queue_json(queue_report))
         else:
             out.write(format_queue_table(queue_report, now=now))
+        return 0
+
+    if parsed.subcommand == "wait":
+        from sglance.formatters import format_wait_json, format_wait_table
+        from sglance.models import ClusterWait, WaitReport
+
+        wait_clusters = _query_clusters(
+            selected_entries,
+            lambda entry: cached_cluster_fetch(
+                entry,
+                command="wait",
+                schema_version=WaitReport.schema_version,
+                result_type=ClusterWait,
+                fetch=lambda target: adapter.query_wait(target, days=parsed.days, now=now),  # type: ignore[return-value]
+                env=effective_env,
+                now=now,
+                refresh=parsed.refresh,
+                options={"days": parsed.days},
+            ),
+            lambda entry, error_text: ClusterWait(
+                cluster=entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=error_text,
+                partitions=(),
+            ),
+        )
+        wait_report = WaitReport(clusters=wait_clusters, days=parsed.days)
+        if parsed.json_output:
+            out.write(format_wait_json(wait_report))
+        else:
+            out.write(format_wait_table(wait_report, now=now))
         return 0
 
     clusters = _query_clusters_status(

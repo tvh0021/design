@@ -1,0 +1,789 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta, timezone
+import io
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from sglance import CommandResult, TransportError, main
+from tests.fakes import FakeRunner, make_test_env
+
+# 2026-11-12T20:00:00Z == 1794513600 Unix epoch seconds.
+FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
+
+
+class WaitCliTests(unittest.TestCase):
+    def test_wait_rejects_non_positive_or_non_integer_days_with_exit_two_before_runner_calls(
+        self,
+    ) -> None:
+        bad_values = ("0", "-1", "-14", "abc", "2.5", "", "1_0")
+        for bad in bad_values:
+            for argv in (["wait", "--days", bad], [f"--days={bad}", "wait"]):
+                if argv[0].startswith("--days="):
+                    argv = ["wait", f"--days={bad}"]
+                with self.subTest(argv=argv), TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    config_dir = root / "config" / "sglance"
+                    config_dir.mkdir(parents=True)
+                    (config_dir / "config.toml").write_text(
+                        '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                        encoding="utf-8",
+                    )
+                    runner = FakeRunner()
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+
+                    exit_code = main(
+                        argv,
+                        env=make_test_env(root),
+                        runner=runner,
+                        clock=lambda: FIXED_NOW,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+
+                    self.assertEqual(exit_code, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("--days", stderr.getvalue())
+                    self.assertEqual(runner.calls, [])
+
+    def test_wait_records_exact_slurm_argv_and_computes_standalone_percentiles_in_json(
+        self,
+    ) -> None:
+        sacct_cluster_a = (
+            "1001|1001|alice|cpu|COMPLETED|1794500000|1794500000|1794500060|1|8|cpu=8|cpu=8|01:00:00\n"
+            "1002|1002|bob|cpu|RUNNING|1794501000|1794501000|1794501600|2|16|cpu=16|cpu=16|02:00:00\n"
+            "1003|1003|alice|cpu|TIMEOUT|1794502000|1794502000|1794502120|1|8|cpu=8|cpu=8|00:30:00\n"
+            "1004|1004|bob|cpu|FAILED|1794503000|1794503000|1794503300|1|4|cpu=4|cpu=4|01:00:00\n"
+            "2001|2001|alice|gpu|OUT_OF_MEMORY|1794505000|1794505000|1794505045|1|8|cpu=8,gres/gpu=1|cpu=8,gres/gpu=1|04:00:00\n"
+        )
+        sacct_cluster_b = (
+            "3001|3001|alice|gpu|COMPLETED|1794000000|1794000000|1794000000|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "3002|3002|bob|gpu|NODE_FAIL|1794001000|1794001000|1794001013|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "3003|3003|alice|gpu|PREEMPTED|1794002000|1794002000|1794002000|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "3004|3004|bob|gpu|CANCELLED by 1001|1794003000|1794003000|1794003010|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nssh = "cluster-b"\nslurm_cluster = "prod"\n',
+                encoding="utf-8",
+            )
+
+            runner_a = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_cluster_a,
+                    ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
+            out_a = io.StringIO()
+            err_a = io.StringIO()
+            rc_a = main(
+                ["wait", "--cluster", "cluster-a", "--json"],
+                env=make_test_env(root),
+                runner=runner_a,
+                clock=lambda: FIXED_NOW,
+                stdout=out_a,
+                stderr=err_a,
+            )
+
+            self.assertEqual(rc_a, 0)
+            self.assertEqual(err_a.getvalue(), "")
+            self.assertEqual(
+                runner_a.calls,
+                [
+                    (
+                        "cluster-a",
+                        "ssh",
+                        "login.example.edu",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "sacct",
+                            "-X",
+                            "-P",
+                            "-n",
+                            "-a",
+                            "-S",
+                            "now-7days",
+                            "--state=CD,F,TO,CA,OOM,NF,PR,R",
+                            "--format=JobID,JobIDRaw,User,Partition,State,Submit,Eligible,Start,NNodes,NCPUS,ReqTRES,AllocTRES,Timelimit",
+                        ],
+                    ),
+                    (
+                        "cluster-a",
+                        "ssh",
+                        "login.example.edu",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "squeue",
+                            "-h",
+                            "-r",
+                            "-t",
+                            "PD",
+                            "-O",
+                            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
+                        ],
+                    ),
+                    (
+                        "cluster-a",
+                        "ssh",
+                        "login.example.edu",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "scontrol",
+                            "show",
+                            "config",
+                        ],
+                    ),
+                ],
+            )
+            self.assertEqual(
+                json.loads(out_a.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "wait",
+                    "days": 7,
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "cpu",
+                                    "n": 4,
+                                    "p50_seconds": 210.0,
+                                    "p90_seconds": 510.0,
+                                    "oldest_pending_seconds": None,
+                                },
+                                {
+                                    "partition": "gpu",
+                                    "n": 1,
+                                    "p50_seconds": 45.0,
+                                    "p90_seconds": 45.0,
+                                    "oldest_pending_seconds": None,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            runner_b = FakeRunner(
+                {
+                    ("cluster-b", "sacct"): sacct_cluster_b,
+                    ("cluster-b", "squeue"): "",
+                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
+                }
+            )
+            out_b = io.StringIO()
+            err_b = io.StringIO()
+            rc_b = main(
+                ["wait", "--cluster", "cluster-b", "--days", "14", "--json"],
+                env=make_test_env(root),
+                runner=runner_b,
+                clock=lambda: FIXED_NOW,
+                stdout=out_b,
+                stderr=err_b,
+            )
+
+            self.assertEqual(rc_b, 0)
+            self.assertEqual(err_b.getvalue(), "")
+            self.assertEqual(
+                runner_b.calls,
+                [
+                    (
+                        "cluster-b",
+                        "ssh",
+                        "cluster-b",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "sacct",
+                            "-M",
+                            "prod",
+                            "-X",
+                            "-P",
+                            "-n",
+                            "-a",
+                            "-S",
+                            "now-14days",
+                            "--state=CD,F,TO,CA,OOM,NF,PR,R",
+                            "--format=JobID,JobIDRaw,User,Partition,State,Submit,Eligible,Start,NNodes,NCPUS,ReqTRES,AllocTRES,Timelimit",
+                        ],
+                    ),
+                    (
+                        "cluster-b",
+                        "ssh",
+                        "cluster-b",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "squeue",
+                            "-M",
+                            "prod",
+                            "-h",
+                            "-r",
+                            "-t",
+                            "PD",
+                            "-O",
+                            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
+                        ],
+                    ),
+                    (
+                        "cluster-b",
+                        "ssh",
+                        "cluster-b",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "scontrol",
+                            "-M",
+                            "prod",
+                            "show",
+                            "config",
+                        ],
+                    ),
+                ],
+            )
+            self.assertEqual(
+                json.loads(out_b.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "wait",
+                    "days": 14,
+                    "clusters": [
+                        {
+                            "cluster": "cluster-b",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "gpu",
+                                    "n": 4,
+                                    "p50_seconds": 5.0,
+                                    "p90_seconds": 12.1,
+                                    "oldest_pending_seconds": None,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+    def test_wait_collapses_twenty_task_array_and_filters_prewindow_cancelled_requeued_and_hold_time(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600; 7-day window cutoff = 1794513600 - 604800 = 1793908800.
+        array_rows = []
+        for idx in range(1, 21):
+            start_epoch = 1794200120 if idx == 7 else 1794200300 + idx * 60
+            array_rows.append(
+                f"6000_{idx}|{6000 + idx}|bob|gpu|COMPLETED|1794200000|1794200000|{start_epoch}|1|8|gres/gpu=1|gres/gpu=1|01:00:00"
+            )
+        sacct_lines = [
+            # Pre-window job: started 1s before cutoff (1793908799), ended inside window -> discard.
+            "4001|4001|alice|gpu|COMPLETED|1793900000|1793900000|1793908799|1|8|gres/gpu=1|gres/gpu=1|12:00:00",
+            # Pre-window job on retired partition -> must not emit a phantom partition row.
+            "40010|40010|alice|legacy|COMPLETED|1793800000|1793800000|1793850000|1|8|cpu=8|cpu=8|48:00:00",
+            # Cancelled before start (Start=Unknown and Start=None) -> discard.
+            "4002|4002|bob|gpu|CANCELLED by 1002|1794100000|1794100000|Unknown|1|8|gres/gpu=1||01:00:00",
+            "4003|4003|alice|gpu|CANCELLED|1794100100|1794100100|None|1|8|gres/gpu=1||",
+            # Unknown Eligible -> discard.
+            "4004|4004|bob|gpu|CANCELLED|1794100200|Unknown|Unknown|1|8|gres/gpu=1||01:00:00",
+            # Clock skew / invalid Start < Eligible -> discard.
+            "4005|4005|alice|gpu|COMPLETED|1794100300|1794100500|1794100499|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
+            # Requeued records (standalone + array task with earlier Start) -> discard.
+            "4006|4006|bob|gpu|REQUEUED|1794101000|1794101000|1794109999|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
+            "6000_21|6021|bob|gpu|REQUEUED|1794200000|1794200000|1794200010|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
+            "4007|4007|alice|gpu|REQUEUE_HOLD|1794110000|1794110000|1794119999|1|8|gres/gpu=1||01:00:00",
+            "4008|4008|bob|gpu|PENDING|1794115000|1794115000|Unknown|1|8|gres/gpu=1||01:00:00",
+            # Step row (if present) -> skip leniently.
+            "5001.batch|5001.batch||gpu|COMPLETED|1793908800|1793908800|1793908800|1|8||cpu=8|",
+            # Sample 1: started at exact cutoff (1793908800), wait = 30s.
+            "5001|5001|alice|gpu|COMPLETED|1793908770|1793908770|1793908800|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
+            # Sample 2: 20-task array 6000_1..6000_20, earliest Start is 6000_7 -> wait = 120s.
+            *array_rows,
+            # Sample 3: held job (Eligible > Submit by 7200s), Start - Eligible = 90s.
+            "7001|7001|alice|gpu|COMPLETED|1794300000|1794307200|1794307290|1|8|gres/gpu=1|gres/gpu=1|02:00:00",
+            # Sample 4: held/dependency job (Eligible > Submit by 3600s), Start - Eligible = 240s.
+            "7002|7002|bob|gpu|COMPLETED|1794350000|1794353600|1794353840|1|8|gres/gpu=1|gres/gpu=1|02:00:00",
+            # Sample 5: standalone running job, Start - Eligible = 600s.
+            "7003|7003|alice|gpu|RUNNING|1794400000|1794400000|1794400600|1|8|gres/gpu=1|gres/gpu=1|04:00:00",
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): "\n".join(sacct_lines) + "\n",
+                    ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            # Sorted waits: [30, 90, 120, 240, 600], n = 5
+            # p50: pos = 0.50 * 4 = 2.0 -> 120.0
+            # p90: pos = 0.90 * 4 = 3.6 -> 240 + 0.6 * (600 - 240) = 456.0
+            self.assertEqual(
+                json.loads(stdout.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "wait",
+                    "days": 7,
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "gpu",
+                                    "n": 5,
+                                    "p50_seconds": 120.0,
+                                    "p90_seconds": 456.0,
+                                    "oldest_pending_seconds": None,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+    def test_wait_computes_oldest_pending_age_excluding_non_runnable_reasons_and_invalid_eligible_times(
+        self,
+    ) -> None:
+        # Cluster in UTC+9 (2026-11-13T05:00:00+09:00 == 2026-11-12T20:00:00Z == 1794513600).
+        jst = timezone(timedelta(hours=9))
+        now_jst = datetime(2026, 11, 13, 5, 0, 0, tzinfo=jst)
+
+        sacct_stdout = (
+            "7101|7101|alice|gpu|COMPLETED|1794500000|1794500000|1794500100|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "7102|7102|bob|gpu|COMPLETED|1794501000|1794501000|1794501300|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "7201|7201|alice|cpu|COMPLETED|1794502000|1794502000|1794502060|1|4|cpu=4|cpu=4|00:30:00\n"
+        )
+        squeue_stdout = (
+            # Excluded reasons on gpu (all much older than 5400s):
+            "8001|alice|gpu|PD|JobHeldUser|1794400000|\n"
+            "8002|bob|gpu|PD|JobHeldAdmin|1794410000|\n"
+            "8003|alice|gpu|PD|BeginTime|1794420000|\n"
+            "8004|bob|gpu|PD|Dependency|1794430000|\n"
+            "8005|alice|gpu|PD|DependencyNeverSatisfied|1794440000|\n"
+            "8006|bob|gpu|PD|ReqNodeNotAvail|1794450000|\n"
+            "8007|alice|gpu|PD|ReqNodeNotAvail, UnavailableNodes:node04|1794460000|\n"
+            # Excluded EligibleTime values on gpu:
+            "8008|bob|gpu|PD|Resources|Unknown|\n"
+            "8009|alice|gpu|PD|Priority|N/A|\n"
+            "8010|bob|gpu|PD|Resources|None|\n"
+            "8011|alice|gpu|PD|Priority|1794513601|\n"
+            # Runnable pending jobs on gpu (03:30+09:00 = 1794508200 -> 5400s old; 1800s; 0s):
+            "8012|alice|gpu|PD|Resources|1794508200|\n"
+            "8013|bob|gpu|PD|Priority|1794511800|\n"
+            "8014|alice|gpu|PD|AssocGrpGpuLimit|1794513600|\n"
+            # cpu has only excluded pending jobs -> oldest_pending_seconds = None:
+            "8020|bob|cpu|PD|JobHeldUser|1794490000|\n"
+            "8021|alice|cpu|PD|Resources|1794514000|\n"
+            # Stalled partition debug has n=0 in sacct and multi-partition target debug,cpu -> 3600s on debug only:
+            "8030_1|bob|debug,cpu|PD|Resources|1794510000|\n"
+            "8030_2|bob|debug,cpu|PD|Priority|1794512000|\n"
+            # Hold-only partition with no sacct samples -> must not emit phantom all-null row:
+            "8040|alice|holdonly|PD|Dependency|1794480000|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_stdout,
+                    ("cluster-a", "squeue"): squeue_stdout,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: now_jst,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(stdout.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "wait",
+                    "days": 7,
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "gpu",
+                                    "n": 2,
+                                    "p50_seconds": 200.0,
+                                    "p90_seconds": 280.0,
+                                    "oldest_pending_seconds": 5400,
+                                },
+                                {
+                                    "partition": "cpu",
+                                    "n": 1,
+                                    "p50_seconds": 60.0,
+                                    "p90_seconds": 60.0,
+                                    "oldest_pending_seconds": None,
+                                },
+                                {
+                                    "partition": "debug",
+                                    "n": 0,
+                                    "p50_seconds": None,
+                                    "p90_seconds": None,
+                                    "oldest_pending_seconds": 3600,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+
+    def test_wait_sets_user_scoped_from_sacct_distinct_users_and_scontrol_private_data(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nssh = "cluster-b"\n\n'
+                '[[clusters]]\nname = "cluster-c"\nlocal = true\n\n'
+                '[[clusters]]\nname = "cluster-d"\nssh = "cluster-d"\n\n'
+                '[[clusters]]\nname = "cluster-e"\nssh = "cluster-e"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    # cluster-a: slurmdbd restricts sacct to alice while slurmctld omits jobs/all and squeue shows bob too.
+                    ("cluster-a", "sacct"): (
+                        "9001|9001|alice|gpu|COMPLETED|1794500000|1794500000|1794500060|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+                        "9002|9002|alice|gpu|RUNNING|1794501000|1794501000|1794501180|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+                    ),
+                    ("cluster-a", "squeue"): (
+                        "9010|alice|gpu|PD|Resources|1794513000|\n"
+                        "9011|bob|gpu|PD|Priority|1794513300|\n"
+                    ),
+                    ("cluster-a", "scontrol"): "PrivateData             = usage,accounts\n",
+                    # cluster-b: sacct returns alice (started) and bob (cancelled Start=Unknown) -> 2 distinct sacct users -> False.
+                    ("cluster-b", "sacct"): (
+                        "9101|9101|alice|cpu|COMPLETED|1794500000|1794500000|1794500030|1|4|cpu=4|cpu=4|01:00:00\n"
+                        "9102|9102|bob|cpu|CANCELLED by 1002|1794501000|1794501000|Unknown|1|4|cpu=4||01:00:00\n"
+                    ),
+                    ("cluster-b", "squeue"): "",
+                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
+                    # cluster-c: sacct has only alice on a cancelled job row, scontrol omits jobs/all -> 1 distinct sacct user -> True.
+                    ("cluster-c", "sacct"): (
+                        "9201|9201|alice|cpu|CANCELLED|1794500000|1794500000|Unknown|1|4|cpu=4||01:00:00\n"
+                    ),
+                    ("cluster-c", "squeue"): "",
+                    ("cluster-c", "scontrol"): "PrivateData             = usage\n",
+                    # cluster-d: empty sacct, scontrol has PrivateData = jobs -> True.
+                    ("cluster-d", "sacct"): "",
+                    ("cluster-d", "squeue"): "",
+                    ("cluster-d", "scontrol"): "PrivateData             = jobs\n",
+                    # cluster-e: empty sacct, scontrol omits jobs/all -> False.
+                    ("cluster-e", "sacct"): "",
+                    ("cluster-e", "squeue"): "",
+                    ("cluster-e", "scontrol"): "PrivateData             = usage\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            clusters = json.loads(stdout.getvalue())["clusters"]
+            scoping = {item["cluster"]: item["user_scoped"] for item in clusters}
+            self.assertEqual(
+                scoping,
+                {
+                    "cluster-a": True,
+                    "cluster-b": False,
+                    "cluster-c": True,
+                    "cluster-d": True,
+                    "cluster-e": False,
+                },
+            )
+
+    def test_wait_table_renders_aligned_durations_dashes_headers_and_empty_or_error_states(
+        self,
+    ) -> None:
+        sacct_a = (
+            "101|101|alice|gpu|COMPLETED|1794500000|1794500000|1794500015|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "102|102|alice|gpu|COMPLETED|1794501000|1794501000|1794501045|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "103|103|alice|gpu|COMPLETED|1794502000|1794502000|1794502170|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "201|201|alice|cpu|COMPLETED|1794503000|1794503000|1794506600|1|4|cpu=4|cpu=4|02:00:00\n"
+        )
+        squeue_a = (
+            "301|alice|gpu|PD|Resources|1794508200|\n"
+            "302|alice|bigmem|PD|Priority|1794423600|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nlocal = true\n\n'
+                '[[clusters]]\nname = "cluster-c"\nssh = "cluster-c"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_a,
+                    ("cluster-a", "squeue"): squeue_a,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                    ("cluster-b", "sacct"): "",
+                    ("cluster-b", "squeue"): "",
+                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
+                    ("cluster-c", "sacct"): TransportError("timed out after 25s"),
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            rendered = stdout.getvalue()
+            self.assertNotIn("\x1b", rendered)
+            self.assertEqual(
+                rendered,
+                "cluster-a [user-scoped]\n"
+                "  PARTITION  N  P50    P90     OLDEST PENDING\n"
+                "  gpu        3  45s    2m 25s  1h 30m\n"
+                "  cpu        1  1h 0m  1h 0m   -\n"
+                "  bigmem     0  -      -       1d 1h\n"
+                "\n"
+                "cluster-b\n"
+                "  (no wait data)\n"
+                "\n"
+                "cluster-c: unreachable (timed out after 25s)\n",
+            )
+
+    def test_wait_isolates_cache_by_days_skips_cluster_banners_and_never_caches_errors(
+        self,
+    ) -> None:
+        sacct_with_banner = (
+            "CLUSTER: prod\n"
+            "501|501|alice|gpu|COMPLETED|1794500000|1794500000|1794500120|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "502|502|bob|gpu|COMPLETED|1794501000|1794501000|1794501120|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+        )
+        squeue_with_banner = (
+            "CLUSTER: prod\n"
+            "510|alice|gpu|PD|Resources|1794513300|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\nslurm_cluster = "prod"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            shared_env = make_test_env(root)
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_with_banner,
+                    ("cluster-a", "squeue"): squeue_with_banner,
+                    ("cluster-a", "scontrol"): "CLUSTER: prod\nPrivateData = none\n",
+                    (
+                        "cluster-b",
+                        "sacct",
+                    ): "sacct: error: Problem talking to the database\n",
+                    ("cluster-b", "squeue"): "",
+                }
+            )
+
+            # Run 1 at t = 0s (default days=7): cluster-a succeeds (3 calls), cluster-b fails sacct parse (2 calls).
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["wait", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(err1.getvalue(), "")
+            self.assertEqual(len(runner.calls), 5)
+            clusters1 = json.loads(out1.getvalue())["clusters"]
+            self.assertIsNone(clusters1[0]["error"])
+            self.assertFalse(clusters1[0]["stale"])
+            self.assertEqual(
+                clusters1[0]["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 2,
+                        "p50_seconds": 120.0,
+                        "p90_seconds": 120.0,
+                        "oldest_pending_seconds": 300,
+                    }
+                ],
+            )
+            self.assertIsNone(clusters1[1]["fetched_at"])
+            self.assertFalse(clusters1[1]["stale"])
+            self.assertIsNotNone(clusters1[1]["error"])
+            self.assertEqual(clusters1[1]["partitions"], [])
+
+            # Run 2 at t = 75s with explicit --days 7: cluster-a served from cache (0 calls),
+            # cluster-b retried because errors are never cached (now fails squeue rc=1 -> 2 calls).
+            runner._responses[("cluster-b", "sacct")] = (
+                "601|601|alice|cpu|COMPLETED|1794500000|1794500000|1794500030|1|4|cpu=4|cpu=4|01:00:00\n"
+            )
+            runner._responses[("cluster-b", "squeue")] = CommandResult(
+                1, "", "squeue: error: controller busy\n"
+            )
+            t_hit = FIXED_NOW + timedelta(seconds=75)
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["wait", "--days", "7"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_hit,
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            self.assertEqual(len(runner.calls), 7)
+            self.assertEqual(
+                out2.getvalue(),
+                "cluster-a [cached 75s ago]\n"
+                "  PARTITION  N  P50    P90    OLDEST PENDING\n"
+                "  gpu        2  2m 0s  2m 0s  5m 0s\n"
+                "\n"
+                "cluster-b: squeue exited 1: squeue: error: controller busy\n",
+            )
+
+            # Run 3 at t = 90s with --days 3 on cluster-a: distinct options={"days": 3} misses cache!
+            t_days3 = FIXED_NOW + timedelta(seconds=90)
+            out3, err3 = io.StringIO(), io.StringIO()
+            rc3 = main(
+                ["wait", "--cluster", "cluster-a", "--days", "3", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_days3,
+                stdout=out3,
+                stderr=err3,
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(err3.getvalue(), "")
+            self.assertEqual(len(runner.calls), 10)
+            payload3 = json.loads(out3.getvalue())
+            self.assertEqual(payload3["days"], 3)
+            self.assertFalse(payload3["clusters"][0]["stale"])
+
+            # Run 4 at t = 120s after cluster-b recovers: cluster-a hits 7d cache, cluster-b succeeds.
+            runner._responses[("cluster-b", "squeue")] = ""
+            runner._responses[("cluster-b", "scontrol")] = "PrivateData = none\n"
+            t_rec = FIXED_NOW + timedelta(seconds=120)
+            out4, err4 = io.StringIO(), io.StringIO()
+            rc4 = main(
+                ["wait", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_rec,
+                stdout=out4,
+                stderr=err4,
+            )
+            self.assertEqual(rc4, 0)
+            self.assertEqual(len(runner.calls), 13)
+            clusters4 = json.loads(out4.getvalue())["clusters"]
+            self.assertTrue(clusters4[0]["stale"])
+            self.assertFalse(clusters4[1]["stale"])
+            self.assertIsNone(clusters4[1]["error"])
+
+            # Run 5 at t = 130s with --refresh on cluster-a: bypasses cache and refetches.
+            t_ref = FIXED_NOW + timedelta(seconds=130)
+            out5, err5 = io.StringIO(), io.StringIO()
+            rc5 = main(
+                ["--refresh", "wait", "--cluster", "cluster-a", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_ref,
+                stdout=out5,
+                stderr=err5,
+            )
+            self.assertEqual(rc5, 0)
+            self.assertEqual(len(runner.calls), 16)
+            self.assertFalse(json.loads(out5.getvalue())["clusters"][0]["stale"])
+
+
+if __name__ == "__main__":
+    unittest.main()
