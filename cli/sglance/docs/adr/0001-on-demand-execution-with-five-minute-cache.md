@@ -1,0 +1,3 @@
+# On-demand execution with a five-minute file cache
+
+`sglance` typically runs on an always-on Raspberry Pi where both a human user and multiple concurrent AI agents check cluster availability before launching work, yet Slurm controllers enforce per-user RPC rate limits and degrade under polling loops. Instead of running a background collector daemon with a local database, `sglance` runs only on demand and caches per-cluster responses in the user cache directory for five minutes across all commands, with `--refresh` to bypass the cache. This gives up continuous historical time series and sub-minute default freshness, in exchange for zero idle load on `slurmctld` and `slurmdbd`, no background service to supervise, and bounded RPC traffic when several agents query at once.
