@@ -11,7 +11,9 @@ import unittest
 
 import sglance
 from sglance import CommandResult, TransportError, main
-from tests.fakes import FakeRunner
+from sglance.models import ClusterEntry
+from sglance.runner import AllowlistError, AllowlistedRunner, validate_allowlist
+from tests.fakes import FakeRunner, UnmatchedFakeRequest
 
 FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
 
@@ -278,6 +280,55 @@ class StatusCliTests(unittest.TestCase):
                         rest = rest[2:]
                     self.assertEqual(rest, ["show", "config"])
 
+    def test_allowlist_rejects_disallowed_binaries_missing_prefix_non_config_scontrol_and_dash_m_flags(
+        self,
+    ) -> None:
+        cluster_entry = ClusterEntry(name="cluster-a", ssh="login.example.edu")
+        rejected_vectors: list[tuple[str, list[str]]] = [
+            ("disallowed-rm", ["env", "SLURM_TIME_FORMAT=%s", "rm", "-rf", "/tmp/work"]),
+            ("disallowed-scancel", ["env", "SLURM_TIME_FORMAT=%s", "scancel", "1001"]),
+            ("disallowed-sbatch", ["env", "SLURM_TIME_FORMAT=%s", "sbatch", "--test-only", "job.sh"]),
+            ("missing-env-prefix", ["sinfo", "-h", "-N"]),
+            ("bare-env-without-time-format", ["env", "sinfo", "-h"]),
+            ("wrong-time-format-env", ["env", "SLURM_TIME_FORMAT=standard", "sinfo", "-h"]),
+            ("too-short-argv", ["env", "SLURM_TIME_FORMAT=%s"]),
+            ("scontrol-show-node", ["env", "SLURM_TIME_FORMAT=%s", "scontrol", "show", "node"]),
+            (
+                "scontrol-update",
+                ["env", "SLURM_TIME_FORMAT=%s", "scontrol", "update", "NodeName=node01", "State=DRAIN"],
+            ),
+            (
+                "scontrol-extra-arg",
+                ["env", "SLURM_TIME_FORMAT=%s", "scontrol", "show", "config", "SlurmctldHost"],
+            ),
+            ("scontrol-no-args", ["env", "SLURM_TIME_FORMAT=%s", "scontrol"]),
+            (
+                "scontrol-dash-m-leading-dash",
+                ["env", "SLURM_TIME_FORMAT=%s", "scontrol", "-M", "-cluster", "show", "config"],
+            ),
+            (
+                "sinfo-dash-m-leading-dash",
+                ["env", "SLURM_TIME_FORMAT=%s", "sinfo", "-M", "-cluster", "-h"],
+            ),
+            (
+                "squeue-dash-m-leading-dash",
+                ["env", "SLURM_TIME_FORMAT=%s", "squeue", "-M", "--all", "-h"],
+            ),
+            (
+                "sacct-dash-m-missing-value",
+                ["env", "SLURM_TIME_FORMAT=%s", "sacct", "-M"],
+            ),
+        ]
+        for label, bad_argv in rejected_vectors:
+            with self.subTest(case=label):
+                fake_runner = FakeRunner()
+                guarded = AllowlistedRunner(fake_runner)
+                with self.assertRaises(AllowlistError):
+                    validate_allowlist(bad_argv)
+                with self.assertRaises(AllowlistError):
+                    guarded.run(cluster_entry, bad_argv)
+                self.assertEqual(fake_runner.calls, [])
+
     def test_nonzero_sinfo_returncode_reports_inline_cluster_error(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -298,7 +349,8 @@ class StatusCliTests(unittest.TestCase):
                     ("cluster-a", "sinfo"): CommandResult(
                         1,
                         "",
-                        "sinfo: error: Unable to contact slurm controller\nmore details\n",
+                        "sinfo: warning: ignoring deprecated config key\n"
+                        "sinfo: error: Unable to contact slurm controller\n",
                     ),
                     ("cluster-b", "sinfo"): CommandResult(7, "", "   \n"),
                 }
@@ -360,6 +412,51 @@ class StatusCliTests(unittest.TestCase):
                 table_out.getvalue(),
                 "cluster-a: sinfo: error: Unable to contact slurm controller\n\n"
                 "cluster-b: sinfo exited 7\n",
+            )
+
+    def test_nonzero_sinfo_stderr_uses_last_nonempty_line_after_warning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sinfo"): CommandResult(
+                        1,
+                        "",
+                        "Warning: Permanently added 'login.example.edu' (ED25519) to known hosts.\n"
+                        "\n"
+                        "  sinfo: error: slurm_receive_msg: Zero Bytes were transmitted or received  \n"
+                        "   \n",
+                    )
+                }
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a: sinfo: error: slurm_receive_msg: Zero Bytes were transmitted or received\n",
             )
 
     def test_malformed_sinfo_stdout_rows_report_inline_cluster_error(self) -> None:
@@ -536,7 +633,7 @@ class StatusCliTests(unittest.TestCase):
                 "HOME": str(root / "home"),
             }
             runner = FakeRunner({("cluster-a", "squeue"): ""})
-            with self.assertRaises(KeyError) as ctx:
+            with self.assertRaises(UnmatchedFakeRequest) as ctx:
                 main(
                     ["status"],
                     env=env,
@@ -547,6 +644,112 @@ class StatusCliTests(unittest.TestCase):
                 )
             self.assertIn("cluster-a", str(ctx.exception))
             self.assertIn("sinfo", str(ctx.exception))
+
+    def test_unexpected_keyerror_or_valueerror_isolates_to_single_cluster_error(self) -> None:
+        cases: list[tuple[str, Exception, str]] = [
+            ("keyerror", KeyError("missing_field"), "'missing_field'"),
+            ("valueerror", ValueError("unexpected token"), "unexpected token"),
+        ]
+        for label, raised_exc, expected_error in cases:
+            with self.subTest(case=label), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                    '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
+                    encoding="utf-8",
+                )
+                env = {
+                    "XDG_CONFIG_HOME": str(root / "config"),
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "HOME": str(root / "home"),
+                }
+                runner = FakeRunner(
+                    {
+                        ("cluster-a", "sinfo"): raised_exc,
+                        ("cluster-b", "sinfo"): "cpu|node01|idle|0/64/0/64|(null)|(null)|\n",
+                    }
+                )
+
+                json_out = io.StringIO()
+                json_err = io.StringIO()
+                json_rc = main(
+                    ["status", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=json_out,
+                    stderr=json_err,
+                )
+
+                self.assertEqual(json_rc, 0)
+                self.assertEqual(json_err.getvalue(), "")
+                self.assertEqual(
+                    json.loads(json_out.getvalue()),
+                    {
+                        "schema_version": 1,
+                        "command": "status",
+                        "clusters": [
+                            {
+                                "cluster": "cluster-a",
+                                "fetched_at": None,
+                                "stale": False,
+                                "user_scoped": False,
+                                "error": expected_error,
+                                "partitions": [],
+                            },
+                            {
+                                "cluster": "cluster-b",
+                                "fetched_at": "2026-11-12T20:00:00Z",
+                                "stale": False,
+                                "user_scoped": False,
+                                "error": None,
+                                "partitions": [
+                                    {
+                                        "partition": "cpu",
+                                        "default": False,
+                                        "cpus_alloc": 0,
+                                        "cpus_total": 64,
+                                        "cpus_utilization": 0.0,
+                                        "gpus_alloc": 0,
+                                        "gpus_total": 0,
+                                        "gpus_utilization": None,
+                                        "nodes_alloc": 0,
+                                        "nodes_mixed": 0,
+                                        "nodes_idle": 1,
+                                        "nodes_down": 0,
+                                        "nodes_drained": 0,
+                                        "nodes_draining": 0,
+                                        "nodes_other": 0,
+                                        "nodes_total": 1,
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                )
+
+                table_out = io.StringIO()
+                table_err = io.StringIO()
+                table_rc = main(
+                    ["status"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=table_out,
+                    stderr=table_err,
+                )
+
+                self.assertEqual(table_rc, 0)
+                self.assertEqual(table_err.getvalue(), "")
+                self.assertEqual(
+                    table_out.getvalue(),
+                    f"cluster-a: {expected_error}\n\n"
+                    "cluster-b\n"
+                    "  PARTITION  CPUS       GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                    "  cpu        0/64 (0%)  -     1      0      0      1     0     0        0         0\n",
+                )
 
     def test_slurm_cluster_entry_passes_dash_m_immediately_after_binary(self) -> None:
         with TemporaryDirectory() as tmp:

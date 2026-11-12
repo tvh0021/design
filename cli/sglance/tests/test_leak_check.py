@@ -507,6 +507,30 @@ class LeakCheckCliTests(unittest.TestCase):
             self.assertEqual(ignored_check.returncode, 0, msg=ignored_check.stderr)
             self.assertEqual(len(ignored_check.stdout.splitlines()), 6)
 
+            # Commits staging nothing under cli/sglance exit 0 without requiring .leak-denylist
+            outside_dir = repo / "other"
+            outside_dir.mkdir()
+            (outside_dir / "readme.txt").write_text("unrelated change\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "other/readme.txt"],
+                cwd=str(repo),
+                env=git_env,
+                check=True,
+            )
+            outside_commit = subprocess.run(
+                ["git", "commit", "-m", "unrelated commit without denylist"],
+                cwd=str(repo),
+                env=git_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                outside_commit.returncode,
+                0,
+                msg=outside_commit.stdout + outside_commit.stderr,
+            )
+
             app_file = pkg / "app.py"
             app_file.write_text('CLUSTER = "cluster-a"\n', encoding="utf-8")
             subprocess.run(
@@ -516,7 +540,7 @@ class LeakCheckCliTests(unittest.TestCase):
                 check=True,
             )
 
-            # Fails closed without .leak-denylist
+            # Fails closed without .leak-denylist when staging under cli/sglance
             no_denylist_commit = subprocess.run(
                 ["git", "commit", "-m", "should fail closed"],
                 cwd=str(repo),
