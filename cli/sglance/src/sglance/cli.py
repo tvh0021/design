@@ -159,6 +159,7 @@ def _query_clusters_status(
                     cached_cluster_fetch,
                     entry,
                     command="status",
+                    schema_version=StatusReport.schema_version,
                     result_type=ClusterStatus,
                     fetch=lambda target: adapter.query_status(target, now=now),
                     env=env,

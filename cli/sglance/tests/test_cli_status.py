@@ -734,7 +734,7 @@ class StatusCliTests(unittest.TestCase):
                 table_err = io.StringIO()
                 table_rc = main(
                     ["status"],
-                    env=env,
+                    env={**env, "XDG_CACHE_HOME": str(root / "cache-table")},
                     runner=runner,
                     clock=lambda: FIXED_NOW,
                     stdout=table_out,
@@ -1205,7 +1205,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             table_rc = main(
                 ["status"],
-                env=env,
+                env={**env, "XDG_CACHE_HOME": str(root / "cache-table")},
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
@@ -1342,7 +1342,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             table_rc = main(
                 ["status"],
-                env=env,
+                env={**env, "XDG_CACHE_HOME": str(root / "cache-table")},
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
