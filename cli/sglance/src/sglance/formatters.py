@@ -4,7 +4,14 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 import json
 
-from sglance.models import ClusterQueue, ClusterStatus, QueueReport, StatusReport
+from sglance.models import (
+    ClusterMine,
+    ClusterQueue,
+    ClusterStatus,
+    MineReport,
+    QueueReport,
+    StatusReport,
+)
 
 _STATUS_HEADERS = (
     "PARTITION",
@@ -170,6 +177,98 @@ def _format_cluster_queue_section(cluster: ClusterQueue, *, now: datetime | None
     ]
 
     lines = [header, _render_table_row(_QUEUE_HEADERS, widths)]
+    for row in rows:
+        lines.append(_render_table_row(row, widths))
+    return "\n".join(lines)
+
+
+def format_mine_json(report: MineReport) -> str:
+    payload = {
+        "schema_version": report.schema_version,
+        "command": report.command,
+        "account": report.account,
+        "clusters": [asdict(cluster) for cluster in report.clusters],
+    }
+    return json.dumps(payload, indent=2) + "\n"
+
+
+_MINE_HEADERS = (
+    "JOBID",
+    "NAME",
+    "USER",
+    "ACCOUNT",
+    "PARTITION",
+    "STATE",
+    "CPUS",
+    "GPUS",
+    "NODES",
+    "ELAPSED",
+    "LIMIT",
+    "REASON",
+    "ESTIMATED START",
+)
+
+
+def _format_duration_seconds(seconds: int) -> str:
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}-{hours:02d}:{minutes:02d}:{secs:02d}"
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def format_mine_table(report: MineReport, *, now: datetime | None = None) -> str:
+    sections = [_format_cluster_mine_section(cluster, now=now) for cluster in report.clusters]
+    return "\n\n".join(sections) + "\n"
+
+
+def _format_cluster_mine_section(cluster: ClusterMine, *, now: datetime | None = None) -> str:
+    if cluster.error is not None:
+        return f"{cluster.cluster}: {cluster.error}"
+    header = format_cluster_header(
+        cluster.cluster,
+        user_scoped=cluster.user_scoped,
+        stale=cluster.stale,
+        fetched_at=cluster.fetched_at,
+        now=now,
+    )
+    if not cluster.jobs:
+        return f"{header}\n  (no jobs)"
+
+    rows: list[tuple[str, ...]] = []
+    for job in cluster.jobs:
+        limit_label = (
+            _format_duration_seconds(job.time_limit_seconds)
+            if job.time_limit_seconds is not None
+            else "-"
+        )
+        rows.append(
+            (
+                job.job_id,
+                job.name or "-",
+                job.user or "-",
+                job.account or "-",
+                job.partition,
+                job.state,
+                str(job.cpus),
+                str(job.gpus),
+                str(job.nodes),
+                _format_duration_seconds(job.elapsed_seconds),
+                limit_label,
+                job.reason if job.reason is not None else "-",
+                job.estimated_start if job.estimated_start is not None else "-",
+            )
+        )
+
+    widths = [
+        max(len(_MINE_HEADERS[col]), *(len(row[col]) for row in rows))
+        for col in range(len(_MINE_HEADERS))
+    ]
+
+    lines = [header, _render_table_row(_MINE_HEADERS, widths)]
     for row in rows:
         lines.append(_render_table_row(row, widths))
     return "\n".join(lines)

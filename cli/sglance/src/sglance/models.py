@@ -77,3 +77,40 @@ class QueueReport:
     clusters: tuple[ClusterQueue, ...]
     schema_version: int = 1
     command: str = "queue"
+
+
+@dataclass(frozen=True)
+class MineJob:
+    job_id: str
+    name: str
+    user: str
+    account: str
+    partition: str
+    state: str
+    cpus: int
+    gpus: int
+    nodes: int
+    elapsed_seconds: int
+    time_limit_seconds: int | None
+    reason: str | None
+    estimated_start: str | None
+
+
+@dataclass(frozen=True)
+class ClusterMine:
+    cluster: str
+    fetched_at: str | None
+    stale: bool
+    user_scoped: bool
+    error: str | None
+    slurm_user: str | None
+    account_filter: str | None
+    jobs: tuple[MineJob, ...]
+
+
+@dataclass(frozen=True)
+class MineReport:
+    clusters: tuple[ClusterMine, ...]
+    account: str | None = None
+    schema_version: int = 1
+    command: str = "mine"

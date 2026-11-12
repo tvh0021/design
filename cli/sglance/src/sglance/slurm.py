@@ -4,8 +4,10 @@ from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 import re
 
+from sglance.mine import MINE_SQUEUE_FIELDS, MineParseError, parse_squeue_mine
 from sglance.models import (
     ClusterEntry,
+    ClusterMine,
     ClusterQueue,
     ClusterStatus,
     PartitionQueue,
@@ -225,6 +227,77 @@ class SlurmAdapter:
             user_scoped=user_scoped,
             error=None,
             partitions=partitions,
+        )
+
+    def query_mine(
+        self,
+        cluster_entry: ClusterEntry,
+        *,
+        now: datetime,
+        account: str | None = None,
+    ) -> ClusterMine:
+        cluster_flag = (
+            ["-M", cluster_entry.slurm_cluster]
+            if cluster_entry.slurm_cluster is not None
+            else []
+        )
+        if account is not None:
+            from sglance.config import validate_safe_token
+
+            validate_safe_token(account, field_name="--account")
+        scope_flags = ["-A", account] if account is not None else ["--me"]
+        argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            *cluster_flag,
+            "-h",
+            "-r",
+            *scope_flags,
+            "-O",
+            MINE_SQUEUE_FIELDS,
+        ]
+        outcome = self._run_command(cluster_entry, argv)
+        if isinstance(outcome, str):
+            return ClusterMine(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=outcome,
+                slurm_user=None,
+                account_filter=account,
+                jobs=(),
+            )
+        try:
+            jobs, distinct_users, first_user = parse_squeue_mine(outcome.stdout)
+        except MineParseError as exc:
+            return ClusterMine(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=str(exc),
+                slurm_user=None,
+                account_filter=account,
+                jobs=(),
+            )
+        user_scoped = self.detect_user_scoped(
+            cluster_entry,
+            command="mine",
+            distinct_users=distinct_users,
+            account_scoped=(account is not None),
+        )
+        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return ClusterMine(
+            cluster=cluster_entry.name,
+            fetched_at=fetched_at,
+            stale=False,
+            user_scoped=user_scoped,
+            error=None,
+            slurm_user=first_user if account is None else None,
+            account_filter=account,
+            jobs=jobs,
         )
 
 

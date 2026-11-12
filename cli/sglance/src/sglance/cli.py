@@ -9,14 +9,24 @@ import sys
 from typing import NoReturn, TextIO, TypeVar
 
 from sglance.cache import cached_cluster_fetch
-from sglance.config import ConfigError, load_config
+from sglance.config import ConfigError, load_config, validate_safe_token
 from sglance.formatters import (
+    format_mine_json,
+    format_mine_table,
     format_queue_json,
     format_queue_table,
     format_status_json,
     format_status_table,
 )
-from sglance.models import ClusterEntry, ClusterQueue, ClusterStatus, QueueReport, StatusReport
+from sglance.models import (
+    ClusterEntry,
+    ClusterMine,
+    ClusterQueue,
+    ClusterStatus,
+    MineReport,
+    QueueReport,
+    StatusReport,
+)
 from sglance.runner import (
     AllowlistError,
     AllowlistedRunner,
@@ -106,6 +116,40 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
     )
     queue_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+
+    def _account_arg(raw: str) -> str:
+        try:
+            return validate_safe_token(raw, field_name="--account")
+        except ConfigError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    mine_parser = subparsers.add_parser(
+        "mine",
+        help="Show caller or account jobs with backfill estimated start times.",
+    )
+    mine_parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=argparse.SUPPRESS,
+        metavar="NAME",
+        help="Query only the named configured cluster entry.",
+    )
+    mine_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        dest="refresh",
+        default=argparse.SUPPRESS,
+        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+    )
+    mine_parser.add_argument(
+        "--account",
+        dest="account",
+        type=_account_arg,
+        default=None,
+        metavar="NAME",
+        help="List all jobs charged to the named Slurm account.",
+    )
+    mine_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
     return parser
 
 
@@ -154,6 +198,22 @@ def main(
     safe_runner = AllowlistedRunner(effective_runner)
     adapter = SlurmAdapter(safe_runner)
     now = effective_clock()
+
+    if parsed.subcommand == "mine":
+        mine_clusters = _query_clusters_mine(
+            adapter,
+            selected_entries,
+            env=effective_env,
+            now=now,
+            refresh=parsed.refresh,
+            account=parsed.account,
+        )
+        mine_report = MineReport(clusters=mine_clusters, account=parsed.account)
+        if parsed.json_output:
+            out.write(format_mine_json(mine_report))
+        else:
+            out.write(format_mine_table(mine_report, now=now))
+        return 0
 
     if parsed.subcommand == "queue":
         queue_clusters = _query_clusters_queue(
@@ -263,6 +323,41 @@ def _query_clusters_queue(
             user_scoped=False,
             error=error_text,
             partitions=(),
+        ),
+    )
+
+
+def _query_clusters_mine(
+    adapter: SlurmAdapter,
+    entries: Sequence[ClusterEntry],
+    *,
+    env: Mapping[str, str],
+    now: datetime,
+    refresh: bool = False,
+    account: str | None = None,
+) -> tuple[ClusterMine, ...]:
+    return _query_clusters(
+        entries,
+        lambda entry: cached_cluster_fetch(
+            entry,
+            command="mine",
+            schema_version=MineReport.schema_version,
+            result_type=ClusterMine,
+            fetch=lambda target: adapter.query_mine(target, now=now, account=account),
+            env=env,
+            now=now,
+            refresh=refresh,
+            options={"account": account} if account is not None else {},
+        ),
+        lambda entry, error_text: ClusterMine(
+            cluster=entry.name,
+            fetched_at=None,
+            stale=False,
+            user_scoped=False,
+            error=error_text,
+            slurm_user=None,
+            account_filter=account,
+            jobs=(),
         ),
     )
 
