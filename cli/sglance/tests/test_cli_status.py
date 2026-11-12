@@ -920,6 +920,398 @@ class StatusCliTests(unittest.TestCase):
                 ],
             )
 
+    def test_status_strips_node_state_flags_and_classifies_health_states(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            sinfo_fixture = (
+                "cpu*|node01|allocated#|64/0/0/64|(null)|(null)|\n"
+                "cpu*|node02|mixed-|32/32/0/64|(null)|(null)|\n"
+                "cpu*|node03|idle~|0/64/0/64|(null)|(null)|\n"
+                "cpu*|node04|down*|0/0/64/64|(null)|(null)|\n"
+                "cpu*|node05|fail!|0/0/64/64|(null)|(null)|\n"
+                "cpu*|node06|failing%|16/0/48/64|(null)|(null)|\n"
+                "cpu*|node07|drained$|0/0/64/64|(null)|(null)|\n"
+                "cpu*|node08|draining@|48/0/16/64|(null)|(null)|\n"
+                "cpu*|node09|maint^|0/0/64/64|(null)|(null)|\n"
+                "cpu*|node10|power_down|0/0/64/64|(null)|(null)|\n"
+            )
+            runner = FakeRunner({("cluster-a", "sinfo"): sinfo_fixture})
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "status",
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "cpu",
+                                    "default": True,
+                                    "cpus_alloc": 160,
+                                    "cpus_total": 640,
+                                    "cpus_utilization": 0.25,
+                                    "gpus_alloc": 0,
+                                    "gpus_total": 0,
+                                    "gpus_utilization": None,
+                                    "nodes_alloc": 1,
+                                    "nodes_mixed": 1,
+                                    "nodes_idle": 1,
+                                    "nodes_down": 3,
+                                    "nodes_drained": 1,
+                                    "nodes_draining": 1,
+                                    "nodes_other": 2,
+                                    "nodes_total": 10,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            expected_table = (
+                "cluster-a\n"
+                "  PARTITION  CPUS           GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                "  cpu*       160/640 (25%)  -     10     1      1      1     3     1        1         2\n"
+            )
+            self.assertEqual(table_out.getvalue(), expected_table)
+            self.assertEqual(len(runner.calls), 2)
+            for _cluster, _kind, _target, argv in runner.calls:
+                self.assertEqual(argv[2], "sinfo")
+
+    def test_status_counts_heterogeneous_gpus_and_ignores_shards_and_counters(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            sinfo_fixture = (
+                "cpu*|node01|allocated|64/0/0/64|(null)|(null)|\n"
+                "cpu*|node02|idle~|0/64/0/64|(null)|none|\n"
+                "cpu*|node03|down*|0/0/64/64|none|(null)|\n"
+                "cpu*|node04|idle|0/64/0/64|(null)|(null)|\n"
+                "gpu|gpu01|mixed|32/32/0/64|gpu:a100:4(S:0-1),shard:16(S:0-1)|gpu:a100:2(IDX:0,2),shard:4(IDX:0-1)|\n"
+                "gpu|gpu01|mixed|32/32/0/64|gpu:a100:4(S:0-1),shard:16(S:0-1)|gpu:a100:2(IDX:0,2),shard:4(IDX:0-1)|\n"
+                "gpu|gpu02|allocated|64/0/0/64|gpu:v100:8(S:0-1),gpumem:256G|gpu:v100:8(IDX:0-7),gpuutil:95|\n"
+                "gpu|gpu03|draining|16/48/0/64|gpu:4(S:0,1)|gpu:2(IDX:1,3)|\n"
+                "gpu|gpu04|drained*|0/0/64/64|gpu:a100:4(S:0-1)|gpu:a100:0(IDX:N/A)|\n"
+                "debug|gpu05|idle~|0/32/0/32|gpu:a100:2(S:0)|gpu:a100:0(IDX:N/A)|\n"
+            )
+            runner = FakeRunner({("cluster-a", "sinfo"): sinfo_fixture})
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "status",
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "cpu",
+                                    "default": True,
+                                    "cpus_alloc": 64,
+                                    "cpus_total": 256,
+                                    "cpus_utilization": 0.25,
+                                    "gpus_alloc": 0,
+                                    "gpus_total": 0,
+                                    "gpus_utilization": None,
+                                    "nodes_alloc": 1,
+                                    "nodes_mixed": 0,
+                                    "nodes_idle": 2,
+                                    "nodes_down": 1,
+                                    "nodes_drained": 0,
+                                    "nodes_draining": 0,
+                                    "nodes_other": 0,
+                                    "nodes_total": 4,
+                                },
+                                {
+                                    "partition": "gpu",
+                                    "default": False,
+                                    "cpus_alloc": 112,
+                                    "cpus_total": 256,
+                                    "cpus_utilization": 0.4375,
+                                    "gpus_alloc": 12,
+                                    "gpus_total": 20,
+                                    "gpus_utilization": 0.6,
+                                    "nodes_alloc": 1,
+                                    "nodes_mixed": 1,
+                                    "nodes_idle": 0,
+                                    "nodes_down": 0,
+                                    "nodes_drained": 1,
+                                    "nodes_draining": 1,
+                                    "nodes_other": 0,
+                                    "nodes_total": 4,
+                                },
+                                {
+                                    "partition": "debug",
+                                    "default": False,
+                                    "cpus_alloc": 0,
+                                    "cpus_total": 32,
+                                    "cpus_utilization": 0.0,
+                                    "gpus_alloc": 0,
+                                    "gpus_total": 2,
+                                    "gpus_utilization": 0.0,
+                                    "nodes_alloc": 0,
+                                    "nodes_mixed": 0,
+                                    "nodes_idle": 1,
+                                    "nodes_down": 0,
+                                    "nodes_drained": 0,
+                                    "nodes_draining": 0,
+                                    "nodes_other": 0,
+                                    "nodes_total": 1,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            expected_table = (
+                "cluster-a\n"
+                "  PARTITION  CPUS           GPUS         NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                "  cpu*       64/256 (25%)   -            4      1      0      2     1     0        0         0\n"
+                "  gpu        112/256 (44%)  12/20 (60%)  4      1      1      0     0     1        1         0\n"
+                "  debug      0/32 (0%)      0/2 (0%)     1      0      0      1     0     0        0         0\n"
+            )
+            self.assertEqual(table_out.getvalue(), expected_table)
+            self.assertEqual(len(runner.calls), 2)
+            for _cluster, _kind, _target, argv in runner.calls:
+                self.assertEqual(argv[2], "sinfo")
+
+    def test_status_prefers_untyped_gpu_counts_without_double_counting_typed_tokens(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "HOME": str(root / "home"),
+            }
+            sinfo_fixture = (
+                "gpu|gpu01|mixed|32/32/0/64|gpu:6(S:0-1),gpu:a100:4(S:0),gpu:v100:2(S:1)|gpu:3(IDX:0,2,4),gpu:a100:2(IDX:0,2),gpu:v100:1(IDX:4)|\n"
+                "gpu|gpu02|mixed|16/48/0/64|gpu:a100:2(S:0),gpu:v100:2(S:1)|gpu:a100:1(IDX:0),gpu:v100:2(IDX:2-3)|\n"
+                "gpu|gpu03|mixed|16/112/0/128|gpu:6(S:0-1)|gpu:(null):3(IDX:0,2,5)|\n"
+            )
+            runner = FakeRunner({("cluster-a", "sinfo"): sinfo_fixture})
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "status",
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "gpu",
+                                    "default": False,
+                                    "cpus_alloc": 64,
+                                    "cpus_total": 256,
+                                    "cpus_utilization": 0.25,
+                                    "gpus_alloc": 9,
+                                    "gpus_total": 16,
+                                    "gpus_utilization": 0.5625,
+                                    "nodes_alloc": 0,
+                                    "nodes_mixed": 3,
+                                    "nodes_idle": 0,
+                                    "nodes_down": 0,
+                                    "nodes_drained": 0,
+                                    "nodes_draining": 0,
+                                    "nodes_other": 0,
+                                    "nodes_total": 3,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["status"],
+                env=env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            expected_table = (
+                "cluster-a\n"
+                "  PARTITION  CPUS          GPUS        NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                "  gpu        64/256 (25%)  9/16 (56%)  3      0      3      0     0     0        0         0\n"
+            )
+            self.assertEqual(table_out.getvalue(), expected_table)
+
+    def test_malformed_sinfo_gres_and_state_flags_report_inline_cluster_error(self) -> None:
+        malformed_cases = [
+            ("non-integer-gpu-count", "gpu|gpu01|idle|0/64/0/64|gpu:a100:four|(null)|\n"),
+            ("negative-gpu-count", "gpu|gpu01|idle|0/64/0/64|gpu:-2|(null)|\n"),
+            ("bad-gres-used-count", "gpu|gpu01|mixed|32/32/0/64|gpu:a100:4|gpu:a100:bad|\n"),
+            ("unclosed-gres-paren", "gpu|gpu01|idle|0/64/0/64|gpu:a100:4(S:0-1|(null)|\n"),
+            ("empty-gpu-type", "gpu|gpu01|idle|0/64/0/64|gpu::4|(null)|\n"),
+            ("extra-gpu-colon-fields", "gpu|gpu01|idle|0/64/0/64|gpu:a100:4:2|(null)|\n"),
+            ("bare-gres-word", "gpu|gpu01|idle|0/64/0/64|gpu|(null)|\n"),
+            ("flag-only-node-state", "cpu|node01|*~|0/64/0/64|(null)|(null)|\n"),
+        ]
+        for label, bad_stdout in malformed_cases:
+            with self.subTest(case=label), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
+                    '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
+                    encoding="utf-8",
+                )
+                env = {
+                    "XDG_CONFIG_HOME": str(root / "config"),
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "HOME": str(root / "home"),
+                }
+                runner = FakeRunner(
+                    {
+                        ("cluster-a", "sinfo"): bad_stdout,
+                        ("cluster-b", "sinfo"): "gpu|gpu01|idle~|0/64/0/64|gpu:a100:4(S:0-1)|gpu:a100:0(IDX:N/A)|\n",
+                    }
+                )
+
+                json_out = io.StringIO()
+                json_err = io.StringIO()
+                json_rc = main(
+                    ["status", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=json_out,
+                    stderr=json_err,
+                )
+
+                self.assertEqual(json_rc, 0)
+                self.assertEqual(json_err.getvalue(), "")
+                payload = json.loads(json_out.getvalue())
+                cluster_a, cluster_b = payload["clusters"]
+                self.assertEqual(cluster_a["cluster"], "cluster-a")
+                self.assertIsNone(cluster_a["fetched_at"])
+                self.assertFalse(cluster_a["stale"])
+                self.assertFalse(cluster_a["user_scoped"])
+                self.assertIsInstance(cluster_a["error"], str)
+                self.assertNotEqual(cluster_a["error"].strip(), "")
+                self.assertEqual(cluster_a["partitions"], [])
+
+                self.assertEqual(cluster_b["cluster"], "cluster-b")
+                self.assertIsNone(cluster_b["error"])
+                self.assertEqual(cluster_b["partitions"][0]["gpus_total"], 4)
+                self.assertEqual(cluster_b["partitions"][0]["nodes_idle"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import re
 
 from sglance.models import ClusterEntry, ClusterStatus, PartitionStatus
 from sglance.runner import (
@@ -87,6 +88,38 @@ class SlurmAdapter:
         )
 
 
+def _parse_gres_gpus(raw: str) -> int:
+    stripped = raw.strip()
+    if stripped.lower() in {"", "(null)", "none"}:
+        return 0
+    cleaned = re.sub(r"\((?!null\))[^()]*\)", "", stripped, flags=re.IGNORECASE)
+    without_null_type = re.sub(r":\(null\):", "::", cleaned, flags=re.IGNORECASE)
+    if "(" in without_null_type or ")" in without_null_type:
+        raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+    untyped_total = 0
+    has_untyped = False
+    typed_total = 0
+    for token in cleaned.split(","):
+        item = token.strip()
+        if not item:
+            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) < 2 or any(not part for part in parts):
+            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+        if parts[0].lower() != "gpu":
+            continue
+        count_str = parts[-1]
+        if len(parts) not in (2, 3) or not (count_str.isascii() and count_str.isdigit()):
+            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+        count = int(count_str)
+        if len(parts) == 2 or parts[1].lower() == "(null)":
+            has_untyped = True
+            untyped_total += count
+        else:
+            typed_total += count
+    return untyped_total if has_untyped else typed_total
+
+
 def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
     by_partition: dict[str, dict[str, int | bool]] = {}
     seen_nodes: set[tuple[str, str]] = set()
@@ -98,11 +131,12 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
         cells = [cell.strip() for cell in line.split("|")]
         if len(cells) != 6:
             raise _SlurmParseError(f"malformed sinfo output: {stripped}")
-        partition_name, node_host, state_long, cpus_state, _gres, _gres_used = cells
+        partition_name, node_host, state_long, cpus_state, gres, gres_used = cells
         is_default = partition_name.endswith("*")
         if is_default:
             partition_name = partition_name[:-1]
-        if not partition_name or not node_host or not state_long:
+        normalized_state = state_long.rstrip("*~#!%$@^-").lower()
+        if not partition_name or not node_host or not normalized_state:
             raise _SlurmParseError(f"malformed sinfo row: {stripped}")
 
         cpu_parts = cpus_state.split("/")
@@ -116,6 +150,8 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
             raise _SlurmParseError(f"malformed sinfo CPUsState {cpus_state!r}")
         cpus_alloc = parsed_cpus[0]
         cpus_total = parsed_cpus[3]
+        gpus_total = _parse_gres_gpus(gres)
+        gpus_alloc = _parse_gres_gpus(gres_used)
 
         acc = by_partition.setdefault(
             partition_name,
@@ -123,6 +159,8 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
                 "default": False,
                 "cpus_alloc": 0,
                 "cpus_total": 0,
+                "gpus_alloc": 0,
+                "gpus_total": 0,
                 "nodes_alloc": 0,
                 "nodes_mixed": 0,
                 "nodes_idle": 0,
@@ -143,9 +181,10 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
 
         acc["cpus_alloc"] = int(acc["cpus_alloc"]) + cpus_alloc
         acc["cpus_total"] = int(acc["cpus_total"]) + cpus_total
+        acc["gpus_alloc"] = int(acc["gpus_alloc"]) + gpus_alloc
+        acc["gpus_total"] = int(acc["gpus_total"]) + gpus_total
         acc["nodes_total"] = int(acc["nodes_total"]) + 1
 
-        normalized_state = state_long.lower()
         if normalized_state == "allocated":
             acc["nodes_alloc"] = int(acc["nodes_alloc"]) + 1
         elif normalized_state == "mixed":
@@ -166,6 +205,9 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
         cpus_alloc = int(acc["cpus_alloc"])
         cpus_total = int(acc["cpus_total"])
         cpus_utilization = (cpus_alloc / cpus_total) if cpus_total > 0 else None
+        gpus_alloc = int(acc["gpus_alloc"])
+        gpus_total = int(acc["gpus_total"])
+        gpus_utilization = (gpus_alloc / gpus_total) if gpus_total > 0 else None
         partitions.append(
             PartitionStatus(
                 partition=name,
@@ -173,9 +215,9 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
                 cpus_alloc=cpus_alloc,
                 cpus_total=cpus_total,
                 cpus_utilization=cpus_utilization,
-                gpus_alloc=0,
-                gpus_total=0,
-                gpus_utilization=None,
+                gpus_alloc=gpus_alloc,
+                gpus_total=gpus_total,
+                gpus_utilization=gpus_utilization,
                 nodes_alloc=int(acc["nodes_alloc"]),
                 nodes_mixed=int(acc["nodes_mixed"]),
                 nodes_idle=int(acc["nodes_idle"]),
@@ -187,3 +229,4 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
             )
         )
     return tuple(partitions)
+
