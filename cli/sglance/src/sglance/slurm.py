@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 import re
 
@@ -13,6 +14,7 @@ from sglance.models import (
 )
 from sglance.runner import (
     AllowlistedRunner,
+    CommandResult,
     CommandRunner,
     TransportError,
     format_ssh_exit_255,
@@ -31,6 +33,26 @@ class SlurmAdapter:
     def __init__(self, runner: CommandRunner) -> None:
         self._runner = runner if isinstance(runner, AllowlistedRunner) else AllowlistedRunner(runner)
 
+    def _run_command(
+        self, cluster_entry: ClusterEntry, argv: Sequence[str]
+    ) -> CommandResult | str:
+        try:
+            result = self._runner.run(cluster_entry, argv)
+        except (TransportError, OSError) as exc:
+            return format_transport_error(exc)
+        if result.returncode == 0:
+            return result
+        if not cluster_entry.local and result.returncode == 255:
+            return format_ssh_exit_255(result.stderr)
+        tool = argv[2]
+        last_stderr = next(
+            (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+            "",
+        )
+        if last_stderr:
+            return f"{tool} exited {result.returncode}: {last_stderr}"
+        return f"{tool} exited {result.returncode}"
+
     def query_status(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
         cluster_flag = (
             ["-M", cluster_entry.slurm_cluster]
@@ -47,36 +69,18 @@ class SlurmAdapter:
             "-O",
             _SINFO_FIELDS,
         ]
-        try:
-            result = self._runner.run(cluster_entry, argv)
-        except (TransportError, OSError) as exc:
+        outcome = self._run_command(cluster_entry, argv)
+        if isinstance(outcome, str):
             return ClusterStatus(
                 cluster=cluster_entry.name,
                 fetched_at=None,
                 stale=False,
                 user_scoped=False,
-                error=format_transport_error(exc),
-                partitions=(),
-            )
-        if result.returncode != 0:
-            if not cluster_entry.local and result.returncode == 255:
-                error_msg = format_ssh_exit_255(result.stderr)
-            else:
-                last_stderr = next(
-                    (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-                    "",
-                )
-                error_msg = last_stderr or f"sinfo exited {result.returncode}"
-            return ClusterStatus(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=error_msg,
+                error=outcome,
                 partitions=(),
             )
         try:
-            partitions = _parse_sinfo_status(result.stdout)
+            partitions = _parse_sinfo_status(outcome.stdout)
         except _SlurmParseError as exc:
             return ClusterStatus(
                 cluster=cluster_entry.name,
@@ -112,36 +116,18 @@ class SlurmAdapter:
             "-O",
             _SQUEUE_QUEUE_FIELDS,
         ]
-        try:
-            result = self._runner.run(cluster_entry, argv)
-        except (TransportError, OSError) as exc:
+        outcome = self._run_command(cluster_entry, argv)
+        if isinstance(outcome, str):
             return ClusterQueue(
                 cluster=cluster_entry.name,
                 fetched_at=None,
                 stale=False,
                 user_scoped=False,
-                error=format_transport_error(exc),
-                partitions=(),
-            )
-        if result.returncode != 0:
-            if not cluster_entry.local and result.returncode == 255:
-                error_msg = format_ssh_exit_255(result.stderr)
-            else:
-                first_stderr = next(
-                    (line.strip() for line in result.stderr.splitlines() if line.strip()),
-                    "",
-                )
-                error_msg = first_stderr or f"squeue exited {result.returncode}"
-            return ClusterQueue(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=error_msg,
+                error=outcome,
                 partitions=(),
             )
         try:
-            partitions = _parse_squeue_queue(result.stdout)
+            partitions = _parse_squeue_queue(outcome.stdout)
         except _SlurmParseError as exc:
             return ClusterQueue(
                 cluster=cluster_entry.name,
@@ -228,7 +214,7 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
     seen_nodes: set[tuple[str, str]] = set()
     for raw_line in stdout.splitlines():
         stripped = raw_line.strip()
-        if not stripped:
+        if not stripped or stripped.startswith("CLUSTER: "):
             continue
         line = stripped[:-1] if stripped.endswith("|") else stripped
         cells = [cell.strip() for cell in line.split("|")]
@@ -334,67 +320,44 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
     return tuple(partitions)
 
 
-_VALID_SQUEUE_COMPACT_STATES = frozenset(
-    {
-        "BF",
-        "CA",
-        "CD",
-        "CF",
-        "CG",
-        "DL",
-        "F",
-        "NF",
-        "OOM",
-        "PD",
-        "PR",
-        "R",
-        "RD",
-        "RF",
-        "RH",
-        "RQ",
-        "RS",
-        "RV",
-        "S",
-        "SE",
-        "SI",
-        "SO",
-        "ST",
-        "TO",
-    }
-)
+_RUNNING_SQUEUE_STATES = frozenset({"R", "CF"})
+_PENDING_SQUEUE_STATES = frozenset({"PD", "RQ", "RH", "RD", "SE"})
 
 
 def _parse_squeue_queue(stdout: str) -> tuple[PartitionQueue, ...]:
     by_partition: dict[str, tuple[int, int, dict[str, int]]] = {}
     for raw_line in stdout.splitlines():
         stripped = raw_line.strip()
-        if not stripped:
+        if not stripped or stripped.startswith("CLUSTER: "):
             continue
-        line = stripped[:-1] if stripped.endswith("|") else stripped
-        cells = [cell.strip() for cell in line.split("|")]
+        if not stripped.endswith("|"):
+            raise _SlurmParseError(f"malformed squeue output: {stripped}")
+        line = stripped[:-1]
+        cells = [cell.strip() for cell in line.split("|", 4)]
         if len(cells) != 5:
             raise _SlurmParseError(f"malformed squeue output: {stripped}")
-        job_id, user_name, partition_field, state_compact, reason = cells
-        if not job_id or not user_name or not partition_field:
+        job_id, _user_name, partition_field, state_compact, reason = cells
+        if not job_id or not partition_field:
             raise _SlurmParseError(f"malformed squeue row: {stripped}")
         partition_parts = [part.strip() for part in partition_field.split(",")]
         if any(not part for part in partition_parts):
             raise _SlurmParseError(f"malformed squeue partition {partition_field!r}")
         partition_name = partition_parts[0]
 
-        if state_compact not in _VALID_SQUEUE_COMPACT_STATES:
-            raise _SlurmParseError(f"malformed squeue StateCompact {state_compact!r}")
+        is_running = state_compact in _RUNNING_SQUEUE_STATES
+        is_pending = state_compact in _PENDING_SQUEUE_STATES
+        if not is_running and not is_pending:
+            continue
 
         running_jobs, pending_jobs, reason_counts = by_partition.get(
             partition_name, (0, 0, {})
         )
-        if state_compact == "R":
+        if is_running:
             running_jobs += 1
-        elif state_compact == "PD":
-            if not reason:
-                raise _SlurmParseError(f"malformed squeue pending row: {stripped}")
+        else:
+            normalized_reason = reason.split(",", 1)[0].strip() or "None"
             pending_jobs += 1
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            reason_counts[normalized_reason] = reason_counts.get(normalized_reason, 0) + 1
         by_partition[partition_name] = (running_jobs, pending_jobs, reason_counts)
 
     partitions: list[PartitionQueue] = []

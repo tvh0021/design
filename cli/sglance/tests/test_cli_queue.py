@@ -327,9 +327,10 @@ class QueueCliTests(unittest.TestCase):
                 CommandResult(
                     1,
                     "",
-                    "squeue: error: Slurm controller not responding\nextra line\n",
+                    "squeue: warning: ignoring deprecated config key\n"
+                    "squeue: error: Slurm controller not responding\n",
                 ),
-                "squeue: error: Slurm controller not responding",
+                "squeue exited 1: squeue: error: Slurm controller not responding",
             ),
         ]
 
@@ -505,11 +506,8 @@ class QueueCliTests(unittest.TestCase):
                 "1001|alice|cpu|R|None|\n",
             ),
             ("empty-job-id", "|alice|cpu|R|None|\n"),
-            ("empty-user", "1001||cpu|R|None|\n"),
             ("empty-partition", "1001|alice||R|None|\n"),
             ("empty-multipartition-segment", "1001|alice|,gpu|PD|Resources|\n"),
-            ("invalid-state-compact", "1001|alice|cpu|BOGUS|None|\n"),
-            ("empty-pending-reason", "1001|alice|cpu|PD||\n"),
         ]
         for label, bad_stdout in malformed_cases:
             with self.subTest(case=label), TemporaryDirectory() as tmp:
@@ -622,17 +620,97 @@ class QueueCliTests(unittest.TestCase):
                 [
                     {
                         "partition": "cpu",
-                        "running_jobs": 1,
+                        "running_jobs": 2,
                         "pending_jobs": 1,
                         "top_reasons": [{"reason": "Resources", "count": 1}],
                     },
-                    {
-                        "partition": "debug",
-                        "running_jobs": 0,
-                        "pending_jobs": 0,
-                        "top_reasons": [],
-                    },
                 ],
+            )
+
+    def test_queue_counts_running_and_pending_states_skips_uncounted_and_defaults_empty_reason(self) -> None:
+        squeue_output = (
+            "7001|alice|cpu|R|None|\n"
+            "7002|bob|cpu|CF|None|\n"
+            "7003|alice|cpu|EX|None|\n"
+            "7004|bob|cpu|BOGUS|None|\n"
+            "7005||cpu|RH|JobHeldAdmin|\n"
+            "7006|alice|cpu|RQ|Resources|\n"
+            "7007|bob|cpu|RD|Reservation|\n"
+            "7008|alice|cpu|SE|SpecialExit|\n"
+            "7009|bob|cpu|PD||\n"
+            "7010|alice|cpu|PD|JobHeldAdmin|\n"
+            "8001|bob|archive|EX|None|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner({("cluster-a", "squeue"): squeue_output})
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["queue", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "queue",
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "partitions": [
+                                {
+                                    "partition": "cpu",
+                                    "running_jobs": 2,
+                                    "pending_jobs": 6,
+                                    "top_reasons": [
+                                        {"reason": "JobHeldAdmin", "count": 2},
+                                        {"reason": "None", "count": 1},
+                                        {"reason": "Reservation", "count": 1},
+                                        {"reason": "Resources", "count": 1},
+                                        {"reason": "SpecialExit", "count": 1},
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["queue"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
+                "  cpu        2        6        JobHeldAdmin (2), None (1), Reservation (1), Resources (1), SpecialExit (1)\n",
             )
 
     def test_queue_reuses_five_minute_cache_and_refresh_refetches(self) -> None:
@@ -718,6 +796,227 @@ class QueueCliTests(unittest.TestCase):
                 "cluster-a\n"
                 "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
                 "  cpu        3        0        -\n",
+            )
+
+    def test_nonzero_squeue_stderr_uses_last_nonempty_line_after_warning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): CommandResult(
+                        1,
+                        "",
+                        "squeue: warning: x\nsqueue: error: Invalid user\n",
+                    )
+                }
+            )
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["queue", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "queue",
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": None,
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": "squeue exited 1: squeue: error: Invalid user",
+                            "partitions": [],
+                        }
+                    ],
+                },
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["queue"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertNotIn("warning", table_out.getvalue())
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a: squeue exited 1: squeue: error: Invalid user\n",
+            )
+
+    def test_queue_skips_dash_m_cluster_banner_line(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\nslurm_cluster = "prod"\n',
+                encoding="utf-8",
+            )
+            squeue_fixture = (
+                "CLUSTER: prod\n"
+                "1001|alice|gpu|R|None|\n"
+                "1002|bob|gpu|PD|Resources|\n"
+            )
+            runner = FakeRunner({("cluster-a", "squeue"): squeue_fixture})
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["queue"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
+                "  gpu        1        1        Resources (1)\n",
+            )
+
+    def test_queue_groups_pending_reasons_by_prefix_before_first_comma(self) -> None:
+        squeue_fixture = (
+            "9001|alice|gpu|PD|ReqNodeNotAvail, UnavailableNodes:g[01-03]|\n"
+            "9002|bob|gpu|PD|ReqNodeNotAvail, UnavailableNodes:g[02-03]|\n"
+            "9003|alice|gpu|PD|Priority|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner({("cluster-a", "squeue"): squeue_fixture})
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["queue", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "running_jobs": 0,
+                        "pending_jobs": 3,
+                        "top_reasons": [
+                            {"reason": "ReqNodeNotAvail", "count": 2},
+                            {"reason": "Priority", "count": 1},
+                        ],
+                    }
+                ],
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["queue"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
+                "  gpu        0        3        ReqNodeNotAvail (2), Priority (1)\n",
+            )
+
+    def test_queue_allows_pipe_character_inside_last_reason_column(self) -> None:
+        squeue_fixture = "1|alice|cpu|PD|Held by admin | maint|\n"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner({("cluster-a", "squeue"): squeue_fixture})
+
+            json_out = io.StringIO()
+            json_err = io.StringIO()
+            json_rc = main(
+                ["queue", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=json_out,
+                stderr=json_err,
+            )
+            self.assertEqual(json_rc, 0)
+            self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                json.loads(json_out.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "cpu",
+                        "running_jobs": 0,
+                        "pending_jobs": 1,
+                        "top_reasons": [
+                            {"reason": "Held by admin | maint", "count": 1},
+                        ],
+                    }
+                ],
+            )
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["queue"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
+                "  cpu        0        1        Held by admin | maint (1)\n",
             )
 
 

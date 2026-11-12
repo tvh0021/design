@@ -380,7 +380,7 @@ class StatusCliTests(unittest.TestCase):
                             "fetched_at": None,
                             "stale": False,
                             "user_scoped": False,
-                            "error": "sinfo: error: Unable to contact slurm controller",
+                            "error": "sinfo exited 1: sinfo: error: Unable to contact slurm controller",
                             "partitions": [],
                         },
                         {
@@ -410,7 +410,7 @@ class StatusCliTests(unittest.TestCase):
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(
                 table_out.getvalue(),
-                "cluster-a: sinfo: error: Unable to contact slurm controller\n\n"
+                "cluster-a: sinfo exited 1: sinfo: error: Unable to contact slurm controller\n\n"
                 "cluster-b: sinfo exited 7\n",
             )
 
@@ -456,7 +456,7 @@ class StatusCliTests(unittest.TestCase):
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(
                 table_out.getvalue(),
-                "cluster-a: sinfo: error: slurm_receive_msg: Zero Bytes were transmitted or received\n",
+                "cluster-a: sinfo exited 1: sinfo: error: slurm_receive_msg: Zero Bytes were transmitted or received\n",
             )
 
     def test_malformed_sinfo_stdout_rows_report_inline_cluster_error(self) -> None:
@@ -1848,6 +1848,41 @@ class StatusCliTests(unittest.TestCase):
                 self.assertIn(f"cluster-a: {cluster_a['error']}\n\ncluster-b\n", rendered_table)
                 for exc_name in ("KeyError", "ValueError", "IndexError", "TypeError", "AttributeError"):
                     self.assertNotIn(exc_name, rendered_table)
+
+    def test_status_skips_dash_m_cluster_banner_line(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\nslurm_cluster = "prod"\n',
+                encoding="utf-8",
+            )
+            sinfo_fixture = (
+                "CLUSTER: prod\n"
+                "cpu*|node01|mixed|16/48/0/64|(null)|(null)|\n"
+                "cpu*|node02|idle|0/64/0/64|(null)|(null)|\n"
+            )
+            runner = FakeRunner({("cluster-a", "sinfo"): sinfo_fixture})
+
+            table_out = io.StringIO()
+            table_err = io.StringIO()
+            table_rc = main(
+                ["status"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=table_out,
+                stderr=table_err,
+            )
+            self.assertEqual(table_rc, 0)
+            self.assertEqual(table_err.getvalue(), "")
+            self.assertEqual(
+                table_out.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  CPUS          GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                "  cpu*       16/128 (12%)  -     2      0      1      1     0     0        0         0\n",
+            )
 
 
 if __name__ == "__main__":

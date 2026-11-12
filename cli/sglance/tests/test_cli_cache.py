@@ -598,7 +598,7 @@ class CacheCliTests(unittest.TestCase):
                 stderr=err3,
             )
             self.assertEqual(rc3, 0)
-            self.assertIn("cluster-b: sinfo: error: controller busy", out3.getvalue())
+            self.assertIn("cluster-b: sinfo exited 1: sinfo: error: controller busy", out3.getvalue())
 
     def test_cache_falls_back_to_home_dot_cache_and_isolates_cluster_target_changes(self) -> None:
         with TemporaryDirectory() as tmp:
