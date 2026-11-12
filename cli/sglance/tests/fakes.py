@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
+from tempfile import mkdtemp
 import threading
 from typing import Protocol
 
 from sglance import CommandResult
+
+
+def make_test_env(
+    root: Path,
+    *,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build an isolated XDG/HOME env under *root* with a fresh XDG_CACHE_HOME."""
+    root.mkdir(parents=True, exist_ok=True)
+    env = {
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": mkdtemp(prefix="cache-", dir=root),
+        "HOME": str(root / "home"),
+    }
+    if extra is not None:
+        env.update(extra)
+    return env
 
 
 class _ClusterTarget(Protocol):

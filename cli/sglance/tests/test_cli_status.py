@@ -13,7 +13,7 @@ import sglance
 from sglance import CommandResult, TransportError, main
 from sglance.models import ClusterEntry
 from sglance.runner import AllowlistError, AllowlistedRunner, validate_allowlist
-from tests.fakes import FakeRunner, UnmatchedFakeRequest
+from tests.fakes import FakeRunner, UnmatchedFakeRequest, make_test_env
 
 FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
 
@@ -1374,11 +1374,6 @@ class StatusCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
             sinfo_fixture = (
                 "gpu|gpu01|mixed|32/32/0/64|gpu:a100:2,gpu:2|gpu:a100:1(IDX:0),gpu:(null):2(IDX:2-3)|\n"
                 "multi|gpu02|mixed|48/80/0/128|gpu:a100:2(S:0),gpu:v100:2(S:1)|gpu:a100:1(IDX:0),gpu:v100:2(IDX:2-3)|\n"
@@ -1390,7 +1385,7 @@ class StatusCliTests(unittest.TestCase):
             json_err = io.StringIO()
             json_rc = main(
                 ["status", "--json"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=json_out,
@@ -1458,7 +1453,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             table_rc = main(
                 ["status"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
@@ -1484,11 +1479,6 @@ class StatusCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
             sinfo_fixture = (
                 "cpu|node01|idle|0/64/0/64|fpga|(null)|\n"
                 "cpu|node02|mixed|32/32/0/64|bandwidth:lustre:no_consume:4G,tmpdisk:100G|bandwidth:lustre:1G,tmpdisk:20G|\n"
@@ -1500,7 +1490,7 @@ class StatusCliTests(unittest.TestCase):
             json_err = io.StringIO()
             json_rc = main(
                 ["status", "--json"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=json_out,
@@ -1568,7 +1558,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             table_rc = main(
                 ["status"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
@@ -1594,11 +1584,6 @@ class StatusCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
             sinfo_fixture = (
                 "bare|gpu01|idle|0/64/0/64|gpu|(null)|\n"
                 "bare|gpu02|mixed|32/32/0/64|gpu:a100|gpu:a100:1(IDX:0)|\n"
@@ -1612,7 +1597,7 @@ class StatusCliTests(unittest.TestCase):
             json_err = io.StringIO()
             json_rc = main(
                 ["status", "--json"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=json_out,
@@ -1680,7 +1665,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             table_rc = main(
                 ["status"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
@@ -1706,11 +1691,6 @@ class StatusCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
             sinfo_fixture = (
                 "cpu|node01|allocated+|64/0/0/64|(null)|(null)|\n"
                 "cpu|node02|idle?|0/64/0/64|(null)|(null)|\n"
@@ -1723,7 +1703,7 @@ class StatusCliTests(unittest.TestCase):
             json_err = io.StringIO()
             json_rc = main(
                 ["status", "--json"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=json_out,
@@ -1773,7 +1753,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             table_rc = main(
                 ["status"],
-                env=env,
+                env=make_test_env(root),
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
@@ -1815,11 +1795,6 @@ class StatusCliTests(unittest.TestCase):
                     '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
                     encoding="utf-8",
                 )
-                env = {
-                    "XDG_CONFIG_HOME": str(root / "config"),
-                    "XDG_CACHE_HOME": str(root / "cache"),
-                    "HOME": str(root / "home"),
-                }
                 runner = FakeRunner(
                     {
                         ("cluster-a", "sinfo"): bad_stdout,
@@ -1831,7 +1806,7 @@ class StatusCliTests(unittest.TestCase):
                 json_err = io.StringIO()
                 json_rc = main(
                     ["status", "--json"],
-                    env=env,
+                    env=make_test_env(root),
                     runner=runner,
                     clock=lambda: FIXED_NOW,
                     stdout=json_out,
@@ -1861,7 +1836,7 @@ class StatusCliTests(unittest.TestCase):
                 table_err = io.StringIO()
                 table_rc = main(
                     ["status"],
-                    env=env,
+                    env=make_test_env(root),
                     runner=runner,
                     clock=lambda: FIXED_NOW,
                     stdout=table_out,
