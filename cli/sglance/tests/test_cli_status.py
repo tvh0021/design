@@ -254,10 +254,10 @@ class StatusCliTests(unittest.TestCase):
             }
             runner = FakeRunner({("cluster-a", "sinfo"): SYNTHETIC_SINFO_SINGLE_PARTITION})
 
-            for cli_argv in (["status"], ["status", "--json"]):
+            for idx, cli_argv in enumerate((["status"], ["status", "--json"])):
                 exit_code = main(
                     cli_argv,
-                    env=env,
+                    env={**env, "XDG_CACHE_HOME": str(root / f"cache-{idx}")},
                     runner=runner,
                     clock=lambda: FIXED_NOW,
                     stdout=io.StringIO(),
@@ -428,7 +428,7 @@ class StatusCliTests(unittest.TestCase):
                 table_err = io.StringIO()
                 table_rc = main(
                     ["status"],
-                    env=env,
+                    env={**env, "XDG_CACHE_HOME": str(root / "cache-table")},
                     runner=runner,
                     clock=lambda: FIXED_NOW,
                     stdout=table_out,
@@ -656,7 +656,7 @@ class StatusCliTests(unittest.TestCase):
             table_err = io.StringIO()
             prefix_rc = main(
                 ["--cluster", "cluster-b", "status"],
-                env=env,
+                env={**env, "XDG_CACHE_HOME": str(root / "cache-table")},
                 runner=runner,
                 clock=lambda: FIXED_NOW,
                 stdout=table_out,
@@ -838,7 +838,7 @@ class StatusCliTests(unittest.TestCase):
                 table_err = io.StringIO()
                 table_rc = main(
                     ["status"],
-                    env=env,
+                    env={**env, "XDG_CACHE_HOME": str(root / "cache-table")},
                     runner=runner,
                     clock=lambda: FIXED_NOW,
                     stdout=table_out,
