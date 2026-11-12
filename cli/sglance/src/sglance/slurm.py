@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 import re
 
@@ -23,6 +23,44 @@ from sglance.runner import (
 
 _SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
 _SQUEUE_QUEUE_FIELDS = "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|"
+_JOB_SCOPING_PRIVATE_DATA_FLAGS = frozenset({"jobs", "all"})
+
+
+def scoping_private_data_flags(
+    command: str, *, account_scoped: bool = False
+) -> frozenset[str]:
+    if command in {"queue", "wait"}:
+        return _JOB_SCOPING_PRIVATE_DATA_FLAGS
+    if command == "mine":
+        return _JOB_SCOPING_PRIVATE_DATA_FLAGS if account_scoped else frozenset()
+    if command == "status":
+        return frozenset()
+    raise ValueError(f"unknown sglance command {command!r}")
+
+
+def is_user_scoped(
+    command: str,
+    *,
+    private_data: frozenset[str],
+    distinct_users: Collection[str],
+    account_scoped: bool = False,
+) -> bool:
+    flags = scoping_private_data_flags(command, account_scoped=account_scoped)
+    if not flags:
+        return False
+    nonempty_users = {user for user in distinct_users if user}
+    return bool(private_data & flags) or len(nonempty_users) == 1
+
+
+def _parse_scontrol_private_data(stdout: str) -> frozenset[str]:
+    flags: frozenset[str] = frozenset()
+    for raw_line in stdout.splitlines():
+        key, sep, value = raw_line.partition("=")
+        if sep != "=" or key.strip().lower() != "privatedata":
+            continue
+        tokens = {tok.strip().lower() for tok in value.split(",") if tok.strip()}
+        flags = frozenset(tokens - {"none", "(null)"})
+    return flags
 
 
 class _SlurmParseError(Exception):
@@ -52,6 +90,43 @@ class SlurmAdapter:
         if last_stderr:
             return f"{tool} exited {result.returncode}: {last_stderr}"
         return f"{tool} exited {result.returncode}"
+
+    def query_private_data(self, cluster_entry: ClusterEntry) -> frozenset[str]:
+        cluster_flag = (
+            ["-M", cluster_entry.slurm_cluster]
+            if cluster_entry.slurm_cluster is not None
+            else []
+        )
+        argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "scontrol",
+            *cluster_flag,
+            "show",
+            "config",
+        ]
+        outcome = self._run_command(cluster_entry, argv)
+        if isinstance(outcome, str):
+            return frozenset()
+        return _parse_scontrol_private_data(outcome.stdout)
+
+    def detect_user_scoped(
+        self,
+        cluster_entry: ClusterEntry,
+        *,
+        command: str,
+        distinct_users: Collection[str],
+        account_scoped: bool = False,
+    ) -> bool:
+        if not scoping_private_data_flags(command, account_scoped=account_scoped):
+            return False
+        private_data = self.query_private_data(cluster_entry)
+        return is_user_scoped(
+            command,
+            private_data=private_data,
+            distinct_users=distinct_users,
+            account_scoped=account_scoped,
+        )
 
     def query_status(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
         cluster_flag = (
@@ -127,7 +202,7 @@ class SlurmAdapter:
                 partitions=(),
             )
         try:
-            partitions = _parse_squeue_queue(outcome.stdout)
+            partitions, distinct_users = _parse_squeue_queue(outcome.stdout)
         except _SlurmParseError as exc:
             return ClusterQueue(
                 cluster=cluster_entry.name,
@@ -137,12 +212,17 @@ class SlurmAdapter:
                 error=str(exc),
                 partitions=(),
             )
+        user_scoped = self.detect_user_scoped(
+            cluster_entry,
+            command="queue",
+            distinct_users=distinct_users,
+        )
         fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return ClusterQueue(
             cluster=cluster_entry.name,
             fetched_at=fetched_at,
             stale=False,
-            user_scoped=False,
+            user_scoped=user_scoped,
             error=None,
             partitions=partitions,
         )
@@ -324,8 +404,9 @@ _RUNNING_SQUEUE_STATES = frozenset({"R", "CF"})
 _PENDING_SQUEUE_STATES = frozenset({"PD", "RQ", "RH", "RD", "SE"})
 
 
-def _parse_squeue_queue(stdout: str) -> tuple[PartitionQueue, ...]:
+def _parse_squeue_queue(stdout: str) -> tuple[tuple[PartitionQueue, ...], frozenset[str]]:
     by_partition: dict[str, tuple[int, int, dict[str, int]]] = {}
+    distinct_users: set[str] = set()
     for raw_line in stdout.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("CLUSTER: "):
@@ -336,13 +417,15 @@ def _parse_squeue_queue(stdout: str) -> tuple[PartitionQueue, ...]:
         cells = [cell.strip() for cell in line.split("|", 4)]
         if len(cells) != 5:
             raise _SlurmParseError(f"malformed squeue output: {stripped}")
-        job_id, _user_name, partition_field, state_compact, reason = cells
+        job_id, user_name, partition_field, state_compact, reason = cells
         if not job_id or not partition_field:
             raise _SlurmParseError(f"malformed squeue row: {stripped}")
         partition_parts = [part.strip() for part in partition_field.split(",")]
         if any(not part for part in partition_parts):
             raise _SlurmParseError(f"malformed squeue partition {partition_field!r}")
         partition_name = partition_parts[0]
+        if user_name:
+            distinct_users.add(user_name)
 
         is_running = state_compact in _RUNNING_SQUEUE_STATES
         is_pending = state_compact in _PENDING_SQUEUE_STATES
@@ -377,4 +460,4 @@ def _parse_squeue_queue(stdout: str) -> tuple[PartitionQueue, ...]:
                 ),
             )
         )
-    return tuple(partitions)
+    return tuple(partitions), frozenset(distinct_users)

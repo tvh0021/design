@@ -39,7 +39,12 @@ class QueueCliTests(unittest.TestCase):
                 "XDG_CACHE_HOME": str(root / "cache"),
                 "HOME": str(root / "home"),
             }
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_output})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_output,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
             stdout = io.StringIO()
             stderr = io.StringIO()
 
@@ -72,7 +77,19 @@ class QueueCliTests(unittest.TestCase):
                             "-O",
                             "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
                         ],
-                    )
+                    ),
+                    (
+                        "cluster-a",
+                        "ssh",
+                        "login.example.edu",
+                        [
+                            "env",
+                            "SLURM_TIME_FORMAT=%s",
+                            "scontrol",
+                            "show",
+                            "config",
+                        ],
+                    ),
                 ],
             )
             self.assertEqual(
@@ -146,7 +163,12 @@ class QueueCliTests(unittest.TestCase):
                 "XDG_CACHE_HOME": str(root / "cache"),
                 "HOME": str(root / "home"),
             }
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_output})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_output,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
 
             json_out = io.StringIO()
             json_err = io.StringIO()
@@ -223,7 +245,9 @@ class QueueCliTests(unittest.TestCase):
             runner = FakeRunner(
                 {
                     ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
                     ("cluster-b", "squeue"): "   \n\n",
+                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
                 }
             )
 
@@ -311,6 +335,22 @@ class QueueCliTests(unittest.TestCase):
             "-O",
             "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
         ]
+        base_scontrol_argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "scontrol",
+            "show",
+            "config",
+        ]
+        dash_m_scontrol_argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "scontrol",
+            "-M",
+            "prod",
+            "show",
+            "config",
+        ]
         failure_cases = [
             (
                 "ssh-timeout",
@@ -348,6 +388,7 @@ class QueueCliTests(unittest.TestCase):
                 runner = FakeRunner(
                     {
                         ("cluster-a", "squeue"): "100|alice|cpu|R|None|\n101|bob|cpu|PD|Resources|\n",
+                        ("cluster-a", "scontrol"): "PrivateData             = none\n",
                         ("cluster-b", "squeue"): cluster_b_response,
                         ("cluster-c", "squeue"): CommandResult(5, "", "   \n"),
                     }
@@ -370,6 +411,7 @@ class QueueCliTests(unittest.TestCase):
                     sorted(runner.calls, key=lambda c: c[0]),
                     [
                         ("cluster-a", "ssh", "login.example.edu", base_argv),
+                        ("cluster-a", "ssh", "login.example.edu", base_scontrol_argv),
                         ("cluster-b", "ssh", "cluster-b", dash_m_argv),
                         ("cluster-c", "local", None, base_argv),
                     ],
@@ -451,7 +493,10 @@ class QueueCliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             filtered_runner = FakeRunner(
-                {("cluster-b", "squeue"): "200|alice|gpu|PD|Priority|\n"}
+                {
+                    ("cluster-b", "squeue"): "200|alice|gpu|PD|Priority|\n",
+                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
+                }
             )
             for argv in (["queue", "--cluster", "cluster-b"], ["--cluster", "cluster-b", "queue"]):
                 out = io.StringIO()
@@ -468,7 +513,7 @@ class QueueCliTests(unittest.TestCase):
                 self.assertEqual(err.getvalue(), "")
                 self.assertEqual(
                     out.getvalue(),
-                    "cluster-b\n"
+                    "cluster-b [user-scoped]\n"
                     "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
                     "  gpu        0        1        Priority (1)\n",
                 )
@@ -476,7 +521,9 @@ class QueueCliTests(unittest.TestCase):
                 filtered_runner.calls,
                 [
                     ("cluster-b", "ssh", "cluster-b", dash_m_argv),
+                    ("cluster-b", "ssh", "cluster-b", dash_m_scontrol_argv),
                     ("cluster-b", "ssh", "cluster-b", dash_m_argv),
+                    ("cluster-b", "ssh", "cluster-b", dash_m_scontrol_argv),
                 ],
             )
 
@@ -523,6 +570,7 @@ class QueueCliTests(unittest.TestCase):
                     {
                         ("cluster-a", "squeue"): bad_stdout,
                         ("cluster-b", "squeue"): "201|bob|gpu|R|None|\n",
+                        ("cluster-b", "scontrol"): "PrivateData             = none\n",
                     }
                 )
 
@@ -550,6 +598,7 @@ class QueueCliTests(unittest.TestCase):
 
                 self.assertEqual(cluster_b["cluster"], "cluster-b")
                 self.assertEqual(cluster_b["fetched_at"], "2026-11-12T20:00:00Z")
+                self.assertTrue(cluster_b["user_scoped"])
                 self.assertIsNone(cluster_b["error"])
                 self.assertEqual(
                     cluster_b["partitions"],
@@ -576,7 +625,7 @@ class QueueCliTests(unittest.TestCase):
                 self.assertEqual(table_rc, 0)
                 self.assertEqual(table_err.getvalue(), "")
                 self.assertIn(
-                    f"cluster-a: {cluster_a['error']}\n\ncluster-b\n",
+                    f"cluster-a: {cluster_a['error']}\n\ncluster-b [user-scoped]\n",
                     table_out.getvalue(),
                 )
 
@@ -598,7 +647,12 @@ class QueueCliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env = make_test_env(root)
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_output})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_output,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
             stdout = io.StringIO()
             stderr = io.StringIO()
 
@@ -649,7 +703,12 @@ class QueueCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_output})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_output,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
 
             json_out = io.StringIO()
             json_err = io.StringIO()
@@ -733,7 +792,12 @@ class QueueCliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             shared_env = make_test_env(root)
-            runner = FakeRunner({("cluster-a", "squeue"): initial_squeue})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): initial_squeue,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
 
             first_out = io.StringIO()
             first_err = io.StringIO()
@@ -747,7 +811,7 @@ class QueueCliTests(unittest.TestCase):
             )
             self.assertEqual(first_rc, 0)
             self.assertEqual(first_err.getvalue(), "")
-            self.assertEqual(len(runner.calls), 1)
+            self.assertEqual(len(runner.calls), 2)
             self.assertEqual(
                 first_out.getvalue(),
                 "cluster-a\n"
@@ -770,7 +834,7 @@ class QueueCliTests(unittest.TestCase):
             )
             self.assertEqual(cached_rc, 0)
             self.assertEqual(cached_err.getvalue(), "")
-            self.assertEqual(len(runner.calls), 1)
+            self.assertEqual(len(runner.calls), 2)
             self.assertEqual(
                 cached_out.getvalue(),
                 "cluster-a [cached 120s ago]\n"
@@ -790,7 +854,7 @@ class QueueCliTests(unittest.TestCase):
             )
             self.assertEqual(refresh_rc, 0)
             self.assertEqual(refresh_err.getvalue(), "")
-            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(len(runner.calls), 4)
             self.assertEqual(
                 refresh_out.getvalue(),
                 "cluster-a\n"
@@ -879,7 +943,12 @@ class QueueCliTests(unittest.TestCase):
                 "1001|alice|gpu|R|None|\n"
                 "1002|bob|gpu|PD|Resources|\n"
             )
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_fixture})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_fixture,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
 
             table_out = io.StringIO()
             table_err = io.StringIO()
@@ -914,7 +983,12 @@ class QueueCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_fixture})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_fixture,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
 
             json_out = io.StringIO()
             json_err = io.StringIO()
@@ -972,7 +1046,12 @@ class QueueCliTests(unittest.TestCase):
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            runner = FakeRunner({("cluster-a", "squeue"): squeue_fixture})
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "squeue"): squeue_fixture,
+                    ("cluster-a", "scontrol"): "PrivateData             = none\n",
+                }
+            )
 
             json_out = io.StringIO()
             json_err = io.StringIO()
@@ -1014,7 +1093,7 @@ class QueueCliTests(unittest.TestCase):
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(
                 table_out.getvalue(),
-                "cluster-a\n"
+                "cluster-a [user-scoped]\n"
                 "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
                 "  cpu        0        1        Held by admin | maint (1)\n",
             )
