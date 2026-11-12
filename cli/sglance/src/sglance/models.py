@@ -46,3 +46,34 @@ class StatusReport:
     clusters: tuple[ClusterStatus, ...]
     schema_version: int = 1
     command: str = "status"
+
+
+@dataclass(frozen=True)
+class PendingReasonCount:
+    reason: str
+    count: int
+
+
+@dataclass(frozen=True)
+class PartitionQueue:
+    partition: str
+    running_jobs: int
+    pending_jobs: int
+    top_reasons: tuple[PendingReasonCount, ...]
+
+
+@dataclass(frozen=True)
+class ClusterQueue:
+    cluster: str
+    fetched_at: str | None
+    stale: bool
+    user_scoped: bool
+    error: str | None
+    partitions: tuple[PartitionQueue, ...]
+
+
+@dataclass(frozen=True)
+class QueueReport:
+    clusters: tuple[ClusterQueue, ...]
+    schema_version: int = 1
+    command: str = "queue"

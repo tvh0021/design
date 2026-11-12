@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import re
 
-from sglance.models import ClusterEntry, ClusterStatus, PartitionStatus
+from sglance.models import (
+    ClusterEntry,
+    ClusterQueue,
+    ClusterStatus,
+    PartitionQueue,
+    PartitionStatus,
+    PendingReasonCount,
+)
 from sglance.runner import (
     AllowlistedRunner,
     CommandRunner,
@@ -13,6 +20,7 @@ from sglance.runner import (
 )
 
 _SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
+_SQUEUE_QUEUE_FIELDS = "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|"
 
 
 class _SlurmParseError(Exception):
@@ -80,6 +88,71 @@ class SlurmAdapter:
             )
         fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return ClusterStatus(
+            cluster=cluster_entry.name,
+            fetched_at=fetched_at,
+            stale=False,
+            user_scoped=False,
+            error=None,
+            partitions=partitions,
+        )
+
+    def query_queue(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterQueue:
+        cluster_flag = (
+            ["-M", cluster_entry.slurm_cluster]
+            if cluster_entry.slurm_cluster is not None
+            else []
+        )
+        argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            *cluster_flag,
+            "-h",
+            "-r",
+            "-O",
+            _SQUEUE_QUEUE_FIELDS,
+        ]
+        try:
+            result = self._runner.run(cluster_entry, argv)
+        except (TransportError, OSError) as exc:
+            return ClusterQueue(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=format_transport_error(exc),
+                partitions=(),
+            )
+        if result.returncode != 0:
+            if not cluster_entry.local and result.returncode == 255:
+                error_msg = format_ssh_exit_255(result.stderr)
+            else:
+                first_stderr = next(
+                    (line.strip() for line in result.stderr.splitlines() if line.strip()),
+                    "",
+                )
+                error_msg = first_stderr or f"squeue exited {result.returncode}"
+            return ClusterQueue(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=error_msg,
+                partitions=(),
+            )
+        try:
+            partitions = _parse_squeue_queue(result.stdout)
+        except _SlurmParseError as exc:
+            return ClusterQueue(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=str(exc),
+                partitions=(),
+            )
+        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return ClusterQueue(
             cluster=cluster_entry.name,
             fetched_at=fetched_at,
             stale=False,
@@ -260,3 +333,85 @@ def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
         )
     return tuple(partitions)
 
+
+_VALID_SQUEUE_COMPACT_STATES = frozenset(
+    {
+        "BF",
+        "CA",
+        "CD",
+        "CF",
+        "CG",
+        "DL",
+        "F",
+        "NF",
+        "OOM",
+        "PD",
+        "PR",
+        "R",
+        "RD",
+        "RF",
+        "RH",
+        "RQ",
+        "RS",
+        "RV",
+        "S",
+        "SE",
+        "SI",
+        "SO",
+        "ST",
+        "TO",
+    }
+)
+
+
+def _parse_squeue_queue(stdout: str) -> tuple[PartitionQueue, ...]:
+    by_partition: dict[str, tuple[int, int, dict[str, int]]] = {}
+    for raw_line in stdout.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        line = stripped[:-1] if stripped.endswith("|") else stripped
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) != 5:
+            raise _SlurmParseError(f"malformed squeue output: {stripped}")
+        job_id, user_name, partition_field, state_compact, reason = cells
+        if not job_id or not user_name or not partition_field:
+            raise _SlurmParseError(f"malformed squeue row: {stripped}")
+        partition_parts = [part.strip() for part in partition_field.split(",")]
+        if any(not part for part in partition_parts):
+            raise _SlurmParseError(f"malformed squeue partition {partition_field!r}")
+        partition_name = partition_parts[0]
+
+        if state_compact not in _VALID_SQUEUE_COMPACT_STATES:
+            raise _SlurmParseError(f"malformed squeue StateCompact {state_compact!r}")
+
+        running_jobs, pending_jobs, reason_counts = by_partition.get(
+            partition_name, (0, 0, {})
+        )
+        if state_compact == "R":
+            running_jobs += 1
+        elif state_compact == "PD":
+            if not reason:
+                raise _SlurmParseError(f"malformed squeue pending row: {stripped}")
+            pending_jobs += 1
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        by_partition[partition_name] = (running_jobs, pending_jobs, reason_counts)
+
+    partitions: list[PartitionQueue] = []
+    for name, (running_jobs, pending_jobs, reason_counts) in by_partition.items():
+        sorted_reasons = sorted(
+            reason_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:5]
+        partitions.append(
+            PartitionQueue(
+                partition=name,
+                running_jobs=running_jobs,
+                pending_jobs=pending_jobs,
+                top_reasons=tuple(
+                    PendingReasonCount(reason=r_name, count=r_count)
+                    for r_name, r_count in sorted_reasons
+                ),
+            )
+        )
+    return tuple(partitions)
