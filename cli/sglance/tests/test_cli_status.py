@@ -2265,6 +2265,7 @@ class StatusCliTests(unittest.TestCase):
                             "n": 1,
                             "p50_seconds": 60.0,
                             "p90_seconds": 60.0,
+                            "median_pending_seconds": None,
                             "oldest_pending_seconds": None,
                         }
                     ],

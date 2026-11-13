@@ -128,7 +128,7 @@ When no running or pending jobs exist on a cluster, `queue` prints `  0 running,
 
 ### `wait`
 
-Shows historical wait-time percentiles from `sacct` and the age of the oldest contention-blocked eligible pending job from `squeue`.
+Shows historical wait-time percentiles from `sacct` and the median and oldest ages of contention-blocked eligible pending jobs from `squeue`. A few stuck jobs can skew `OLDEST PENDING`, while `MEDIAN PENDING` shows the typical current wait.
 
 Option:
 
@@ -137,9 +137,9 @@ Option:
 ```text
 $ sglance wait --days 7
 cluster-a
-  PARTITION  N   P50     P90     OLDEST PENDING
-  cpu        84  2m 30s  38m 0s  15m 0s
-  gpu        29  32m 0s  4h 30m  2h 10m
+  PARTITION  N   P50     P90     MEDIAN PENDING  OLDEST PENDING
+  cpu        84  2m 30s  38m 0s  6m 0s           15m 0s
+  gpu        29  32m 0s  4h 30m  45m 0s          2h 10m
 ```
 
 Columns:
@@ -148,11 +148,12 @@ Columns:
 - **`N`**. Started job samples in the lookback window. Wait time equals `Start - Eligible`. Each job array counts once using its earliest started task, and each heterogeneous job counts once using its earliest started component. Job steps, requeued records, and jobs cancelled before receiving an allocation are excluded.
 - **`P50`**. Median wait time across the `N` samples, or `-` when `N` is `0`.
 - **`P90`**. 90th-percentile wait time across the `N` samples, or `-` when `N` is `0`.
-- **`OLDEST PENDING`**. Elapsed time since eligible time for the oldest job in state `PD` whose pending reason is `Resources`, `Priority`, `None`, `AssocGrp*`, or `QOSGrp*`, or `-` when none match.
+- **`MEDIAN PENDING`**. Median elapsed time since eligible time across jobs and expanded job array tasks in state `PD` whose pending reason is `Resources`, `Priority`, `None`, `AssocGrp*`, or `QOSGrp*`, interpolated at `0.5 * (n - 1)` like `P50`, or `-` when none match. Multi-partition pending jobs count in each listed partition. Emitted as `"median_pending_seconds"` in `--json`, or `null` when none match.
+- **`OLDEST PENDING`**. Elapsed time since eligible time for the oldest job in that same pending set, or `-` when none match. Emitted as `"oldest_pending_seconds"` in `--json`, or `null` when none match.
 
 When neither started samples nor eligible contention-blocked pending jobs exist, `wait` prints `  (no wait data)`.
 
-When `sacct` fails on a cluster, such as when Slurm accounting storage is disabled, `wait` still runs the `squeue` pending query and reports per-partition `OLDEST PENDING` with `N` set to `0` and `P50` and `P90` unset. Table mode prints `  history unavailable: <sacct error>` under the cluster header, and `--json` sets `"history_error"` on the cluster object while keeping `"error": null`. Results with only `"history_error"` still use the five-minute cache, whereas a cluster where `squeue` also fails reports `"error"` as usual and is not cached.
+When `sacct` fails on a cluster, such as when Slurm accounting storage is disabled, `wait` still runs the `squeue` pending query and reports per-partition `MEDIAN PENDING` and `OLDEST PENDING` with `N` set to `0` and `P50` and `P90` unset. Table mode prints `  history unavailable: <sacct error>` under the cluster header, and `--json` sets `"history_error"` on the cluster object while keeping `"error": null`. Results with only `"history_error"` still use the five-minute cache, whereas a cluster where `squeue` also fails reports `"error"` as usual and is not cached.
 
 ### `mine`
 
@@ -245,7 +246,7 @@ Each element of `"clusters"` shares `"cluster"`, `"fetched_at"`, `"stale"`, `"us
 
 - **`status`**. `"partitions"` array of objects with `"partition"`, `"default"`, `"cpus_alloc"`, `"cpus_total"`, `"cpus_utilization"`, `"gpus_alloc"`, `"gpus_total"`, `"gpus_utilization"`, `"nodes_alloc"`, `"nodes_mixed"`, `"nodes_idle"`, `"nodes_down"`, `"nodes_drained"`, `"nodes_draining"`, `"nodes_other"`, and `"nodes_total"`.
 - **`queue`**. `"partitions"` array of objects with `"partition"`, `"running_jobs"`, `"pending_jobs"`, and `"top_reasons"`, where each entry in `"top_reasons"` has `"reason"` and `"count"`.
-- **`wait`**. `"history_error"`, which is a string or `null`, and `"partitions"` array of objects with `"partition"`, `"n"`, `"p50_seconds"`, `"p90_seconds"`, and `"oldest_pending_seconds"`.
+- **`wait`**. `"history_error"`, which is a string or `null`, and `"partitions"` array of objects with `"partition"`, `"n"`, `"p50_seconds"`, `"p90_seconds"`, `"median_pending_seconds"`, and `"oldest_pending_seconds"`.
 - **`mine`**. `"slurm_user"`, `"account_filter"`, and `"jobs"` array of objects with `"job_id"`, `"name"`, `"user"`, `"account"`, `"partition"`, `"state"`, `"cpus"`, `"gpus"`, `"nodes"`, `"elapsed_seconds"`, `"time_limit_seconds"`, `"reason"`, and `"estimated_start"`.
 
 Compatibility rules:

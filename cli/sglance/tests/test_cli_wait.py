@@ -168,6 +168,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 4,
                                     "p50_seconds": 210.0,
                                     "p90_seconds": 510.0,
+                                    "median_pending_seconds": None,
                                     "oldest_pending_seconds": None,
                                 },
                                 {
@@ -175,6 +176,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 1,
                                     "p50_seconds": 45.0,
                                     "p90_seconds": 45.0,
+                                    "median_pending_seconds": None,
                                     "oldest_pending_seconds": None,
                                 },
                             ],
@@ -282,6 +284,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 4,
                                     "p50_seconds": 5.0,
                                     "p90_seconds": 12.1,
+                                    "median_pending_seconds": None,
                                     "oldest_pending_seconds": None,
                                 }
                             ],
@@ -418,6 +421,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 5,
                                     "p50_seconds": 120.0,
                                     "p90_seconds": 456.0,
+                                    "median_pending_seconds": None,
                                     "oldest_pending_seconds": None,
                                 }
                             ],
@@ -459,7 +463,7 @@ class WaitCliTests(unittest.TestCase):
             # cpu's single-partition pending jobs are excluded, while debug,cpu below updates both debug and cpu:
             "8020|bob|cpu|PD|JobHeldUser|1794490000|\n"
             "8021|alice|cpu|PD|Resources|1794514000|\n"
-            # Multi-partition target debug,cpu -> 3600s on both debug (n=0 in sacct) and cpu:
+            # Multi-partition target debug,cpu -> 3600s and 1600s on both debug (n=0 in sacct) and cpu:
             "8030_1|bob|debug,cpu|PD|Resources|1794510000|\n"
             "8030_2|bob|debug,cpu|PD|Priority|1794512000|\n"
             # Hold-only partition with no sacct samples -> must not emit phantom all-null row:
@@ -514,6 +518,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 2,
                                     "p50_seconds": 200.0,
                                     "p90_seconds": 280.0,
+                                    "median_pending_seconds": 1800.0,
                                     "oldest_pending_seconds": 5400,
                                 },
                                 {
@@ -521,6 +526,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 1,
                                     "p50_seconds": 60.0,
                                     "p90_seconds": 60.0,
+                                    "median_pending_seconds": 2600.0,
                                     "oldest_pending_seconds": 3600,
                                 },
                                 {
@@ -528,6 +534,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 0,
                                     "p50_seconds": None,
                                     "p90_seconds": None,
+                                    "median_pending_seconds": 2600.0,
                                     "oldest_pending_seconds": 3600,
                                 },
                             ],
@@ -674,6 +681,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 2,
                         "p50_seconds": 120.0,
                         "p90_seconds": 168.0,
+                        "median_pending_seconds": None,
                         "oldest_pending_seconds": None,
                     }
                 ],
@@ -740,6 +748,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 0,
                         "p50_seconds": None,
                         "p90_seconds": None,
+                        "median_pending_seconds": 2700.0,
                         "oldest_pending_seconds": 7200,
                     },
                     {
@@ -747,6 +756,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 0,
                         "p50_seconds": None,
                         "p90_seconds": None,
+                        "median_pending_seconds": 900.0,
                         "oldest_pending_seconds": 900,
                     },
                 ],
@@ -815,6 +825,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 1,
                         "p50_seconds": 90.0,
                         "p90_seconds": 90.0,
+                        "median_pending_seconds": None,
                         "oldest_pending_seconds": None,
                     }
                 ],
@@ -874,6 +885,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 1,
                         "p50_seconds": 120.0,
                         "p90_seconds": 120.0,
+                        "median_pending_seconds": None,
                         "oldest_pending_seconds": None,
                     },
                     {
@@ -881,6 +893,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 1,
                         "p50_seconds": 40.0,
                         "p90_seconds": 40.0,
+                        "median_pending_seconds": None,
                         "oldest_pending_seconds": None,
                     },
                 ],
@@ -935,6 +948,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 0,
                         "p50_seconds": None,
                         "p90_seconds": None,
+                        "median_pending_seconds": 3600.0,
                         "oldest_pending_seconds": 3600,
                     },
                     {
@@ -942,6 +956,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 0,
                         "p50_seconds": None,
                         "p90_seconds": None,
+                        "median_pending_seconds": 2700.0,
                         "oldest_pending_seconds": 3600,
                     },
                     {
@@ -949,6 +964,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 0,
                         "p50_seconds": None,
                         "p90_seconds": None,
+                        "median_pending_seconds": 2100.0,
                         "oldest_pending_seconds": 3600,
                     },
                     {
@@ -956,6 +972,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 0,
                         "p50_seconds": None,
                         "p90_seconds": None,
+                        "median_pending_seconds": 4500.0,
                         "oldest_pending_seconds": 7200,
                     },
                 ],
@@ -1013,6 +1030,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 1,
                         "p50_seconds": 75.0,
                         "p90_seconds": 75.0,
+                        "median_pending_seconds": 1200.0,
                         "oldest_pending_seconds": 1200,
                     }
                 ],
@@ -1072,10 +1090,10 @@ class WaitCliTests(unittest.TestCase):
             self.assertEqual(
                 rendered,
                 "cluster-a [user-scoped]\n"
-                "  PARTITION  N  P50    P90     OLDEST PENDING\n"
-                "  gpu        3  45s    2m 25s  1h 30m\n"
-                "  cpu        1  1h 0m  1h 0m   -\n"
-                "  bigmem     0  -      -       1d 1h\n"
+                "  PARTITION  N  P50    P90     MEDIAN PENDING  OLDEST PENDING\n"
+                "  gpu        3  45s    2m 25s  1h 30m          1h 30m\n"
+                "  cpu        1  1h 0m  1h 0m   -               -\n"
+                "  bigmem     0  -      -       1d 1h           1d 1h\n"
                 "\n"
                 "cluster-b\n"
                 "  (no wait data)\n"
@@ -1142,6 +1160,7 @@ class WaitCliTests(unittest.TestCase):
                         "n": 2,
                         "p50_seconds": 120.0,
                         "p90_seconds": 120.0,
+                        "median_pending_seconds": 300.0,
                         "oldest_pending_seconds": 300,
                     }
                 ],
@@ -1175,8 +1194,8 @@ class WaitCliTests(unittest.TestCase):
             self.assertEqual(
                 out2.getvalue(),
                 "cluster-a [cached 75s ago]\n"
-                "  PARTITION  N  P50    P90    OLDEST PENDING\n"
-                "  gpu        2  2m 0s  2m 0s  5m 0s\n"
+                "  PARTITION  N  P50    P90    MEDIAN PENDING  OLDEST PENDING\n"
+                "  gpu        2  2m 0s  2m 0s  5m 0s           5m 0s\n"
                 "\n"
                 "cluster-b: squeue exited 1: error: controller busy\n",
             )
@@ -1307,6 +1326,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 0,
                                     "p50_seconds": None,
                                     "p90_seconds": None,
+                                    "median_pending_seconds": 600.0,
                                     "oldest_pending_seconds": 900,
                                 },
                                 {
@@ -1314,6 +1334,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 0,
                                     "p50_seconds": None,
                                     "p90_seconds": None,
+                                    "median_pending_seconds": 7200.0,
                                     "oldest_pending_seconds": 7200,
                                 },
                             ],
@@ -1363,9 +1384,9 @@ class WaitCliTests(unittest.TestCase):
                 out2.getvalue(),
                 "cluster-a [cached 45s ago]\n"
                 "  history unavailable: sacct exited 1: error: Slurm accounting storage is disabled\n"
-                "  PARTITION  N  P50  P90  OLDEST PENDING\n"
-                "  gpu        0  -    -    15m 0s\n"
-                "  cpu        0  -    -    2h 0m\n"
+                "  PARTITION  N  P50  P90  MEDIAN PENDING  OLDEST PENDING\n"
+                "  gpu        0  -    -    10m 0s          15m 0s\n"
+                "  cpu        0  -    -    2h 0m           2h 0m\n"
                 "\n"
                 "cluster-b [user-scoped] [cached 45s ago]\n"
                 "  history unavailable: sacct exited 1: Slurm accounting storage is disabled\n"
@@ -1373,8 +1394,8 @@ class WaitCliTests(unittest.TestCase):
                 "\n"
                 "cluster-c\n"
                 "  history unavailable: sacct exited 1: error: Slurm accounting storage is disabled\n"
-                "  PARTITION  N  P50  P90  OLDEST PENDING\n"
-                "  debug      0  -    -    1m 40s\n",
+                "  PARTITION  N  P50  P90  MEDIAN PENDING  OLDEST PENDING\n"
+                "  debug      0  -    -    1m 40s          1m 40s\n",
             )
 
             out3, err3 = io.StringIO(), io.StringIO()
@@ -1404,6 +1425,7 @@ class WaitCliTests(unittest.TestCase):
                             "n": 0,
                             "p50_seconds": None,
                             "p90_seconds": None,
+                            "median_pending_seconds": 600.0,
                             "oldest_pending_seconds": 900,
                         },
                         {
@@ -1411,10 +1433,354 @@ class WaitCliTests(unittest.TestCase):
                             "n": 0,
                             "p50_seconds": None,
                             "p90_seconds": None,
+                            "median_pending_seconds": 7200.0,
                             "oldest_pending_seconds": 7200,
                         },
                     ],
                 },
+            )
+
+
+    def test_wait_computes_median_pending_seconds_for_skewed_even_odd_multipartition_and_empty_partitions(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600 (2026-11-12T20:00:00Z).
+        sacct_stdout = (
+            "1001|alice|gpu|COMPLETED|1794500000|1794500120|gres/gpu=1\n"
+            "1002|bob|debug|COMPLETED|1794501000|1794501030|cpu=4\n"
+        )
+        squeue_stdout = (
+            # gpu qualifying pending ages: 7200s, 4_450_000s, 600s, 3600s (unsorted)
+            # -> sorted [600, 3600, 7200, 4450000], median = 3600 + 0.5*(7200 - 3600) = 5400.0, oldest = 4450000.
+            "2001|alice|gpu|PD|Priority|1794506400|\n"
+            "2002|bob|gpu|PD|Resources|1790063600|\n"
+            "2003|alice|gpu|PD|AssocGrpGpuLimit|1794513000|\n"
+            "2004|bob|gpu|PD|QOSGrpBillingMinutes|1794510000|\n"
+            # gpu non-qualifying rows (excluded reasons and invalid/future EligibleTime):
+            "2005|alice|gpu|PD|JobHeldUser|1789000000|\n"
+            "2006|bob|gpu|PD|Dependency|1789500000|\n"
+            "2007|alice|gpu|PD|Resources|Unknown|\n"
+            "2008|bob|gpu|PD|Priority|1794513605|\n"
+            # cpu array tasks from squeue -r (10s, 25s, 40s) + multi-partition job 2200 (100s)
+            # -> sorted [10, 25, 40, 100], median = 25 + 0.5*(40 - 25) = 32.5, oldest = 100.
+            "2100_1|alice|cpu|PD|Resources|1794513590|\n"
+            "2100_2|alice|cpu|PD|Resources|1794513575|\n"
+            "2100_3|alice|cpu|PD|None|1794513560|\n"
+            "2200|bob|cpu*,bigmem|PD|Priority|1794513500|\n"
+            # bigmem gets 2200 (100s) plus 300s and 900s -> sorted [100, 300, 900], median = 300.0, oldest = 900.
+            "2301|alice|bigmem|PD|Resources|1794513300|\n"
+            "2302|bob|bigmem|PD|Priority|1794512700|\n"
+            # debug has only a BeginTime pending job -> median_pending_seconds and oldest_pending_seconds are None.
+            "2401|alice|debug|PD|BeginTime|1794500000|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.cluster-a.example.org"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_stdout,
+                    ("cluster-a", "squeue"): squeue_stdout,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                payload,
+                {
+                    "schema_version": 1,
+                    "command": "wait",
+                    "days": 7,
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "history_error": None,
+                            "partitions": [
+                                {
+                                    "partition": "gpu",
+                                    "n": 1,
+                                    "p50_seconds": 120.0,
+                                    "p90_seconds": 120.0,
+                                    "median_pending_seconds": 5400.0,
+                                    "oldest_pending_seconds": 4450000,
+                                },
+                                {
+                                    "partition": "debug",
+                                    "n": 1,
+                                    "p50_seconds": 30.0,
+                                    "p90_seconds": 30.0,
+                                    "median_pending_seconds": None,
+                                    "oldest_pending_seconds": None,
+                                },
+                                {
+                                    "partition": "cpu",
+                                    "n": 0,
+                                    "p50_seconds": None,
+                                    "p90_seconds": None,
+                                    "median_pending_seconds": 32.5,
+                                    "oldest_pending_seconds": 100,
+                                },
+                                {
+                                    "partition": "bigmem",
+                                    "n": 0,
+                                    "p50_seconds": None,
+                                    "p90_seconds": None,
+                                    "median_pending_seconds": 300.0,
+                                    "oldest_pending_seconds": 900,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+            for part_obj in payload["clusters"][0]["partitions"]:
+                self.assertEqual(
+                    list(part_obj.keys()),
+                    [
+                        "partition",
+                        "n",
+                        "p50_seconds",
+                        "p90_seconds",
+                        "median_pending_seconds",
+                        "oldest_pending_seconds",
+                    ],
+                )
+
+
+    def test_wait_table_renders_median_pending_before_oldest_pending_with_skewed_and_null_values(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600.
+        sacct_stdout = (
+            "1001|alice|gpu|COMPLETED|1794500000|1794501800|gres/gpu=1\n"
+            "1002|bob|gpu|COMPLETED|1794502000|1794509200|gres/gpu=1\n"
+            "1003|alice|cpu|COMPLETED|1794503000|1794503045|cpu=8\n"
+        )
+        squeue_stdout = (
+            # gpu pending ages: 600s, 3600s, 7200s, 4_450_000s -> median 5400s (1h 30m), oldest 4_450_000s (51d 12h).
+            "2001|alice|gpu|PD|Resources|1794513000|\n"
+            "2002|bob|gpu|PD|Priority|1794510000|\n"
+            "2003|alice|gpu|PD|Resources|1794506400|\n"
+            "2004|bob|gpu|PD|Priority|1790063600|\n"
+            # debug has no sacct history, 2 pending jobs (45s, 135s) -> median 90s (1m 30s), oldest 135s (2m 15s).
+            "2005|alice|debug|PD|Resources|1794513555|\n"
+            "2006|bob|debug|PD|Priority|1794513465|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_stdout,
+                    ("cluster-a", "squeue"): squeue_stdout,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            # gpu waits: [1800, 7200] -> p50 = 4500s (1h 15m), p90 = 6660s (1h 51m).
+            self.assertEqual(
+                stdout.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  N  P50     P90     MEDIAN PENDING  OLDEST PENDING\n"
+                "  gpu        2  1h 15m  1h 51m  1h 30m          51d 12h\n"
+                "  cpu        1  45s     45s     -               -\n"
+                "  debug      0  -       -       1m 30s          2m 15s\n",
+            )
+
+    def test_wait_history_unavailable_and_cache_round_trip_preserve_median_pending_and_miss_legacy_schema(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600 (2026-11-12T20:00:00Z).
+        squeue_initial = (
+            # gpu pending ages: 600s, 3600s, 7200s, 4_450_000s -> median 5400.0 (1h 30m), oldest 4450000 (51d 12h).
+            "3001|alice|gpu|PD|Resources|1794513000|\n"
+            "3002|bob|gpu|PD|Priority|1794510000|\n"
+            "3003|alice|gpu|PD|Resources|1794506400|\n"
+            "3004|bob|gpu|PD|Priority|1790063600|\n"
+            # cpu pending ages: 300s, 900s -> median 600.0 (10m 0s), oldest 900 (15m 0s).
+            "3005|alice|cpu|PD|Resources|1794513300|\n"
+            "3006|bob|cpu|PD|Priority|1794512700|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.cluster-a.example.org"\n',
+                encoding="utf-8",
+            )
+            shared_env = make_test_env(root)
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): CommandResult(
+                        1, "", "sacct: error: Slurm accounting storage is disabled\n"
+                    ),
+                    ("cluster-a", "squeue"): squeue_initial,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+
+            # Call 1 at t = 0s: live history-unavailable fetch writes median_pending_seconds to cache.
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["wait", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(err1.getvalue(), "")
+            self.assertEqual(len(runner.calls), 3)
+            cluster1 = json.loads(out1.getvalue())["clusters"][0]
+            self.assertIsNone(cluster1["error"])
+            self.assertEqual(
+                cluster1["history_error"],
+                "sacct exited 1: error: Slurm accounting storage is disabled",
+            )
+            self.assertEqual(
+                cluster1["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "median_pending_seconds": 5400.0,
+                        "oldest_pending_seconds": 4450000,
+                    },
+                    {
+                        "partition": "cpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "median_pending_seconds": 600.0,
+                        "oldest_pending_seconds": 900,
+                    },
+                ],
+            )
+
+            # Mutate squeue response to prove t = 60s table and JSON reads come from cache.
+            runner._responses[("cluster-a", "squeue")] = (
+                "3999|alice|gpu|PD|Resources|1794513600|\n"
+            )
+            t_hit = FIXED_NOW + timedelta(seconds=60)
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["wait"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_hit,
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            self.assertEqual(len(runner.calls), 3)
+            self.assertEqual(
+                out2.getvalue(),
+                "cluster-a [cached 60s ago]\n"
+                "  history unavailable: sacct exited 1: error: Slurm accounting storage is disabled\n"
+                "  PARTITION  N  P50  P90  MEDIAN PENDING  OLDEST PENDING\n"
+                "  gpu        0  -    -    1h 30m          51d 12h\n"
+                "  cpu        0  -    -    10m 0s          15m 0s\n",
+            )
+
+            out3, err3 = io.StringIO(), io.StringIO()
+            rc3 = main(
+                ["wait", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_hit,
+                stdout=out3,
+                stderr=err3,
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(err3.getvalue(), "")
+            self.assertEqual(len(runner.calls), 3)
+            cluster3 = json.loads(out3.getvalue())["clusters"][0]
+            self.assertTrue(cluster3["stale"])
+            self.assertIsInstance(cluster3["partitions"][0]["median_pending_seconds"], float)
+            self.assertIsInstance(cluster3["partitions"][0]["oldest_pending_seconds"], int)
+            self.assertEqual(cluster3["partitions"][0]["median_pending_seconds"], 5400.0)
+            self.assertEqual(cluster3["partitions"][0]["oldest_pending_seconds"], 4450000)
+
+            # Overwrite cache file with a pre-median_pending_seconds snapshot -> treated as miss and refetched.
+            cache_sglance_dir = Path(shared_env["XDG_CACHE_HOME"]) / "sglance"
+            cache_file = next(p for p in cache_sglance_dir.iterdir() if p.suffix == ".json")
+            legacy_payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            for part_dict in legacy_payload["partitions"]:
+                part_dict.pop("median_pending_seconds", None)
+            cache_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+            t_refetch = FIXED_NOW + timedelta(seconds=90)
+            out4, err4 = io.StringIO(), io.StringIO()
+            rc4 = main(
+                ["wait", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_refetch,
+                stdout=out4,
+                stderr=err4,
+            )
+            self.assertEqual(rc4, 0)
+            self.assertEqual(err4.getvalue(), "")
+            self.assertEqual(len(runner.calls), 6)
+            cluster4 = json.loads(out4.getvalue())["clusters"][0]
+            self.assertFalse(cluster4["stale"])
+            self.assertEqual(
+                cluster4["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "median_pending_seconds": 90.0,
+                        "oldest_pending_seconds": 90,
+                    }
+                ],
             )
 
 
