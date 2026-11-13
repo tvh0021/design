@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+if [ -f "$repo_root/cli/sglance/scripts/leak_check.py" ]; then
+    sglance_root="$repo_root/cli/sglance"
+elif [ -f "$repo_root/scripts/leak_check.py" ]; then
+    sglance_root="$repo_root"
+else
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    sglance_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+fi
+
+git diff --cached --quiet -- "$sglance_root" && exit 0
+
+exec python3 "$sglance_root/scripts/leak_check.py" --require-denylist --staged --root "$sglance_root"
