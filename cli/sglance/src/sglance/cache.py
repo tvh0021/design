@@ -18,8 +18,9 @@ import stat
 import tempfile
 import time
 import types
-from typing import Any, NoReturn, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, NoReturn, TypeVar, get_args, get_origin, get_type_hints
 
+from sglance.config import xdg_dir
 from sglance.models import ClusterEntry, ClusterResult
 
 CACHE_TTL_SECONDS = 300
@@ -46,7 +47,7 @@ def cached_cluster_fetch(
     options: Mapping[str, str | int | float | bool | None] | None = None,
 ) -> T:
     """Fetch a per-cluster result through the 5-minute XDG response cache."""
-    cache_dir = _resolve_cache_dir(env)
+    cache_dir = xdg_dir(env, "XDG_CACHE_HOME", ".cache")
     if cache_dir is None:
         return fetch(entry)
 
@@ -63,7 +64,7 @@ def cached_cluster_fetch(
         if cached is not None:
             return cached
 
-    lock_fd = _acquire_cache_lock(cache_dir / f"{digest}.lock", now=now)
+    lock_fd = _acquire_cache_lock(cache_dir / f"{digest}.lock")
     try:
         if lock_fd is not None and not refresh:
             cached = _read_valid_snapshot(cache_path, entry=entry, result_type=result_type, now=now)
@@ -72,7 +73,7 @@ def cached_cluster_fetch(
 
         live_result = fetch(entry)
         if live_result.error is None and live_result.fetched_at is not None:
-            if _write_snapshot_atomic(cache_path, live_result, now=now):
+            if _write_snapshot_atomic(cache_path, live_result):
                 _prune_old_cache_files(cache_dir, now=now, keep_stem=digest)
         return live_result
     finally:
@@ -85,40 +86,25 @@ def _ensure_cache_dir(cache_dir: Path) -> None:
     os.chmod(cache_dir, 0o700)
 
 
-def _set_mtime_best_effort(target: int | str | Path, now: datetime) -> None:
-    try:
-        ts = now.astimezone(UTC).timestamp()
-        os.utime(target, (ts, ts))
-    except Exception:
-        pass
-
-
-def _acquire_cache_lock(lock_path: Path, *, now: datetime) -> int | None:
+def _acquire_cache_lock(lock_path: Path) -> int | None:
     if fcntl is None:
         return None
     fd: int | None = None
     try:
         _ensure_cache_dir(lock_path.parent)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        else:  # pragma: no cover
-            os.chmod(lock_path, 0o600)
+        os.fchmod(fd, 0o600)
         deadline = time.monotonic() + CACHE_LOCK_TIMEOUT_SECONDS
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                _set_mtime_best_effort(fd, now)
                 return fd
             except OSError as exc:
                 if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    fd_to_close = fd
-                    fd = None
-                    os.close(fd_to_close)
-                    return None
+                    raise
                 time.sleep(min(CACHE_LOCK_POLL_SECONDS, remaining))
     except Exception:
         if fd is not None:
@@ -139,16 +125,6 @@ def _release_cache_lock(lock_fd: int) -> None:
         os.close(lock_fd)
     except OSError:
         pass
-
-
-def _resolve_cache_dir(env: Mapping[str, str]) -> Path | None:
-    xdg_cache = env.get("XDG_CACHE_HOME", "")
-    if xdg_cache:
-        return Path(xdg_cache) / "sglance"
-    home_dir = env.get("HOME", "")
-    if home_dir:
-        return Path(home_dir) / ".cache" / "sglance"
-    return None
 
 
 def _cache_key_digest(
@@ -183,6 +159,30 @@ def _reject_json_constant(token: str) -> NoReturn:
     raise ValueError(f"invalid JSON constant {token!r}")
 
 
+def _load_json(path: str | Path, flags: int = 0) -> Any:
+    fd = os.open(path, os.O_RDONLY | flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_CACHE_FILE_BYTES:
+            raise ValueError("invalid cache file")
+        with open(fd, "rb", closefd=False) as fh:
+            raw = fh.read(MAX_CACHE_FILE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_CACHE_FILE_BYTES:
+        raise ValueError("oversized cache file")
+    return json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+
+
+def _age_seconds(fetched_at: object, now: datetime) -> float | None:
+    if not isinstance(fetched_at, str) or not fetched_at.endswith("Z"):
+        return None
+    dt = datetime.fromisoformat(fetched_at)
+    if dt.tzinfo is None:
+        return None
+    return (now.astimezone(UTC) - dt.astimezone(UTC)).total_seconds()
+
+
 def _read_valid_snapshot(
     cache_path: Path,
     *,
@@ -191,35 +191,24 @@ def _read_valid_snapshot(
     now: datetime,
 ) -> T | None:
     try:
-        with cache_path.open("rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_CACHE_FILE_BYTES:
-                return None
-            raw_bytes = fh.read(MAX_CACHE_FILE_BYTES + 1)
-        if len(raw_bytes) > MAX_CACHE_FILE_BYTES:
+        loaded = _decode_value(result_type, _load_json(cache_path))
+        age = _age_seconds(loaded.fetched_at, now)
+        if (
+            loaded.cluster != entry.name
+            or loaded.error is not None
+            or age is None
+            or not (0 <= age < CACHE_TTL_SECONDS)
+        ):
             return None
-        raw_text = raw_bytes.decode("utf-8")
-        raw_payload = json.loads(raw_text, parse_constant=_reject_json_constant)
-        loaded = _decode_value(result_type, raw_payload)
-        if loaded.cluster != entry.name or loaded.error is not None or loaded.fetched_at is None:
-            return None
-        if not loaded.fetched_at.endswith("Z"):
-            return None
-        fetched_dt = datetime.fromisoformat(loaded.fetched_at)
-        if fetched_dt.tzinfo is None:
-            return None
-        age_seconds = (now.astimezone(UTC) - fetched_dt.astimezone(UTC)).total_seconds()
-        if not (0 <= age_seconds < CACHE_TTL_SECONDS):
-            return None
-        return dataclasses.replace(loaded, stale=True)  # type: ignore[type-var]
+        return dataclasses.replace(loaded, stale=True)
     except Exception:
         return None
 
 
-def _write_snapshot_atomic(cache_path: Path, result: T, *, now: datetime) -> bool:
+def _write_snapshot_atomic(cache_path: Path, result: T) -> bool:
     tmp_path: str | None = None
     try:
-        snapshot = dataclasses.replace(result, stale=False)  # type: ignore[type-var]
+        snapshot = dataclasses.replace(result, stale=False)
         serialized = json.dumps(dataclasses.asdict(snapshot), indent=2, allow_nan=False) + "\n"
         _ensure_cache_dir(cache_path.parent)
         with tempfile.NamedTemporaryFile(
@@ -233,7 +222,6 @@ def _write_snapshot_atomic(cache_path: Path, result: T, *, now: datetime) -> boo
             tmp_path = fh.name
             fh.write(serialized)
         os.chmod(tmp_path, 0o600)
-        _set_mtime_best_effort(tmp_path, now)
         os.replace(tmp_path, cache_path)
         tmp_path = None
         return True
@@ -247,49 +235,26 @@ def _write_snapshot_atomic(cache_path: Path, result: T, *, now: datetime) -> boo
                 pass
 
 
-def _is_expired_sglance_snapshot(path: str, *, now_utc: datetime) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_CACHE_FILE_BYTES:
-            return False
-        raw_bytes = os.read(fd, MAX_CACHE_FILE_BYTES + 1)
-    finally:
-        os.close(fd)
-    if len(raw_bytes) > MAX_CACHE_FILE_BYTES:
-        return False
-    payload = json.loads(raw_bytes.decode("utf-8"), parse_constant=_reject_json_constant)
-    if not isinstance(payload, dict) or not (_SNAPSHOT_ENVELOPE_KEYS <= payload.keys()):
-        return False
-    fetched_at = payload.get("fetched_at")
-    if (
-        not isinstance(payload.get("cluster"), str)
-        or not isinstance(payload.get("stale"), bool)
-        or not isinstance(payload.get("user_scoped"), bool)
-        or not isinstance(fetched_at, str)
-        or not fetched_at.endswith("Z")
-    ):
-        return False
-    fetched_dt = datetime.fromisoformat(fetched_at)
-    if fetched_dt.tzinfo is None:
-        return False
-    age_seconds = (now_utc - fetched_dt.astimezone(UTC)).total_seconds()
-    return age_seconds > CACHE_PRUNE_AGE_SECONDS
-
-
-def _prune_expired_snapshot(snapshot_path: str, lock_path: str, *, now_utc: datetime) -> None:
+def _prune_expired_snapshot(snapshot_path: str, lock_path: str, *, now: datetime) -> None:
     if fcntl is None:  # pragma: no cover
         return
-    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    lock_fd = os.open(lock_path, flags)
+    lock_fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
     locked = False
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         locked = True
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
             return
-        if _is_expired_sglance_snapshot(snapshot_path, now_utc=now_utc):
+        payload = _load_json(snapshot_path, getattr(os, "O_NOFOLLOW", 0))
+        if (
+            isinstance(payload, dict)
+            and _SNAPSHOT_ENVELOPE_KEYS <= payload.keys()
+            and isinstance(payload.get("cluster"), str)
+            and isinstance(payload.get("stale"), bool)
+            and isinstance(payload.get("user_scoped"), bool)
+            and (age := _age_seconds(payload.get("fetched_at"), now)) is not None
+            and age > CACHE_PRUNE_AGE_SECONDS
+        ):
             os.unlink(snapshot_path)
     finally:
         if locked:
@@ -302,25 +267,21 @@ def _prune_expired_snapshot(snapshot_path: str, lock_path: str, *, now_utc: date
 
 def _prune_old_cache_files(cache_dir: Path, *, now: datetime, keep_stem: str) -> None:
     try:
-        now_utc = now.astimezone(UTC)
         with os.scandir(cache_dir) as entries:
             for dent in entries:
                 try:
-                    if dent.is_symlink():
-                        continue
                     stem, dot, ext = dent.name.partition(".")
                     if (
                         dot != "."
                         or ext != "json"
                         or stem == keep_stem
                         or not _HEX_DIGEST_RE.fullmatch(stem)
+                        or not dent.is_file(follow_symlinks=False)
                     ):
                         continue
-                    st = dent.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(st.st_mode):
-                        continue
-                    lock_path = os.path.join(cache_dir, f"{stem}.lock")
-                    _prune_expired_snapshot(dent.path, lock_path, now_utc=now_utc)
+                    _prune_expired_snapshot(
+                        dent.path, os.path.join(cache_dir, f"{stem}.lock"), now=now
+                    )
                 except Exception:
                     continue
     except Exception:
@@ -332,77 +293,33 @@ def _decode_value(expected_type: Any, raw: Any) -> Any:
         if not isinstance(raw, dict):
             raise TypeError("expected JSON object for dataclass")
         fields = dataclasses.fields(expected_type)
-        if set(raw.keys()) != {f.name for f in fields}:
+        if set(raw) != {f.name for f in fields}:
             raise ValueError("dataclass field mismatch")
         hints = get_type_hints(expected_type)
-        kwargs = {f.name: _decode_value(hints[f.name], raw[f.name]) for f in fields}
-        return expected_type(**kwargs)
+        return expected_type(**{f.name: _decode_value(hints[f.name], raw[f.name]) for f in fields})
 
     origin = get_origin(expected_type)
-    if origin in (types.UnionType, Union):
-        args = get_args(expected_type)
+    args = get_args(expected_type)
+    if origin is types.UnionType and len(args) == 2 and type(None) in args:
         if raw is None:
-            if type(None) in args:
-                return None
-            raise TypeError("unexpected null")
-        ordered_candidates = sorted(
-            (arg for arg in args if arg is not type(None)),
-            key=lambda arg: 0 if arg is type(raw) else 1,
-        )
-        for candidate in ordered_candidates:
-            try:
-                return _decode_value(candidate, raw)
-            except (TypeError, ValueError):
-                continue
-        raise TypeError("value did not match any union member")
+            return None
+        inner = args[0] if args[1] is type(None) else args[1]
+        return _decode_value(inner, raw)
 
-    if origin is tuple:
+    if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
         if not isinstance(raw, list):
             raise TypeError("expected JSON array for tuple")
-        args = get_args(expected_type)
-        if not args:
-            return tuple(raw)
-        if len(args) == 2 and args[1] is Ellipsis:
-            return tuple(_decode_value(args[0], item) for item in raw)
-        if len(raw) != len(args):
-            raise ValueError("tuple length mismatch")
-        return tuple(_decode_value(arg, item) for arg, item in zip(args, raw, strict=True))
+        return tuple(_decode_value(args[0], item) for item in raw)
 
-    if origin is list:
-        if not isinstance(raw, list):
-            raise TypeError("expected JSON array for list")
-        args = get_args(expected_type)
-        if not args:
-            return list(raw)
-        return [_decode_value(args[0], item) for item in raw]
-
-    if origin is dict:
-        if not isinstance(raw, dict):
-            raise TypeError("expected JSON object for dict")
-        args = get_args(expected_type)
-        if len(args) != 2:
-            return dict(raw)
-        return {_decode_value(args[0], k): _decode_value(args[1], v) for k, v in raw.items()}
-
-    if expected_type is str:
-        if not isinstance(raw, str):
-            raise TypeError("expected str")
+    if expected_type is str and isinstance(raw, str):
         return raw
-    if expected_type is bool:
-        if not isinstance(raw, bool):
-            raise TypeError("expected bool")
+    if expected_type is bool and isinstance(raw, bool):
         return raw
-    if expected_type is int:
-        if not isinstance(raw, int) or isinstance(raw, bool):
-            raise TypeError("expected int")
+    if expected_type is int and isinstance(raw, int) and not isinstance(raw, bool):
         return raw
-    if expected_type is float:
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
-            raise TypeError("expected float")
+    if expected_type is float and isinstance(raw, (int, float)) and not isinstance(raw, bool):
         value = float(raw)
         if not math.isfinite(value):
             raise ValueError("expected finite float")
         return value
-    if expected_type in (Any, object):
-        return raw
-    raise TypeError(f"unsupported schema type {expected_type!r}")
+    raise TypeError(f"invalid value for {expected_type!r}")

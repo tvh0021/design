@@ -26,17 +26,19 @@ def validate_safe_token(value: object, *, field_name: str) -> str:
     return value
 
 
-def load_config(env: Mapping[str, str]) -> tuple[ClusterEntry, ...]:
-    xdg_config = env.get("XDG_CONFIG_HOME", "")
-    if xdg_config:
-        config_base = Path(xdg_config)
-    else:
-        home_dir = env.get("HOME", "")
-        if not home_dir:
-            raise ConfigError("neither XDG_CONFIG_HOME nor HOME is set to locate config.toml")
-        config_base = Path(home_dir) / ".config"
+def xdg_dir(env: Mapping[str, str], var: str, fallback: str) -> Path | None:
+    if value := env.get(var):
+        return Path(value) / "sglance"
+    if home := env.get("HOME"):
+        return Path(home) / fallback / "sglance"
+    return None
 
-    config_path = config_base / "sglance" / "config.toml"
+
+def load_config(env: Mapping[str, str]) -> tuple[ClusterEntry, ...]:
+    config_dir = xdg_dir(env, "XDG_CONFIG_HOME", ".config")
+    if config_dir is None:
+        raise ConfigError("neither XDG_CONFIG_HOME nor HOME is set to locate config.toml")
+    config_path = config_dir / "config.toml"
     try:
         with config_path.open("rb") as fh:
             data = tomllib.load(fh)
