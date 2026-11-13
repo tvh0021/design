@@ -6,10 +6,7 @@ from decimal import Decimal
 
 from sglance.models import PartitionWait
 
-SACCT_WAIT_FORMAT = (
-    "JobID,JobIDRaw,User,Partition,State,Submit,Eligible,Start,"
-    "NNodes,NCPUS,ReqTRES,AllocTRES,Timelimit"
-)
+SACCT_WAIT_FORMAT = "JobID,User,Partition,State,Eligible,Start,AllocTRES"
 SQUEUE_WAIT_FIELDS = (
     "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|"
 )
@@ -43,16 +40,8 @@ _STARTED_SACCT_STATES = frozenset(
     }
 )
 
-_EXCLUDED_PENDING_REASONS = frozenset(
-    {
-        "JobHeldUser",
-        "JobHeldAdmin",
-        "BeginTime",
-        "Dependency",
-        "DependencyNeverSatisfied",
-        "ReqNodeNotAvail",
-    }
-)
+_CONTENTION_PENDING_REASONS = frozenset({"Resources", "Priority", "None"})
+_CONTENTION_PENDING_PREFIXES = ("AssocGrp", "QOSGrp")
 
 
 class WaitParseError(Exception):
@@ -65,7 +54,10 @@ def _parse_epoch(raw: str) -> int | None:
         return None
     if not (stripped.isascii() and stripped.isdigit()):
         return None
-    return int(stripped, 10)
+    value = int(stripped, 10)
+    if value <= 0:
+        return None
+    return value
 
 
 def _quantile_hundredths(sorted_values: Sequence[int], pct: int) -> float:
@@ -94,20 +86,23 @@ def _parse_squeue_oldest_pending(squeue_stdout: str, *, now_epoch: int) -> dict[
         partition_parts = [part.strip().rstrip("*") for part in partition_field.split(",")]
         if any(not part for part in partition_parts):
             raise WaitParseError(f"malformed squeue partition {partition_field!r}")
-        partition = partition_parts[0]
 
         if state_compact != "PD":
             continue
         reason_code = reason.split(",", 1)[0].strip().strip("()")
-        if reason_code in _EXCLUDED_PENDING_REASONS:
+        if (
+            reason_code not in _CONTENTION_PENDING_REASONS
+            and not reason_code.startswith(_CONTENTION_PENDING_PREFIXES)
+        ):
             continue
         eligible = _parse_epoch(eligible_s)
         if eligible is None or eligible > now_epoch:
             continue
         age_seconds = now_epoch - eligible
-        prev = oldest_by_partition.get(partition)
-        if prev is None or age_seconds > prev:
-            oldest_by_partition[partition] = age_seconds
+        for partition in partition_parts:
+            prev = oldest_by_partition.get(partition)
+            if prev is None or age_seconds > prev:
+                oldest_by_partition[partition] = age_seconds
     return oldest_by_partition
 
 
@@ -121,7 +116,7 @@ def parse_wait_partitions(
     now_epoch = int(now.astimezone(UTC).timestamp())
     window_start = now_epoch - days * 86400
 
-    # Key: ("array", array_id) or ("job", str(row_idx)) -> (start_epoch, partition, wait_seconds)
+    # Key: ("array", array_id), ("het", het_id), or ("job", str(row_idx)) -> (start_epoch, partition, wait_seconds)
     collapsed: dict[tuple[str, str], tuple[int, str, int]] = {}
     distinct_users: set[str] = set()
 
@@ -130,15 +125,17 @@ def parse_wait_partitions(
         if not stripped or stripped.startswith("CLUSTER: "):
             continue
         cells = [cell.strip() for cell in stripped.split("|")]
-        if len(cells) != 13:
+        if len(cells) != 7:
             raise WaitParseError(f"malformed sacct output: {stripped}")
-        job_id, job_id_raw, user, partition_field, state, _submit, eligible_s, start_s = cells[:8]
+        job_id, user, partition_field, state, eligible_s, start_s, alloc_tres = cells
         if not job_id:
             raise WaitParseError(f"malformed sacct row: {stripped}")
-        if "." in job_id or "." in job_id_raw:
+        if "." in job_id:
             continue
         if user:
             distinct_users.add(user)
+        if not alloc_tres:
+            continue
 
         partition = partition_field.split(",", 1)[0].strip().rstrip("*")
         if not partition:
@@ -154,21 +151,26 @@ def parse_wait_partitions(
 
         eligible = _parse_epoch(eligible_s)
         start = _parse_epoch(start_s)
-        if eligible is None or start is None or start < eligible or start < window_start:
+        if eligible is None or start is None or start < eligible:
             continue
 
         wait_seconds = start - eligible
-        array_id, sep, task_id = job_id.partition("_")
-        if sep == "_" and array_id and task_id:
+        array_id, array_sep, task_id = job_id.partition("_")
+        het_id, het_sep, het_offset = job_id.partition("+")
+        if array_sep == "_" and array_id and task_id:
             key = ("array", array_id)
-            existing = collapsed.get(key)
-            if existing is None or start < existing[0]:
-                collapsed[key] = (start, partition, wait_seconds)
+        elif het_sep == "+" and het_id and het_offset:
+            key = ("het", het_id)
         else:
-            collapsed[("job", str(row_idx))] = (start, partition, wait_seconds)
+            key = ("job", str(row_idx))
+        existing = collapsed.get(key)
+        if existing is None or start < existing[0]:
+            collapsed[key] = (start, partition, wait_seconds)
 
     samples_by_partition: dict[str, list[int]] = {}
-    for _start, partition, wait_seconds in collapsed.values():
+    for start, partition, wait_seconds in collapsed.values():
+        if start < window_start:
+            continue
         samples_by_partition.setdefault(partition, []).append(wait_seconds)
 
     oldest_by_partition = _parse_squeue_oldest_pending(squeue_stdout, now_epoch=now_epoch)

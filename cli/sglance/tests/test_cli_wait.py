@@ -53,17 +53,17 @@ class WaitCliTests(unittest.TestCase):
         self,
     ) -> None:
         sacct_cluster_a = (
-            "1001|1001|alice|cpu|COMPLETED|1794500000|1794500000|1794500060|1|8|cpu=8|cpu=8|01:00:00\n"
-            "1002|1002|bob|cpu|RUNNING|1794501000|1794501000|1794501600|2|16|cpu=16|cpu=16|02:00:00\n"
-            "1003|1003|alice|cpu|TIMEOUT|1794502000|1794502000|1794502120|1|8|cpu=8|cpu=8|00:30:00\n"
-            "1004|1004|bob|cpu|FAILED|1794503000|1794503000|1794503300|1|4|cpu=4|cpu=4|01:00:00\n"
-            "2001|2001|alice|gpu|OUT_OF_MEMORY|1794505000|1794505000|1794505045|1|8|cpu=8,gres/gpu=1|cpu=8,gres/gpu=1|04:00:00\n"
+            "1001|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
+            "1002|bob|cpu|RUNNING|1794501000|1794501600|cpu=16\n"
+            "1003|alice|cpu|TIMEOUT|1794502000|1794502120|cpu=8\n"
+            "1004|bob|cpu|FAILED|1794503000|1794503300|cpu=4\n"
+            "2001|alice|gpu|OUT_OF_MEMORY|1794505000|1794505045|cpu=8,gres/gpu=1\n"
         )
         sacct_cluster_b = (
-            "3001|3001|alice|gpu|COMPLETED|1794000000|1794000000|1794000000|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "3002|3002|bob|gpu|NODE_FAIL|1794001000|1794001000|1794001013|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "3003|3003|alice|gpu|PREEMPTED|1794002000|1794002000|1794002000|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "3004|3004|bob|gpu|CANCELLED by 1001|1794003000|1794003000|1794003010|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "3001|alice|gpu|COMPLETED|1794000000|1794000000|gres/gpu=1\n"
+            "3002|bob|gpu|NODE_FAIL|1794001000|1794001013|gres/gpu=1\n"
+            "3003|alice|gpu|PREEMPTED|1794002000|1794002000|gres/gpu=1\n"
+            "3004|bob|gpu|CANCELLED by 1001|1794003000|1794003010|gres/gpu=1\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -113,7 +113,7 @@ class WaitCliTests(unittest.TestCase):
                             "-S",
                             "now-7days",
                             "--state=CD,F,TO,CA,OOM,NF,PR,R",
-                            "--format=JobID,JobIDRaw,User,Partition,State,Submit,Eligible,Start,NNodes,NCPUS,ReqTRES,AllocTRES,Timelimit",
+                            "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
                         ],
                     ),
                     (
@@ -220,7 +220,7 @@ class WaitCliTests(unittest.TestCase):
                             "-S",
                             "now-14days",
                             "--state=CD,F,TO,CA,OOM,NF,PR,R",
-                            "--format=JobID,JobIDRaw,User,Partition,State,Submit,Eligible,Start,NNodes,NCPUS,ReqTRES,AllocTRES,Timelimit",
+                            "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
                         ],
                     ),
                     (
@@ -284,6 +284,40 @@ class WaitCliTests(unittest.TestCase):
                 },
             )
 
+    def test_wait_rejects_sacct_rows_not_matching_seven_field_format(self) -> None:
+        for bad_row in (
+            "1001|alice|cpu|COMPLETED|1794500000|1794500060\n",
+            "1001|1001|alice|cpu|COMPLETED|1794500000|1794500000|1794500060|1|8|cpu=8|cpu=8|01:00:00\n",
+        ):
+            with self.subTest(bad_row=bad_row), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                    encoding="utf-8",
+                )
+                runner = FakeRunner(
+                    {
+                        ("cluster-a", "sacct"): bad_row,
+                        ("cluster-a", "squeue"): "",
+                    }
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                rc = main(
+                    ["wait", "--json"],
+                    env=make_test_env(root),
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                self.assertEqual(rc, 0)
+                cluster_payload = json.loads(stdout.getvalue())["clusters"][0]
+                self.assertIn("malformed sacct output", cluster_payload["error"] or "")
+                self.assertEqual(cluster_payload["partitions"], [])
+
     def test_wait_collapses_twenty_task_array_and_filters_prewindow_cancelled_requeued_and_hold_time(
         self,
     ) -> None:
@@ -292,37 +326,39 @@ class WaitCliTests(unittest.TestCase):
         for idx in range(1, 21):
             start_epoch = 1794200120 if idx == 7 else 1794200300 + idx * 60
             array_rows.append(
-                f"6000_{idx}|{6000 + idx}|bob|gpu|COMPLETED|1794200000|1794200000|{start_epoch}|1|8|gres/gpu=1|gres/gpu=1|01:00:00"
+                f"6000_{idx}|bob|gpu|COMPLETED|1794200000|{start_epoch}|gres/gpu=1"
             )
         sacct_lines = [
             # Pre-window job: started 1s before cutoff (1793908799), ended inside window -> discard.
-            "4001|4001|alice|gpu|COMPLETED|1793900000|1793900000|1793908799|1|8|gres/gpu=1|gres/gpu=1|12:00:00",
+            "4001|alice|gpu|COMPLETED|1793900000|1793908799|gres/gpu=1",
             # Pre-window job on retired partition -> must not emit a phantom partition row.
-            "40010|40010|alice|legacy|COMPLETED|1793800000|1793800000|1793850000|1|8|cpu=8|cpu=8|48:00:00",
-            # Cancelled before start (Start=Unknown and Start=None) -> discard.
-            "4002|4002|bob|gpu|CANCELLED by 1002|1794100000|1794100000|Unknown|1|8|gres/gpu=1||01:00:00",
-            "4003|4003|alice|gpu|CANCELLED|1794100100|1794100100|None|1|8|gres/gpu=1||",
-            # Unknown Eligible -> discard.
-            "4004|4004|bob|gpu|CANCELLED|1794100200|Unknown|Unknown|1|8|gres/gpu=1||01:00:00",
+            "40010|alice|legacy|COMPLETED|1793800000|1793850000|cpu=8",
+            # Cancelled while pending (numeric Start = cancel time, empty AllocTRES) -> discard.
+            "4002|bob|gpu|CANCELLED by 1002|1794100000|1794100500|",
+            "4003|alice|gpu|CANCELLED|1794100100|1794100250|",
+            # Unknown / None Start or Eligible -> discard.
+            "40030|bob|gpu|COMPLETED|1794100150|Unknown|gres/gpu=1",
+            "40031|alice|gpu|COMPLETED|1794100160|None|gres/gpu=1",
+            "4004|bob|gpu|CANCELLED|Unknown|1794100200|",
             # Clock skew / invalid Start < Eligible -> discard.
-            "4005|4005|alice|gpu|COMPLETED|1794100300|1794100500|1794100499|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
+            "4005|alice|gpu|COMPLETED|1794100500|1794100499|gres/gpu=1",
             # Requeued records (standalone + array task with earlier Start) -> discard.
-            "4006|4006|bob|gpu|REQUEUED|1794101000|1794101000|1794109999|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
-            "6000_21|6021|bob|gpu|REQUEUED|1794200000|1794200000|1794200010|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
-            "4007|4007|alice|gpu|REQUEUE_HOLD|1794110000|1794110000|1794119999|1|8|gres/gpu=1||01:00:00",
-            "4008|4008|bob|gpu|PENDING|1794115000|1794115000|Unknown|1|8|gres/gpu=1||01:00:00",
+            "4006|bob|gpu|REQUEUED|1794101000|1794109999|gres/gpu=1",
+            "6000_21|bob|gpu|REQUEUED|1794200000|1794200010|gres/gpu=1",
+            "4007|alice|gpu|REQUEUE_HOLD|1794110000|1794119999|",
+            "4008|bob|gpu|PENDING|1794115000|Unknown|",
             # Step row (if present) -> skip leniently.
-            "5001.batch|5001.batch||gpu|COMPLETED|1793908800|1793908800|1793908800|1|8||cpu=8|",
+            "5001.batch||gpu|COMPLETED|1793908800|1793908800|cpu=8",
             # Sample 1: started at exact cutoff (1793908800), wait = 30s.
-            "5001|5001|alice|gpu|COMPLETED|1793908770|1793908770|1793908800|1|8|gres/gpu=1|gres/gpu=1|01:00:00",
+            "5001|alice|gpu|COMPLETED|1793908770|1793908800|gres/gpu=1",
             # Sample 2: 20-task array 6000_1..6000_20, earliest Start is 6000_7 -> wait = 120s.
             *array_rows,
-            # Sample 3: held job (Eligible > Submit by 7200s), Start - Eligible = 90s.
-            "7001|7001|alice|gpu|COMPLETED|1794300000|1794307200|1794307290|1|8|gres/gpu=1|gres/gpu=1|02:00:00",
-            # Sample 4: held/dependency job (Eligible > Submit by 3600s), Start - Eligible = 240s.
-            "7002|7002|bob|gpu|COMPLETED|1794350000|1794353600|1794353840|1|8|gres/gpu=1|gres/gpu=1|02:00:00",
+            # Sample 3: held job, Start - Eligible = 90s.
+            "7001|alice|gpu|COMPLETED|1794307200|1794307290|gres/gpu=1",
+            # Sample 4: held/dependency job, Start - Eligible = 240s.
+            "7002|bob|gpu|COMPLETED|1794353600|1794353840|gres/gpu=1",
             # Sample 5: standalone running job, Start - Eligible = 600s.
-            "7003|7003|alice|gpu|RUNNING|1794400000|1794400000|1794400600|1|8|gres/gpu=1|gres/gpu=1|04:00:00",
+            "7003|alice|gpu|RUNNING|1794400000|1794400600|gres/gpu=1",
         ]
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -391,9 +427,9 @@ class WaitCliTests(unittest.TestCase):
         now_jst = datetime(2026, 11, 13, 5, 0, 0, tzinfo=jst)
 
         sacct_stdout = (
-            "7101|7101|alice|gpu|COMPLETED|1794500000|1794500000|1794500100|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "7102|7102|bob|gpu|COMPLETED|1794501000|1794501000|1794501300|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "7201|7201|alice|cpu|COMPLETED|1794502000|1794502000|1794502060|1|4|cpu=4|cpu=4|00:30:00\n"
+            "7101|alice|gpu|COMPLETED|1794500000|1794500100|gres/gpu=1\n"
+            "7102|bob|gpu|COMPLETED|1794501000|1794501300|gres/gpu=1\n"
+            "7201|alice|cpu|COMPLETED|1794502000|1794502060|cpu=4\n"
         )
         squeue_stdout = (
             # Excluded reasons on gpu (all much older than 5400s):
@@ -413,10 +449,10 @@ class WaitCliTests(unittest.TestCase):
             "8012|alice|gpu|PD|Resources|1794508200|\n"
             "8013|bob|gpu|PD|Priority|1794511800|\n"
             "8014|alice|gpu|PD|AssocGrpGpuLimit|1794513600|\n"
-            # cpu has only excluded pending jobs -> oldest_pending_seconds = None:
+            # cpu's single-partition pending jobs are excluded, while debug,cpu below updates both debug and cpu:
             "8020|bob|cpu|PD|JobHeldUser|1794490000|\n"
             "8021|alice|cpu|PD|Resources|1794514000|\n"
-            # Stalled partition debug has n=0 in sacct and multi-partition target debug,cpu -> 3600s on debug only:
+            # Multi-partition target debug,cpu -> 3600s on both debug (n=0 in sacct) and cpu:
             "8030_1|bob|debug,cpu|PD|Resources|1794510000|\n"
             "8030_2|bob|debug,cpu|PD|Priority|1794512000|\n"
             # Hold-only partition with no sacct samples -> must not emit phantom all-null row:
@@ -477,7 +513,7 @@ class WaitCliTests(unittest.TestCase):
                                     "n": 1,
                                     "p50_seconds": 60.0,
                                     "p90_seconds": 60.0,
-                                    "oldest_pending_seconds": None,
+                                    "oldest_pending_seconds": 3600,
                                 },
                                 {
                                     "partition": "debug",
@@ -511,24 +547,24 @@ class WaitCliTests(unittest.TestCase):
                 {
                     # cluster-a: slurmdbd restricts sacct to alice while slurmctld omits jobs/all and squeue shows bob too.
                     ("cluster-a", "sacct"): (
-                        "9001|9001|alice|gpu|COMPLETED|1794500000|1794500000|1794500060|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-                        "9002|9002|alice|gpu|RUNNING|1794501000|1794501000|1794501180|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+                        "9001|alice|gpu|COMPLETED|1794500000|1794500060|gres/gpu=1\n"
+                        "9002|alice|gpu|RUNNING|1794501000|1794501180|gres/gpu=1\n"
                     ),
                     ("cluster-a", "squeue"): (
                         "9010|alice|gpu|PD|Resources|1794513000|\n"
                         "9011|bob|gpu|PD|Priority|1794513300|\n"
                     ),
                     ("cluster-a", "scontrol"): "PrivateData             = usage,accounts\n",
-                    # cluster-b: sacct returns alice (started) and bob (cancelled Start=Unknown) -> 2 distinct sacct users -> False.
+                    # cluster-b: sacct returns alice (started) and bob (cancelled while pending) -> 2 distinct sacct users -> False.
                     ("cluster-b", "sacct"): (
-                        "9101|9101|alice|cpu|COMPLETED|1794500000|1794500000|1794500030|1|4|cpu=4|cpu=4|01:00:00\n"
-                        "9102|9102|bob|cpu|CANCELLED by 1002|1794501000|1794501000|Unknown|1|4|cpu=4||01:00:00\n"
+                        "9101|alice|cpu|COMPLETED|1794500000|1794500030|cpu=4\n"
+                        "9102|bob|cpu|CANCELLED by 1002|1794501000|1794501200|\n"
                     ),
                     ("cluster-b", "squeue"): "",
                     ("cluster-b", "scontrol"): "PrivateData             = none\n",
-                    # cluster-c: sacct has only alice on a cancelled job row, scontrol omits jobs/all -> 1 distinct sacct user -> True.
+                    # cluster-c: sacct has only alice on a cancelled-pending job row, scontrol omits jobs/all -> 1 distinct sacct user -> True.
                     ("cluster-c", "sacct"): (
-                        "9201|9201|alice|cpu|CANCELLED|1794500000|1794500000|Unknown|1|4|cpu=4||01:00:00\n"
+                        "9201|alice|cpu|CANCELLED|1794500000|1794500300|\n"
                     ),
                     ("cluster-c", "squeue"): "",
                     ("cluster-c", "scontrol"): "PrivateData             = usage\n",
@@ -557,7 +593,8 @@ class WaitCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(stderr.getvalue(), "")
             clusters = json.loads(stdout.getvalue())["clusters"]
-            scoping = {item["cluster"]: item["user_scoped"] for item in clusters}
+            by_name = {item["cluster"]: item for item in clusters}
+            scoping = {name: item["user_scoped"] for name, item in by_name.items()}
             self.assertEqual(
                 scoping,
                 {
@@ -568,15 +605,417 @@ class WaitCliTests(unittest.TestCase):
                     "cluster-e": False,
                 },
             )
+            self.assertEqual(by_name["cluster-b"]["partitions"][0]["n"], 1)
+            self.assertEqual(by_name["cluster-c"]["partitions"], [])
+
+    def test_wait_skips_cancelled_pending_and_empty_alloc_tres_rows_with_numeric_start(
+        self,
+    ) -> None:
+        sacct_stdout = (
+            # Cancelled while pending: Slurm sets numeric Start = End = cancel time, AllocTRES empty.
+            "4101|alice|gpu|CANCELLED by 1001|1794500000|1794500900|\n"
+            "4102|bob|gpu|CA|1794501000|1794501300|\n"
+            # Any row with empty AllocTRES must not count even if State is COMPLETED.
+            "4103|alice|gpu|COMPLETED|1794502000|1794502400|\n"
+            # Array task cancelled while pending before sibling started must not become array Start.
+            "4200_1|bob|gpu|CANCELLED|1794503000|1794503010|\n"
+            "4200_2|bob|gpu|COMPLETED|1794503000|1794503180|gres/gpu=1\n"
+            # Cancelled after starting (non-empty AllocTRES) still counts: wait = 60s.
+            "4104|bob|gpu|CANCELLED by 1001|1794504000|1794504060|gres/gpu=1\n"
+            # Partition with only cancelled-pending row must not emit a partition entry.
+            "4301|alice|cpu|CANCELLED|1794505000|1794505600|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_stdout,
+                    ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            # Valid samples on gpu: [60, 180], n = 2
+            # p50: 60 + 0.5 * 120 = 120.0; p90: 60 + 0.9 * 120 = 168.0
+            self.assertEqual(
+                json.loads(stdout.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 2,
+                        "p50_seconds": 120.0,
+                        "p90_seconds": 168.0,
+                        "oldest_pending_seconds": None,
+                    }
+                ],
+            )
+
+    def test_wait_oldest_pending_whitelists_only_contention_reasons(self) -> None:
+        # FIXED_NOW = 1794513600.
+        squeue_stdout = (
+            # Excluded non-contention reasons with much older eligible times:
+            "8101|alice|gpu|PD|JobArrayTaskLimit|1794000000|\n"
+            "8102|bob|gpu|PD|QOSMaxJobsPerUserLimit|1794100000|\n"
+            "8103|alice|gpu|PD|AssocMaxJobsLimit|1794200000|\n"
+            "8104|bob|gpu|PD|PartitionDown|1794300000|\n"
+            "8105|alice|gpu|PD|Reservation|1794350000|\n"
+            "8106|bob|gpu|PD|JobHeldUser|1794400000|\n"
+            "8107|alice|gpu|PD|Dependency|1794410000|\n"
+            "8108|bob|gpu|PD|BeginTime|1794420000|\n"
+            "8109|alice|gpu|PD|ReqNodeNotAvail|1794430000|\n"
+            # Whitelisted contention reasons on gpu (oldest is QOSGrpGpuLimit at 7200s):
+            "8110|bob|gpu|PD|QOSGrpGpuLimit|1794506400|\n"
+            "8111|alice|gpu|PD|AssocGrpCpuLimit|1794510000|\n"
+            "8112|bob|gpu|PD|Resources|1794511800|\n"
+            "8113|alice|gpu|PD|Priority|1794513000|\n"
+            # cpu: JobArrayTaskLimit excluded; Reason=None whitelisted (900s old):
+            "8201|alice|cpu|PD|JobArrayTaskLimit|1794000000|\n"
+            "8202|bob|cpu|PD|None|1794512700|\n"
+            # bigmem: only PartitionDown -> must not emit a partition row:
+            "8301|alice|bigmem|PD|PartitionDown|1794000000|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): "",
+                    ("cluster-a", "squeue"): squeue_stdout,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(stdout.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "oldest_pending_seconds": 7200,
+                    },
+                    {
+                        "partition": "cpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "oldest_pending_seconds": 900,
+                    },
+                ],
+            )
+
+    def test_wait_collapses_array_to_earliest_start_before_applying_window_cutoff(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600; 7-day window_start = 1793908800.
+        # Eligible 100s before window = 1793908700;
+        # 6000_1 starts 50s before window = 1793908750;
+        # 6000_50 starts 1 day into window = 1793995200.
+        sacct_only_array = (
+            "6000_1|alice|gpu|COMPLETED|1793908700|1793908750|gres/gpu=1\n"
+            "6000_50|alice|gpu|COMPLETED|1793908700|1793995200|gres/gpu=1\n"
+        )
+        # Also verify reverse sacct row order (in-window task before pre-window earliest task).
+        sacct_reversed_plus_valid = (
+            "6001_50|bob|gpu|COMPLETED|1793908700|1793995200|gres/gpu=1\n"
+            "6001_1|bob|gpu|COMPLETED|1793908700|1793908750|gres/gpu=1\n"
+            "6002|alice|gpu|COMPLETED|1794500000|1794500090|gres/gpu=1\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n\n'
+                '[[clusters]]\nname = "cluster-b"\nssh = "cluster-b"\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_only_array,
+                    ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                    ("cluster-b", "sacct"): sacct_reversed_plus_valid,
+                    ("cluster-b", "squeue"): "",
+                    ("cluster-b", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            clusters = {
+                item["cluster"]: item["partitions"]
+                for item in json.loads(stdout.getvalue())["clusters"]
+            }
+            self.assertEqual(clusters["cluster-a"], [])
+            self.assertEqual(
+                clusters["cluster-b"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 1,
+                        "p50_seconds": 90.0,
+                        "p90_seconds": 90.0,
+                        "oldest_pending_seconds": None,
+                    }
+                ],
+            )
+
+    def test_wait_collapses_heterogeneous_jobs_on_base_id_using_earliest_start_partition(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600; window_start = 1793908800.
+        sacct_stdout = (
+            # Hetjob 7500: +0 and +1 tie at Start=1794500120 -> keeps +0 on cpu (wait=120s); +2 on bigmem ignored.
+            "7500+0.batch||cpu|COMPLETED|1794500000|1794500000|cpu=16\n"
+            "7500+0|alice|cpu|COMPLETED|1794500000|1794500120|cpu=16\n"
+            "7500+1|alice|gpu|COMPLETED|1794500000|1794500120|gres/gpu=2\n"
+            "7500+2|alice|bigmem|COMPLETED|1794500000|1794500125|cpu=32\n"
+            # Hetjob 7600: +1 has earlier Start (1794501040 < 1794501090) -> uses +1's partition gpu (wait=40s).
+            "7600+0|bob|cpu|COMPLETED|1794501000|1794501090|cpu=8\n"
+            "7600+1|bob|gpu|COMPLETED|1794501000|1794501040|gres/gpu=1\n"
+            # Hetjob 7700: +0 starts pre-window (1793908750), +1 in-window -> collapsed Start < window_start -> dropped.
+            "7700+0|alice|bigmem|COMPLETED|1793908700|1793908750|cpu=32\n"
+            "7700+1|alice|bigmem|COMPLETED|1793908700|1793908810|cpu=32\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_stdout,
+                    ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(stdout.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "cpu",
+                        "n": 1,
+                        "p50_seconds": 120.0,
+                        "p90_seconds": 120.0,
+                        "oldest_pending_seconds": None,
+                    },
+                    {
+                        "partition": "gpu",
+                        "n": 1,
+                        "p50_seconds": 40.0,
+                        "p90_seconds": 40.0,
+                        "oldest_pending_seconds": None,
+                    },
+                ],
+            )
+
+    def test_wait_multipartition_pending_job_updates_every_listed_partition(self) -> None:
+        # FIXED_NOW = 1794513600.
+        squeue_stdout = (
+            # 3600s old across debug* (default marker stripped), cpu, and bigmem:
+            "9501|alice|debug*,cpu,bigmem|PD|Resources|1794510000|\n"
+            # 7200s old on gpu:
+            "9502|bob|gpu|PD|Priority|1794506400|\n"
+            # 1800s old across cpu,gpu -> must not overwrite older 3600s on cpu or 7200s on gpu:
+            "9503|alice|cpu,gpu|PD|Priority|1794511800|\n"
+            # 600s old on bigmem -> must keep 3600s from 9501:
+            "9504|bob|bigmem|PD|Resources|1794513000|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): "",
+                    ("cluster-a", "squeue"): squeue_stdout,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(stdout.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "debug",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "oldest_pending_seconds": 3600,
+                    },
+                    {
+                        "partition": "cpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "oldest_pending_seconds": 3600,
+                    },
+                    {
+                        "partition": "bigmem",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "oldest_pending_seconds": 3600,
+                    },
+                    {
+                        "partition": "gpu",
+                        "n": 0,
+                        "p50_seconds": None,
+                        "p90_seconds": None,
+                        "oldest_pending_seconds": 7200,
+                    },
+                ],
+            )
+
+    def test_wait_treats_non_positive_epoch_timestamps_as_unknown(self) -> None:
+        # FIXED_NOW = 1794513600.
+        sacct_stdout = (
+            "9601|alice|gpu|COMPLETED|0|1794500100|gres/gpu=1\n"
+            "9602|bob|gpu|COMPLETED|-1|1794500200|gres/gpu=1\n"
+            "9603|alice|gpu|COMPLETED|1794500000|0|gres/gpu=1\n"
+            "9604|bob|gpu|COMPLETED|0|0|gres/gpu=1\n"
+            "9605|alice|gpu|COMPLETED|1794500000|1794500075|gres/gpu=1\n"
+        )
+        squeue_stdout = (
+            "9701|alice|gpu|PD|Resources|0|\n"
+            "9702|bob|gpu|PD|Priority|-5|\n"
+            "9703|alice|gpu|PD|Resources|1794512400|\n"
+            "9704|bob|cpu|PD|Resources|0|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): sacct_stdout,
+                    ("cluster-a", "squeue"): squeue_stdout,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            rc = main(
+                ["wait", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(stdout.getvalue())["clusters"][0]["partitions"],
+                [
+                    {
+                        "partition": "gpu",
+                        "n": 1,
+                        "p50_seconds": 75.0,
+                        "p90_seconds": 75.0,
+                        "oldest_pending_seconds": 1200,
+                    }
+                ],
+            )
 
     def test_wait_table_renders_aligned_durations_dashes_headers_and_empty_or_error_states(
         self,
     ) -> None:
         sacct_a = (
-            "101|101|alice|gpu|COMPLETED|1794500000|1794500000|1794500015|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "102|102|alice|gpu|COMPLETED|1794501000|1794501000|1794501045|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "103|103|alice|gpu|COMPLETED|1794502000|1794502000|1794502170|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "201|201|alice|cpu|COMPLETED|1794503000|1794503000|1794506600|1|4|cpu=4|cpu=4|02:00:00\n"
+            "101|alice|gpu|COMPLETED|1794500000|1794500015|gres/gpu=1\n"
+            "102|alice|gpu|COMPLETED|1794501000|1794501045|gres/gpu=1\n"
+            "103|alice|gpu|COMPLETED|1794502000|1794502170|gres/gpu=1\n"
+            "201|alice|cpu|COMPLETED|1794503000|1794506600|cpu=4\n"
         )
         squeue_a = (
             "301|alice|gpu|PD|Resources|1794508200|\n"
@@ -638,8 +1077,8 @@ class WaitCliTests(unittest.TestCase):
     ) -> None:
         sacct_with_banner = (
             "CLUSTER: prod\n"
-            "501|501|alice|gpu|COMPLETED|1794500000|1794500000|1794500120|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
-            "502|502|bob|gpu|COMPLETED|1794501000|1794501000|1794501120|1|8|gres/gpu=1|gres/gpu=1|01:00:00\n"
+            "501|alice|gpu|COMPLETED|1794500000|1794500120|gres/gpu=1\n"
+            "502|bob|gpu|COMPLETED|1794501000|1794501120|gres/gpu=1\n"
         )
         squeue_with_banner = (
             "CLUSTER: prod\n"
@@ -704,7 +1143,7 @@ class WaitCliTests(unittest.TestCase):
             # Run 2 at t = 75s with explicit --days 7: cluster-a served from cache (0 calls),
             # cluster-b retried because errors are never cached (now fails squeue rc=1 -> 2 calls).
             runner._responses[("cluster-b", "sacct")] = (
-                "601|601|alice|cpu|COMPLETED|1794500000|1794500000|1794500030|1|4|cpu=4|cpu=4|01:00:00\n"
+                "601|alice|cpu|COMPLETED|1794500000|1794500030|cpu=4\n"
             )
             runner._responses[("cluster-b", "squeue")] = CommandResult(
                 1, "", "squeue: error: controller busy\n"
