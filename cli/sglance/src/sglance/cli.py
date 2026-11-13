@@ -6,40 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 import os
 import sys
-from typing import NoReturn, TextIO, TypeVar
+from typing import NoReturn, TextIO
 
 from sglance.cache import cached_cluster_fetch
 from sglance.config import ConfigError, load_config, validate_safe_token
-from sglance.formatters import (
-    format_mine_json,
-    format_mine_table,
-    format_queue_json,
-    format_queue_table,
-    format_status_json,
-    format_status_table,
-    format_wait_json,
-    format_wait_table,
-)
+from sglance.formatters import format_json, format_table
 from sglance.models import (
+    SCHEMA_VERSION,
     ClusterEntry,
     ClusterMine,
     ClusterQueue,
+    ClusterResult,
     ClusterStatus,
     ClusterWait,
-    MineReport,
-    QueueReport,
-    StatusReport,
-    WaitReport,
 )
-from sglance.runner import (
-    AllowlistError,
-    AllowlistedRunner,
-    CommandRunner,
-    TransportDispatcher,
-)
+from sglance.runner import AllowlistError, CommandRunner, TransportDispatcher
 from sglance.slurm import SlurmAdapter
-
-_ClusterResultT = TypeVar("_ClusterResultT")
 
 
 class _ParserExit(Exception):
@@ -271,234 +253,58 @@ def main(
         err.write(f"sglance: error: {exc}\n")
         return 2
 
-    if parsed.cluster is not None:
-        selected_entries = tuple(
-            entry for entry in cluster_entries if entry.name == parsed.cluster
-        )
-        if not selected_entries:
-            configured = ", ".join(entry.name for entry in cluster_entries)
-            err.write(
-                f"sglance: error: unknown cluster {parsed.cluster!r} (configured: {configured})\n"
-            )
-            return 2
-    else:
-        selected_entries = cluster_entries
+    selected = tuple(e for e in cluster_entries if parsed.cluster in (None, e.name))
+    if not selected:
+        configured = ", ".join(e.name for e in cluster_entries)
+        err.write(f"sglance: error: unknown cluster {parsed.cluster!r} (configured: {configured})\n")
+        return 2
 
-    effective_runner: CommandRunner = TransportDispatcher() if runner is None else runner
-    # Single production enforcement point for the read-only Slurm allowlist.
-    safe_runner = AllowlistedRunner(effective_runner)
-    adapter = SlurmAdapter(safe_runner)
+    adapter = SlurmAdapter(TransportDispatcher() if runner is None else runner)
     now = effective_clock()
-
-    if parsed.subcommand == "mine":
-        mine_clusters = _query_clusters_mine(
-            adapter,
-            selected_entries,
-            env=effective_env,
-            now=now,
-            refresh=parsed.refresh,
-            account=parsed.account,
-        )
-        mine_report = MineReport(clusters=mine_clusters, account=parsed.account)
-        if parsed.json_output:
-            out.write(format_mine_json(mine_report))
-        else:
-            out.write(format_mine_table(mine_report, now=now))
-        return 0
-
-    if parsed.subcommand == "queue":
-        queue_clusters = _query_clusters_queue(
-            adapter,
-            selected_entries,
-            env=effective_env,
-            now=now,
-            refresh=parsed.refresh,
-        )
-        queue_report = QueueReport(clusters=queue_clusters)
-        if parsed.json_output:
-            out.write(format_queue_json(queue_report))
-        else:
-            out.write(format_queue_table(queue_report, now=now))
-        return 0
-
-    if parsed.subcommand == "wait":
-        wait_clusters = _query_clusters_wait(
-            adapter,
-            selected_entries,
-            env=effective_env,
-            now=now,
-            refresh=parsed.refresh,
-            days=parsed.days,
-        )
-        wait_report = WaitReport(clusters=wait_clusters, days=parsed.days)
-        if parsed.json_output:
-            out.write(format_wait_json(wait_report))
-        else:
-            out.write(format_wait_table(wait_report, now=now))
-        return 0
-
-    clusters = _query_clusters_status(
-        adapter,
-        selected_entries,
-        env=effective_env,
-        now=now,
-        refresh=parsed.refresh,
+    command: str = parsed.subcommand
+    result_type, query = {
+        "status": (ClusterStatus, adapter.query_status),
+        "queue": (ClusterQueue, adapter.query_queue),
+        "wait": (ClusterWait, adapter.query_wait),
+        "mine": (ClusterMine, adapter.query_mine),
+    }[command]
+    extra: dict[str, int | str | None] = (
+        {"days": parsed.days}
+        if command == "wait"
+        else {"account": parsed.account}
+        if command == "mine"
+        else {}
     )
-    report = StatusReport(clusters=clusters)
+    err_extra = {"account_filter": parsed.account} if command == "mine" else {}
 
-    if parsed.json_output:
-        out.write(format_status_json(report))
-    else:
-        out.write(format_status_table(report, now=now))
+    def query_one(entry: ClusterEntry) -> ClusterResult:
+        try:
+            return cached_cluster_fetch(
+                entry,
+                command=command,
+                schema_version=SCHEMA_VERSION,
+                result_type=result_type,  # type: ignore[arg-type]
+                fetch=lambda t: query(t, now=now, **extra),  # type: ignore[operator]
+                env=effective_env,
+                now=now,
+                refresh=parsed.refresh,
+                options=extra,
+            )
+        except AllowlistError:
+            raise
+        except Exception as exc:
+            return result_type(
+                cluster=entry.name,
+                error=str(exc).strip() or type(exc).__name__,
+                **err_extra,  # type: ignore[arg-type]
+            )
+
+    with ThreadPoolExecutor(max_workers=len(selected)) as ex:
+        clusters = list(ex.map(query_one, selected))
+    out.write(
+        format_json(command, clusters, extra)
+        if parsed.json_output
+        else format_table(command, clusters, now)
+    )
     return 0
-
-
-def _query_clusters(
-    entries: Sequence[ClusterEntry],
-    query_one: Callable[[ClusterEntry], _ClusterResultT],
-    make_error: Callable[[ClusterEntry, str], _ClusterResultT],
-) -> tuple[_ClusterResultT, ...]:
-    with ThreadPoolExecutor(max_workers=len(entries)) as executor:
-        futures = [(entry, executor.submit(query_one, entry)) for entry in entries]
-        results: list[_ClusterResultT] = []
-        for entry, future in futures:
-            try:
-                results.append(future.result())
-            except AllowlistError:
-                raise
-            except Exception as exc:
-                results.append(make_error(entry, str(exc).strip() or type(exc).__name__))
-    return tuple(results)
-
-
-def _query_clusters_status(
-    adapter: SlurmAdapter,
-    entries: Sequence[ClusterEntry],
-    *,
-    env: Mapping[str, str],
-    now: datetime,
-    refresh: bool = False,
-) -> tuple[ClusterStatus, ...]:
-    return _query_clusters(
-        entries,
-        lambda entry: cached_cluster_fetch(
-            entry,
-            command="status",
-            schema_version=StatusReport.schema_version,
-            result_type=ClusterStatus,
-            fetch=lambda target: adapter.query_status(target, now=now),
-            env=env,
-            now=now,
-            refresh=refresh,
-        ),
-        lambda entry, error_text: ClusterStatus(
-            cluster=entry.name,
-            fetched_at=None,
-            stale=False,
-            user_scoped=False,
-            error=error_text,
-            partitions=(),
-        ),
-    )
-
-
-def _query_clusters_queue(
-    adapter: SlurmAdapter,
-    entries: Sequence[ClusterEntry],
-    *,
-    env: Mapping[str, str],
-    now: datetime,
-    refresh: bool = False,
-) -> tuple[ClusterQueue, ...]:
-    return _query_clusters(
-        entries,
-        lambda entry: cached_cluster_fetch(
-            entry,
-            command="queue",
-            schema_version=QueueReport.schema_version,
-            result_type=ClusterQueue,
-            fetch=lambda target: adapter.query_queue(target, now=now),
-            env=env,
-            now=now,
-            refresh=refresh,
-            options={},
-        ),
-        lambda entry, error_text: ClusterQueue(
-            cluster=entry.name,
-            fetched_at=None,
-            stale=False,
-            user_scoped=False,
-            error=error_text,
-            partitions=(),
-        ),
-    )
-
-
-def _query_clusters_wait(
-    adapter: SlurmAdapter,
-    entries: Sequence[ClusterEntry],
-    *,
-    env: Mapping[str, str],
-    now: datetime,
-    refresh: bool = False,
-    days: int = 7,
-) -> tuple[ClusterWait, ...]:
-    return _query_clusters(
-        entries,
-        lambda entry: cached_cluster_fetch(
-            entry,
-            command="wait",
-            schema_version=WaitReport.schema_version,
-            result_type=ClusterWait,
-            fetch=lambda target: adapter.query_wait(target, days=days, now=now),
-            env=env,
-            now=now,
-            refresh=refresh,
-            options={"days": days},
-        ),
-        lambda entry, error_text: ClusterWait(
-            cluster=entry.name,
-            fetched_at=None,
-            stale=False,
-            user_scoped=False,
-            error=error_text,
-            history_error=None,
-            partitions=(),
-        ),
-    )
-
-
-def _query_clusters_mine(
-    adapter: SlurmAdapter,
-    entries: Sequence[ClusterEntry],
-    *,
-    env: Mapping[str, str],
-    now: datetime,
-    refresh: bool = False,
-    account: str | None = None,
-) -> tuple[ClusterMine, ...]:
-    return _query_clusters(
-        entries,
-        lambda entry: cached_cluster_fetch(
-            entry,
-            command="mine",
-            schema_version=MineReport.schema_version,
-            result_type=ClusterMine,
-            fetch=lambda target: adapter.query_mine(target, now=now, account=account),
-            env=env,
-            now=now,
-            refresh=refresh,
-            options={"account": account} if account is not None else {},
-        ),
-        lambda entry, error_text: ClusterMine(
-            cluster=entry.name,
-            fetched_at=None,
-            stale=False,
-            user_scoped=False,
-            error=error_text,
-            slurm_user=None,
-            account_filter=account,
-            jobs=(),
-        ),
-    )
 

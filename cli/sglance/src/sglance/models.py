@@ -49,13 +49,6 @@ class ClusterStatus(ClusterResult):
 
 
 @dataclass(frozen=True)
-class StatusReport:
-    clusters: tuple[ClusterStatus, ...]
-    schema_version: int = SCHEMA_VERSION
-    command: str = "status"
-
-
-@dataclass(frozen=True)
 class PendingReasonCount:
     reason: str
     count: int
@@ -72,13 +65,6 @@ class PartitionQueue:
 @dataclass(frozen=True)
 class ClusterQueue(ClusterResult):
     partitions: tuple[PartitionQueue, ...] = ()
-
-
-@dataclass(frozen=True)
-class QueueReport:
-    clusters: tuple[ClusterQueue, ...]
-    schema_version: int = SCHEMA_VERSION
-    command: str = "queue"
 
 
 @dataclass(frozen=True)
@@ -106,14 +92,6 @@ class ClusterMine(ClusterResult):
 
 
 @dataclass(frozen=True)
-class MineReport:
-    clusters: tuple[ClusterMine, ...]
-    account: str | None = None
-    schema_version: int = SCHEMA_VERSION
-    command: str = "mine"
-
-
-@dataclass(frozen=True)
 class PartitionWait:
     partition: str
     n: int
@@ -127,11 +105,3 @@ class PartitionWait:
 class ClusterWait(ClusterResult):
     history_error: str | None = None
     partitions: tuple[PartitionWait, ...] = ()
-
-
-@dataclass(frozen=True)
-class WaitReport:
-    clusters: tuple[ClusterWait, ...]
-    days: int = 7
-    schema_version: int = SCHEMA_VERSION
-    command: str = "wait"
