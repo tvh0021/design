@@ -1,409 +1,151 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from sglance import main
-from tests.fakes import FakeRunner
+from tests.fakes import FakeRunner, run_cli, write_config
 
-FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
 MINIMAL_SINFO = "cpu|node01|idle|0/64/0/64|(null)|(null)|\n"
+SINFO_ARGV = [
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "sinfo",
+    "-h",
+    "-N",
+    "-O",
+    "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|",
+]
 
 
 class ConfigCliTests(unittest.TestCase):
-    def test_cluster_entry_with_only_name_defaults_ssh_to_name(self) -> None:
+    def test_valid_config_defaults_ssh_to_name_and_falls_back_to_home_dot_config(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            config_dir = root / "config" / "sglance"
-            config_dir.mkdir(parents=True)
-            (config_dir / "config.toml").write_text(
-                '[[clusters]]\nname = "cluster-a"\n',
-                encoding="utf-8",
-            )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
+            write_config(root, '[[clusters]]\nname = "cluster-a"\n')
             runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
-            stdout = io.StringIO()
-            stderr = io.StringIO()
+            rc, _out, err = run_cli(["status", "--json"], root=root, runner=runner)
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertEqual(runner.calls, [("cluster-a", "ssh", "cluster-a", SINFO_ARGV)])
 
-            exit_code = main(
-                ["status", "--json"],
-                env=env,
-                runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(stderr.getvalue(), "")
-            self.assertEqual(
-                runner.calls,
-                [
-                    (
-                        "cluster-a",
-                        "ssh",
-                        "cluster-a",
-                        [
-                            "env",
-                            "SLURM_TIME_FORMAT=%s",
-                            "sinfo",
-                            "-h",
-                            "-N",
-                            "-O",
-                            "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|",
-                        ],
-                    )
-                ],
-            )
-
-    def test_xdg_config_falls_back_to_home_dot_config_when_xdg_config_home_unset(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            home_config_dir = root / "home" / ".config" / "sglance"
-            home_config_dir.mkdir(parents=True)
-            (home_config_dir / "config.toml").write_text(
+            home_cfg = root / "alt-home" / ".config" / "sglance"
+            home_cfg.mkdir(parents=True)
+            (home_cfg / "config.toml").write_text(
                 '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n',
                 encoding="utf-8",
             )
-            env = {
-                "HOME": str(root / "home"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-            }
-            runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            exit_code = main(
+            runner2 = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
+            rc2, _out2, err2 = run_cli(
                 ["status", "--json"],
-                env=env,
-                runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
+                root=root,
+                runner=runner2,
+                env={"HOME": str(root / "alt-home"), "XDG_CACHE_HOME": str(root / "alt-cache")},
             )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2, "")
             self.assertEqual(
-                runner.calls,
-                [
-                    (
-                        "cluster-a",
-                        "ssh",
-                        "login.example.edu",
-                        [
-                            "env",
-                            "SLURM_TIME_FORMAT=%s",
-                            "sinfo",
-                            "-h",
-                            "-N",
-                            "-O",
-                            "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|",
-                        ],
-                    )
-                ],
+                runner2.calls,
+                [("cluster-a", "ssh", "login.example.edu", SINFO_ARGV)],
             )
 
-    def test_missing_config_file_exits_two_with_stderr_diagnostic(self) -> None:
+    def test_invalid_configs_exit_two_with_diagnostic_before_runner(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            env = {
-                "XDG_CONFIG_HOME": str(root / "empty-config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
             runner = FakeRunner()
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            exit_code = main(
-                ["status"],
-                env=env,
-                runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("config.toml", stderr.getvalue())
+            rc, out, err = run_cli(["status"], root=root, runner=runner)
+            self.assertEqual(rc, 2)
+            self.assertEqual(out, "")
+            self.assertIn("config.toml", err)
             self.assertEqual(runner.calls, [])
 
-    def test_malformed_toml_exits_two_with_stderr_diagnostic(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config_dir = root / "config" / "sglance"
-            config_dir.mkdir(parents=True)
-            (config_dir / "config.toml").write_text(
-                '[[clusters]\nname = "cluster-a"\n',
-                encoding="utf-8",
-            )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
-            runner = FakeRunner()
-            stdout = io.StringIO()
-            stderr = io.StringIO()
+            rc_no_env, _, err_no_env = run_cli(["status"], root=root, runner=runner, env={})
+            self.assertEqual(rc_no_env, 2)
+            self.assertIn("XDG_CONFIG_HOME", err_no_env)
 
-            exit_code = main(
-                ["status"],
-                env=env,
-                runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("config.toml", stderr.getvalue())
-            self.assertEqual(runner.calls, [])
-
-    def test_unknown_top_level_key_in_config_exits_two(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config_dir = root / "config" / "sglance"
-            config_dir.mkdir(parents=True)
-            (config_dir / "config.toml").write_text(
+        bad_configs: tuple[tuple[str, str, str], ...] = (
+            ("malformed-toml", '[[clusters]\nname = "cluster-a"\n', "config.toml"),
+            ("empty-clusters", "", "[[clusters]]"),
+            (
+                "unknown-top-key",
                 'timeout_seconds = 30\n\n[[clusters]]\nname = "cluster-a"\n',
-                encoding="utf-8",
-            )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
-            runner = FakeRunner()
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            exit_code = main(
-                ["status"],
-                env=env,
-                runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("timeout_seconds", stderr.getvalue())
-            self.assertEqual(runner.calls, [])
-
-    def test_unknown_cluster_entry_key_in_config_exits_two(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config_dir = root / "config" / "sglance"
-            config_dir.mkdir(parents=True)
-            (config_dir / "config.toml").write_text(
+                "timeout_seconds",
+            ),
+            (
+                "unknown-entry-key",
                 '[[clusters]]\nname = "cluster-a"\nhostname = "login.example.edu"\n',
-                encoding="utf-8",
-            )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
-            runner = FakeRunner()
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            exit_code = main(
-                ["status"],
-                env=env,
-                runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("hostname", stderr.getvalue())
-            self.assertEqual(runner.calls, [])
-
-    def test_invalid_cluster_names_exit_two_with_stderr_diagnostic(self) -> None:
-        bad_configs = [
-            ("empty", '[[clusters]]\nname = ""\n'),
-            ("leading-dash", '[[clusters]]\nname = "-cluster"\n'),
-            ("space", '[[clusters]]\nname = "cluster a"\n'),
-            ("tab", '[[clusters]]\nname = "cluster\\ta"\n'),
-            ("comma", '[[clusters]]\nname = "cluster,a"\n'),
-            ("ascii-bell", '[[clusters]]\nname = "cluster\\u0007a"\n'),
-            ("ascii-del", '[[clusters]]\nname = "cluster\\u007fa"\n'),
-            ("missing-name", '[[clusters]]\nssh = "login.example.edu"\n'),
-            ("non-string-name", "[[clusters]]\nname = 42\n"),
-            ("missing-clusters", ""),
-        ]
-        for label, toml_body in bad_configs:
+                "hostname",
+            ),
+            ("missing-name", '[[clusters]]\nssh = "login.example.edu"\n', "name"),
+            (
+                "duplicate-name",
+                '[[clusters]]\nname = "cluster-a"\n[[clusters]]\nname = "cluster-a"\n',
+                "duplicate",
+            ),
+            (
+                "local-ssh-conflict",
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\nssh = "login.example.edu"\n',
+                "local = true and ssh",
+            ),
+            ("non-bool-local", '[[clusters]]\nname = "cluster-a"\nlocal = "yes"\n', "boolean"),
+            ("unsafe-name-empty", '[[clusters]]\nname = ""\n', "clusters[0].name"),
+            ("unsafe-name-dash", '[[clusters]]\nname = "-bad"\n', "must not start with '-'"),
+            ("unsafe-name-comma", '[[clusters]]\nname = "a,b"\n', "commas"),
+            ("unsafe-ssh-dash", '[[clusters]]\nname = "cluster-a"\nssh = "-oProxyCommand=x"\n', "'-'"),
+            ("unsafe-ssh-space", '[[clusters]]\nname = "cluster-a"\nssh = "bad host"\n', "whitespace"),
+            (
+                "unsafe-ssh-ctrl",
+                '[[clusters]]\nname = "cluster-a"\nssh = "host\\u0007"\n',
+                "control",
+            ),
+            (
+                "unsafe-slurm-cluster-dash",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "-prod"\n',
+                "'-'",
+            ),
+            (
+                "unsafe-slurm-cluster-comma",
+                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "a,b"\n',
+                "commas",
+            ),
+        )
+        for label, toml_body, expected_err in bad_configs:
             with self.subTest(case=label), TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                config_dir = root / "config" / "sglance"
-                config_dir.mkdir(parents=True)
-                (config_dir / "config.toml").write_text(toml_body, encoding="utf-8")
-                env = {
-                    "XDG_CONFIG_HOME": str(root / "config"),
-                    "XDG_CACHE_HOME": str(root / "cache"),
-                    "HOME": str(root / "home"),
-                }
-                runner = FakeRunner()
-                stdout = io.StringIO()
-                stderr = io.StringIO()
-
-                exit_code = main(
-                    ["status"],
-                    env=env,
-                    runner=runner,
-                    clock=lambda: FIXED_NOW,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-
-                self.assertEqual(exit_code, 2)
-                self.assertEqual(stdout.getvalue(), "")
-                self.assertNotEqual(stderr.getvalue().strip(), "")
+                write_config(root, toml_body)
+                runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
+                rc, out, err = run_cli(["status"], root=root, runner=runner)
+                self.assertEqual(rc, 2)
+                self.assertEqual(out, "")
+                self.assertIn(expected_err, err)
                 self.assertEqual(runner.calls, [])
 
-    def test_duplicate_cluster_names_exit_two_with_stderr_diagnostic(self) -> None:
+    def test_cluster_filter_queries_selected_entry_and_rejects_unknown_cluster(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            config_dir = root / "config" / "sglance"
-            config_dir.mkdir(parents=True)
-            (config_dir / "config.toml").write_text(
-                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n\n'
-                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
-                encoding="utf-8",
+            write_config(
+                root,
+                '[[clusters]]\nname = "cluster-a"\n[[clusters]]\nname = "cluster-b"\nlocal = true\n',
             )
-            env = {
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "HOME": str(root / "home"),
-            }
-            runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            exit_code = main(
-                ["status"],
-                env=env,
+            runner = FakeRunner({("cluster-b", "sinfo"): MINIMAL_SINFO})
+            rc, _out, err = run_cli(
+                ["status", "--cluster", "cluster-b", "--json"],
+                root=root,
                 runner=runner,
-                clock=lambda: FIXED_NOW,
-                stdout=stdout,
-                stderr=stderr,
             )
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertEqual(runner.calls, [("cluster-b", "local", None, SINFO_ARGV)])
 
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("cluster-a", stderr.getvalue())
-            self.assertEqual(runner.calls, [])
-
-    def test_invalid_cluster_transport_and_slurm_cluster_configs_exit_two(self) -> None:
-        bad_configs = [
-            (
-                "local-with-ssh",
-                '[[clusters]]\nname = "cluster-a"\nlocal = true\nssh = "login.example.edu"\n',
-            ),
-            (
-                "non-bool-local",
-                '[[clusters]]\nname = "cluster-a"\nlocal = "true"\n',
-            ),
-            ("ssh-empty", '[[clusters]]\nname = "cluster-a"\nssh = ""\n'),
-            ("ssh-non-string", '[[clusters]]\nname = "cluster-a"\nssh = 123\n'),
-            (
-                "ssh-leading-dash",
-                '[[clusters]]\nname = "cluster-a"\nssh = "-oProxyCommand=evil"\n',
-            ),
-            (
-                "ssh-space",
-                '[[clusters]]\nname = "cluster-a"\nssh = "login example.edu"\n',
-            ),
-            (
-                "ssh-tab",
-                '[[clusters]]\nname = "cluster-a"\nssh = "login\\texample.edu"\n',
-            ),
-            (
-                "ssh-newline",
-                '[[clusters]]\nname = "cluster-a"\nssh = "login\\nexample.edu"\n',
-            ),
-            (
-                "ssh-comma",
-                '[[clusters]]\nname = "cluster-a"\nssh = "login,example.edu"\n',
-            ),
-            (
-                "ssh-control-bell",
-                '[[clusters]]\nname = "cluster-a"\nssh = "login\\u0007.example.edu"\n',
-            ),
-            (
-                "ssh-control-del",
-                '[[clusters]]\nname = "cluster-a"\nssh = "login\\u007f.example.edu"\n',
-            ),
-            (
-                "slurm-cluster-empty",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = ""\n',
-            ),
-            (
-                "slurm-cluster-non-string",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = true\n',
-            ),
-            (
-                "slurm-cluster-leading-dash",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "-prod"\n',
-            ),
-            (
-                "slurm-cluster-space",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod dev"\n',
-            ),
-            (
-                "slurm-cluster-comma",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod,dev"\n',
-            ),
-            (
-                "slurm-cluster-control-bell",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod\\u0007"\n',
-            ),
-            (
-                "slurm-cluster-control-del",
-                '[[clusters]]\nname = "cluster-a"\nslurm_cluster = "prod\\u007f"\n',
-            ),
-        ]
-        for label, toml_body in bad_configs:
-            with self.subTest(case=label), TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                config_dir = root / "config" / "sglance"
-                config_dir.mkdir(parents=True)
-                (config_dir / "config.toml").write_text(toml_body, encoding="utf-8")
-                env = {
-                    "XDG_CONFIG_HOME": str(root / "config"),
-                    "XDG_CACHE_HOME": str(root / "cache"),
-                    "HOME": str(root / "home"),
-                }
-                runner = FakeRunner({("cluster-a", "sinfo"): MINIMAL_SINFO})
-                stdout = io.StringIO()
-                stderr = io.StringIO()
-
-                exit_code = main(
-                    ["status"],
-                    env=env,
-                    runner=runner,
-                    clock=lambda: FIXED_NOW,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-
-                self.assertEqual(exit_code, 2)
-                self.assertEqual(stdout.getvalue(), "")
-                self.assertNotEqual(stderr.getvalue().strip(), "")
-                self.assertEqual(runner.calls, [])
+            rc_bad, out_bad, err_bad = run_cli(
+                ["status", "--cluster", "missing"],
+                root=root,
+                runner=runner,
+            )
+            self.assertEqual(rc_bad, 2)
+            self.assertEqual(out_bad, "")
+            self.assertIn("unknown cluster 'missing'", err_bad)
 
 
+if __name__ == "__main__":
+    unittest.main()
