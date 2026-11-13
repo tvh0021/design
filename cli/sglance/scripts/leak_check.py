@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
 import ipaddress
 import os
 from pathlib import Path, PurePosixPath
@@ -17,13 +17,9 @@ DENYLIST_FILENAME = ".leak-denylist"
 DENYLIST_ENV_VAR = "SGLANCE_LEAK_DENYLIST"
 SKIP_DIRS = {".git", "__pycache__", ".venv", "build", "dist", ".pytest_cache"}
 EMAIL_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9._%+-])"
-    r"[A-Za-z0-9](?:[A-Za-z0-9._%+-]*[A-Za-z0-9])?"
-    r"@"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*"
-    r"\.[A-Za-z]{2,}"
-    r"(?![A-Za-z0-9])"
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9](?:[A-Za-z0-9._%+-]*[A-Za-z0-9])?"
+    r"@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*\.[A-Za-z]{2,}(?![A-Za-z0-9])"
 )
 _OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
 IPV4_PATTERN = re.compile(
@@ -37,49 +33,32 @@ ALLOWED_IPV4_NETWORKS = (
 )
 
 
-def has_forbidden_ipv4(line: str) -> bool:
-    for match in IPV4_PATTERN.finditer(line):
-        addr = ipaddress.IPv4Address(match.group(0))
-        if not any(addr in net for net in ALLOWED_IPV4_NETWORKS):
-            return True
-    return False
-
-
-def redact_sensitive_spans(
-    text: str,
-    token_patterns: Sequence[tuple[int, re.Pattern[str]]],
-) -> str:
-    spans: list[tuple[int, int]] = []
-    for _idx, pattern in token_patterns:
-        for match in pattern.finditer(text):
-            spans.append((match.start(), match.end()))
-    for match in EMAIL_PATTERN.finditer(text):
-        spans.append((match.start(), match.end()))
+def iter_forbidden_ipv4(text: str) -> Iterator[re.Match[str]]:
     for match in IPV4_PATTERN.finditer(text):
         addr = ipaddress.IPv4Address(match.group(0))
         if not any(addr in net for net in ALLOWED_IPV4_NETWORKS):
-            spans.append((match.start(), match.end()))
-    if not spans:
-        return text
+            yield match
 
-    spans.sort(key=lambda item: (item[0], -item[1]))
-    merged: list[tuple[int, int]] = []
-    cur_start, cur_end = spans[0]
-    for start, end in spans[1:]:
-        if start <= cur_end:
-            cur_end = max(cur_end, end)
-        else:
-            merged.append((cur_start, cur_end))
-            cur_start, cur_end = start, end
-    merged.append((cur_start, cur_end))
 
+def has_forbidden_ipv4(line: str) -> bool:
+    return any(iter_forbidden_ipv4(line))
+
+
+def redact_sensitive_spans(text: str, token_patterns: Sequence[re.Pattern[str]]) -> str:
+    spans = [
+        *(m.span() for pat in token_patterns for m in pat.finditer(text)),
+        *(m.span() for m in EMAIL_PATTERN.finditer(text)),
+        *(m.span() for m in iter_forbidden_ipv4(text)),
+    ]
     pieces: list[str] = []
-    cursor = 0
-    for start, end in merged:
-        pieces.append(text[cursor:start])
-        pieces.append("<redacted>")
-        cursor = end
-    pieces.append(text[cursor:])
+    cur_end = -1
+    for start, end in sorted(spans):
+        if start > cur_end:
+            pieces.extend((text[max(0, cur_end) : start], "<redacted>"))
+            cur_end = end
+        elif end > cur_end:
+            cur_end = end
+    pieces.append(text[max(0, cur_end) :])
     return "".join(pieces)
 
 
@@ -91,13 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "positional_root",
         nargs="?",
-        default=None,
         help="Optional root directory to scan (defaults to cli/sglance).",
     )
     parser.add_argument(
         "--root",
         dest="flag_root",
-        default=None,
         help="Root directory to scan (defaults to cli/sglance).",
     )
     parser.add_argument(
@@ -113,45 +90,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_denylist_file(path: Path) -> list[str]:
-    if not path.is_file():
-        return []
+def parse_denylist(raw_text: str, *, split_commas: bool = False) -> list[str]:
     tokens: list[str] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in raw_text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        tokens.append(stripped)
-    return tokens
-
-
-def parse_denylist_env(raw_value: str) -> list[str]:
-    tokens: list[str] = []
-    for raw_line in raw_value.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        for piece in stripped.split(","):
-            token = piece.strip()
-            if token:
-                tokens.append(token)
+        parts = stripped.split(",") if split_commas else (stripped,)
+        tokens.extend(tok for part in parts if (tok := part.strip()))
     return tokens
 
 
 def merge_tokens(*token_lists: Sequence[str]) -> list[str]:
-    merged: list[str] = []
-    seen_lower: set[str] = set()
+    seen: dict[str, str] = {}
     for items in token_lists:
         for tok in items:
-            key = tok.lower()
-            if key not in seen_lower:
-                seen_lower.add(key)
-                merged.append(tok)
-    return merged
+            seen.setdefault(tok.lower(), tok)
+    return list(seen.values())
 
 
-def iter_plain_files(root: Path, skip_paths: set[Path]) -> list[Path]:
-    found: list[Path] = []
+def load_plain_targets(root: Path, skip_paths: AbstractSet[Path]) -> list[tuple[str, bytes]]:
+    targets: list[tuple[str, bytes]] = []
     for dirpath_str, dirnames, filenames in os.walk(root):
         dirpath = Path(dirpath_str)
         dirnames[:] = sorted(
@@ -162,11 +121,10 @@ def iter_plain_files(root: Path, skip_paths: set[Path]) -> list[Path]:
             if raw_candidate.is_symlink():
                 continue
             candidate = raw_candidate.resolve()
-            if candidate in skip_paths:
-                continue
-            if candidate.is_file():
-                found.append(candidate)
-    return sorted(found, key=lambda p: p.relative_to(root).as_posix())
+            if candidate not in skip_paths and candidate.is_file():
+                targets.append((candidate.relative_to(root).as_posix(), candidate.read_bytes()))
+    targets.sort(key=lambda item: item[0])
+    return targets
 
 
 def find_git_toplevel(root: Path) -> Path | None:
@@ -176,15 +134,17 @@ def find_git_toplevel(root: Path) -> Path | None:
         text=True,
         check=False,
     )
-    if proc.returncode != 0:
-        return None
-    out = proc.stdout.strip()
+    out = proc.stdout.strip() if proc.returncode == 0 else ""
     return Path(out).resolve() if out else None
 
 
-def load_git_tracked_targets(root: Path) -> list[tuple[str, bytes]]:
+def load_git_ls_targets(
+    root: Path,
+    *flags: str,
+    skip_paths: AbstractSet[Path] = frozenset(),
+) -> list[tuple[str, bytes]]:
     proc = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--", "."],
+        ["git", "-C", str(root), "ls-files", "-z", *flags, "--", "."],
         capture_output=True,
         check=True,
     )
@@ -198,40 +158,9 @@ def load_git_tracked_targets(root: Path) -> list[tuple[str, bytes]]:
             continue
         seen.add(rel_posix)
         full_path = root / rel_posix
-        if full_path.is_file() and not full_path.is_symlink():
-            targets.append((rel_posix, full_path.read_bytes()))
-    targets.sort(key=lambda item: item[0])
-    return targets
-
-
-def load_git_untracked_targets(
-    root: Path,
-    skip_paths: set[Path],
-) -> list[tuple[str, bytes]]:
-    proc = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--",
-            ".",
-        ],
-        capture_output=True,
-        check=True,
-    )
-    targets: list[tuple[str, bytes]] = []
-    for raw_entry in proc.stdout.split(b"\x00"):
-        if not raw_entry:
-            continue
-        rel_posix = raw_entry.decode("utf-8", errors="surrogateescape")
-        full_path = root / rel_posix
         if full_path.is_symlink() or not full_path.is_file():
             continue
-        if full_path.resolve() in skip_paths:
+        if skip_paths and full_path.resolve() in skip_paths:
             continue
         targets.append((rel_posix, full_path.read_bytes()))
     targets.sort(key=lambda item: item[0])
@@ -275,13 +204,7 @@ def load_git_staged_targets(git_toplevel: Path, root: Path) -> list[tuple[str, b
 
         meta_fields = meta.lstrip(b":").decode("ascii", errors="replace").split()
         dst_mode = meta_fields[1] if len(meta_fields) >= 2 else ""
-
-        pure_path = PurePosixPath(repo_rel_posix)
-        rel_posix = (
-            pure_path.as_posix()
-            if root_rel == "."
-            else pure_path.relative_to(root_rel).as_posix()
-        )
+        rel_posix = PurePosixPath(repo_rel_posix).relative_to(root_rel).as_posix()
 
         blob_proc = subprocess.run(
             ["git", "-C", str(git_toplevel), "cat-file", "blob", f":{repo_rel_posix}"],
@@ -289,21 +212,21 @@ def load_git_staged_targets(git_toplevel: Path, root: Path) -> list[tuple[str, b
             check=False,
         )
         if blob_proc.returncode != 0:
-            if dst_mode == "160000":
-                targets.append((rel_posix, b""))
-            else:
-                targets.append((rel_posix, None))
-            continue
-        targets.append((rel_posix, blob_proc.stdout))
+            targets.append((rel_posix, b"" if dst_mode == "160000" else None))
+        else:
+            targets.append((rel_posix, blob_proc.stdout))
     targets.sort(key=lambda item: item[0])
     return targets
 
 
-def load_plain_targets(root: Path, skip_paths: set[Path]) -> list[tuple[str, bytes]]:
-    return [
-        (file_path.relative_to(root).as_posix(), file_path.read_bytes())
-        for file_path in iter_plain_files(root, skip_paths=skip_paths)
-    ]
+def scan_labels(text: str, token_patterns: Sequence[re.Pattern[str]]) -> Iterator[str]:
+    for idx, pattern in enumerate(token_patterns, 1):
+        if pattern.search(text):
+            yield f"denylist token #{idx}"
+    if EMAIL_PATTERN.search(text):
+        yield "email address"
+    if has_forbidden_ipv4(text):
+        yield "non-RFC-5737 IPv4 address"
 
 
 def main(
@@ -323,15 +246,16 @@ def main(
 
     git_toplevel = find_git_toplevel(root)
     if args.staged and git_toplevel is None:
-        print(
-            f"leak_check.py: error: --staged requires a git worktree: {root}",
-            file=sys.stderr,
-        )
+        print(f"leak_check.py: error: --staged requires a git worktree: {root}", file=sys.stderr)
         return 2
 
     denylist_path = (root / DENYLIST_FILENAME).resolve()
-    file_tokens = load_denylist_file(denylist_path)
-    env_tokens = parse_denylist_env(effective_env.get(DENYLIST_ENV_VAR, ""))
+    file_tokens = (
+        parse_denylist(denylist_path.read_text(encoding="utf-8"))
+        if denylist_path.is_file()
+        else []
+    )
+    env_tokens = parse_denylist(effective_env.get(DENYLIST_ENV_VAR, ""), split_commas=True)
     tokens = merge_tokens(file_tokens, env_tokens)
     if args.require_denylist and not tokens:
         print(
@@ -341,14 +265,8 @@ def main(
         )
         return 1
     token_patterns = [
-        (
-            idx,
-            re.compile(
-                rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])",
-                re.IGNORECASE,
-            ),
-        )
-        for idx, tok in enumerate(tokens, start=1)
+        re.compile(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])", re.IGNORECASE)
+        for tok in tokens
     ]
 
     targets: Sequence[tuple[str, bytes | None]]
@@ -356,42 +274,29 @@ def main(
         assert git_toplevel is not None
         targets = load_git_staged_targets(git_toplevel, root)
     elif git_toplevel is not None:
-        targets = load_git_tracked_targets(root)
-        if not targets:
-            targets = load_git_untracked_targets(root, skip_paths={denylist_path})
+        targets = load_git_ls_targets(root, "--cached") or load_git_ls_targets(
+            root, "--others", "--exclude-standard", skip_paths={denylist_path}
+        )
     else:
         targets = load_plain_targets(root, skip_paths={denylist_path})
 
     findings: list[str] = []
     for rel_posix, raw_bytes in targets:
         display_path = redact_sensitive_spans(rel_posix, token_patterns)
-        for idx, pattern in token_patterns:
-            if pattern.search(rel_posix):
-                findings.append(f"{display_path}:0: denylist token #{idx} in path")
-        if EMAIL_PATTERN.search(rel_posix):
-            findings.append(f"{display_path}:0: email address in path")
-        if has_forbidden_ipv4(rel_posix):
-            findings.append(f"{display_path}:0: non-RFC-5737 IPv4 address in path")
-
+        findings.extend(
+            f"{display_path}:0: {label} in path" for label in scan_labels(rel_posix, token_patterns)
+        )
         if raw_bytes is None:
             findings.append(f"{display_path}:0: unable to read staged blob")
             continue
+        for line_no, line in enumerate(raw_bytes.decode("utf-8", errors="replace").splitlines(), 1):
+            findings.extend(
+                f"{display_path}:{line_no}: {label}" for label in scan_labels(line, token_patterns)
+            )
 
-        text = raw_bytes.decode("utf-8", errors="replace")
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            for idx, pattern in token_patterns:
-                if pattern.search(line):
-                    findings.append(f"{display_path}:{line_no}: denylist token #{idx}")
-            if EMAIL_PATTERN.search(line):
-                findings.append(f"{display_path}:{line_no}: email address")
-            if has_forbidden_ipv4(line):
-                findings.append(f"{display_path}:{line_no}: non-RFC-5737 IPv4 address")
-
-    if findings:
-        for item in findings:
-            print(item)
-        return 1
-    return 0
+    for item in findings:
+        print(item)
+    return 1 if findings else 0
 
 
 if __name__ == "__main__":
