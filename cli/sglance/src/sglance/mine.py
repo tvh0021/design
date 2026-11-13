@@ -1,22 +1,38 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+import re
 
 from sglance.models import MineJob
 
 MINE_SQUEUE_FIELDS = (
-    "JobID:0|,Name:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
-    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,tres-alloc:0|,StartTime:0|,Reason:0|"
+    "JobID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,"
+    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,StartTime:0|,Reason:0|,Name:0|"
 )
 
-_PENDING_STATES = frozenset({"PD", "RQ", "RH", "RD", "SE"})
-_TERMINAL_STATES = frozenset({"CD", "F", "CA", "TO", "OOM", "NF", "PR", "BF", "DL", "RV", "EX"})
+_PENDING_STATES = frozenset({"PD", "RQ", "RH", "RD", "RF", "SE"})
+_ACTIVE_STATES = frozenset({"R", "CF", "CG", "S", "ST", "RS", "SI", "SO", "PO"})
+_VALID_NONTERMINAL_STATES = _PENDING_STATES | _ACTIVE_STATES
 _UNBOUNDED_LIMITS = frozenset({"unlimited", "partition_limit"})
 _UNSET_START_VALUES = frozenset({"", "n/a", "unknown", "none", "(null)"})
+_UNSET_TRES_VALUES = frozenset({"", "(null)", "none", "n/a"})
+_INVALID_GPU_TYPES = frozenset({"", "(null)", "none", "n/a", "invalid", "no_consume"})
+_INVALID_PARTITION_VALUES = frozenset({"", "(null)", "n/a", "none"})
+_JOB_ID_RE = re.compile(r"^\d+(?:_\d+|\+\d+|_\[[0-9][0-9,\-:%]*\])?$")
+_GPU_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 
 class MineParseError(Exception):
     """Raised when squeue output for mine is structurally malformed."""
+
+
+def _parse_optional(parser: Callable[[str], int | None], raw: str) -> int | None:
+    try:
+        return parser(raw)
+    except ValueError:
+        return None
 
 
 def _parse_nonneg_int(raw: str) -> int:
@@ -59,41 +75,120 @@ def _parse_time_limit_seconds(raw: str) -> int | None:
     return _parse_slurm_duration_seconds(stripped)
 
 
-def _parse_tres_gpus(raw: str) -> int:
+def _is_gpu_type_name(value: str) -> bool:
+    lowered = value.lower()
+    if lowered in _INVALID_GPU_TYPES or re.fullmatch(r"\d+[kmgtp]", lowered):
+        return False
+    return bool(_GPU_TYPE_RE.fullmatch(value)) and any(
+        ch.isascii() and ch.isalpha() for ch in value
+    )
+
+
+def _parse_tres_spec_gpus(raw: str) -> tuple[bool, int]:
     stripped = raw.strip()
-    if stripped.lower() in {"", "(null)", "none"}:
-        return 0
+    if stripped.lower() in _UNSET_TRES_VALUES:
+        return False, 0
     has_untyped = False
     untyped_gpus = 0
+    has_typed = False
     typed_gpus = 0
     for token in stripped.split(","):
         item = token.strip()
         if not item:
             continue
-        key, sep, val = item.partition("=")
-        if sep != "=":
+        item_lower = item.lower()
+        if item_lower.startswith(("gres/gpu", "gres:gpu")):
+            rest = item[8:].strip()
+        elif item_lower.startswith("gpu"):
+            rest = item[3:].strip()
+        else:
             continue
-        key_lower = key.strip().lower()
-        val_str = val.strip()
-        if key_lower == "gres/gpu":
-            untyped_gpus += _parse_nonneg_int(val_str)
+        if rest and rest[0] not in {":", "="}:
+            continue
+        if not rest:
             has_untyped = True
-        elif key_lower.startswith("gres/gpu:"):
-            gpu_type = key_lower[len("gres/gpu:") :].strip()
-            if not gpu_type:
-                raise ValueError(f"empty GPU type in TRES {raw!r}")
-            typed_gpus += _parse_nonneg_int(val_str)
-    return untyped_gpus if has_untyped else typed_gpus
+            untyped_gpus += 1
+        elif rest[0] == "=":
+            untyped_gpus += _parse_nonneg_int(rest[1:].strip())
+            has_untyped = True
+        else:
+            tail = rest[1:].strip()
+            if not tail:
+                raise ValueError(f"empty GPU specifier in TRES {raw!r}")
+            if "=" in tail:
+                gpu_type, _, count_str = tail.partition("=")
+                if not _is_gpu_type_name(gpu_type.strip()):
+                    raise ValueError(f"invalid GPU type in TRES {raw!r}")
+                typed_gpus += _parse_nonneg_int(count_str.strip())
+                has_typed = True
+            else:
+                parts = [part.strip() for part in tail.split(":")]
+                if any(not part for part in parts):
+                    raise ValueError(f"malformed GPU TRES {raw!r}")
+                if len(parts) == 1:
+                    if parts[0].isascii() and parts[0].isdigit():
+                        untyped_gpus += int(parts[0])
+                        has_untyped = True
+                    elif _is_gpu_type_name(parts[0]):
+                        typed_gpus += 1
+                        has_typed = True
+                    else:
+                        raise ValueError(f"malformed GPU TRES {raw!r}")
+                elif len(parts) == 2:
+                    if not _is_gpu_type_name(parts[0]):
+                        raise ValueError(f"invalid GPU type in TRES {raw!r}")
+                    typed_gpus += _parse_nonneg_int(parts[1])
+                    has_typed = True
+                else:
+                    raise ValueError(f"malformed GPU TRES {raw!r}")
+    has_any = has_untyped or has_typed
+    return has_any, (untyped_gpus if has_untyped else typed_gpus)
+
+
+def _resolve_job_gpus(
+    tres_alloc_raw: str,
+    tres_per_node_raw: str,
+    tres_per_job_raw: str,
+    *,
+    nodes: int | None,
+) -> int | None:
+    try:
+        alloc_has_gpu, alloc_gpus = _parse_tres_spec_gpus(tres_alloc_raw)
+    except ValueError:
+        return None
+    if alloc_has_gpu:
+        return alloc_gpus
+    try:
+        per_job_has_gpu, per_job_gpus = _parse_tres_spec_gpus(tres_per_job_raw)
+        per_node_has_gpu, per_node_gpus = _parse_tres_spec_gpus(tres_per_node_raw)
+    except ValueError:
+        return None
+    if per_job_has_gpu:
+        return per_job_gpus
+    if per_node_has_gpu:
+        if nodes is None:
+            return None
+        return per_node_gpus * nodes
+    return 0
 
 
 def _normalize_partition(raw: str) -> str:
-    first = raw.split(",", 1)[0].strip()
+    parts = [part.strip() for part in raw.split(",")]
+    if not parts or any(not part.rstrip("*") for part in parts):
+        return ""
+    first = parts[0]
     if first.endswith("*"):
         first = first[:-1]
+    if (
+        first.lower() in _INVALID_PARTITION_VALUES
+        or first.startswith("-")
+        or any(ch.isspace() for ch in first)
+    ):
+        return ""
     return first
 
 
-def _parse_estimated_start(raw: str, *, is_pending: bool) -> str | None:
+def _parse_estimated_start(raw: str, *, is_pending: bool, now_utc: datetime) -> str | None:
     if not is_pending:
         return None
     stripped = raw.strip()
@@ -105,12 +200,18 @@ def _parse_estimated_start(raw: str, *, is_pending: bool) -> str | None:
     if epoch <= 0:
         return None
     try:
-        return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        start_dt = datetime.fromtimestamp(epoch, tz=UTC)
     except (OverflowError, OSError, ValueError):
         return None
+    if start_dt < now_utc:
+        return None
+    return start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_squeue_mine(stdout: str) -> tuple[tuple[MineJob, ...], frozenset[str], str | None]:
+def parse_squeue_mine(
+    stdout: str, *, now: datetime
+) -> tuple[tuple[MineJob, ...], frozenset[str], str | None]:
+    now_utc = now.astimezone(UTC)
     jobs: list[MineJob] = []
     distinct_users: set[str] = set()
     first_user: str | None = None
@@ -121,13 +222,12 @@ def parse_squeue_mine(stdout: str) -> tuple[tuple[MineJob, ...], frozenset[str],
             continue
         if not stripped.endswith("|"):
             raise MineParseError(f"malformed squeue output: {stripped}")
-        cells = [cell.strip() for cell in stripped[:-1].split("|", 12)]
-        if len(cells) != 13:
+        cells = [cell.strip() for cell in stripped[:-1].split("|", 14)]
+        if len(cells) != 15:
             raise MineParseError(f"malformed squeue output: {stripped}")
 
         (
             job_id,
-            name,
             user_name,
             account_val,
             partition_field,
@@ -137,26 +237,34 @@ def parse_squeue_mine(stdout: str) -> tuple[tuple[MineJob, ...], frozenset[str],
             num_nodes_raw,
             num_cpus_raw,
             tres_alloc_raw,
+            tres_per_node_raw,
+            tres_per_job_raw,
             start_time_raw,
             reason_raw,
+            name,
         ) = cells
 
         partition_name = _normalize_partition(partition_field)
-        if not job_id or not partition_name or not state_compact or state_compact in _TERMINAL_STATES:
+        if (
+            not _JOB_ID_RE.fullmatch(job_id)
+            or not partition_name
+            or state_compact not in _VALID_NONTERMINAL_STATES
+        ):
             continue
 
-        try:
-            nodes = _parse_nonneg_int(num_nodes_raw)
-            cpus = _parse_nonneg_int(num_cpus_raw)
-            elapsed_seconds = _parse_slurm_duration_seconds(time_used_raw)
-            time_limit_seconds = _parse_time_limit_seconds(time_limit_raw)
-            gpus = _parse_tres_gpus(tres_alloc_raw)
-        except ValueError:
-            continue
+        nodes = _parse_optional(_parse_nonneg_int, num_nodes_raw)
+        cpus = _parse_optional(_parse_nonneg_int, num_cpus_raw)
+        elapsed_seconds = _parse_optional(_parse_slurm_duration_seconds, time_used_raw)
+        time_limit_seconds = _parse_optional(_parse_time_limit_seconds, time_limit_raw)
+        gpus = _resolve_job_gpus(
+            tres_alloc_raw, tres_per_node_raw, tres_per_job_raw, nodes=nodes
+        )
 
         is_pending = state_compact in _PENDING_STATES
         reason = (reason_raw or "None") if is_pending else None
-        estimated_start = _parse_estimated_start(start_time_raw, is_pending=is_pending)
+        estimated_start = _parse_estimated_start(
+            start_time_raw, is_pending=is_pending, now_utc=now_utc
+        )
 
         if user_name:
             distinct_users.add(user_name)

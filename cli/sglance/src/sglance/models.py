@@ -87,10 +87,10 @@ class MineJob:
     account: str
     partition: str
     state: str
-    cpus: int
-    gpus: int
-    nodes: int
-    elapsed_seconds: int
+    cpus: int | None
+    gpus: int | None
+    nodes: int | None
+    elapsed_seconds: int | None
     time_limit_seconds: int | None
     reason: str | None
     estimated_start: str | None

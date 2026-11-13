@@ -240,6 +240,11 @@ def _format_cluster_mine_section(cluster: ClusterMine, *, now: datetime | None =
 
     rows: list[tuple[str, ...]] = []
     for job in cluster.jobs:
+        elapsed_label = (
+            _format_duration_seconds(job.elapsed_seconds)
+            if job.elapsed_seconds is not None
+            else "-"
+        )
         limit_label = (
             _format_duration_seconds(job.time_limit_seconds)
             if job.time_limit_seconds is not None
@@ -253,10 +258,10 @@ def _format_cluster_mine_section(cluster: ClusterMine, *, now: datetime | None =
                 job.account or "-",
                 job.partition,
                 job.state,
-                str(job.cpus),
-                str(job.gpus),
-                str(job.nodes),
-                _format_duration_seconds(job.elapsed_seconds),
+                str(job.cpus) if job.cpus is not None else "-",
+                str(job.gpus) if job.gpus is not None else "-",
+                str(job.nodes) if job.nodes is not None else "-",
+                elapsed_label,
                 limit_label,
                 job.reason if job.reason is not None else "-",
                 job.estimated_start if job.estimated_start is not None else "-",
