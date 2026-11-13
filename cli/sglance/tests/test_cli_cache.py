@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 import io
 import json
 import os
@@ -1364,8 +1368,10 @@ class CacheCliTests(unittest.TestCase):
             initial_jsons = [p for p in cache_sglance_dir.iterdir() if p.suffix == ".json"]
             self.assertEqual(len(initial_jsons), 1)
             status_json = initial_jsons[0]
+            status_lock = status_json.with_suffix(".lock")
+            self.assertTrue(status_lock.is_file())
 
-            # Add foreign files/dirs inside cache/sglance and parent XDG_CACHE_HOME with 5-day-old mtimes.
+            # Add foreign files/dirs and old lock files with 5-day-old mtimes.
             old_ts = (BASE_TIME - timedelta(days=5)).timestamp()
             foreign_txt = cache_sglance_dir / "notes.txt"
             foreign_txt.write_text("user note\n", encoding="utf-8")
@@ -1373,12 +1379,23 @@ class CacheCliTests(unittest.TestCase):
             foreign_json.write_text('{"custom": 1}\n', encoding="utf-8")
             foreign_hex_json = cache_sglance_dir / ("a" * 64 + ".json")
             foreign_hex_json.write_text('{"foreign": true}\n', encoding="utf-8")
+            foreign_hex_lock = cache_sglance_dir / ("a" * 64 + ".lock")
+            foreign_hex_lock.write_text("", encoding="utf-8")
+            old_orphan_lock = cache_sglance_dir / ("b" * 64 + ".lock")
+            old_orphan_lock.write_text("", encoding="utf-8")
             foreign_subdir = cache_sglance_dir / "subdir"
             foreign_subdir.mkdir()
             (foreign_subdir / "nested.json").write_text("{}\n", encoding="utf-8")
             parent_file = Path(env["XDG_CACHE_HOME"]) / "outside.json"
             parent_file.write_text("{}\n", encoding="utf-8")
-            for p in (foreign_txt, foreign_json, foreign_hex_json, parent_file):
+            for p in (
+                foreign_txt,
+                foreign_json,
+                foreign_hex_json,
+                foreign_hex_lock,
+                old_orphan_lock,
+                parent_file,
+            ):
                 os.utime(p, (old_ts, old_ts))
 
             # t = +12h (< 1 day): writing queue snapshot keeps 12h-old status snapshot.
@@ -1428,6 +1445,9 @@ class CacheCliTests(unittest.TestCase):
             self.assertEqual(rc3, 0)
             self.assertEqual(err3.getvalue(), "")
             self.assertFalse(status_json.exists())
+            self.assertTrue(status_lock.is_file())
+            self.assertTrue(foreign_hex_lock.is_file())
+            self.assertTrue(old_orphan_lock.is_file())
             self.assertTrue(queue_json.exists())
             self.assertTrue(foreign_txt.exists())
             self.assertTrue(foreign_json.exists())
@@ -1449,6 +1469,194 @@ class CacheCliTests(unittest.TestCase):
                 )
             self.assertEqual(rc4, 0)
             self.assertEqual(err4.getvalue(), "")
+
+    @unittest.skipIf(fcntl is None, "POSIX flock is required")
+    def test_cache_prune_preserves_symlinks_held_locks_missing_locks_and_old_lock_files(
+        self,
+    ) -> None:
+        assert fcntl is not None
+        mine_fields = (
+            "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+            "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+            "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+            "StartTime:0|,Reason:0|,Name:0|"
+        )
+        mine_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", mine_fields)
+        queue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
+        )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                encoding="utf-8",
+            )
+            env = make_test_env(root)
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sinfo"): SINFO_INITIAL,
+                    ("cluster-a", *queue_argv): (
+                        "1001|alice|cpu|R|None|\n"
+                        "1002|bob|cpu|PD|Resources|\n"
+                    ),
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                    ("cluster-a", *mine_argv): (
+                        "2001|alice|proj-123|cpu|R|10:00|01:00:00|1|16|1|"
+                        "cpu=16|N/A|N/A|N/A|1794513000|None|me_job|\n"
+                    ),
+                }
+            )
+
+            # Seed two snapshots at BASE_TIME: status (will be unlocked) and queue (will hold flock).
+            out_s, err_s = io.StringIO(), io.StringIO()
+            self.assertEqual(
+                main(
+                    ["status", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: BASE_TIME,
+                    stdout=out_s,
+                    stderr=err_s,
+                ),
+                0,
+            )
+            cache_sglance_dir = Path(env["XDG_CACHE_HOME"]) / "sglance"
+            status_json = next(p for p in cache_sglance_dir.iterdir() if p.suffix == ".json")
+            status_lock = status_json.with_suffix(".lock")
+            old_snapshot_text = status_json.read_text(encoding="utf-8")
+
+            out_q, err_q = io.StringIO(), io.StringIO()
+            self.assertEqual(
+                main(
+                    ["queue", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: BASE_TIME,
+                    stdout=out_q,
+                    stderr=err_q,
+                ),
+                0,
+            )
+            queue_json = next(
+                p for p in cache_sglance_dir.iterdir() if p.suffix == ".json" and p != status_json
+            )
+            queue_lock = queue_json.with_suffix(".lock")
+
+            # (a) <64-hex>.json symlink to an old valid-looking snapshot outside cache_dir,
+            #     even with a matching unlocked .lock file present: both link and target survive.
+            old_ts = (BASE_TIME - timedelta(days=5)).timestamp()
+            outside_target = root / "outside_old_snapshot.json"
+            outside_target.write_text(old_snapshot_text, encoding="utf-8")
+            os.utime(outside_target, (old_ts, old_ts))
+
+            symlink_stem = "d" * 64
+            symlink_lock = cache_sglance_dir / f"{symlink_stem}.lock"
+            symlink_lock.write_text("", encoding="utf-8")
+            os.utime(symlink_lock, (old_ts, old_ts))
+            symlink_json = cache_sglance_dir / f"{symlink_stem}.json"
+            symlink_json.symlink_to(outside_target)
+
+            # Old valid-looking snapshot with missing .lock file: skipped and survives.
+            missing_lock_json = cache_sglance_dir / ("e" * 64 + ".json")
+            missing_lock_json.write_text(old_snapshot_text, encoding="utf-8")
+            os.utime(missing_lock_json, (old_ts, old_ts))
+
+            # (c) Standalone old empty .lock file: never deleted.
+            standalone_old_lock = cache_sglance_dir / ("f" * 64 + ".lock")
+            standalone_old_lock.write_text("", encoding="utf-8")
+            os.utime(standalone_old_lock, (old_ts, old_ts))
+
+            # (b) Hold flock(LOCK_EX | LOCK_NB) on queue_lock from another fd during prune.
+            t_over_1d = BASE_TIME + timedelta(days=1, seconds=1)
+            held_fd = os.open(queue_lock, os.O_RDWR)
+            try:
+                fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                out_m, err_m = io.StringIO(), io.StringIO()
+                rc_m = main(
+                    ["mine", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: t_over_1d,
+                    stdout=out_m,
+                    stderr=err_m,
+                )
+                self.assertEqual(rc_m, 0)
+                self.assertEqual(err_m.getvalue(), "")
+                self.assertEqual(
+                    json.loads(out_m.getvalue()),
+                    {
+                        "schema_version": 1,
+                        "command": "mine",
+                        "account": None,
+                        "clusters": [
+                            {
+                                "cluster": "cluster-a",
+                                "fetched_at": "2026-11-13T20:00:01Z",
+                                "stale": False,
+                                "user_scoped": False,
+                                "error": None,
+                                "slurm_user": "alice",
+                                "account_filter": None,
+                                "jobs": [
+                                    {
+                                        "job_id": "2001",
+                                        "name": "me_job",
+                                        "user": "alice",
+                                        "account": "proj-123",
+                                        "partition": "cpu",
+                                        "state": "R",
+                                        "cpus": 16,
+                                        "gpus": 0,
+                                        "nodes": 1,
+                                        "elapsed_seconds": 600,
+                                        "time_limit_seconds": 3600,
+                                        "reason": None,
+                                        "estimated_start": None,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+                # Unlocked old snapshot was pruned; locked, symlinked, missing-lock, and .lock files survive.
+                self.assertFalse(status_json.exists())
+                self.assertTrue(queue_json.is_file())
+                self.assertTrue(symlink_json.is_symlink())
+                self.assertTrue(outside_target.is_file())
+                self.assertEqual(outside_target.read_text(encoding="utf-8"), old_snapshot_text)
+                self.assertTrue(missing_lock_json.is_file())
+                self.assertTrue(status_lock.is_file())
+                self.assertTrue(queue_lock.is_file())
+                self.assertTrue(symlink_lock.is_file())
+                self.assertTrue(standalone_old_lock.is_file())
+            finally:
+                fcntl.flock(held_fd, fcntl.LOCK_UN)
+                os.close(held_fd)
+
+            # Once held_fd releases queue_lock, a subsequent cache write prunes queue_json while keeping queue_lock.
+            out_s2, err_s2 = io.StringIO(), io.StringIO()
+            rc_s2 = main(
+                ["status", "--refresh", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: t_over_1d + timedelta(seconds=10),
+                stdout=out_s2,
+                stderr=err_s2,
+            )
+            self.assertEqual(rc_s2, 0)
+            self.assertEqual(err_s2.getvalue(), "")
+            self.assertFalse(queue_json.exists())
+            self.assertTrue(queue_lock.is_file())
 
 
 if __name__ == "__main__":

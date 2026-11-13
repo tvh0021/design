@@ -293,44 +293,49 @@ def _is_expired_sglance_snapshot(path: str, *, now_utc: datetime) -> bool:
     return age_seconds > CACHE_PRUNE_AGE_SECONDS
 
 
-def _prune_old_lock_file(path: str, *, now_ts: float) -> None:
+def _prune_expired_snapshot(snapshot_path: str, lock_path: str, *, now_utc: datetime) -> None:
+    if fcntl is None:  # pragma: no cover
+        return
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    lock_fd = os.open(lock_path, flags)
+    locked = False
     try:
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        st = os.fstat(fd)
-        if stat.S_ISREG(st.st_mode) and st.st_size == 0 and (now_ts - st.st_mtime) > CACHE_PRUNE_AGE_SECONDS:
-            os.unlink(path)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = True
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            return
+        if _is_expired_sglance_snapshot(snapshot_path, now_utc=now_utc):
+            os.unlink(snapshot_path)
     finally:
-        try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        os.close(fd)
+        if locked:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        os.close(lock_fd)
 
 
 def _prune_old_cache_files(cache_dir: Path, *, now: datetime, keep_stem: str) -> None:
     try:
         now_utc = now.astimezone(UTC)
-        now_ts = now_utc.timestamp()
         with os.scandir(cache_dir) as entries:
             for dent in entries:
                 try:
                     if dent.is_symlink():
                         continue
                     stem, dot, ext = dent.name.partition(".")
-                    if dot != "." or stem == keep_stem or not _HEX_DIGEST_RE.fullmatch(stem):
+                    if (
+                        dot != "."
+                        or ext != "json"
+                        or stem == keep_stem
+                        or not _HEX_DIGEST_RE.fullmatch(stem)
+                    ):
                         continue
                     st = dent.stat(follow_symlinks=False)
                     if not stat.S_ISREG(st.st_mode):
                         continue
-                    if ext == "json":
-                        if _is_expired_sglance_snapshot(dent.path, now_utc=now_utc):
-                            os.unlink(dent.path)
-                    elif ext == "lock" and st.st_size == 0 and (now_ts - st.st_mtime) > CACHE_PRUNE_AGE_SECONDS:
-                        _prune_old_lock_file(dent.path, now_ts=now_ts)
+                    lock_path = os.path.join(cache_dir, f"{stem}.lock")
+                    _prune_expired_snapshot(dent.path, lock_path, now_utc=now_utc)
                 except Exception:
                     continue
     except Exception:

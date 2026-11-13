@@ -46,7 +46,4 @@ jobs:
             echo "::notice::SGLANCE_LEAK_DENYLIST secret is empty; skipping leak check."
             exit 0
           fi
-          umask 077
-          trap 'rm -f .leak-denylist' EXIT
-          printf '%s\n' "$SGLANCE_LEAK_DENYLIST" > .leak-denylist
           python3 scripts/leak_check.py --require-denylist

@@ -2,9 +2,9 @@
 
 ## What it does
 
-`sglance` is a Python 3.11+ command-line tool that inspects partition capacity, job queues, historical wait times, and active jobs across one or more Slurm clusters. It uses only the Python standard library, queries remote clusters in parallel over non-interactive OpenSSH or runs directly on a local login node, and caches successful per-cluster responses for five minutes under `$XDG_CACHE_HOME/sglance` or `~/.cache/sglance`.
+`sglance` is a Python 3.11+ command-line tool that inspects partition capacity, job queues, historical wait times, and active jobs across one or more Slurm clusters. It uses only the Python standard library, queries remote clusters in parallel over non-interactive OpenSSH or runs directly on a local login node, and caches successful per-cluster responses for five minutes under `$XDG_CACHE_HOME/sglance` or `~/.cache/sglance`. After each successful cache write, `sglance` deletes its own snapshot files older than one day from its cache directory; caching is off when both `XDG_CACHE_HOME` and `HOME` are unset.
 
-`sglance` is strictly read-only. Every command passes through an internal allowlist that requires a leading `env SLURM_TIME_FORMAT=%s` prefix followed by one of four Slurm binaries, with an optional `-M <slurm_cluster>` flag when `slurm_cluster` is configured:
+`sglance` is strictly read-only. Every command passes through an internal allowlist that enforces the `env SLURM_TIME_FORMAT=%s` prefix, the four binaries `sinfo`, `squeue`, `sacct`, and `scontrol`, and that `scontrol` may only run `show config`; the listed command lines are what `sglance` actually sends:
 
 - `env SLURM_TIME_FORMAT=%s sinfo [-M <slurm_cluster>] -h -N -O PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|`
 - `env SLURM_TIME_FORMAT=%s squeue [-M <slurm_cluster>] -h -r -O JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|`
@@ -54,7 +54,7 @@ Each `[[clusters]]` cluster entry accepts these keys:
 
 - **`name`**. Required string. Unique display name for the cluster entry and the value matched by `--cluster NAME`. When `local` is `false` and `ssh` is omitted, `sglance` uses `name` as the `ssh` destination.
 - **`ssh`**. Optional string. OpenSSH host alias or hostname passed to `ssh`. Cannot be set together with `local = true`.
-- **`local`**. Optional boolean, default `false`. Runs Slurm commands directly on the local login node instead of over `ssh`. Cannot be set together with `ssh`.
+- **`local`**. Optional boolean, default `false`. Runs Slurm commands directly on the local login node instead of over `ssh`. When `true`, cannot be set together with `ssh`.
 - **`slurm_cluster`**. Optional string. Named Slurm cluster passed as `-M <slurm_cluster>` when one login node fronts multiple Slurm clusters.
 
 `name`, `ssh`, and `slurm_cluster` must be non-empty strings that do not start with `-`, do not contain commas, and do not contain whitespace or control characters. Unknown keys or invalid values write `sglance: error: ...` to `stderr` and exit with code `2`.
@@ -67,13 +67,13 @@ SSH access to every remote cluster entry must already work without interactive p
 
 Every subcommand queries all configured cluster entries in parallel unless filtered with `--cluster NAME`.
 
-Common options:
+Common options work before or after the subcommand:
 
 - **`--cluster NAME`**. Query only the named cluster entry from `config.toml`. Accepted before or after the subcommand. Passing an unconfigured name writes `sglance: error: unknown cluster 'NAME' (configured: ...)` to `stderr` and exits with code `2`.
 - **`--refresh`**. Bypass the five-minute response cache and fetch fresh Slurm data. Accepted before or after the subcommand.
-- **`--json`**. Emit structured JSON with `"schema_version": 1` instead of plain-text tables. Pass `--json` after the subcommand name.
+- **`--json`**. Emit structured JSON with `"schema_version": 1` instead of plain-text tables. Accepted before or after the subcommand.
 
-When a response comes from the five-minute cache, plain-text headers append `[cached <N>s ago]` and JSON cluster objects set `"stale": true`. CLI flag errors and `config.toml` errors exit with code `2`. Per-cluster transport, Slurm, or parse failures render inline as `<cluster>: unreachable (...)` or `<cluster>: <tool> exited <code>: <stderr>` in table mode and in the cluster object's `"error"` field in JSON mode, while the command still exits with code `0`.
+When a response comes from the five-minute cache, plain-text headers append `[cached <N>s ago]` and JSON cluster objects set `"stale": true`. CLI flag errors and `config.toml` errors exit with code `2`. Per-cluster transport, Slurm, or parse failures still exit with code `0` and report the failure inline in table mode and in the cluster object's `"error"` field in JSON mode. Unreachable hosts show `<cluster>: unreachable (...)` in table mode and `unreachable (...)` in JSON, while non-zero Slurm command exits show `<cluster>: <tool> exited <code>: <last non-empty stderr line, with a leading "<tool>: " removed>`, or `<cluster>: <tool> exited <code>` when `stderr` is empty.
 
 ### `status`
 
@@ -152,7 +152,7 @@ When neither started samples nor eligible contention-blocked pending jobs exist,
 
 ### `mine`
 
-Shows active and pending jobs from `squeue` with scheduler backfill estimated start times. By default `mine` passes `squeue --me`, which matches your Slurm user on each cluster and requires Slurm 20.11 or newer.
+Shows active and pending jobs from `squeue` with scheduler backfill estimated start times. By default `mine` passes `squeue --me`, which matches your Slurm user on each cluster and requires Slurm 20.11 or newer; older clusters report `squeue does not support --me (needs Slurm 20.11 or newer)`.
 
 Option:
 
