@@ -53,14 +53,15 @@ remains in `sessions.title` and JSON `title`.
 | Codex | `~/.codex/state_*.sqlite`, highest numeric suffix | `threads.name`, then `threads.title` |
 | Codex fallback | `~/.codex/session_index.jsonl` | `thread_name` by `id` |
 | Antigravity | `~/.gemini/antigravity/conversation_summaries.db` | `title` by `conversation_id` |
-| T3 | Existing configured state databases | Stored `t3_title` |
+| T3 | Default or `--t3-state` databases | Stored `t3_title` |
 | Opening prompt | Existing transcript sources | Stored first-line `title` |
 
-A hand-set title (`usage-habit-report title`) wins over everything.
-Codex `name` wins over the index; an index headline wins over the weak SQLite
-`title`. Both `name` and index headlines use `codex-name` provenance. Harness
-headlines win over T3 titles, then the opening line is used.
-Claude Code keeps its opening line unless a T3 title is available. The JSON
+A hand-set title (`usage-habit-report title`) wins over everything. Next come
+Codex names and Antigravity summaries, then the T3 title, then the weak Codex
+SQLite `title` (only the opening prompt), then the opening line. Codex `name`
+wins over the index `thread_name`; both use `codex-name` provenance.
+Claude Code has no harness headline, so it keeps its opening line unless a
+hand-set or T3 title is available. The JSON
 `title_source` values are `manual`, `codex-name`, `codex-title`,
 `antigravity-summary`, `t3`, and `first-line`. A session without any title has a null `display_title`
 and `first-line` provenance. Private session lists and fan-outs use the display
@@ -793,25 +794,35 @@ A mapping for `/work/arena` does not match `/work/arena-other`.
 The next scan or `reindex` applies changed mappings to historical sessions.
 Shared container directories such as `/work` are not inferred as projects.
 
-**T3.** T3 Code keeps a state database at `~/.t3/userdata/state.sqlite` (and
-`~/.t3-personal/userdata/state.sqlite` for a second profile).
-`--t3-state FILE` (repeatable) replaces both; a path that does not exist is
-skipped silently, so `--t3-state /nonexistent` turns the step off. Each
-database is opened with `immutable=1`, read-only, and never written. One that
-fails to open or read gets one `notice:` line on stderr and is skipped;
+**T3.** T3 Code keeps state databases at `~/.t3/userdata/statev2.sqlite` and
+`state.sqlite` (and the same pair under `~/.t3-personal/userdata` for a second
+profile). Within a profile the live v2 database is read before the frozen v1
+one. `--t3-state FILE` (repeatable) replaces the list; a path that does not
+exist is skipped silently, so `--t3-state /nonexistent` turns the step off.
+Each database is opened with `immutable=1`, read-only, and never written. One
+that fails to open or read gets one `notice:` line on stderr and is skipped;
 nothing else changes.
 
-- `provider_session_runtime.resume_cursor_json` names the harness session:
-  `{"threadId": "<codex session id>"}` for `codex` rows,
-  `{"schemaVersion": 1, "sessionId": "<conversation id>"}` for `antigravity`
-  rows. Other providers are ignored; Claude Code sessions get no T3 link.
-- `sessions.t3_thread_id` is the row's `thread_id` and `sessions.t3_title`
-  the `projection_threads.title`. A later scan refreshes the title of a
-  session already linked to the same thread. When a session appears in more
-  than one database, the first database in the list wins.
-- A session with no recorded `cwd` uses the thread's `worktree_path`, else
-  its project's `projection_projects.workspace_root`, for project resolution.
-  Recorded worktree ownership then folds that path into the parent project.
+- v2 rows in `orchestration_v2_projection_provider_threads` name the harness
+  session at `payload_json` `/nativeThreadRef/nativeId`, for `claudeAgent`,
+  `codex`, and `antigravity` providers. When one session has several provider
+  threads, the most recently updated wins.
+- v1 rows in `provider_session_runtime.resume_cursor_json` name it as
+  `{"resume": ...}` for `claudeAgent`, `{"threadId": ...}` for `codex`, and
+  `{"schemaVersion": 1, "sessionId": ...}` for `antigravity`. Other providers
+  are ignored. Within one database a v2 link wins over a v1 link.
+- `sessions.t3_thread_id` is the thread id and `sessions.t3_title` the thread
+  title. A later scan refreshes the title of a session already linked to the
+  same thread. Imported external transcripts (thread ids starting with
+  `import:`, or v2 `historyOrigin` `v1_import`) get no title, because T3 copies
+  their raw opening lines; a stored title for such a thread is cleared. When a
+  session appears in more than one database, the first database in the list
+  wins.
+- A session with no recorded `cwd` uses the thread's worktree (v1
+  `worktree_path` or v2 `payload_json` `worktreePath`), else its project's
+  `projection_projects.workspace_root`, for project resolution. Recorded
+  worktree ownership from v1 and v2 threads then folds that path into the
+  parent project; a worktree recorded under two different roots is ignored.
   That directory is not written to `cwd`.
 
 **Session keys.** `query::resolve_session(key)` finds a session by exact
@@ -1180,7 +1191,9 @@ user prompt by deterministic keyword rules in `src/labels.rs`: `research`,
   opening prompt never reached the log (no user
   turn, or logs ingested before labels existed) is classified from its
   headline instead, once the headline refresh has one, under
-  `label_source = 'headline'`. A hand-set label still wins.
+  `label_source = 'headline'`. That label follows the headline: it changes
+  when the headline changes, clears when the headline goes away, and gives
+  way to a later rule label. A hand-set label still wins.
 - Subagent sessions report under their root session's label, following
   parent links across harnesses (an Antigravity subagent started from a
   Claude Code thread counts under that thread's label).

@@ -305,12 +305,14 @@ pub fn parse_kind(kind: &str) -> Option<&'static str> {
     KINDS.iter().copied().find(|c| *c == k)
 }
 
-/// Store the rule label for a session that has none yet. Never touches
-/// `session_labels`, so a hand-set label is unaffected.
+/// Store the rule label for a session that has none yet, or only a label
+/// guessed from its headline. Never touches `session_labels`, so a hand-set
+/// label is unaffected.
 pub fn set_rule_label(tx: &Transaction, tool: &str, session_id: &str, label: &str) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET label = ?3, label_source = 'rule'
-         WHERE tool = ?1 AND session_id = ?2 AND label IS NULL",
+         WHERE tool = ?1 AND session_id = ?2
+           AND (label IS NULL OR label_source = 'headline')",
         params![tool, session_id, label],
     )?;
     Ok(())
@@ -867,7 +869,8 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.conn
             .execute(
-                "INSERT INTO sessions (tool, session_id) VALUES ('codex', 'x')",
+                "INSERT INTO sessions (tool, session_id, label, label_source)
+                 VALUES ('codex', 'x', 'review', 'headline')",
                 [],
             )
             .unwrap();

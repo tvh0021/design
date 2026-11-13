@@ -45,7 +45,7 @@ struct ScanArgs {
     #[arg(long = "antigravity-dir")]
     antigravity_dirs: Vec<PathBuf>,
     /// T3 Code state database, read-only; repeatable; a missing path is skipped
-    /// [default: state.sqlite and statev2.sqlite under ~/.t3 and ~/.t3-personal]
+    /// [default: statev2.sqlite and state.sqlite under ~/.t3 and ~/.t3-personal]
     #[arg(long = "t3-state")]
     t3_states: Vec<PathBuf>,
 }
