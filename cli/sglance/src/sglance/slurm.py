@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Collection
 from datetime import UTC, datetime
 import re
+from typing import Any
 
+from sglance._parse import SlurmError, is_gpu_type, iter_rows
 from sglance.config import validate_safe_token
 from sglance.mine import MINE_SQUEUE_FIELDS, parse_squeue_mine
 from sglance.models import (
@@ -28,13 +31,24 @@ from sglance.wait import SACCT_WAIT_FORMAT, SQUEUE_WAIT_FIELDS, parse_wait_parti
 
 _SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
 _SQUEUE_QUEUE_FIELDS = "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|"
-
-
-class SlurmError(Exception):
-    """Raised when a Slurm command fails or returns malformed output."""
-
-
-_SlurmParseError = SlurmError
+_INVALID_GRES_GPU_TYPES = frozenset({"no_consume", "(null)"})
+_NODE_BUCKETS = {
+    "allocated": "nodes_alloc",
+    "mixed": "nodes_mixed",
+    "idle": "nodes_idle",
+    "down": "nodes_down",
+    "fail": "nodes_down",
+    "failing": "nodes_down",
+    "drained": "nodes_drained",
+    "draining": "nodes_draining",
+}
+_COUNTS = (
+    "cpus_alloc", "cpus_total", "gpus_alloc", "gpus_total",
+    "nodes_alloc", "nodes_mixed", "nodes_idle", "nodes_down",
+    "nodes_drained", "nodes_draining", "nodes_other", "nodes_total",
+)
+_RUNNING_SQUEUE_STATES = frozenset({"R", "CF"})
+_PENDING_SQUEUE_STATES = frozenset({"PD", "RQ", "RH", "RD", "SE"})
 
 
 def _stamp(now: datetime) -> str:
@@ -91,9 +105,7 @@ class SlurmAdapter:
     def query_status(self, entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
         stdout = self._run(entry, "sinfo", "-h", "-N", "-O", _SINFO_FIELDS)
         return ClusterStatus(
-            cluster=entry.name,
-            fetched_at=_stamp(now),
-            partitions=_parse_sinfo_status(stdout),
+            cluster=entry.name, fetched_at=_stamp(now), partitions=_parse_sinfo_status(stdout)
         )
 
     def query_queue(self, entry: ClusterEntry, *, now: datetime) -> ClusterQueue:
@@ -126,18 +138,8 @@ class SlurmAdapter:
     def query_wait(self, entry: ClusterEntry, *, days: int, now: datetime) -> ClusterWait:
         try:
             sacct_stdout = self._run(
-                entry,
-                "sacct",
-                "-X",
-                "-P",
-                "-n",
-                "-a",
-                "-S",
-                f"now-{days}days",
-                "-E",
-                "now",
-                "--state=CD,F,TO,CA,OOM,NF,PR,R",
-                f"--format={SACCT_WAIT_FORMAT}",
+                entry, "sacct", "-X", "-P", "-n", "-a", "-S", f"now-{days}days",
+                "-E", "now", "--state=CD,F,TO,CA,OOM,NF,PR,R", f"--format={SACCT_WAIT_FORMAT}",
             )
             history_error = None
         except SlurmError as exc:
@@ -153,236 +155,124 @@ class SlurmAdapter:
         )
 
 
+def _is_count(value: str) -> bool:
+    return value.isascii() and value.isdigit()
+
+
 def _parse_gres_gpus(raw: str) -> int:
+    bad = SlurmError(f"malformed sinfo GRES {raw!r}")
     stripped = raw.strip()
     if stripped.lower() in {"", "(null)", "none"}:
         return 0
     cleaned = re.sub(r"\((?!null\))[^()]*\)", "", stripped, flags=re.IGNORECASE)
-    without_null_type = re.sub(r":\(null\):", "::", cleaned, flags=re.IGNORECASE)
-    if "(" in without_null_type or ")" in without_null_type:
-        raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-    def _is_count(value: str) -> bool:
-        return value.isascii() and value.isdigit()
-
-    def _is_gpu_type(value: str) -> bool:
-        lowered = value.lower()
-        if lowered in {"no_consume", "(null)"}:
-            return False
-        if re.fullmatch(r"\d+[kmgtp]", lowered):
-            return False
-        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value)) and any(
-            ch.isascii() and ch.isalpha() for ch in value
-        )
-
-    total_gpus = 0
+    if re.search(r"[()]", re.sub(r":\(null\):", "::", cleaned, flags=re.IGNORECASE)):
+        raise bad
+    total = 0
     for token in cleaned.split(","):
-        item = token.strip()
-        if not item:
-            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-        parts = [part.strip() for part in item.split(":")]
+        parts = [part.strip() for part in token.split(":")]
+        n = len(parts)
         if not parts[0]:
-            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
+            raise bad
         if parts[0].lower() != "gpu":
             continue
-        if any(not part for part in parts):
-            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-        if len(parts) == 1:
-            total_gpus += 1
-        elif len(parts) == 2:
-            if _is_count(parts[1]):
-                total_gpus += int(parts[1])
-            elif _is_gpu_type(parts[1]):
-                total_gpus += 1
-            else:
-                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-        elif len(parts) == 3:
-            if not _is_count(parts[2]):
-                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-            if parts[1].lower() not in {"(null)", "no_consume"} and not _is_gpu_type(parts[1]):
-                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-            total_gpus += int(parts[2])
-        elif len(parts) == 4:
-            if (
-                not _is_gpu_type(parts[1])
-                or parts[2].lower() != "no_consume"
-                or not _is_count(parts[3])
-            ):
-                raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-            total_gpus += int(parts[3])
+        if not all(parts):
+            raise bad
+        if n == 1 or (n == 2 and is_gpu_type(parts[1], _INVALID_GRES_GPU_TYPES)):
+            total += 1
+        elif _is_count(parts[-1]) and (
+            n == 2
+            or (
+                n == 3
+                and (
+                    parts[1].lower() in {"(null)", "no_consume"}
+                    or is_gpu_type(parts[1], _INVALID_GRES_GPU_TYPES)
+                )
+            )
+            or (
+                n == 4
+                and is_gpu_type(parts[1], _INVALID_GRES_GPU_TYPES)
+                and parts[2].lower() == "no_consume"
+            )
+        ):
+            total += int(parts[-1])
         else:
-            raise _SlurmParseError(f"malformed sinfo GRES {raw!r}")
-    return total_gpus
+            raise bad
+    return total
 
 
 def _parse_sinfo_status(stdout: str) -> tuple[PartitionStatus, ...]:
-    by_partition: dict[str, dict[str, int | bool]] = {}
-    seen_nodes: set[tuple[str, str]] = set()
-    for raw_line in stdout.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("CLUSTER: "):
-            continue
-        line = stripped[:-1] if stripped.endswith("|") else stripped
-        cells = [cell.strip() for cell in line.split("|")]
-        if len(cells) != 6:
-            raise _SlurmParseError(f"malformed sinfo output: {stripped}")
-        partition_name, node_host, state_long, cpus_state, gres, gres_used = cells
-        is_default = partition_name.endswith("*")
-        if is_default:
-            partition_name = partition_name[:-1]
-        normalized_state = state_long.rstrip("*~#!%$@^?+-").lower()
-        if not partition_name or not node_host or not normalized_state:
-            raise _SlurmParseError(f"malformed sinfo row: {stripped}")
-
-        cpu_parts = cpus_state.split("/")
-        if len(cpu_parts) != 4:
-            raise _SlurmParseError(f"malformed sinfo CPUsState {cpus_state!r}")
+    totals: dict[str, Counter[str]] = {}
+    defaults: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    for line, (name, host, state, cpus_state, gres, gres_used) in iter_rows(
+        stdout, "sinfo", 6, bar=None
+    ):
+        is_default = name.endswith("*")
+        name = name[:-1] if is_default else name
+        state = state.rstrip("*~#!%$@^?+-").lower()
+        if not name or not host or not state:
+            raise SlurmError(f"malformed sinfo row: {line}")
         try:
-            parsed_cpus = [int(part) for part in cpu_parts]
+            cpus_alloc, _idle, _other, cpus_total = cpus = [int(p) for p in cpus_state.split("/")]
+            if min(cpus) < 0:
+                raise ValueError
         except ValueError as exc:
-            raise _SlurmParseError(f"malformed sinfo CPUsState {cpus_state!r}") from exc
-        if any(val < 0 for val in parsed_cpus):
-            raise _SlurmParseError(f"malformed sinfo CPUsState {cpus_state!r}")
-        cpus_alloc = parsed_cpus[0]
-        cpus_total = parsed_cpus[3]
-        gpus_total = _parse_gres_gpus(gres)
-        gpus_alloc = _parse_gres_gpus(gres_used)
-
-        acc = by_partition.setdefault(
-            partition_name,
-            {
-                "default": False,
-                "cpus_alloc": 0,
-                "cpus_total": 0,
-                "gpus_alloc": 0,
-                "gpus_total": 0,
-                "nodes_alloc": 0,
-                "nodes_mixed": 0,
-                "nodes_idle": 0,
-                "nodes_down": 0,
-                "nodes_drained": 0,
-                "nodes_draining": 0,
-                "nodes_other": 0,
-                "nodes_total": 0,
-            },
-        )
+            raise SlurmError(f"malformed sinfo CPUsState {cpus_state!r}") from exc
+        gpus_total, gpus_alloc = _parse_gres_gpus(gres), _parse_gres_gpus(gres_used)
+        acc = totals.setdefault(name, Counter())
         if is_default:
-            acc["default"] = True
-
-        node_key = (partition_name, node_host)
-        if node_key in seen_nodes:
+            defaults.add(name)
+        if (name, host) in seen:
             continue
-        seen_nodes.add(node_key)
-
-        acc["cpus_alloc"] = int(acc["cpus_alloc"]) + cpus_alloc
-        acc["cpus_total"] = int(acc["cpus_total"]) + cpus_total
-        acc["gpus_alloc"] = int(acc["gpus_alloc"]) + gpus_alloc
-        acc["gpus_total"] = int(acc["gpus_total"]) + gpus_total
-        acc["nodes_total"] = int(acc["nodes_total"]) + 1
-
-        if normalized_state == "allocated":
-            acc["nodes_alloc"] = int(acc["nodes_alloc"]) + 1
-        elif normalized_state == "mixed":
-            acc["nodes_mixed"] = int(acc["nodes_mixed"]) + 1
-        elif normalized_state == "idle":
-            acc["nodes_idle"] = int(acc["nodes_idle"]) + 1
-        elif normalized_state in {"down", "fail", "failing"}:
-            acc["nodes_down"] = int(acc["nodes_down"]) + 1
-        elif normalized_state == "drained":
-            acc["nodes_drained"] = int(acc["nodes_drained"]) + 1
-        elif normalized_state == "draining":
-            acc["nodes_draining"] = int(acc["nodes_draining"]) + 1
-        else:
-            acc["nodes_other"] = int(acc["nodes_other"]) + 1
-
-    partitions: list[PartitionStatus] = []
-    for name, acc in by_partition.items():
-        cpus_alloc = int(acc["cpus_alloc"])
-        cpus_total = int(acc["cpus_total"])
-        cpus_utilization = (cpus_alloc / cpus_total) if cpus_total > 0 else None
-        gpus_alloc = int(acc["gpus_alloc"])
-        gpus_total = int(acc["gpus_total"])
-        gpus_utilization = (gpus_alloc / gpus_total) if gpus_total > 0 else None
-        partitions.append(
-            PartitionStatus(
-                partition=name,
-                default=bool(acc["default"]),
-                cpus_alloc=cpus_alloc,
-                cpus_total=cpus_total,
-                cpus_utilization=cpus_utilization,
-                gpus_alloc=gpus_alloc,
-                gpus_total=gpus_total,
-                gpus_utilization=gpus_utilization,
-                nodes_alloc=int(acc["nodes_alloc"]),
-                nodes_mixed=int(acc["nodes_mixed"]),
-                nodes_idle=int(acc["nodes_idle"]),
-                nodes_down=int(acc["nodes_down"]),
-                nodes_drained=int(acc["nodes_drained"]),
-                nodes_draining=int(acc["nodes_draining"]),
-                nodes_other=int(acc["nodes_other"]),
-                nodes_total=int(acc["nodes_total"]),
-            )
+        seen.add((name, host))
+        acc.update(
+            cpus_alloc=cpus_alloc, cpus_total=cpus_total,
+            gpus_alloc=gpus_alloc, gpus_total=gpus_total, nodes_total=1,
         )
-    return tuple(partitions)
-
-
-_RUNNING_SQUEUE_STATES = frozenset({"R", "CF"})
-_PENDING_SQUEUE_STATES = frozenset({"PD", "RQ", "RH", "RD", "SE"})
+        acc[_NODE_BUCKETS.get(state, "nodes_other")] += 1
+    return tuple(
+        PartitionStatus(
+            partition=name,
+            default=name in defaults,
+            cpus_utilization=acc["cpus_alloc"] / acc["cpus_total"] if acc["cpus_total"] > 0 else None,
+            gpus_utilization=acc["gpus_alloc"] / acc["gpus_total"] if acc["gpus_total"] > 0 else None,
+            **{k: acc[k] for k in _COUNTS},
+        )
+        for name, acc in totals.items()
+    )
 
 
 def _parse_squeue_queue(stdout: str) -> tuple[tuple[PartitionQueue, ...], frozenset[str]]:
-    by_partition: dict[str, tuple[int, int, dict[str, int]]] = {}
-    distinct_users: set[str] = set()
-    for raw_line in stdout.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("CLUSTER: "):
-            continue
-        if not stripped.endswith("|"):
-            raise _SlurmParseError(f"malformed squeue output: {stripped}")
-        line = stripped[:-1]
-        cells = [cell.strip() for cell in line.split("|", 4)]
-        if len(cells) != 5:
-            raise _SlurmParseError(f"malformed squeue output: {stripped}")
-        job_id, user_name, partition_field, state_compact, reason = cells
+    by_partition: dict[str, list[Any]] = {}
+    users: set[str] = set()
+    for line, (job_id, user, partition_field, state, reason) in iter_rows(
+        stdout, "squeue", 5, maxsplit=4
+    ):
         if not job_id or not partition_field:
-            raise _SlurmParseError(f"malformed squeue row: {stripped}")
-        partition_parts = [part.strip() for part in partition_field.split(",")]
-        if any(not part for part in partition_parts):
-            raise _SlurmParseError(f"malformed squeue partition {partition_field!r}")
-        partition_name = partition_parts[0]
-        if user_name:
-            distinct_users.add(user_name)
-
-        is_running = state_compact in _RUNNING_SQUEUE_STATES
-        is_pending = state_compact in _PENDING_SQUEUE_STATES
-        if not is_running and not is_pending:
-            continue
-
-        running_jobs, pending_jobs, reason_counts = by_partition.get(
-            partition_name, (0, 0, {})
-        )
-        if is_running:
-            running_jobs += 1
-        else:
-            normalized_reason = reason.split(",", 1)[0].strip() or "None"
-            pending_jobs += 1
-            reason_counts[normalized_reason] = reason_counts.get(normalized_reason, 0) + 1
-        by_partition[partition_name] = (running_jobs, pending_jobs, reason_counts)
-
-    partitions: list[PartitionQueue] = []
-    for name, (running_jobs, pending_jobs, reason_counts) in by_partition.items():
-        sorted_reasons = sorted(
-            reason_counts.items(),
-            key=lambda item: (-item[1], item[0]),
-        )[:5]
-        partitions.append(
+            raise SlurmError(f"malformed squeue row: {line}")
+        parts = [part.strip() for part in partition_field.split(",")]
+        if not all(parts):
+            raise SlurmError(f"malformed squeue partition {partition_field!r}")
+        if user:
+            users.add(user)
+        if state in _RUNNING_SQUEUE_STATES:
+            by_partition.setdefault(parts[0], [0, Counter()])[0] += 1
+        elif state in _PENDING_SQUEUE_STATES:
+            by_partition.setdefault(parts[0], [0, Counter()])[1][
+                reason.split(",", 1)[0].strip() or "None"
+            ] += 1
+    return (
+        tuple(
             PartitionQueue(
                 partition=name,
-                running_jobs=running_jobs,
-                pending_jobs=pending_jobs,
+                running_jobs=running,
+                pending_jobs=reasons.total(),
                 top_reasons=tuple(
-                    PendingReasonCount(reason=r_name, count=r_count)
-                    for r_name, r_count in sorted_reasons
+                    PendingReasonCount(reason=r, count=c)
+                    for r, c in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
                 ),
             )
-        )
-    return tuple(partitions), frozenset(distinct_users)
+            for name, (running, reasons) in by_partition.items()
+        ),
+        frozenset(users),
+    )

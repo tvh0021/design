@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 import re
 
+from sglance._parse import is_gpu_type, iter_rows, parse_epoch
 from sglance.models import MineJob
 
 MINE_SQUEUE_FIELDS = (
@@ -14,22 +15,16 @@ MINE_SQUEUE_FIELDS = (
 )
 
 _PENDING_STATES = frozenset({"PD", "RQ", "RH", "RD", "RF", "SE"})
-_ACTIVE_STATES = frozenset({"R", "CF", "CG", "S", "ST", "RS", "SI", "SO", "PO"})
-_VALID_NONTERMINAL_STATES = _PENDING_STATES | _ACTIVE_STATES
-_UNBOUNDED_LIMITS = frozenset({"unlimited", "partition_limit"})
-_UNSET_START_VALUES = frozenset({"", "n/a", "unknown", "none", "(null)"})
-_UNSET_TRES_VALUES = frozenset({"", "(null)", "none", "n/a"})
+_VALID_NONTERMINAL_STATES = _PENDING_STATES | {
+    "R", "CF", "CG", "S", "ST", "RS", "SI", "SO", "PO"
+}
 _INVALID_GPU_TYPES = frozenset({"", "(null)", "none", "n/a", "invalid", "no_consume"})
 _INVALID_PARTITION_VALUES = frozenset({"", "(null)", "n/a", "none"})
 _JOB_ID_RE = re.compile(r"^\d+(?:_\d+|\+\d+|_\[[0-9][0-9,\-:%]*\])?$")
-_GPU_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_DURATION_RE = re.compile(r"(?:(?:([0-9]+)-)?([0-9]+):)?([0-9]+):([0-9]+)")
 
 
-class MineParseError(Exception):
-    """Raised when squeue output for mine is structurally malformed."""
-
-
-def _parse_optional(parser: Callable[[str], int | None], raw: str) -> int | None:
+def _parse_optional(parser: Callable[[str], int], raw: str) -> int | None:
     try:
         return parser(raw)
     except ValueError:
@@ -38,151 +33,58 @@ def _parse_optional(parser: Callable[[str], int | None], raw: str) -> int | None
 
 def _parse_nonneg_int(raw: str) -> int:
     if not raw.isascii() or not raw.isdigit():
-        raise ValueError(f"invalid non-negative integer {raw!r}")
+        raise ValueError(raw)
     return int(raw)
 
 
-def _parse_slurm_duration_seconds(raw: str) -> int:
-    text = raw.strip()
-    if not text:
-        raise ValueError("empty duration")
-    days = 0
-    if "-" in text:
-        days_part, time_part = text.split("-", 1)
-        days = _parse_nonneg_int(days_part)
-    else:
-        time_part = text
-    parts = time_part.split(":")
-    if len(parts) == 2 and "-" not in text:
-        minutes = _parse_nonneg_int(parts[0])
-        seconds = _parse_nonneg_int(parts[1])
-        if seconds >= 60:
-            raise ValueError(f"invalid seconds in {raw!r}")
-        return minutes * 60 + seconds
-    if len(parts) == 3:
-        hours = _parse_nonneg_int(parts[0])
-        minutes = _parse_nonneg_int(parts[1])
-        seconds = _parse_nonneg_int(parts[2])
-        if minutes >= 60 or seconds >= 60:
-            raise ValueError(f"invalid MM:SS in {raw!r}")
-        return days * 86400 + hours * 3600 + minutes * 60 + seconds
-    raise ValueError(f"invalid duration {raw!r}")
+def _parse_duration(raw: str) -> int:
+    m = _DURATION_RE.fullmatch(raw.strip())
+    if not m:
+        raise ValueError(raw)
+    days, hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    if seconds >= 60 or (m[2] is not None and minutes >= 60):
+        raise ValueError(raw)
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
 
 
-def _parse_time_limit_seconds(raw: str) -> int | None:
-    stripped = raw.strip()
-    if stripped.lower() in _UNBOUNDED_LIMITS:
-        return None
-    return _parse_slurm_duration_seconds(stripped)
-
-
-def _is_gpu_type_name(value: str) -> bool:
-    lowered = value.lower()
-    if lowered in _INVALID_GPU_TYPES or re.fullmatch(r"\d+[kmgtp]", lowered):
-        return False
-    return bool(_GPU_TYPE_RE.fullmatch(value)) and any(
-        ch.isascii() and ch.isalpha() for ch in value
-    )
-
-
-def _parse_tres_spec_gpus(raw: str) -> tuple[bool, int]:
-    stripped = raw.strip()
-    if stripped.lower() in _UNSET_TRES_VALUES:
-        return False, 0
-    has_untyped = False
-    untyped_gpus = 0
-    has_typed = False
-    typed_gpus = 0
-    for token in stripped.split(","):
+def _parse_tres_spec_gpus(raw: str) -> int | None:
+    untyped: list[int] = []
+    typed: list[int] = []
+    for token in raw.split(","):
         item = token.strip()
-        if not item:
-            continue
-        item_lower = item.lower()
-        if item_lower.startswith(("gres/gpu", "gres:gpu")):
+        low = item.lower()
+        if low.startswith(("gres/gpu", "gres:gpu")):
             rest = item[8:].strip()
-        elif item_lower.startswith("gpu"):
+        elif low.startswith("gpu"):
             rest = item[3:].strip()
         else:
             continue
-        if rest and rest[0] not in {":", "="}:
-            continue
         if not rest:
-            has_untyped = True
-            untyped_gpus += 1
+            untyped.append(1)
         elif rest[0] == "=":
-            untyped_gpus += _parse_nonneg_int(rest[1:].strip())
-            has_untyped = True
-        else:
+            untyped.append(_parse_nonneg_int(rest[1:].strip()))
+        elif rest[0] == ":":
             tail = rest[1:].strip()
-            if not tail:
-                raise ValueError(f"empty GPU specifier in TRES {raw!r}")
-            if "=" in tail:
-                gpu_type, _, count_str = tail.partition("=")
-                if not _is_gpu_type_name(gpu_type.strip()):
-                    raise ValueError(f"invalid GPU type in TRES {raw!r}")
-                typed_gpus += _parse_nonneg_int(count_str.strip())
-                has_typed = True
+            parts = [p.strip() for p in (tail.partition("=")[::2] if "=" in tail else tail.split(":"))]
+            if len(parts) == 1 and parts[0].isascii() and parts[0].isdigit():
+                untyped.append(int(parts[0]))
+            elif len(parts) <= 2 and is_gpu_type(parts[0], _INVALID_GPU_TYPES):
+                typed.append(_parse_nonneg_int(parts[1]) if len(parts) == 2 else 1)
             else:
-                parts = [part.strip() for part in tail.split(":")]
-                if any(not part for part in parts):
-                    raise ValueError(f"malformed GPU TRES {raw!r}")
-                if len(parts) == 1:
-                    if parts[0].isascii() and parts[0].isdigit():
-                        untyped_gpus += int(parts[0])
-                        has_untyped = True
-                    elif _is_gpu_type_name(parts[0]):
-                        typed_gpus += 1
-                        has_typed = True
-                    else:
-                        raise ValueError(f"malformed GPU TRES {raw!r}")
-                elif len(parts) == 2:
-                    if not _is_gpu_type_name(parts[0]):
-                        raise ValueError(f"invalid GPU type in TRES {raw!r}")
-                    typed_gpus += _parse_nonneg_int(parts[1])
-                    has_typed = True
-                else:
-                    raise ValueError(f"malformed GPU TRES {raw!r}")
-    has_any = has_untyped or has_typed
-    return has_any, (untyped_gpus if has_untyped else typed_gpus)
+                raise ValueError(raw)
+    return sum(untyped) if untyped else sum(typed) if typed else None
 
 
 def _resolve_job_gpus(
-    tres_alloc_raw: str,
-    tres_per_node_raw: str,
-    tres_per_job_raw: str,
-    tres_per_task_raw: str,
-    *,
-    nodes: int | None,
-    tasks: int | None,
+    alloc: str, per_node: str, per_job: str, per_task: str, *, nodes: int | None, tasks: int | None
 ) -> int | None:
     try:
-        alloc_has_gpu, alloc_gpus = _parse_tres_spec_gpus(tres_alloc_raw)
+        for raw, factor in ((alloc, 1), (per_job, 1), (per_node, nodes), (per_task, tasks)):
+            count = _parse_tres_spec_gpus(raw)
+            if count is not None:
+                return None if factor is None else count * factor
     except ValueError:
         return None
-    if alloc_has_gpu:
-        return alloc_gpus
-    try:
-        per_job_has_gpu, per_job_gpus = _parse_tres_spec_gpus(tres_per_job_raw)
-    except ValueError:
-        return None
-    if per_job_has_gpu:
-        return per_job_gpus
-    try:
-        per_node_has_gpu, per_node_gpus = _parse_tres_spec_gpus(tres_per_node_raw)
-    except ValueError:
-        return None
-    if per_node_has_gpu:
-        if nodes is None:
-            return None
-        return per_node_gpus * nodes
-    try:
-        per_task_has_gpu, per_task_gpus = _parse_tres_spec_gpus(tres_per_task_raw)
-    except ValueError:
-        return None
-    if per_task_has_gpu:
-        if tasks is None:
-            return None
-        return per_task_gpus * tasks
     return 0
 
 
@@ -190,9 +92,7 @@ def _normalize_partition(raw: str) -> str:
     parts = [part.strip() for part in raw.split(",")]
     if not parts or any(not part.rstrip("*") for part in parts):
         return ""
-    first = parts[0]
-    if first.endswith("*"):
-        first = first[:-1]
+    first = parts[0].removesuffix("*")
     if (
         first.lower() in _INVALID_PARTITION_VALUES
         or first.startswith("-")
@@ -202,24 +102,15 @@ def _normalize_partition(raw: str) -> str:
     return first
 
 
-def _parse_estimated_start(raw: str, *, is_pending: bool, now_utc: datetime) -> str | None:
-    if not is_pending:
-        return None
-    stripped = raw.strip()
-    if stripped.lower() in _UNSET_START_VALUES:
-        return None
-    if not stripped.isascii() or not stripped.isdigit():
-        return None
-    epoch = int(stripped)
-    if epoch <= 0:
+def _parse_estimated_start(raw: str, now_utc: datetime) -> str | None:
+    epoch = parse_epoch(raw)
+    if epoch is None:
         return None
     try:
         start_dt = datetime.fromtimestamp(epoch, tz=UTC)
     except (OverflowError, OSError, ValueError):
         return None
-    if start_dt < now_utc:
-        return None
-    return start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return start_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if start_dt >= now_utc else None
 
 
 def parse_squeue_mine(
@@ -227,88 +118,42 @@ def parse_squeue_mine(
 ) -> tuple[tuple[MineJob, ...], frozenset[str], str | None]:
     now_utc = now.astimezone(UTC)
     jobs: list[MineJob] = []
-    distinct_users: set[str] = set()
+    users: set[str] = set()
     first_user: str | None = None
 
-    for raw_line in stdout.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("CLUSTER: "):
-            continue
-        if not stripped.endswith("|"):
-            raise MineParseError(f"malformed squeue output: {stripped}")
-        cells = [cell.strip() for cell in stripped[:-1].split("|", 16)]
-        if len(cells) != 17:
-            raise MineParseError(f"malformed squeue output: {stripped}")
-
+    for _line, cells in iter_rows(stdout, "squeue", 17, maxsplit=16):
         (
-            job_id,
-            user_name,
-            account_val,
-            partition_field,
-            state_compact,
-            time_used_raw,
-            time_limit_raw,
-            num_nodes_raw,
-            num_cpus_raw,
-            num_tasks_raw,
-            tres_alloc_raw,
-            tres_per_node_raw,
-            tres_per_job_raw,
-            tres_per_task_raw,
-            start_time_raw,
-            reason_raw,
-            name,
+            job_id, user_name, account_val, partition_field, state,
+            time_used, time_limit, num_nodes, num_cpus, num_tasks,
+            tres_alloc, tres_per_node, tres_per_job, tres_per_task,
+            start_time, reason_raw, name,
         ) = cells
-
-        partition_name = _normalize_partition(partition_field)
-        if (
-            not _JOB_ID_RE.fullmatch(job_id)
-            or not partition_name
-            or state_compact not in _VALID_NONTERMINAL_STATES
-        ):
+        partition = _normalize_partition(partition_field)
+        if not _JOB_ID_RE.fullmatch(job_id) or not partition or state not in _VALID_NONTERMINAL_STATES:
             continue
 
-        nodes = _parse_optional(_parse_nonneg_int, num_nodes_raw)
-        cpus = _parse_optional(_parse_nonneg_int, num_cpus_raw)
-        tasks = _parse_optional(_parse_nonneg_int, num_tasks_raw)
-        elapsed_seconds = _parse_optional(_parse_slurm_duration_seconds, time_used_raw)
-        time_limit_seconds = _parse_optional(_parse_time_limit_seconds, time_limit_raw)
-        gpus = _resolve_job_gpus(
-            tres_alloc_raw,
-            tres_per_node_raw,
-            tres_per_job_raw,
-            tres_per_task_raw,
-            nodes=nodes,
-            tasks=tasks,
-        )
-
-        is_pending = state_compact in _PENDING_STATES
-        reason = (reason_raw or "None") if is_pending else None
-        estimated_start = _parse_estimated_start(
-            start_time_raw, is_pending=is_pending, now_utc=now_utc
-        )
-
+        nodes = _parse_optional(_parse_nonneg_int, num_nodes)
+        cpus = _parse_optional(_parse_nonneg_int, num_cpus)
+        tasks = _parse_optional(_parse_nonneg_int, num_tasks)
+        is_pending = state in _PENDING_STATES
         if user_name:
-            distinct_users.add(user_name)
+            users.add(user_name)
             if first_user is None:
                 first_user = user_name
 
         jobs.append(
             MineJob(
-                job_id=job_id,
-                name=name,
-                user=user_name,
-                account=account_val,
-                partition=partition_name,
-                state=state_compact,
-                cpus=cpus,
-                gpus=gpus,
+                job_id=job_id, name=name, user=user_name, account=account_val,
+                partition=partition, state=state, cpus=cpus,
+                gpus=_resolve_job_gpus(
+                    tres_alloc, tres_per_node, tres_per_job, tres_per_task,
+                    nodes=nodes, tasks=tasks,
+                ),
                 nodes=nodes,
-                elapsed_seconds=elapsed_seconds,
-                time_limit_seconds=time_limit_seconds,
-                reason=reason,
-                estimated_start=estimated_start,
+                elapsed_seconds=_parse_optional(_parse_duration, time_used),
+                time_limit_seconds=_parse_optional(_parse_duration, time_limit),
+                reason=(reason_raw or "None") if is_pending else None,
+                estimated_start=_parse_estimated_start(start_time, now_utc) if is_pending else None,
             )
         )
-
-    return tuple(jobs), frozenset(distinct_users), first_user
+    return tuple(jobs), frozenset(users), first_user
