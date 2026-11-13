@@ -161,9 +161,7 @@ def _render_row(cells: tuple[str, ...], widths: list[int]) -> str:
     return "  " + "  ".join([*(c.ljust(w) for c, w in zip(cells[:-1], widths)), cells[-1]])
 
 
-def _format_section(
-    command: str, cluster: ClusterResult, now: datetime, compact: bool = False
-) -> str:
+def _format_section(command: str, cluster: ClusterResult, now: datetime, compact: bool = False) -> str:
     if cluster.error is not None:
         return f"{cluster.cluster}: {cluster.error}"
     header = f"{cluster.cluster} [user-scoped]" if cluster.user_scoped else cluster.cluster
@@ -187,7 +185,5 @@ def _format_section(
     return "\n".join(lines)
 
 
-def format_table(
-    command: str, clusters: Sequence[ClusterResult], now: datetime, compact: bool = False
-) -> str:
+def format_table(command: str, clusters: Sequence[ClusterResult], now: datetime, compact: bool = False) -> str:
     return "\n\n".join(_format_section(command, c, now, compact=compact) for c in clusters) + "\n"

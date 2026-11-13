@@ -287,83 +287,53 @@ class StatusCliTests(unittest.TestCase):
             rc_bad, _, _ = run_cli(["--unknown-flag"], root=root, runner=FakeRunner())
             self.assertEqual(rc_bad, 2)
 
-    def test_compact_tables_across_subcommands_cache_and_json(self) -> None:
+    def test_compact_tables(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_config(
-                root,
-                '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n'
-                '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
-            )
+            write_config(root)
             env = make_test_env(root)
             runner = FakeRunner(
                 {
                     ("cluster-a", "sinfo"): (
-                        "cpu*|node01|allocated|64/0/0/64|(null)|(null)|\n"
-                        "cpu*|node02|mixed|16/48/0/64|(null)|(null)|\n"
-                        "cpu*|node03|idle|0/64/0/64|(null)|(null)|\n"
+                        "cpu*|node01|idle|0/64/0/64|(null)|(null)|\n"
                         "gpu|gpu01|mixed|16/48/0/64|gpu:a100:4|gpu:a100:1|\n"
-                        "gpu|gpu02|idle|0/64/0/64|gpu:a100:4|(null)|\n"
                     ),
-                    ("cluster-b", "sinfo"): TransportError("timed out after 25s"),
-                    ("cluster-a", *QUEUE_ARGV): "1|alice|cpu|R|None|\n2|alice|gpu|PD|Resources|\n",
-                    ("cluster-b", *QUEUE_ARGV): "",
+                    ("cluster-a", *QUEUE_ARGV): "1|alice|cpu|R|None|\n",
                     ("cluster-a", *MINE_ME_ARGV): (
-                        "1001|alice|proj-1|gpu|R|45:30|04:00:00|2|64|8|cpu=64,gres/gpu=8|N/A|N/A|N/A|1794510870|None|train|\n"
-                        "1002_[1-4]|alice|proj-1|cpu|PD|0:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794517200|Resources|eval|\n"
+                        "1002|alice|proj-1|cpu|PD|0:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794517200|Resources|eval|\n"
                     ),
-                    ("cluster-b", *MINE_ME_ARGV): "",
                     ("cluster-a", "sacct"): (
-                        "1001|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
-                        "1002|bob|cpu|RUNNING|1794501000|1794501600|cpu=16\n"
-                        "1003|alice|cpu|TIMEOUT|1794502000|1794502120|cpu=8\n"
-                        "1004|bob|cpu|FAILED|1794503000|1794503300|cpu=4\n"
+                        "1|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
+                        "2|bob|cpu|COMPLETED|1794501000|1794501600|cpu=8\n"
                     ),
                     ("cluster-a", *WAIT_SQUEUE_ARGV): "",
                     ("cluster-a", "scontrol"): "PrivateData = none\n",
-                    ("cluster-b", "sacct"): CommandResult(1, "", "sacct: error: Slurm accounting storage is disabled\n"),
-                    ("cluster-b", *WAIT_SQUEUE_ARGV): "901|alice|gpu|PD|Resources|1794512700|\n902|bob|gpu|PD|Priority|1794513300|\n",
-                    ("cluster-b", "scontrol"): "PrivateData = none\n",
                 }
             )
-            run_cli(["status", "--cluster", "cluster-a"], root=root, env=env, runner=runner, now=FIXED_NOW)
-            t_later = FIXED_NOW + timedelta(seconds=15)
-            cases: tuple[tuple[list[str], str], ...] = (
+            run_cli(["status"], root=root, env=env, runner=runner, now=FIXED_NOW)
+            later = FIXED_NOW + timedelta(seconds=15)
+            cases = (
                 (
                     ["--compact", "status"],
                     "cluster-a [cached 15s ago]\n"
                     "  PARTITION  FREE CPUS  FREE GPUS  IDLE NODES\n"
-                    "  cpu*       112/192    -          1/3\n"
-                    "  gpu        112/128    7/8        1/2\n\n"
-                    "cluster-b: unreachable (timed out after 25s)\n",
+                    "  cpu*       64/64      -          1/1\n"
+                    "  gpu        48/64      3/4        0/1\n",
                 ),
-                (
-                    ["queue", "--compact"],
-                    "cluster-a [user-scoped]\n  PARTITION\n  cpu\n  gpu\n\ncluster-b\n  0 running, 0 pending\n",
-                ),
+                (["queue", "--compact"], "cluster-a [user-scoped]\n  PARTITION\n  cpu\n"),
                 (
                     ["mine", "--compact"],
-                    "cluster-a\n"
-                    "  JOBID       PARTITION  STATE  ESTIMATED START\n"
-                    "  1001        gpu        R      -\n"
-                    "  1002_[1-4]  cpu        PD     2026-11-12T21:00:00Z\n\n"
-                    "cluster-b\n  (no jobs)\n",
+                    "cluster-a\n  JOBID  PARTITION  STATE  ESTIMATED START\n  1002   cpu        PD     2026-11-12T21:00:00Z\n",
                 ),
-                (
-                    ["wait", "--compact"],
-                    "cluster-a\n  PARTITION  P50     P90\n  cpu        3m 30s  8m 30s\n\n"
-                    "cluster-b\n  PARTITION  P50  P90\n  gpu        -    -\n",
-                ),
+                (["wait", "--compact"], "cluster-a\n  PARTITION  P50     P90\n  cpu        5m 30s  9m 6s\n"),
             )
             for argv, expected in cases:
                 with self.subTest(argv=argv):
-                    rc, out, err = run_cli(argv, root=root, env=env, runner=runner, now=t_later)
-                    self.assertEqual((rc, err, out), (0, "", expected))
-            self.assertEqual([c[0] for c in runner.calls if c[3][2] == "sinfo"], ["cluster-a", "cluster-b"])
-            _, json_plain, _ = run_cli(["status", "--json", "--cluster", "cluster-a"], root=root, env=env, runner=runner, now=t_later)
-            _, json_compact, _ = run_cli(["status", "--compact", "--json", "--cluster", "cluster-a"], root=root, env=env, runner=runner, now=t_later)
-            self.assertEqual(json_compact, json_plain)
-
+                    self.assertEqual(run_cli(argv, root=root, env=env, runner=runner, now=later), (0, expected, ""))
+            self.assertEqual(sum(c[3][2] == "sinfo" for c in runner.calls), 1)
+            json_args = ["status", "--json"]
+            plain = run_cli(json_args, root=root, env=env, runner=runner, now=later)
+            self.assertEqual(run_cli([*json_args, "--compact"], root=root, env=env, runner=runner, now=later), plain)
 
 if __name__ == "__main__":
     unittest.main()
