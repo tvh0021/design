@@ -76,29 +76,51 @@ class _SlurmParseError(Exception):
     """Raised when Slurm command output cannot be parsed."""
 
 
+def _format_command_failure(tool: str, result: CommandResult) -> str:
+    last_stderr = next(
+        (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+        "",
+    )
+    if last_stderr:
+        return f"{tool} exited {result.returncode}: {last_stderr}"
+    return f"{tool} exited {result.returncode}"
+
+
+def _is_unsupported_me_stderr(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return bool(re.search(r"--\s*me\b", lowered)) and any(
+        phrase in lowered
+        for phrase in (
+            "unrecognized option",
+            "unknown option",
+            "invalid option",
+            "illegal option",
+        )
+    )
+
+
 class SlurmAdapter:
     def __init__(self, runner: CommandRunner) -> None:
         self._runner = runner if isinstance(runner, AllowlistedRunner) else AllowlistedRunner(runner)
 
-    def _run_command(
+    def _execute(
         self, cluster_entry: ClusterEntry, argv: Sequence[str]
     ) -> CommandResult | str:
         try:
             result = self._runner.run(cluster_entry, argv)
         except (TransportError, OSError) as exc:
             return format_transport_error(exc)
-        if result.returncode == 0:
-            return result
         if not cluster_entry.local and result.returncode == 255:
             return format_ssh_exit_255(result.stderr)
-        tool = argv[2]
-        last_stderr = next(
-            (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-            "",
-        )
-        if last_stderr:
-            return f"{tool} exited {result.returncode}: {last_stderr}"
-        return f"{tool} exited {result.returncode}"
+        return result
+
+    def _run_command(
+        self, cluster_entry: ClusterEntry, argv: Sequence[str]
+    ) -> CommandResult | str:
+        outcome = self._execute(cluster_entry, argv)
+        if isinstance(outcome, str) or outcome.returncode == 0:
+            return outcome
+        return _format_command_failure(argv[2], outcome)
 
     def query_private_data(self, cluster_entry: ClusterEntry) -> frozenset[str]:
         cluster_flag = (
@@ -263,27 +285,20 @@ class SlurmAdapter:
             "-O",
             MINE_SQUEUE_FIELDS,
         ]
-        outcome = self._run_command(cluster_entry, argv)
-        if isinstance(outcome, str):
-            if account is None and outcome.startswith("squeue exited "):
-                _, _, last_stderr = outcome.partition(": ")
-                lowered = last_stderr.lower()
-                if re.search(r"--\s*me\b", lowered) and any(
-                    phrase in lowered
-                    for phrase in (
-                        "unrecognized option",
-                        "unknown option",
-                        "invalid option",
-                        "illegal option",
-                    )
-                ):
-                    outcome = "squeue does not support --me (needs Slurm 20.11 or newer)"
+        outcome = self._execute(cluster_entry, argv)
+        if isinstance(outcome, str) or outcome.returncode != 0:
+            if isinstance(outcome, str):
+                error = outcome
+            elif account is None and _is_unsupported_me_stderr(outcome.stderr):
+                error = "squeue does not support --me (needs Slurm 20.11 or newer)"
+            else:
+                error = _format_command_failure("squeue", outcome)
             return ClusterMine(
                 cluster=cluster_entry.name,
                 fetched_at=None,
                 stale=False,
                 user_scoped=False,
-                error=outcome,
+                error=error,
                 slurm_user=None,
                 account_filter=account,
                 jobs=(),

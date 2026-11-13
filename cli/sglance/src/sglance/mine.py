@@ -7,9 +7,10 @@ import re
 from sglance.models import MineJob
 
 MINE_SQUEUE_FIELDS = (
-    "JobID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
-    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,"
-    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,StartTime:0|,Reason:0|,Name:0|"
+    "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+    "StartTime:0|,Reason:0|,Name:0|"
 )
 
 _PENDING_STATES = frozenset({"PD", "RQ", "RH", "RD", "RF", "SE"})
@@ -149,8 +150,10 @@ def _resolve_job_gpus(
     tres_alloc_raw: str,
     tres_per_node_raw: str,
     tres_per_job_raw: str,
+    tres_per_task_raw: str,
     *,
     nodes: int | None,
+    tasks: int | None,
 ) -> int | None:
     try:
         alloc_has_gpu, alloc_gpus = _parse_tres_spec_gpus(tres_alloc_raw)
@@ -160,15 +163,26 @@ def _resolve_job_gpus(
         return alloc_gpus
     try:
         per_job_has_gpu, per_job_gpus = _parse_tres_spec_gpus(tres_per_job_raw)
-        per_node_has_gpu, per_node_gpus = _parse_tres_spec_gpus(tres_per_node_raw)
     except ValueError:
         return None
     if per_job_has_gpu:
         return per_job_gpus
+    try:
+        per_node_has_gpu, per_node_gpus = _parse_tres_spec_gpus(tres_per_node_raw)
+    except ValueError:
+        return None
     if per_node_has_gpu:
         if nodes is None:
             return None
         return per_node_gpus * nodes
+    try:
+        per_task_has_gpu, per_task_gpus = _parse_tres_spec_gpus(tres_per_task_raw)
+    except ValueError:
+        return None
+    if per_task_has_gpu:
+        if tasks is None:
+            return None
+        return per_task_gpus * tasks
     return 0
 
 
@@ -222,8 +236,8 @@ def parse_squeue_mine(
             continue
         if not stripped.endswith("|"):
             raise MineParseError(f"malformed squeue output: {stripped}")
-        cells = [cell.strip() for cell in stripped[:-1].split("|", 14)]
-        if len(cells) != 15:
+        cells = [cell.strip() for cell in stripped[:-1].split("|", 16)]
+        if len(cells) != 17:
             raise MineParseError(f"malformed squeue output: {stripped}")
 
         (
@@ -236,9 +250,11 @@ def parse_squeue_mine(
             time_limit_raw,
             num_nodes_raw,
             num_cpus_raw,
+            num_tasks_raw,
             tres_alloc_raw,
             tres_per_node_raw,
             tres_per_job_raw,
+            tres_per_task_raw,
             start_time_raw,
             reason_raw,
             name,
@@ -254,10 +270,16 @@ def parse_squeue_mine(
 
         nodes = _parse_optional(_parse_nonneg_int, num_nodes_raw)
         cpus = _parse_optional(_parse_nonneg_int, num_cpus_raw)
+        tasks = _parse_optional(_parse_nonneg_int, num_tasks_raw)
         elapsed_seconds = _parse_optional(_parse_slurm_duration_seconds, time_used_raw)
         time_limit_seconds = _parse_optional(_parse_time_limit_seconds, time_limit_raw)
         gpus = _resolve_job_gpus(
-            tres_alloc_raw, tres_per_node_raw, tres_per_job_raw, nodes=nodes
+            tres_alloc_raw,
+            tres_per_node_raw,
+            tres_per_job_raw,
+            tres_per_task_raw,
+            nodes=nodes,
+            tasks=tasks,
         )
 
         is_pending = state_compact in _PENDING_STATES
