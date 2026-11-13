@@ -17,15 +17,19 @@ from sglance.formatters import (
     format_queue_table,
     format_status_json,
     format_status_table,
+    format_wait_json,
+    format_wait_table,
 )
 from sglance.models import (
     ClusterEntry,
     ClusterMine,
     ClusterQueue,
     ClusterStatus,
+    ClusterWait,
     MineReport,
     QueueReport,
     StatusReport,
+    WaitReport,
 )
 from sglance.runner import (
     AllowlistError,
@@ -116,6 +120,46 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
     )
     queue_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+
+    def _parse_days(raw: str) -> int:
+        has_digits = (
+            raw[1:].isascii() and raw[1:].isdigit()
+            if raw[:1] in {"+", "-"}
+            else raw.isascii() and raw.isdigit()
+        )
+        if not raw or not has_digits:
+            raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
+        value = int(raw, 10)
+        if value < 1:
+            raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
+        return value
+
+    wait_parser = subparsers.add_parser(
+        "wait",
+        help="Show historical wait-time percentiles and oldest eligible pending job age per partition.",
+    )
+    wait_parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=argparse.SUPPRESS,
+        metavar="NAME",
+        help="Query only the named configured cluster entry.",
+    )
+    wait_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        dest="refresh",
+        default=argparse.SUPPRESS,
+        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+    )
+    wait_parser.add_argument(
+        "--days",
+        type=_parse_days,
+        default=7,
+        metavar="N",
+        help="Lookback window in days for historical wait times (integer >= 1, default: 7).",
+    )
+    wait_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
 
     def _account_arg(raw: str) -> str:
         try:
@@ -230,6 +274,22 @@ def main(
             out.write(format_queue_table(queue_report, now=now))
         return 0
 
+    if parsed.subcommand == "wait":
+        wait_clusters = _query_clusters_wait(
+            adapter,
+            selected_entries,
+            env=effective_env,
+            now=now,
+            refresh=parsed.refresh,
+            days=parsed.days,
+        )
+        wait_report = WaitReport(clusters=wait_clusters, days=parsed.days)
+        if parsed.json_output:
+            out.write(format_wait_json(wait_report))
+        else:
+            out.write(format_wait_table(wait_report, now=now))
+        return 0
+
     clusters = _query_clusters_status(
         adapter,
         selected_entries,
@@ -317,6 +377,39 @@ def _query_clusters_queue(
             options={},
         ),
         lambda entry, error_text: ClusterQueue(
+            cluster=entry.name,
+            fetched_at=None,
+            stale=False,
+            user_scoped=False,
+            error=error_text,
+            partitions=(),
+        ),
+    )
+
+
+def _query_clusters_wait(
+    adapter: SlurmAdapter,
+    entries: Sequence[ClusterEntry],
+    *,
+    env: Mapping[str, str],
+    now: datetime,
+    refresh: bool = False,
+    days: int = 7,
+) -> tuple[ClusterWait, ...]:
+    return _query_clusters(
+        entries,
+        lambda entry: cached_cluster_fetch(
+            entry,
+            command="wait",
+            schema_version=WaitReport.schema_version,
+            result_type=ClusterWait,
+            fetch=lambda target: adapter.query_wait(target, days=days, now=now),
+            env=env,
+            now=now,
+            refresh=refresh,
+            options={"days": days},
+        ),
+        lambda entry, error_text: ClusterWait(
             cluster=entry.name,
             fetched_at=None,
             stale=False,

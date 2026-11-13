@@ -114,3 +114,30 @@ class MineReport:
     account: str | None = None
     schema_version: int = 1
     command: str = "mine"
+
+
+@dataclass(frozen=True)
+class PartitionWait:
+    partition: str
+    n: int
+    p50_seconds: float | None
+    p90_seconds: float | None
+    oldest_pending_seconds: int | None
+
+
+@dataclass(frozen=True)
+class ClusterWait:
+    cluster: str
+    fetched_at: str | None
+    stale: bool
+    user_scoped: bool
+    error: str | None
+    partitions: tuple[PartitionWait, ...]
+
+
+@dataclass(frozen=True)
+class WaitReport:
+    clusters: tuple[ClusterWait, ...]
+    days: int = 7
+    schema_version: int = 1
+    command: str = "wait"

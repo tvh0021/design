@@ -10,6 +10,7 @@ from sglance.models import (
     ClusterMine,
     ClusterQueue,
     ClusterStatus,
+    ClusterWait,
     PartitionQueue,
     PartitionStatus,
     PendingReasonCount,
@@ -21,6 +22,12 @@ from sglance.runner import (
     TransportError,
     format_ssh_exit_255,
     format_transport_error,
+)
+from sglance.wait import (
+    SACCT_WAIT_FORMAT,
+    SQUEUE_WAIT_FIELDS,
+    WaitParseError,
+    parse_wait_partitions,
 )
 
 _SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
@@ -298,6 +305,94 @@ class SlurmAdapter:
             slurm_user=first_user if account is None else None,
             account_filter=account,
             jobs=jobs,
+        )
+
+    def query_wait(
+        self, cluster_entry: ClusterEntry, *, days: int, now: datetime
+    ) -> ClusterWait:
+        cluster_flag = (
+            ["-M", cluster_entry.slurm_cluster]
+            if cluster_entry.slurm_cluster is not None
+            else []
+        )
+        sacct_argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "sacct",
+            *cluster_flag,
+            "-X",
+            "-P",
+            "-n",
+            "-a",
+            "-S",
+            f"now-{days}days",
+            "--state=CD,F,TO,CA,OOM,NF,PR,R",
+            f"--format={SACCT_WAIT_FORMAT}",
+        ]
+        sacct_outcome = self._run_command(cluster_entry, sacct_argv)
+        if isinstance(sacct_outcome, str):
+            return ClusterWait(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=sacct_outcome,
+                partitions=(),
+            )
+
+        squeue_argv = [
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            *cluster_flag,
+            "-h",
+            "-r",
+            "-t",
+            "PD",
+            "-O",
+            SQUEUE_WAIT_FIELDS,
+        ]
+        squeue_outcome = self._run_command(cluster_entry, squeue_argv)
+        if isinstance(squeue_outcome, str):
+            return ClusterWait(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=squeue_outcome,
+                partitions=(),
+            )
+
+        try:
+            partitions, distinct_users = parse_wait_partitions(
+                sacct_outcome.stdout,
+                squeue_outcome.stdout,
+                days=days,
+                now=now,
+            )
+        except WaitParseError as exc:
+            return ClusterWait(
+                cluster=cluster_entry.name,
+                fetched_at=None,
+                stale=False,
+                user_scoped=False,
+                error=str(exc),
+                partitions=(),
+            )
+
+        user_scoped = self.detect_user_scoped(
+            cluster_entry,
+            command="wait",
+            distinct_users=distinct_users,
+        )
+        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return ClusterWait(
+            cluster=cluster_entry.name,
+            fetched_at=fetched_at,
+            stale=False,
+            user_scoped=user_scoped,
+            error=None,
+            partitions=partitions,
         )
 
 
