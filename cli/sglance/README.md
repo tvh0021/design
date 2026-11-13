@@ -10,7 +10,7 @@
 - `env SLURM_TIME_FORMAT=%s squeue [-M <slurm_cluster>] -h -r -O JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|`
 - `env SLURM_TIME_FORMAT=%s squeue [-M <slurm_cluster>] -h -r -t PD -O JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|`
 - `env SLURM_TIME_FORMAT=%s squeue [-M <slurm_cluster>] -h --me -O JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,StartTime:0|,Reason:0|,Name:0|` or the same command with `-A <account>` in place of `--me`
-- `env SLURM_TIME_FORMAT=%s sacct [-M <slurm_cluster>] -X -P -n -a -S now-<days>days --state=CD,F,TO,CA,OOM,NF,PR,R --format=JobID,User,Partition,State,Eligible,Start,AllocTRES`
+- `env SLURM_TIME_FORMAT=%s sacct [-M <slurm_cluster>] -X -P -n -a -S now-<days>days -E now --state=CD,F,TO,CA,OOM,NF,PR,R --format=JobID,User,Partition,State,Eligible,Start,AllocTRES`
 - `env SLURM_TIME_FORMAT=%s scontrol [-M <slurm_cluster>] show config`
 
 `sglance` never submits, alters, holds, or cancels jobs, never runs `sbatch --test-only`, and provides no configuration hook to override remote binaries.
@@ -18,6 +18,8 @@
 ## Install
 
 `sglance` requires Python 3.11 or newer and OpenSSH `ssh` for remote cluster entries.
+
+Install `pipx` first if missing with `brew install pipx` on macOS or `sudo apt install pipx` on Debian/Raspberry Pi OS, then run `pipx ensurepath` and open a new shell; Homebrew and Debian Python refuse plain `pip install` outside a virtual environment.
 
 Install in an isolated environment with `pipx`:
 
@@ -150,6 +152,8 @@ Columns:
 
 When neither started samples nor eligible contention-blocked pending jobs exist, `wait` prints `  (no wait data)`.
 
+When `sacct` fails on a cluster, such as when Slurm accounting storage is disabled, `wait` still runs the `squeue` pending query and reports per-partition `OLDEST PENDING` with `N` set to `0` and `P50` and `P90` unset. Table mode prints `  history unavailable: <sacct error>` under the cluster header, and `--json` sets `"history_error"` on the cluster object while keeping `"error": null`. Results with only `"history_error"` still use the five-minute cache, whereas a cluster where `squeue` also fails reports `"error"` as usual and is not cached.
+
 ### `mine`
 
 Shows active and pending jobs from `squeue` with scheduler backfill estimated start times. By default `mine` passes `squeue --me`, which matches your Slurm user on each cluster and requires Slurm 20.11 or newer; older clusters report `squeue does not support --me (needs Slurm 20.11 or newer)`.
@@ -241,7 +245,7 @@ Each element of `"clusters"` shares `"cluster"`, `"fetched_at"`, `"stale"`, `"us
 
 - **`status`**. `"partitions"` array of objects with `"partition"`, `"default"`, `"cpus_alloc"`, `"cpus_total"`, `"cpus_utilization"`, `"gpus_alloc"`, `"gpus_total"`, `"gpus_utilization"`, `"nodes_alloc"`, `"nodes_mixed"`, `"nodes_idle"`, `"nodes_down"`, `"nodes_drained"`, `"nodes_draining"`, `"nodes_other"`, and `"nodes_total"`.
 - **`queue`**. `"partitions"` array of objects with `"partition"`, `"running_jobs"`, `"pending_jobs"`, and `"top_reasons"`, where each entry in `"top_reasons"` has `"reason"` and `"count"`.
-- **`wait`**. `"partitions"` array of objects with `"partition"`, `"n"`, `"p50_seconds"`, `"p90_seconds"`, and `"oldest_pending_seconds"`.
+- **`wait`**. `"history_error"`, which is a string or `null`, and `"partitions"` array of objects with `"partition"`, `"n"`, `"p50_seconds"`, `"p90_seconds"`, and `"oldest_pending_seconds"`.
 - **`mine`**. `"slurm_user"`, `"account_filter"`, and `"jobs"` array of objects with `"job_id"`, `"name"`, `"user"`, `"account"`, `"partition"`, `"state"`, `"cpus"`, `"gpus"`, `"nodes"`, `"elapsed_seconds"`, `"time_limit_seconds"`, `"reason"`, and `"estimated_start"`.
 
 Compatibility rules:

@@ -112,6 +112,8 @@ class WaitCliTests(unittest.TestCase):
                             "-a",
                             "-S",
                             "now-7days",
+                            "-E",
+                            "now",
                             "--state=CD,F,TO,CA,OOM,NF,PR,R",
                             "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
                         ],
@@ -159,6 +161,7 @@ class WaitCliTests(unittest.TestCase):
                             "stale": False,
                             "user_scoped": False,
                             "error": None,
+                            "history_error": None,
                             "partitions": [
                                 {
                                     "partition": "cpu",
@@ -219,6 +222,8 @@ class WaitCliTests(unittest.TestCase):
                             "-a",
                             "-S",
                             "now-14days",
+                            "-E",
+                            "now",
                             "--state=CD,F,TO,CA,OOM,NF,PR,R",
                             "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
                         ],
@@ -270,6 +275,7 @@ class WaitCliTests(unittest.TestCase):
                             "stale": False,
                             "user_scoped": False,
                             "error": None,
+                            "history_error": None,
                             "partitions": [
                                 {
                                     "partition": "gpu",
@@ -405,6 +411,7 @@ class WaitCliTests(unittest.TestCase):
                             "stale": False,
                             "user_scoped": False,
                             "error": None,
+                            "history_error": None,
                             "partitions": [
                                 {
                                     "partition": "gpu",
@@ -500,6 +507,7 @@ class WaitCliTests(unittest.TestCase):
                             "stale": False,
                             "user_scoped": False,
                             "error": None,
+                            "history_error": None,
                             "partitions": [
                                 {
                                     "partition": "gpu",
@@ -1042,6 +1050,7 @@ class WaitCliTests(unittest.TestCase):
                     ("cluster-b", "squeue"): "",
                     ("cluster-b", "scontrol"): "PrivateData             = none\n",
                     ("cluster-c", "sacct"): TransportError("timed out after 25s"),
+                    ("cluster-c", "squeue"): TransportError("timed out after 25s"),
                 }
             )
             stdout = io.StringIO()
@@ -1223,6 +1232,190 @@ class WaitCliTests(unittest.TestCase):
             self.assertEqual(rc5, 0)
             self.assertEqual(len(runner.calls), 15)
             self.assertFalse(json.loads(out5.getvalue())["clusters"][0]["stale"])
+
+    def test_wait_falls_back_to_squeue_when_sacct_fails_and_caches_history_only_error(
+        self,
+    ) -> None:
+        # FIXED_NOW = 1794513600 (2026-11-12T20:00:00Z).
+        squeue_cluster_a = (
+            "901|alice|gpu|PD|Resources|1794512700|\n"
+            "902|bob|gpu|PD|Priority|1794513300|\n"
+            "903|alice|gpu|PD|JobHeldUser|1794400000|\n"
+            "904|bob|cpu|PD|Priority|1794506400|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "login.cluster-a.example.org"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nlocal = true\n\n'
+                '[[clusters]]\nname = "cluster-c"\nssh = "login.cluster-c.example.org"\n',
+                encoding="utf-8",
+            )
+            shared_env = make_test_env(root)
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sacct"): CommandResult(
+                        1, "", "sacct: error: Slurm accounting storage is disabled\n"
+                    ),
+                    ("cluster-a", "squeue"): squeue_cluster_a,
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                    ("cluster-b", "sacct"): CommandResult(
+                        1, "", "sacct: Slurm accounting storage is disabled\n"
+                    ),
+                    ("cluster-b", "squeue"): "",
+                    ("cluster-b", "scontrol"): "PrivateData = jobs\n",
+                    ("cluster-c", "sacct"): CommandResult(
+                        1, "", "sacct: error: Slurm accounting storage is disabled\n"
+                    ),
+                    ("cluster-c", "squeue"): CommandResult(
+                        1, "", "squeue: error: slurm_receive_msg: Socket timed out\n"
+                    ),
+                }
+            )
+
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["wait", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(err1.getvalue(), "")
+            self.assertEqual(len(runner.calls), 8)
+            self.assertEqual(
+                json.loads(out1.getvalue()),
+                {
+                    "schema_version": 1,
+                    "command": "wait",
+                    "days": 7,
+                    "clusters": [
+                        {
+                            "cluster": "cluster-a",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": None,
+                            "history_error": "sacct exited 1: error: Slurm accounting storage is disabled",
+                            "partitions": [
+                                {
+                                    "partition": "gpu",
+                                    "n": 0,
+                                    "p50_seconds": None,
+                                    "p90_seconds": None,
+                                    "oldest_pending_seconds": 900,
+                                },
+                                {
+                                    "partition": "cpu",
+                                    "n": 0,
+                                    "p50_seconds": None,
+                                    "p90_seconds": None,
+                                    "oldest_pending_seconds": 7200,
+                                },
+                            ],
+                        },
+                        {
+                            "cluster": "cluster-b",
+                            "fetched_at": "2026-11-12T20:00:00Z",
+                            "stale": False,
+                            "user_scoped": True,
+                            "error": None,
+                            "history_error": "sacct exited 1: Slurm accounting storage is disabled",
+                            "partitions": [],
+                        },
+                        {
+                            "cluster": "cluster-c",
+                            "fetched_at": None,
+                            "stale": False,
+                            "user_scoped": False,
+                            "error": "squeue exited 1: error: slurm_receive_msg: Socket timed out",
+                            "history_error": None,
+                            "partitions": [],
+                        },
+                    ],
+                },
+            )
+
+            # At t = 45s (1794513645): cluster-a and cluster-b hit cache (0 calls);
+            # cluster-c was not cached because it errored, so it retries and recovers squeue.
+            runner._responses[("cluster-c", "squeue")] = (
+                "950|alice|debug|PD|Resources|1794513545|\n"
+            )
+            runner._responses[("cluster-c", "scontrol")] = "PrivateData = none\n"
+            t_hit = FIXED_NOW + timedelta(seconds=45)
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["wait"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_hit,
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            self.assertEqual(len(runner.calls), 11)
+            self.assertEqual(
+                out2.getvalue(),
+                "cluster-a [cached 45s ago]\n"
+                "  history unavailable: sacct exited 1: error: Slurm accounting storage is disabled\n"
+                "  PARTITION  N  P50  P90  OLDEST PENDING\n"
+                "  gpu        0  -    -    15m 0s\n"
+                "  cpu        0  -    -    2h 0m\n"
+                "\n"
+                "cluster-b [user-scoped] [cached 45s ago]\n"
+                "  history unavailable: sacct exited 1: Slurm accounting storage is disabled\n"
+                "  (no wait data)\n"
+                "\n"
+                "cluster-c\n"
+                "  history unavailable: sacct exited 1: error: Slurm accounting storage is disabled\n"
+                "  PARTITION  N  P50  P90  OLDEST PENDING\n"
+                "  debug      0  -    -    1m 40s\n",
+            )
+
+            out3, err3 = io.StringIO(), io.StringIO()
+            rc3 = main(
+                ["wait", "--cluster", "cluster-a", "--json"],
+                env=shared_env,
+                runner=runner,
+                clock=lambda: t_hit,
+                stdout=out3,
+                stderr=err3,
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(err3.getvalue(), "")
+            self.assertEqual(len(runner.calls), 11)
+            self.assertEqual(
+                json.loads(out3.getvalue())["clusters"][0],
+                {
+                    "cluster": "cluster-a",
+                    "fetched_at": "2026-11-12T20:00:00Z",
+                    "stale": True,
+                    "user_scoped": False,
+                    "error": None,
+                    "history_error": "sacct exited 1: error: Slurm accounting storage is disabled",
+                    "partitions": [
+                        {
+                            "partition": "gpu",
+                            "n": 0,
+                            "p50_seconds": None,
+                            "p90_seconds": None,
+                            "oldest_pending_seconds": 900,
+                        },
+                        {
+                            "partition": "cpu",
+                            "n": 0,
+                            "p50_seconds": None,
+                            "p90_seconds": None,
+                            "oldest_pending_seconds": 7200,
+                        },
+                    ],
+                },
+            )
 
 
 if __name__ == "__main__":

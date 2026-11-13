@@ -132,6 +132,7 @@ class ClusterWait:
     stale: bool
     user_scoped: bool
     error: str | None
+    history_error: str | None
     partitions: tuple[PartitionWait, ...]
 
 

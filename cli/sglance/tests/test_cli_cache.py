@@ -1180,6 +1180,8 @@ class CacheCliTests(unittest.TestCase):
             "-a",
             "-S",
             "now-7days",
+            "-E",
+            "now",
             "--state=CD,F,TO,CA,OOM,NF,PR,R",
             "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
         )
@@ -1193,6 +1195,8 @@ class CacheCliTests(unittest.TestCase):
             "-a",
             "-S",
             "now-14days",
+            "-E",
+            "now",
             "--state=CD,F,TO,CA,OOM,NF,PR,R",
             "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
         )

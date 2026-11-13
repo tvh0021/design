@@ -462,6 +462,7 @@ def _query_clusters_wait(
             stale=False,
             user_scoped=False,
             error=error_text,
+            history_error=None,
             partitions=(),
         ),
     )

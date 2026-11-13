@@ -333,8 +333,12 @@ def _format_cluster_wait_section(cluster: ClusterWait, *, now: datetime | None =
         fetched_at=cluster.fetched_at,
         now=now,
     )
+    lines = [header]
+    if cluster.history_error is not None:
+        lines.append(f"  history unavailable: {cluster.history_error}")
     if not cluster.partitions:
-        return f"{header}\n  (no wait data)"
+        lines.append("  (no wait data)")
+        return "\n".join(lines)
 
     rows: list[tuple[str, ...]] = []
     for part in cluster.partitions:
@@ -353,7 +357,7 @@ def _format_cluster_wait_section(cluster: ClusterWait, *, now: datetime | None =
         for col in range(len(_WAIT_HEADERS))
     ]
 
-    lines = [header, _render_table_row(_WAIT_HEADERS, widths)]
+    lines.append(_render_table_row(_WAIT_HEADERS, widths))
     for row in rows:
         lines.append(_render_table_row(row, widths))
     return "\n".join(lines)

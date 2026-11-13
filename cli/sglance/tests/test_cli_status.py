@@ -478,7 +478,11 @@ class StatusCliTests(unittest.TestCase):
             (
                 "sacct-prefixed",
                 ["wait", "--json"],
-                {("cluster-a", "sacct"): CommandResult(1, "", "sacct: error: accounting disabled\n")},
+                {
+                    ("cluster-a", "sacct"): CommandResult(1, "", "sacct: error: accounting disabled\n"),
+                    ("cluster-a", "squeue"): "",
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                },
                 "sacct exited 1: error: accounting disabled",
             ),
             (
@@ -515,7 +519,11 @@ class StatusCliTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 self.assertEqual(err.getvalue(), "")
                 payload = json.loads(out.getvalue())
-                self.assertEqual(payload["clusters"][0]["error"], expected_error)
+                if label == "sacct-prefixed":
+                    self.assertIsNone(payload["clusters"][0]["error"])
+                    self.assertEqual(payload["clusters"][0]["history_error"], expected_error)
+                else:
+                    self.assertEqual(payload["clusters"][0]["error"], expected_error)
 
     def test_malformed_sinfo_stdout_rows_report_inline_cluster_error(self) -> None:
         malformed_cases = [
@@ -2250,6 +2258,7 @@ class StatusCliTests(unittest.TestCase):
                     "stale": False,
                     "user_scoped": False,
                     "error": None,
+                    "history_error": None,
                     "partitions": [
                         {
                             "partition": "cpu",
