@@ -13,7 +13,19 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from sglance import TransportError
-from tests.fakes import FIXED_NOW, FakeRunner, make_test_env, run_cli, write_config
+from tests.fakes import (
+    FIXED_NOW,
+    MINE_ACCT_ARGV,
+    MINE_ME_ARGV,
+    QUEUE_ARGV,
+    WAIT_SACCT_14D_ARGV,
+    WAIT_SACCT_7D_ARGV,
+    WAIT_SQUEUE_ARGV,
+    FakeRunner,
+    make_test_env,
+    run_cli,
+    write_config,
+)
 
 SINFO_INITIAL = (
     "cpu|node01|allocated|64/0/0/64|(null)|(null)|\n"
@@ -22,12 +34,6 @@ SINFO_INITIAL = (
 SINFO_UPDATED = (
     "cpu|node01|allocated|64/0/0/64|(null)|(null)|\n"
     "cpu|node02|allocated|64/0/0/64|(null)|(null)|\n"
-)
-MINE_FIELDS = (
-    "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
-    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
-    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
-    "StartTime:0|,Reason:0|,Name:0|"
 )
 
 
@@ -55,6 +61,11 @@ class CacheCliTests(unittest.TestCase):
             self.assertFalse(c1[0]["stale"])
             self.assertEqual(c1[0]["partitions"][0]["cpus_alloc"], 64)
             self.assertEqual(c1[1]["error"], "unreachable (timed out after 25s)")
+            snapshots = list((Path(env["XDG_CACHE_HOME"]) / "sglance").glob("*.json"))
+            self.assertEqual(
+                [json.loads(p.read_text(encoding="utf-8"))["cluster"] for p in snapshots],
+                ["cluster-a"],
+            )
 
             # Change responses: at t = 299s, cluster-a hits cache; cluster-b retries live and recovers.
             runner.set_response(("cluster-a", "sinfo"), SINFO_UPDATED)
@@ -104,67 +115,6 @@ class CacheCliTests(unittest.TestCase):
     def test_cache_keys_isolated_across_commands_and_options_and_permissions_0700_0600(
         self,
     ) -> None:
-        queue_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            "-h",
-            "-r",
-            "-O",
-            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
-        )
-        mine_me_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", MINE_FIELDS)
-        mine_acct_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            "-h",
-            "-A",
-            "proj-1",
-            "-O",
-            MINE_FIELDS,
-        )
-        wait_7d_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "sacct",
-            "-X",
-            "-P",
-            "-n",
-            "-a",
-            "-S",
-            "now-7days",
-            "-E",
-            "now",
-            "--state=CD,F,TO,CA,OOM,NF,PR,R",
-            "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
-        )
-        wait_14d_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "sacct",
-            "-X",
-            "-P",
-            "-n",
-            "-a",
-            "-S",
-            "now-14days",
-            "-E",
-            "now",
-            "--state=CD,F,TO,CA,OOM,NF,PR,R",
-            "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
-        )
-        wait_sq_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            "-h",
-            "-r",
-            "-t",
-            "PD",
-            "-O",
-            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
-        )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_config(root)
@@ -172,21 +122,21 @@ class CacheCliTests(unittest.TestCase):
             runner = FakeRunner(
                 {
                     ("cluster-a", "sinfo"): SINFO_INITIAL,
-                    ("cluster-a", *queue_argv): "1|alice|cpu|R|None|\n2|bob|cpu|PD|Resources|\n",
+                    ("cluster-a", *QUEUE_ARGV): "1|alice|cpu|R|None|\n2|bob|cpu|PD|Resources|\n",
                     ("cluster-a", "scontrol"): "PrivateData = none\n",
-                    ("cluster-a", *mine_me_argv): (
+                    ("cluster-a", *MINE_ME_ARGV): (
                         "10|alice|proj-1|cpu|R|10:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794513000|None|j1|\n"
                     ),
-                    ("cluster-a", *mine_acct_argv): (
+                    ("cluster-a", *MINE_ACCT_ARGV): (
                         "10|alice|proj-1|cpu|R|10:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794513000|None|j1|\n"
                         "11|bob|proj-1|cpu|PD|0:00|01:00:00|1|8|1|cpu=8|N/A|N/A|N/A|N/A|Priority|j2|\n"
                     ),
-                    ("cluster-a", *wait_7d_argv): "20|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n",
-                    ("cluster-a", *wait_14d_argv): (
+                    ("cluster-a", *WAIT_SACCT_7D_ARGV): "20|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n",
+                    ("cluster-a", *WAIT_SACCT_14D_ARGV): (
                         "20|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
                         "21|bob|cpu|COMPLETED|1793600000|1793600180|cpu=8\n"
                     ),
-                    ("cluster-a", *wait_sq_argv): "",
+                    ("cluster-a", *WAIT_SQUEUE_ARGV): "",
                 }
             )
             distinct_invocations = (
@@ -197,6 +147,7 @@ class CacheCliTests(unittest.TestCase):
                 ["wait", "--days", "7", "--json"],
                 ["wait", "--days", "14", "--json"],
             )
+            status_json: Path | None = None
             for idx, argv in enumerate(distinct_invocations):
                 rc, out, _ = run_cli(
                     argv,
@@ -207,6 +158,8 @@ class CacheCliTests(unittest.TestCase):
                 )
                 self.assertEqual(rc, 0)
                 self.assertFalse(json.loads(out)["clusters"][0]["stale"])
+                if idx == 0:
+                    (status_json,) = (Path(env["XDG_CACHE_HOME"]) / "sglance").glob("*.json")
 
             calls_after_seed = len(runner.calls)
             for idx, argv in enumerate(distinct_invocations):
@@ -222,6 +175,7 @@ class CacheCliTests(unittest.TestCase):
             self.assertEqual(len(runner.calls), calls_after_seed)
 
             if os.name == "posix":
+                assert status_json is not None
                 cache_dir = Path(env["XDG_CACHE_HOME"]) / "sglance"
                 self.assertEqual(stat.S_IMODE(cache_dir.stat().st_mode), 0o700)
                 entries = list(cache_dir.iterdir())
@@ -241,24 +195,11 @@ class CacheCliTests(unittest.TestCase):
                     now=FIXED_NOW + timedelta(seconds=60),
                 )
                 self.assertEqual(stat.S_IMODE(cache_dir.stat().st_mode), 0o700)
-                for path in cache_dir.iterdir():
-                    if path.stem == entries[0].stem or path.suffix == ".json":
-                        if path.stat().st_mtime >= (FIXED_NOW + timedelta(seconds=60)).timestamp():
-                            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(status_json.stat().st_mode), 0o600)
 
     @unittest.skipIf(fcntl is None, "POSIX flock is required")
     def test_old_snapshot_pruning_respects_held_locks_and_symlinks(self) -> None:
         assert fcntl is not None
-        mine_me_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", MINE_FIELDS)
-        queue_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            "-h",
-            "-r",
-            "-O",
-            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
-        )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_config(root)
@@ -266,8 +207,8 @@ class CacheCliTests(unittest.TestCase):
             runner = FakeRunner(
                 {
                     ("cluster-a", "sinfo"): SINFO_INITIAL,
-                    ("cluster-a", *queue_argv): "1|alice|cpu|R|None|\n",
-                    ("cluster-a", *mine_me_argv): (
+                    ("cluster-a", *QUEUE_ARGV): "1|alice|cpu|R|None|\n",
+                    ("cluster-a", *MINE_ME_ARGV): (
                         "10|alice|proj-1|cpu|R|10:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794513000|None|j1|\n"
                     ),
                 }

@@ -14,6 +14,82 @@ from sglance import CommandResult, main
 FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
 DEFAULT_CLUSTER_TOML = '[[clusters]]\nname = "cluster-a"\nssh = "login.example.edu"\n'
 
+MINE_FIELDS = (
+    "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+    "StartTime:0|,Reason:0|,Name:0|"
+)
+QUEUE_ARGV = (
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "squeue",
+    "-h",
+    "-r",
+    "-O",
+    "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
+)
+MINE_ME_ARGV = (
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "squeue",
+    "-h",
+    "--me",
+    "-O",
+    MINE_FIELDS,
+)
+MINE_ACCT_ARGV = (
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "squeue",
+    "-h",
+    "-A",
+    "proj-1",
+    "-O",
+    MINE_FIELDS,
+)
+WAIT_SACCT_7D_ARGV = (
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "sacct",
+    "-X",
+    "-P",
+    "-n",
+    "-a",
+    "-S",
+    "now-7days",
+    "-E",
+    "now",
+    "--state=CD,F,TO,CA,OOM,NF,PR,R",
+    "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
+)
+WAIT_SACCT_14D_ARGV = (
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "sacct",
+    "-X",
+    "-P",
+    "-n",
+    "-a",
+    "-S",
+    "now-14days",
+    "-E",
+    "now",
+    "--state=CD,F,TO,CA,OOM,NF,PR,R",
+    "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
+)
+WAIT_SQUEUE_ARGV = (
+    "env",
+    "SLURM_TIME_FORMAT=%s",
+    "squeue",
+    "-h",
+    "-r",
+    "-t",
+    "PD",
+    "-O",
+    "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
+)
+
 
 def make_test_env(
     root: Path,

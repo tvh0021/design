@@ -6,10 +6,15 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from sglance import CommandResult
-from tests.fakes import FakeRunner, run_cli, write_config
+from tests.fakes import (
+    WAIT_SACCT_7D_ARGV,
+    WAIT_SQUEUE_ARGV,
+    FakeRunner,
+    run_cli,
+    write_config,
+)
 
 SACCT_FORMAT = "JobID,User,Partition,State,Eligible,Start,AllocTRES"
-SQUEUE_WAIT_FIELDS = "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|"
 
 
 class WaitCliTests(unittest.TestCase):
@@ -56,27 +61,13 @@ class WaitCliTests(unittest.TestCase):
                         "cluster-a",
                         "ssh",
                         "login.example.edu",
-                        [
-                            "env",
-                            "SLURM_TIME_FORMAT=%s",
-                            "sacct",
-                            "-X",
-                            "-P",
-                            "-n",
-                            "-a",
-                            "-S",
-                            "now-7days",
-                            "-E",
-                            "now",
-                            "--state=CD,F,TO,CA,OOM,NF,PR,R",
-                            f"--format={SACCT_FORMAT}",
-                        ],
+                        list(WAIT_SACCT_7D_ARGV),
                     ),
                     (
                         "cluster-a",
                         "ssh",
                         "login.example.edu",
-                        ["env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "-r", "-t", "PD", "-O", SQUEUE_WAIT_FIELDS],
+                        list(WAIT_SQUEUE_ARGV),
                     ),
                     (
                         "cluster-a",

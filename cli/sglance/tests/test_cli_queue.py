@@ -5,17 +5,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from tests.fakes import FakeRunner, run_cli, write_config
+from tests.fakes import QUEUE_ARGV, FakeRunner, run_cli, write_config
 
-SQUEUE_ARGV = [
-    "env",
-    "SLURM_TIME_FORMAT=%s",
-    "squeue",
-    "-h",
-    "-r",
-    "-O",
-    "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
-]
 SCONTROL_ARGV = ["env", "SLURM_TIME_FORMAT=%s", "scontrol", "show", "config"]
 
 
@@ -54,7 +45,7 @@ class QueueCliTests(unittest.TestCase):
             self.assertEqual(
                 sorted(runner.calls, key=lambda c: c[0]),
                 [
-                    ("cluster-a", "ssh", "login.example.edu", SQUEUE_ARGV),
+                    ("cluster-a", "ssh", "login.example.edu", list(QUEUE_ARGV)),
                     ("cluster-a", "ssh", "login.example.edu", SCONTROL_ARGV),
                     (
                         "cluster-b",

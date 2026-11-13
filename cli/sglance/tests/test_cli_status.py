@@ -10,7 +10,14 @@ from unittest import mock
 from sglance import CommandResult, TransportError
 from sglance.models import ClusterEntry
 from sglance.runner import AllowlistedRunner, AllowlistError, validate_allowlist
-from tests.fakes import FakeRunner, run_cli, write_config
+from tests.fakes import (
+    MINE_ME_ARGV,
+    QUEUE_ARGV,
+    WAIT_SQUEUE_ARGV,
+    FakeRunner,
+    run_cli,
+    write_config,
+)
 
 SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
 
@@ -246,44 +253,16 @@ class StatusCliTests(unittest.TestCase):
             )
 
     def test_json_flag_works_before_or_after_subcommand_and_help_exits_zero(self) -> None:
-        mine_fields = (
-            "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
-            "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
-            "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
-            "StartTime:0|,Reason:0|,Name:0|"
-        )
-        queue_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            "-h",
-            "-r",
-            "-O",
-            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
-        )
-        wait_sq_argv = (
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            "-h",
-            "-r",
-            "-t",
-            "PD",
-            "-O",
-            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
-        )
-        mine_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", mine_fields)
-
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_config(root)
             runner = FakeRunner(
                 {
                     ("cluster-a", "sinfo"): "cpu|node01|allocated|64/0/0/64|(null)|(null)|\n",
-                    ("cluster-a", *queue_argv): "1|alice|cpu|R|None|\n",
+                    ("cluster-a", *QUEUE_ARGV): "1|alice|cpu|R|None|\n",
                     ("cluster-a", "sacct"): "2|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n",
-                    ("cluster-a", *wait_sq_argv): "",
-                    ("cluster-a", *mine_argv): (
+                    ("cluster-a", *WAIT_SQUEUE_ARGV): "",
+                    ("cluster-a", *MINE_ME_ARGV): (
                         "3|alice|proj-1|cpu|R|10:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794513000|None|j|\n"
                     ),
                 }

@@ -6,19 +6,11 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from sglance import CommandResult
-from tests.fakes import FakeRunner, run_cli, write_config
-
-MINE_SQUEUE_FIELDS = (
-    "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
-    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
-    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
-    "StartTime:0|,Reason:0|,Name:0|"
-)
+from tests.fakes import MINE_FIELDS, MINE_ME_ARGV, FakeRunner, run_cli, write_config
 
 
 class MineCliTests(unittest.TestCase):
     def test_mine_exact_argv_me_vs_account_validation_and_slurm_20_11_message(self) -> None:
-        me_argv = ["env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", MINE_SQUEUE_FIELDS]
         acct_argv = [
             "env",
             "SLURM_TIME_FORMAT=%s",
@@ -29,7 +21,7 @@ class MineCliTests(unittest.TestCase):
             "-A",
             "proj-1",
             "-O",
-            MINE_SQUEUE_FIELDS,
+            MINE_FIELDS,
         ]
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -40,7 +32,7 @@ class MineCliTests(unittest.TestCase):
             )
             runner = FakeRunner(
                 {
-                    ("cluster-a", *me_argv): (
+                    ("cluster-a", *MINE_ME_ARGV): (
                         "1001|alice|proj-1|gpu|R|45:30|04:00:00|2|64|8|"
                         "cpu=64,gres/gpu=8|N/A|N/A|N/A|1794510870|None|train|\n"
                     ),
@@ -55,10 +47,9 @@ class MineCliTests(unittest.TestCase):
             rc, out, err = run_cli(["mine", "--json"], root=root, runner=runner)
             self.assertEqual(rc, 0)
             self.assertEqual(err, "")
-            self.assertTrue(MINE_SQUEUE_FIELDS.startswith("JobArrayID:0|,"))
             self.assertEqual(
                 [c for c in runner.calls if c[0] == "cluster-a"],
-                [("cluster-a", "ssh", "login.example.edu", me_argv)],
+                [("cluster-a", "ssh", "login.example.edu", list(MINE_ME_ARGV))],
             )
             clusters = json.loads(out)["clusters"]
             self.assertEqual(clusters[0]["slurm_user"], "alice")
