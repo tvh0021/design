@@ -296,6 +296,7 @@ _WAIT_HEADERS = (
     "N",
     "P50",
     "P90",
+    "MEDIAN PENDING",
     "OLDEST PENDING",
 )
 
@@ -348,6 +349,7 @@ def _format_cluster_wait_section(cluster: ClusterWait, *, now: datetime | None =
                 str(part.n),
                 _format_wait_duration(part.p50_seconds),
                 _format_wait_duration(part.p90_seconds),
+                _format_wait_duration(part.median_pending_seconds),
                 _format_wait_duration(part.oldest_pending_seconds),
             )
         )

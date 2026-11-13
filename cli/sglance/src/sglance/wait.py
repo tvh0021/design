@@ -69,8 +69,8 @@ def _quantile_hundredths(sorted_values: Sequence[int], pct: int) -> float:
     return float(Decimal(numer) / Decimal(100))
 
 
-def _parse_squeue_oldest_pending(squeue_stdout: str, *, now_epoch: int) -> dict[str, int]:
-    oldest_by_partition: dict[str, int] = {}
+def _parse_squeue_pending_ages(squeue_stdout: str, *, now_epoch: int) -> dict[str, list[int]]:
+    ages_by_partition: dict[str, list[int]] = {}
     for raw_line in squeue_stdout.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("CLUSTER: "):
@@ -99,11 +99,9 @@ def _parse_squeue_oldest_pending(squeue_stdout: str, *, now_epoch: int) -> dict[
         if eligible is None or eligible > now_epoch:
             continue
         age_seconds = now_epoch - eligible
-        for partition in partition_parts:
-            prev = oldest_by_partition.get(partition)
-            if prev is None or age_seconds > prev:
-                oldest_by_partition[partition] = age_seconds
-    return oldest_by_partition
+        for partition in dict.fromkeys(partition_parts):
+            ages_by_partition.setdefault(partition, []).append(age_seconds)
+    return ages_by_partition
 
 
 def parse_wait_partitions(
@@ -173,9 +171,9 @@ def parse_wait_partitions(
             continue
         samples_by_partition.setdefault(partition, []).append(wait_seconds)
 
-    oldest_by_partition = _parse_squeue_oldest_pending(squeue_stdout, now_epoch=now_epoch)
+    pending_ages_by_partition = _parse_squeue_pending_ages(squeue_stdout, now_epoch=now_epoch)
     ordered_names = list(
-        dict.fromkeys([*samples_by_partition.keys(), *oldest_by_partition.keys()])
+        dict.fromkeys([*samples_by_partition.keys(), *pending_ages_by_partition.keys()])
     )
 
     partitions: list[PartitionWait] = []
@@ -190,13 +188,22 @@ def parse_wait_partitions(
             n = 0
             p50 = None
             p90 = None
+        pending_ages = pending_ages_by_partition.get(partition)
+        if pending_ages:
+            sorted_pending = sorted(pending_ages)
+            median_pending: float | None = _quantile_hundredths(sorted_pending, 50)
+            oldest_pending: int | None = sorted_pending[-1]
+        else:
+            median_pending = None
+            oldest_pending = None
         partitions.append(
             PartitionWait(
                 partition=partition,
                 n=n,
                 p50_seconds=p50,
                 p90_seconds=p90,
-                oldest_pending_seconds=oldest_by_partition.get(partition),
+                median_pending_seconds=median_pending,
+                oldest_pending_seconds=oldest_pending,
             )
         )
     return tuple(partitions), frozenset(distinct_users)

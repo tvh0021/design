@@ -122,6 +122,7 @@ class PartitionWait:
     n: int
     p50_seconds: float | None
     p90_seconds: float | None
+    median_pending_seconds: float | None
     oldest_pending_seconds: int | None
 
 
