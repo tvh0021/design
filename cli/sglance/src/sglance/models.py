@@ -31,20 +31,27 @@ class PartitionStatus:
     nodes_total: int
 
 
+SCHEMA_VERSION = 1
+
+
 @dataclass(frozen=True)
-class ClusterStatus:
+class ClusterResult:
     cluster: str
-    fetched_at: str | None
-    stale: bool
-    user_scoped: bool
-    error: str | None
-    partitions: tuple[PartitionStatus, ...]
+    fetched_at: str | None = None
+    stale: bool = False
+    user_scoped: bool = False
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ClusterStatus(ClusterResult):
+    partitions: tuple[PartitionStatus, ...] = ()
 
 
 @dataclass(frozen=True)
 class StatusReport:
     clusters: tuple[ClusterStatus, ...]
-    schema_version: int = 1
+    schema_version: int = SCHEMA_VERSION
     command: str = "status"
 
 
@@ -63,19 +70,14 @@ class PartitionQueue:
 
 
 @dataclass(frozen=True)
-class ClusterQueue:
-    cluster: str
-    fetched_at: str | None
-    stale: bool
-    user_scoped: bool
-    error: str | None
-    partitions: tuple[PartitionQueue, ...]
+class ClusterQueue(ClusterResult):
+    partitions: tuple[PartitionQueue, ...] = ()
 
 
 @dataclass(frozen=True)
 class QueueReport:
     clusters: tuple[ClusterQueue, ...]
-    schema_version: int = 1
+    schema_version: int = SCHEMA_VERSION
     command: str = "queue"
 
 
@@ -97,22 +99,17 @@ class MineJob:
 
 
 @dataclass(frozen=True)
-class ClusterMine:
-    cluster: str
-    fetched_at: str | None
-    stale: bool
-    user_scoped: bool
-    error: str | None
-    slurm_user: str | None
-    account_filter: str | None
-    jobs: tuple[MineJob, ...]
+class ClusterMine(ClusterResult):
+    slurm_user: str | None = None
+    account_filter: str | None = None
+    jobs: tuple[MineJob, ...] = ()
 
 
 @dataclass(frozen=True)
 class MineReport:
     clusters: tuple[ClusterMine, ...]
     account: str | None = None
-    schema_version: int = 1
+    schema_version: int = SCHEMA_VERSION
     command: str = "mine"
 
 
@@ -127,19 +124,14 @@ class PartitionWait:
 
 
 @dataclass(frozen=True)
-class ClusterWait:
-    cluster: str
-    fetched_at: str | None
-    stale: bool
-    user_scoped: bool
-    error: str | None
-    history_error: str | None
-    partitions: tuple[PartitionWait, ...]
+class ClusterWait(ClusterResult):
+    history_error: str | None = None
+    partitions: tuple[PartitionWait, ...] = ()
 
 
 @dataclass(frozen=True)
 class WaitReport:
     clusters: tuple[ClusterWait, ...]
     days: int = 7
-    schema_version: int = 1
+    schema_version: int = SCHEMA_VERSION
     command: str = "wait"

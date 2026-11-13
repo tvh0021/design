@@ -18,9 +18,9 @@ import stat
 import tempfile
 import time
 import types
-from typing import Any, NoReturn, Protocol, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, NoReturn, TypeVar, Union, get_args, get_origin, get_type_hints
 
-from sglance.models import ClusterEntry
+from sglance.models import ClusterEntry, ClusterResult
 
 CACHE_TTL_SECONDS = 300
 CACHE_PRUNE_AGE_SECONDS = 86400
@@ -30,22 +30,7 @@ CACHE_LOCK_POLL_SECONDS = 0.01
 _HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _SNAPSHOT_ENVELOPE_KEYS = frozenset({"cluster", "fetched_at", "stale", "user_scoped", "error"})
 
-
-class CacheableClusterResult(Protocol):
-    @property
-    def cluster(self) -> str: ...
-
-    @property
-    def fetched_at(self) -> str | None: ...
-
-    @property
-    def stale(self) -> bool: ...
-
-    @property
-    def error(self) -> str | None: ...
-
-
-T = TypeVar("T", bound=CacheableClusterResult)
+T = TypeVar("T", bound=ClusterResult)
 
 
 def cached_cluster_fetch(
