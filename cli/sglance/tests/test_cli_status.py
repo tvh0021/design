@@ -332,9 +332,9 @@ class StatusCliTests(unittest.TestCase):
                 (
                     ["--compact", "status"],
                     "cluster-a [cached 15s ago]\n"
-                    "  PARTITION  CPUS     GPUS  NODES\n"
-                    "  cpu*       112/192  -     1/3\n"
-                    "  gpu        112/128  7/8   1/2\n\n"
+                    "  PARTITION  FREE CPUS  FREE GPUS  IDLE NODES\n"
+                    "  cpu*       112/192    -          1/3\n"
+                    "  gpu        112/128    7/8        1/2\n\n"
                     "cluster-b: unreachable (timed out after 25s)\n",
                 ),
                 (

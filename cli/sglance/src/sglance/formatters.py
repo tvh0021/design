@@ -147,7 +147,7 @@ _TABLES: dict[str, tuple[tuple[str, ...], Callable[[Any], list[tuple[str, ...]]]
 }
 
 _COMPACT_TABLES: dict[str, tuple[tuple[str, ...], Callable[[Any], list[tuple[str, ...]]]]] = {
-    "status": (("PARTITION", "CPUS", "GPUS", "NODES"), _status_compact_rows),
+    "status": (("PARTITION", "FREE CPUS", "FREE GPUS", "IDLE NODES"), _status_compact_rows),
     "queue": (("PARTITION",), lambda c: [(r[0],) for r in _queue_rows(c)]),
     "mine": (
         ("JOBID", "PARTITION", "STATE", "ESTIMATED START"),
