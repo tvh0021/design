@@ -4,10 +4,12 @@ from datetime import UTC, datetime
 import io
 import json
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
+from unittest import mock
 
 import sglance
 from sglance import CommandResult, TransportError, main
@@ -380,7 +382,7 @@ class StatusCliTests(unittest.TestCase):
                             "fetched_at": None,
                             "stale": False,
                             "user_scoped": False,
-                            "error": "sinfo exited 1: sinfo: error: Unable to contact slurm controller",
+                            "error": "sinfo exited 1: error: Unable to contact slurm controller",
                             "partitions": [],
                         },
                         {
@@ -410,7 +412,7 @@ class StatusCliTests(unittest.TestCase):
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(
                 table_out.getvalue(),
-                "cluster-a: sinfo exited 1: sinfo: error: Unable to contact slurm controller\n\n"
+                "cluster-a: sinfo exited 1: error: Unable to contact slurm controller\n\n"
                 "cluster-b: sinfo exited 7\n",
             )
 
@@ -456,8 +458,64 @@ class StatusCliTests(unittest.TestCase):
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(
                 table_out.getvalue(),
-                "cluster-a: sinfo exited 1: sinfo: error: slurm_receive_msg: Zero Bytes were transmitted or received\n",
+                "cluster-a: sinfo exited 1: error: slurm_receive_msg: Zero Bytes were transmitted or received\n",
             )
+
+    def test_command_failure_strips_leading_tool_prefix_without_altering_other_lines(self) -> None:
+        cases = (
+            (
+                "sinfo-prefixed",
+                ["status", "--json"],
+                {("cluster-a", "sinfo"): CommandResult(1, "", "sinfo: error: controller down\n")},
+                "sinfo exited 1: error: controller down",
+            ),
+            (
+                "squeue-prefixed",
+                ["queue", "--json"],
+                {("cluster-a", "squeue"): CommandResult(2, "", "squeue: fatal: invalid partition\n")},
+                "squeue exited 2: fatal: invalid partition",
+            ),
+            (
+                "sacct-prefixed",
+                ["wait", "--json"],
+                {("cluster-a", "sacct"): CommandResult(1, "", "sacct: error: accounting disabled\n")},
+                "sacct exited 1: error: accounting disabled",
+            ),
+            (
+                "non-matching-prefix-preserved",
+                ["status", "--json"],
+                {("cluster-a", "sinfo"): CommandResult(1, "", "sinfo_wrapper: error: wrapped\n")},
+                "sinfo exited 1: sinfo_wrapper: error: wrapped",
+            ),
+            (
+                "other-daemon-line-preserved",
+                ["status", "--json"],
+                {("cluster-a", "sinfo"): CommandResult(1, "", "slurm_receive_msg: Socket timed out\n")},
+                "sinfo exited 1: slurm_receive_msg: Socket timed out",
+            ),
+        )
+        for label, argv, responses, expected_error in cases:
+            with self.subTest(case=label), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                    encoding="utf-8",
+                )
+                out, err = io.StringIO(), io.StringIO()
+                rc = main(
+                    argv,
+                    env=make_test_env(root),
+                    runner=FakeRunner(responses),
+                    clock=lambda: FIXED_NOW,
+                    stdout=out,
+                    stderr=err,
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(err.getvalue(), "")
+                payload = json.loads(out.getvalue())
+                self.assertEqual(payload["clusters"][0]["error"], expected_error)
 
     def test_malformed_sinfo_stdout_rows_report_inline_cluster_error(self) -> None:
         malformed_cases = [
@@ -1885,10 +1943,217 @@ class StatusCliTests(unittest.TestCase):
             )
 
 
+    def test_ssh_runner_invokes_exact_ssh_argv_and_25s_timeout(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            fake_completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="cpu|node01|idle|0/64/0/64|(null)|(null)|\n",
+                stderr="",
+            )
+            with mock.patch("sglance.runner.subprocess.run", return_value=fake_completed) as mock_run:
+                exit_code = main(
+                    ["status", "--json"],
+                    env=make_test_env(root),
+                    clock=lambda: FIXED_NOW,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args
+            expected_remote_cmd = (
+                "env SLURM_TIME_FORMAT=%s sinfo -h -N -O "
+                "'PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|'"
+            )
+            self.assertEqual(
+                call_args.args,
+                (
+                    [
+                        "ssh",
+                        "-T",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=5",
+                        "-o",
+                        "RemoteCommand=none",
+                        "-o",
+                        "LogLevel=ERROR",
+                        "--",
+                        "cluster-a.example",
+                        expected_remote_cmd,
+                    ],
+                ),
+            )
+            self.assertEqual(call_args.kwargs["timeout"], 25.0)
+            self.assertEqual(call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertTrue(call_args.kwargs["capture_output"])
+            self.assertTrue(call_args.kwargs["text"])
+            self.assertFalse(call_args.kwargs["check"])
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["clusters"][0]["partitions"][0]["cpus_total"], 64)
+
+    def test_allowlist_error_from_runner_propagates_through_main_for_status_and_queue(self) -> None:
+        cases = (
+            (
+                "status",
+                {
+                    ("cluster-a", "sinfo"): AllowlistError("disallowed sinfo command"),
+                    ("cluster-b", "sinfo"): "cpu|node01|idle|0/64/0/64|(null)|(null)|\n",
+                },
+            ),
+            (
+                "queue",
+                {
+                    ("cluster-a", "squeue"): AllowlistError("disallowed squeue command"),
+                    ("cluster-b", "squeue"): "1001|alice|cpu|R|None|\n",
+                },
+            ),
+        )
+        for subcommand, responses in cases:
+            with self.subTest(subcommand=subcommand), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n\n'
+                    '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
+                    encoding="utf-8",
+                )
+                runner = FakeRunner(responses)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                with self.assertRaises(AllowlistError):
+                    main(
+                        [subcommand, "--json"],
+                        env=make_test_env(root),
+                        runner=runner,
+                        clock=lambda: FIXED_NOW,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_help_exits_zero_and_mentions_all_flags_for_root_and_all_subcommands(self) -> None:
+        cases: tuple[tuple[list[str], tuple[str, ...], tuple[str, ...]], ...] = (
+            (
+                ["--help"],
+                (
+                    "Read-only inspection of Slurm cluster capacity, queues, wait times, and jobs.",
+                    "--help",
+                    "--cluster",
+                    "--refresh",
+                    "status",
+                    "queue",
+                    "wait",
+                    "mine",
+                    "Query only the named configured cluster entry.",
+                    "Bypass the 5-minute cache and fetch fresh data.",
+                ),
+                ("--json", "--days", "--account"),
+            ),
+            (
+                ["status", "--help"],
+                (
+                    "Show partition CPU, GPU, and node utilization.",
+                    "--help",
+                    "--cluster",
+                    "--refresh",
+                    "--json",
+                    "Query only the named configured cluster entry.",
+                    "Bypass the 5-minute cache and fetch fresh data.",
+                    "Emit JSON output.",
+                ),
+                ("--days", "--account"),
+            ),
+            (
+                ["queue", "--help"],
+                (
+                    "Show running/pending job counts and top pending reasons.",
+                    "--help",
+                    "--cluster",
+                    "--refresh",
+                    "--json",
+                    "Query only the named configured cluster entry.",
+                    "Bypass the 5-minute cache and fetch fresh data.",
+                    "Emit JSON output.",
+                ),
+                ("--days", "--account"),
+            ),
+            (
+                ["wait", "--help"],
+                (
+                    "Show wait-time percentiles and oldest pending job age.",
+                    "--help",
+                    "--cluster",
+                    "--refresh",
+                    "--days",
+                    "--json",
+                    "Query only the named configured cluster entry.",
+                    "Bypass the 5-minute cache and fetch fresh data.",
+                    "Lookback window in days (integer >= 1, default: 7).",
+                    "Emit JSON output.",
+                ),
+                ("--account",),
+            ),
+            (
+                ["mine", "--help"],
+                (
+                    "Show your jobs or an account's jobs and start estimates.",
+                    "--help",
+                    "--cluster",
+                    "--refresh",
+                    "--account",
+                    "--json",
+                    "Query only the named configured cluster entry.",
+                    "Bypass the 5-minute cache and fetch fresh data.",
+                    "List all jobs charged to the named Slurm account.",
+                    "Emit JSON output.",
+                ),
+                ("--days",),
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = make_test_env(root)
+            runner = FakeRunner()
+            for argv, expected_substrings, unexpected_flags in cases:
+                with self.subTest(argv=argv):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    exit_code = main(
+                        argv,
+                        env=env,
+                        runner=runner,
+                        clock=lambda: FIXED_NOW,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                    rendered = stdout.getvalue()
+                    self.assertEqual(exit_code, 0)
+                    self.assertEqual(stderr.getvalue(), "")
+                    self.assertNotIn("\x1b", rendered)
+                    for token in expected_substrings:
+                        self.assertIn(token, rendered)
+                    for flag in unexpected_flags:
+                        self.assertNotIn(flag, rendered)
+            self.assertEqual(runner.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-

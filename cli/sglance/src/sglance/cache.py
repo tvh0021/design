@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import time
@@ -22,9 +23,12 @@ from typing import Any, NoReturn, Protocol, TypeVar, Union, get_args, get_origin
 from sglance.models import ClusterEntry
 
 CACHE_TTL_SECONDS = 300
+CACHE_PRUNE_AGE_SECONDS = 86400
 MAX_CACHE_FILE_BYTES = 4 * 1024 * 1024
 CACHE_LOCK_TIMEOUT_SECONDS = 10.0
 CACHE_LOCK_POLL_SECONDS = 0.01
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_SNAPSHOT_ENVELOPE_KEYS = frozenset({"cluster", "fetched_at", "stale", "user_scoped", "error"})
 
 
 class CacheableClusterResult(Protocol):
@@ -74,7 +78,7 @@ def cached_cluster_fetch(
         if cached is not None:
             return cached
 
-    lock_fd = _acquire_cache_lock(cache_dir / f"{digest}.lock")
+    lock_fd = _acquire_cache_lock(cache_dir / f"{digest}.lock", now=now)
     try:
         if lock_fd is not None and not refresh:
             cached = _read_valid_snapshot(cache_path, entry=entry, result_type=result_type, now=now)
@@ -83,7 +87,8 @@ def cached_cluster_fetch(
 
         live_result = fetch(entry)
         if live_result.error is None and live_result.fetched_at is not None:
-            _write_snapshot_atomic(cache_path, live_result)
+            if _write_snapshot_atomic(cache_path, live_result, now=now):
+                _prune_old_cache_files(cache_dir, now=now, keep_stem=digest)
         return live_result
     finally:
         if lock_fd is not None:
@@ -95,7 +100,15 @@ def _ensure_cache_dir(cache_dir: Path) -> None:
     os.chmod(cache_dir, 0o700)
 
 
-def _acquire_cache_lock(lock_path: Path) -> int | None:
+def _set_mtime_best_effort(target: int | str | Path, now: datetime) -> None:
+    try:
+        ts = now.astimezone(UTC).timestamp()
+        os.utime(target, (ts, ts))
+    except Exception:
+        pass
+
+
+def _acquire_cache_lock(lock_path: Path, *, now: datetime) -> int | None:
     if fcntl is None:
         return None
     fd: int | None = None
@@ -110,6 +123,7 @@ def _acquire_cache_lock(lock_path: Path) -> int | None:
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _set_mtime_best_effort(fd, now)
                 return fd
             except OSError as exc:
                 if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
@@ -217,7 +231,7 @@ def _read_valid_snapshot(
         return None
 
 
-def _write_snapshot_atomic(cache_path: Path, result: T) -> None:
+def _write_snapshot_atomic(cache_path: Path, result: T, *, now: datetime) -> bool:
     tmp_path: str | None = None
     try:
         snapshot = dataclasses.replace(result, stale=False)  # type: ignore[type-var]
@@ -234,16 +248,93 @@ def _write_snapshot_atomic(cache_path: Path, result: T) -> None:
             tmp_path = fh.name
             fh.write(serialized)
         os.chmod(tmp_path, 0o600)
+        _set_mtime_best_effort(tmp_path, now)
         os.replace(tmp_path, cache_path)
         tmp_path = None
+        return True
     except (OSError, ValueError, TypeError):
-        return
+        return False
     finally:
         if tmp_path is not None:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _is_expired_sglance_snapshot(path: str, *, now_utc: datetime) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_CACHE_FILE_BYTES:
+            return False
+        raw_bytes = os.read(fd, MAX_CACHE_FILE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw_bytes) > MAX_CACHE_FILE_BYTES:
+        return False
+    payload = json.loads(raw_bytes.decode("utf-8"), parse_constant=_reject_json_constant)
+    if not isinstance(payload, dict) or not (_SNAPSHOT_ENVELOPE_KEYS <= payload.keys()):
+        return False
+    fetched_at = payload.get("fetched_at")
+    if (
+        not isinstance(payload.get("cluster"), str)
+        or not isinstance(payload.get("stale"), bool)
+        or not isinstance(payload.get("user_scoped"), bool)
+        or not isinstance(fetched_at, str)
+        or not fetched_at.endswith("Z")
+    ):
+        return False
+    fetched_dt = datetime.fromisoformat(fetched_at)
+    if fetched_dt.tzinfo is None:
+        return False
+    age_seconds = (now_utc - fetched_dt.astimezone(UTC)).total_seconds()
+    return age_seconds > CACHE_PRUNE_AGE_SECONDS
+
+
+def _prune_old_lock_file(path: str, *, now_ts: float) -> None:
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_size == 0 and (now_ts - st.st_mtime) > CACHE_PRUNE_AGE_SECONDS:
+            os.unlink(path)
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(fd)
+
+
+def _prune_old_cache_files(cache_dir: Path, *, now: datetime, keep_stem: str) -> None:
+    try:
+        now_utc = now.astimezone(UTC)
+        now_ts = now_utc.timestamp()
+        with os.scandir(cache_dir) as entries:
+            for dent in entries:
+                try:
+                    if dent.is_symlink():
+                        continue
+                    stem, dot, ext = dent.name.partition(".")
+                    if dot != "." or stem == keep_stem or not _HEX_DIGEST_RE.fullmatch(stem):
+                        continue
+                    st = dent.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if ext == "json":
+                        if _is_expired_sglance_snapshot(dent.path, now_utc=now_utc):
+                            os.unlink(dent.path)
+                    elif ext == "lock" and st.st_size == 0 and (now_ts - st.st_mtime) > CACHE_PRUNE_AGE_SECONDS:
+                        _prune_old_lock_file(dent.path, now_ts=now_ts)
+                except Exception:
+                    continue
+    except Exception:
+        return
 
 
 def _decode_value(expected_type: Any, raw: Any) -> Any:
