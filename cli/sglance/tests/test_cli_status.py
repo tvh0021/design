@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 from pathlib import Path
 import subprocess
@@ -11,10 +12,12 @@ from sglance import CommandResult, TransportError
 from sglance.models import ClusterEntry
 from sglance.runner import AllowlistedRunner, AllowlistError, validate_allowlist
 from tests.fakes import (
+    FIXED_NOW,
     MINE_ME_ARGV,
     QUEUE_ARGV,
     WAIT_SQUEUE_ARGV,
     FakeRunner,
+    make_test_env,
     run_cli,
     write_config,
 )
@@ -284,6 +287,53 @@ class StatusCliTests(unittest.TestCase):
             rc_bad, _, _ = run_cli(["--unknown-flag"], root=root, runner=FakeRunner())
             self.assertEqual(rc_bad, 2)
 
+    def test_compact_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_config(root)
+            env = make_test_env(root)
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sinfo"): (
+                        "cpu*|node01|idle|0/64/0/64|(null)|(null)|\n"
+                        "gpu|gpu01|mixed|16/48/0/64|gpu:a100:4|gpu:a100:1|\n"
+                    ),
+                    ("cluster-a", *QUEUE_ARGV): "1|alice|cpu|R|None|\n",
+                    ("cluster-a", *MINE_ME_ARGV): (
+                        "1002|alice|proj-1|cpu|PD|0:00|01:00:00|1|16|1|cpu=16|N/A|N/A|N/A|1794517200|Resources|eval|\n"
+                    ),
+                    ("cluster-a", "sacct"): (
+                        "1|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
+                        "2|bob|cpu|COMPLETED|1794501000|1794501600|cpu=8\n"
+                    ),
+                    ("cluster-a", *WAIT_SQUEUE_ARGV): "",
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+            run_cli(["status"], root=root, env=env, runner=runner, now=FIXED_NOW)
+            later = FIXED_NOW + timedelta(seconds=15)
+            cases = (
+                (
+                    ["--compact", "status"],
+                    "cluster-a [cached 15s ago]\n"
+                    "  PARTITION  FREE CPUS  FREE GPUS  IDLE NODES\n"
+                    "  cpu*       64/64      -          1/1\n"
+                    "  gpu        48/64      3/4        0/1\n",
+                ),
+                (["queue", "--compact"], "cluster-a [user-scoped]\n  PARTITION\n  cpu\n"),
+                (
+                    ["mine", "--compact"],
+                    "cluster-a\n  JOBID  PARTITION  STATE  ESTIMATED START\n  1002   cpu        PD     2026-11-12T21:00:00Z\n",
+                ),
+                (["wait", "--compact"], "cluster-a\n  PARTITION  P50     P90\n  cpu        5m 30s  9m 6s\n"),
+            )
+            for argv, expected in cases:
+                with self.subTest(argv=argv):
+                    self.assertEqual(run_cli(argv, root=root, env=env, runner=runner, now=later), (0, expected, ""))
+            self.assertEqual(sum(c[3][2] == "sinfo" for c in runner.calls), 1)
+            json_args = ["status", "--json"]
+            plain = run_cli(json_args, root=root, env=env, runner=runner, now=later)
+            self.assertEqual(run_cli([*json_args, "--compact"], root=root, env=env, runner=runner, now=later), plain)
 
 if __name__ == "__main__":
     unittest.main()

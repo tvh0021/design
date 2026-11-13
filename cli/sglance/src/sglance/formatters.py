@@ -119,6 +119,18 @@ def _wait_rows(cluster: ClusterWait) -> list[tuple[str, ...]]:
     ]
 
 
+def _status_compact_rows(cluster: ClusterStatus) -> list[tuple[str, ...]]:
+    return [
+        (
+            f"{p.partition}*" if p.default else p.partition,
+            f"{p.cpus_total - p.cpus_alloc}/{p.cpus_total}",
+            f"{p.gpus_total - p.gpus_alloc}/{p.gpus_total}" if p.gpus_total else "-",
+            f"{p.nodes_idle}/{p.nodes_total}",
+        )
+        for p in cluster.partitions
+    ]
+
+
 _TABLES: dict[str, tuple[tuple[str, ...], Callable[[Any], list[tuple[str, ...]]], str]] = {
     "status": (
         ("PARTITION", "CPUS", "GPUS", "NODES", "ALLOC", "MIXED", "IDLE", "DOWN", "DRAINED", "DRAINING", "OTHER"),
@@ -134,12 +146,22 @@ _TABLES: dict[str, tuple[tuple[str, ...], Callable[[Any], list[tuple[str, ...]]]
     "wait": (("PARTITION", "N", "P50", "P90", "MEDIAN PENDING", "OLDEST PENDING"), _wait_rows, "(no wait data)"),
 }
 
+_COMPACT_TABLES: dict[str, tuple[tuple[str, ...], Callable[[Any], list[tuple[str, ...]]]]] = {
+    "status": (("PARTITION", "FREE CPUS", "FREE GPUS", "IDLE NODES"), _status_compact_rows),
+    "queue": (("PARTITION",), lambda c: [(r[0],) for r in _queue_rows(c)]),
+    "mine": (
+        ("JOBID", "PARTITION", "STATE", "ESTIMATED START"),
+        lambda c: [(r[0], r[4], r[5], r[12]) for r in _mine_rows(c)],
+    ),
+    "wait": (("PARTITION", "P50", "P90"), lambda c: [(r[0], r[2], r[3]) for r in _wait_rows(c)]),
+}
+
 
 def _render_row(cells: tuple[str, ...], widths: list[int]) -> str:
     return "  " + "  ".join([*(c.ljust(w) for c, w in zip(cells[:-1], widths)), cells[-1]])
 
 
-def _format_section(command: str, cluster: ClusterResult, now: datetime) -> str:
+def _format_section(command: str, cluster: ClusterResult, now: datetime, compact: bool = False) -> str:
     if cluster.error is not None:
         return f"{cluster.cluster}: {cluster.error}"
     header = f"{cluster.cluster} [user-scoped]" if cluster.user_scoped else cluster.cluster
@@ -148,9 +170,11 @@ def _format_section(command: str, cluster: ClusterResult, now: datetime) -> str:
         age = max(0, int((now.astimezone(UTC) - fetched_dt).total_seconds()))
         header = f"{header} [cached {age}s ago]"
     lines = [header]
-    if getattr(cluster, "history_error", None) is not None:
+    if not compact and getattr(cluster, "history_error", None) is not None:
         lines.append(f"  history unavailable: {cluster.history_error}")  # type: ignore[attr-defined]
     headers, row_fn, empty_text = _TABLES[command]
+    if compact:
+        headers, row_fn = _COMPACT_TABLES[command]
     rows = row_fn(cluster)
     if not rows:
         lines.append(f"  {empty_text}")
@@ -161,5 +185,5 @@ def _format_section(command: str, cluster: ClusterResult, now: datetime) -> str:
     return "\n".join(lines)
 
 
-def format_table(command: str, clusters: Sequence[ClusterResult], now: datetime) -> str:
-    return "\n\n".join(_format_section(command, c, now) for c in clusters) + "\n"
+def format_table(command: str, clusters: Sequence[ClusterResult], now: datetime, compact: bool = False) -> str:
+    return "\n\n".join(_format_section(command, c, now, compact=compact) for c in clusters) + "\n"

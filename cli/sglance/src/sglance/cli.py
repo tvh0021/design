@@ -82,6 +82,12 @@ def _add_options(p: argparse.ArgumentParser, command: str | None = None) -> None
             help="List all jobs charged to the named Slurm account.",
         )
     p.add_argument(
+        "--compact",
+        action="store_true",
+        default=False if command is None else sup,
+        help="Print a narrow table: fewer columns, one line per row. Ignored with --json.",
+    )
+    p.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
@@ -194,7 +200,7 @@ def main(
     out.write(
         format_json(command, clusters, extra)
         if parsed.json_output
-        else format_table(command, clusters, now)
+        else format_table(command, clusters, now, compact=parsed.compact)
     )
     return 0
 
