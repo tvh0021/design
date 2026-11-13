@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from datetime import UTC, datetime
 import re
 
-from sglance.mine import MINE_SQUEUE_FIELDS, MineParseError, parse_squeue_mine
+from sglance.config import validate_safe_token
+from sglance.mine import MINE_SQUEUE_FIELDS, parse_squeue_mine
 from sglance.models import (
     ClusterEntry,
     ClusterMine,
@@ -23,375 +24,130 @@ from sglance.runner import (
     format_ssh_exit_255,
     format_transport_error,
 )
-from sglance.wait import (
-    SACCT_WAIT_FORMAT,
-    SQUEUE_WAIT_FIELDS,
-    WaitParseError,
-    parse_wait_partitions,
-)
+from sglance.wait import SACCT_WAIT_FORMAT, SQUEUE_WAIT_FIELDS, parse_wait_partitions
 
 _SINFO_FIELDS = "PartitionName:0|,NodeHost:0|,StateLong:0|,CPUsState:0|,Gres:0|,GresUsed:0|"
 _SQUEUE_QUEUE_FIELDS = "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|"
-_JOB_SCOPING_PRIVATE_DATA_FLAGS = frozenset({"jobs", "all"})
 
 
-def is_user_scoped(
-    private_data: Collection[str], distinct_users: Collection[str]
-) -> bool:
-    nonempty_users = {user for user in distinct_users if user}
-    has_job_flag = any(
-        tok.strip().lower() in _JOB_SCOPING_PRIVATE_DATA_FLAGS for tok in private_data
-    )
-    return has_job_flag or len(nonempty_users) == 1
+class SlurmError(Exception):
+    """Raised when a Slurm command fails or returns malformed output."""
 
 
-def _parse_scontrol_private_data(stdout: str) -> frozenset[str]:
-    flags: frozenset[str] = frozenset()
-    for raw_line in stdout.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("CLUSTER: "):
-            continue
-        key, sep, value = stripped.partition("=")
-        if sep != "=" or key.strip().lower() != "privatedata":
-            continue
-        tokens = {tok.strip().lower() for tok in value.split(",") if tok.strip()}
-        flags = frozenset(tokens - {"none", "(null)"})
-    return flags
+_SlurmParseError = SlurmError
 
 
-class _SlurmParseError(Exception):
-    """Raised when Slurm command output cannot be parsed."""
+def _stamp(now: datetime) -> str:
+    return now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _format_command_failure(tool: str, result: CommandResult) -> str:
-    last_stderr = next(
-        (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-        "",
-    )
-    if last_stderr:
-        last_stderr = last_stderr.removeprefix(f"{tool}: ")
-    if last_stderr:
-        return f"{tool} exited {result.returncode}: {last_stderr}"
-    return f"{tool} exited {result.returncode}"
+    last = next((s for line in reversed(result.stderr.splitlines()) if (s := line.strip())), "")
+    last = last.removeprefix(f"{tool}: ")
+    return f"{tool} exited {result.returncode}: {last}" if last else f"{tool} exited {result.returncode}"
 
 
 def _is_unsupported_me_stderr(stderr: str) -> bool:
     lowered = stderr.lower()
     return bool(re.search(r"--\s*me\b", lowered)) and any(
         phrase in lowered
-        for phrase in (
-            "unrecognized option",
-            "unknown option",
-            "invalid option",
-            "illegal option",
-        )
+        for phrase in ("unrecognized option", "unknown option", "invalid option", "illegal option")
     )
 
 
 class SlurmAdapter:
     def __init__(self, runner: CommandRunner) -> None:
-        self._runner = runner if isinstance(runner, AllowlistedRunner) else AllowlistedRunner(runner)
+        self._runner = AllowlistedRunner(runner)
 
-    def _execute(
-        self, cluster_entry: ClusterEntry, argv: Sequence[str]
-    ) -> CommandResult | str:
+    def _run(self, entry: ClusterEntry, tool: str, *args: str) -> str:
+        flag = ("-M", entry.slurm_cluster) if entry.slurm_cluster is not None else ()
+        argv = ["env", "SLURM_TIME_FORMAT=%s", tool, *flag, *args]
         try:
-            result = self._runner.run(cluster_entry, argv)
+            result = self._runner.run(entry, argv)
         except (TransportError, OSError) as exc:
-            return format_transport_error(exc)
-        if not cluster_entry.local and result.returncode == 255:
-            return format_ssh_exit_255(result.stderr)
-        return result
+            raise SlurmError(format_transport_error(exc)) from exc
+        if not entry.local and result.returncode == 255:
+            raise SlurmError(format_ssh_exit_255(result.stderr))
+        if result.returncode != 0:
+            if "--me" in args and _is_unsupported_me_stderr(result.stderr):
+                raise SlurmError("squeue does not support --me (needs Slurm 20.11 or newer)")
+            raise SlurmError(_format_command_failure(tool, result))
+        return result.stdout
 
-    def _run_command(
-        self, cluster_entry: ClusterEntry, argv: Sequence[str]
-    ) -> CommandResult | str:
-        outcome = self._execute(cluster_entry, argv)
-        if isinstance(outcome, str) or outcome.returncode == 0:
-            return outcome
-        return _format_command_failure(argv[2], outcome)
-
-    def query_private_data(self, cluster_entry: ClusterEntry) -> frozenset[str]:
-        cluster_flag = (
-            ["-M", cluster_entry.slurm_cluster]
-            if cluster_entry.slurm_cluster is not None
-            else []
-        )
-        argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "scontrol",
-            *cluster_flag,
-            "show",
-            "config",
-        ]
-        outcome = self._run_command(cluster_entry, argv)
-        if isinstance(outcome, str):
-            return frozenset()
-        return _parse_scontrol_private_data(outcome.stdout)
-
-    def detect_user_scoped(
-        self,
-        entry: ClusterEntry,
-        distinct_users: Collection[str],
-    ) -> bool:
-        nonempty_users = {user for user in distinct_users if user}
-        if len(nonempty_users) == 1:
+    def _user_scoped(self, entry: ClusterEntry, users: Collection[str]) -> bool:
+        if len(users) == 1:
             return True
-        return is_user_scoped(self.query_private_data(entry), nonempty_users)
-
-    def query_status(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
-        cluster_flag = (
-            ["-M", cluster_entry.slurm_cluster]
-            if cluster_entry.slurm_cluster is not None
-            else []
-        )
-        argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "sinfo",
-            *cluster_flag,
-            "-h",
-            "-N",
-            "-O",
-            _SINFO_FIELDS,
-        ]
-        outcome = self._run_command(cluster_entry, argv)
-        if isinstance(outcome, str):
-            return ClusterStatus(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=outcome,
-                partitions=(),
-            )
         try:
-            partitions = _parse_sinfo_status(outcome.stdout)
-        except _SlurmParseError as exc:
-            return ClusterStatus(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=str(exc),
-                partitions=(),
-            )
-        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            stdout = self._run(entry, "scontrol", "show", "config")
+        except SlurmError:
+            return False
+        scoped = False
+        for line in stdout.splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key.strip().lower() == "privatedata":
+                scoped = bool({t.strip().lower() for t in value.split(",")} & {"jobs", "all"})
+        return scoped
+
+    def query_status(self, entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
+        stdout = self._run(entry, "sinfo", "-h", "-N", "-O", _SINFO_FIELDS)
         return ClusterStatus(
-            cluster=cluster_entry.name,
-            fetched_at=fetched_at,
-            stale=False,
-            user_scoped=False,
-            error=None,
-            partitions=partitions,
+            cluster=entry.name,
+            fetched_at=_stamp(now),
+            partitions=_parse_sinfo_status(stdout),
         )
 
-    def query_queue(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterQueue:
-        cluster_flag = (
-            ["-M", cluster_entry.slurm_cluster]
-            if cluster_entry.slurm_cluster is not None
-            else []
-        )
-        argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            *cluster_flag,
-            "-h",
-            "-r",
-            "-O",
-            _SQUEUE_QUEUE_FIELDS,
-        ]
-        outcome = self._run_command(cluster_entry, argv)
-        if isinstance(outcome, str):
-            return ClusterQueue(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=outcome,
-                partitions=(),
-            )
-        try:
-            partitions, distinct_users = _parse_squeue_queue(outcome.stdout)
-        except _SlurmParseError as exc:
-            return ClusterQueue(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=str(exc),
-                partitions=(),
-            )
-        user_scoped = self.detect_user_scoped(cluster_entry, distinct_users)
-        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    def query_queue(self, entry: ClusterEntry, *, now: datetime) -> ClusterQueue:
+        stdout = self._run(entry, "squeue", "-h", "-r", "-O", _SQUEUE_QUEUE_FIELDS)
+        partitions, users = _parse_squeue_queue(stdout)
         return ClusterQueue(
-            cluster=cluster_entry.name,
-            fetched_at=fetched_at,
-            stale=False,
-            user_scoped=user_scoped,
-            error=None,
+            cluster=entry.name,
+            fetched_at=_stamp(now),
+            user_scoped=self._user_scoped(entry, users),
             partitions=partitions,
         )
 
     def query_mine(
-        self,
-        cluster_entry: ClusterEntry,
-        *,
-        now: datetime,
-        account: str | None = None,
+        self, entry: ClusterEntry, *, now: datetime, account: str | None = None
     ) -> ClusterMine:
-        cluster_flag = (
-            ["-M", cluster_entry.slurm_cluster]
-            if cluster_entry.slurm_cluster is not None
-            else []
-        )
         if account is not None:
-            from sglance.config import validate_safe_token
-
             validate_safe_token(account, field_name="--account")
-        scope_flags = ["-A", account] if account is not None else ["--me"]
-        argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            *cluster_flag,
-            "-h",
-            *scope_flags,
-            "-O",
-            MINE_SQUEUE_FIELDS,
-        ]
-        outcome = self._execute(cluster_entry, argv)
-        if isinstance(outcome, str) or outcome.returncode != 0:
-            if isinstance(outcome, str):
-                error = outcome
-            elif account is None and _is_unsupported_me_stderr(outcome.stderr):
-                error = "squeue does not support --me (needs Slurm 20.11 or newer)"
-            else:
-                error = _format_command_failure("squeue", outcome)
-            return ClusterMine(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=error,
-                slurm_user=None,
-                account_filter=account,
-                jobs=(),
-            )
-        try:
-            jobs, distinct_users, first_user = parse_squeue_mine(outcome.stdout, now=now)
-        except MineParseError as exc:
-            return ClusterMine(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=str(exc),
-                slurm_user=None,
-                account_filter=account,
-                jobs=(),
-            )
-        user_scoped = (
-            False
-            if account is None
-            else self.detect_user_scoped(cluster_entry, distinct_users)
-        )
-        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        scope = ("-A", account) if account is not None else ("--me",)
+        stdout = self._run(entry, "squeue", "-h", *scope, "-O", MINE_SQUEUE_FIELDS)
+        jobs, users, first_user = parse_squeue_mine(stdout, now=now)
         return ClusterMine(
-            cluster=cluster_entry.name,
-            fetched_at=fetched_at,
-            stale=False,
-            user_scoped=user_scoped,
-            error=None,
+            cluster=entry.name,
+            fetched_at=_stamp(now),
+            user_scoped=False if account is None else self._user_scoped(entry, users),
             slurm_user=first_user if account is None else None,
             account_filter=account,
             jobs=jobs,
         )
 
-    def query_wait(
-        self, cluster_entry: ClusterEntry, *, days: int, now: datetime
-    ) -> ClusterWait:
-        cluster_flag = (
-            ["-M", cluster_entry.slurm_cluster]
-            if cluster_entry.slurm_cluster is not None
-            else []
-        )
-        sacct_argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "sacct",
-            *cluster_flag,
-            "-X",
-            "-P",
-            "-n",
-            "-a",
-            "-S",
-            f"now-{days}days",
-            "-E",
-            "now",
-            "--state=CD,F,TO,CA,OOM,NF,PR,R",
-            f"--format={SACCT_WAIT_FORMAT}",
-        ]
-        sacct_outcome = self._run_command(cluster_entry, sacct_argv)
-        if isinstance(sacct_outcome, str):
-            history_error: str | None = sacct_outcome
-            sacct_stdout = ""
-        else:
-            history_error = None
-            sacct_stdout = sacct_outcome.stdout
-
-        squeue_argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "squeue",
-            *cluster_flag,
-            "-h",
-            "-r",
-            "-t",
-            "PD",
-            "-O",
-            SQUEUE_WAIT_FIELDS,
-        ]
-        squeue_outcome = self._run_command(cluster_entry, squeue_argv)
-        if isinstance(squeue_outcome, str):
-            return ClusterWait(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=squeue_outcome,
-                history_error=None,
-                partitions=(),
-            )
-
+    def query_wait(self, entry: ClusterEntry, *, days: int, now: datetime) -> ClusterWait:
         try:
-            partitions, distinct_users = parse_wait_partitions(
-                sacct_stdout,
-                squeue_outcome.stdout,
-                days=days,
-                now=now,
+            sacct_stdout = self._run(
+                entry,
+                "sacct",
+                "-X",
+                "-P",
+                "-n",
+                "-a",
+                "-S",
+                f"now-{days}days",
+                "-E",
+                "now",
+                "--state=CD,F,TO,CA,OOM,NF,PR,R",
+                f"--format={SACCT_WAIT_FORMAT}",
             )
-        except WaitParseError as exc:
-            return ClusterWait(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=str(exc),
-                history_error=None,
-                partitions=(),
-            )
-
-        user_scoped = self.detect_user_scoped(cluster_entry, distinct_users)
-        fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            history_error = None
+        except SlurmError as exc:
+            sacct_stdout, history_error = "", str(exc)
+        squeue_stdout = self._run(entry, "squeue", "-h", "-r", "-t", "PD", "-O", SQUEUE_WAIT_FIELDS)
+        partitions, users = parse_wait_partitions(sacct_stdout, squeue_stdout, days=days, now=now)
         return ClusterWait(
-            cluster=cluster_entry.name,
-            fetched_at=fetched_at,
-            stale=False,
-            user_scoped=user_scoped,
-            error=None,
+            cluster=entry.name,
+            fetched_at=_stamp(now),
+            user_scoped=self._user_scoped(entry, users),
             history_error=history_error,
             partitions=partitions,
         )
