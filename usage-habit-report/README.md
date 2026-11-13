@@ -971,12 +971,12 @@ usage-habit-report publish [--no-push] [--out DIR] [--no-scan]
 ```
 
 `publish` runs the same catch-up as `query`: scan, enrich, headline refresh,
-and pricing. `--no-scan` exports the existing store. It writes all 16 pages
+and pricing. `--no-scan` exports the existing store. It writes all 17 pages
 into a temporary sibling directory and checks every file for private store
 values, both raw and HTML-escaped. The guard checks paths, session and T3
 thread ids, titles of at least 12 characters, and the home directory. A guard
-failure leaves the previous export untouched and runs no git commands.
-After the guard passes, the new pages replace the destination, including stale files.
+failure leaves the previous export untouched, creates no commit, and pushes
+nothing.
 
 Set the destination in `~/.config/usage-habit-report/config.toml`:
 
@@ -989,42 +989,56 @@ push = true
 Paths use the same quoted scalar syntax as `[sources]`, including `~/`
 expansion. `push` accepts `true` or `false` and defaults to `true`.
 `--out` overrides `dir`; without either destination, `publish` fails.
+The destination must be a directory below the repository root. `publish`
+refuses a path inside `.git`, a path through an existing file or symlink, and,
+when pushing, a path that `origin/main` tracks as a file or submodule.
 
 When `dir` is configured, `serve` publishes before binding its port.
 `serve --no-publish` skips this step. Without a publish destination, `serve`
 behaves as before. Publish errors print a warning on stderr and the dashboard
 still starts. The server opens the store read-only after the startup step.
 
-Inside a git repository, `publish` stages only the destination and commits
-changes with `Refresh the public usage snapshot`. It refuses to commit if
-there are already staged changes. Repeating an unchanged export makes no
-commit; changes in generation time and page-load timing alone do not count. Outside a repository,
-it only writes the files.
+Outside a git repository, the new pages replace the destination, including
+stale files, and nothing else happens.
 
-Before pushing, it checks every commit in `@{u}..HEAD`. Each must be a
-snapshot commit: the snapshot commit message, one parent, and no changed,
-added, deleted, or renamed path outside the destination directory. A commit
-amended or reworded to carry other files fails the check, and so does a commit
-whose change a later commit reverts. If other commits exist, it keeps the
-snapshot commit locally and reports their count. `--no-push` or `push = false`
-always disables pushing. Git failures, including a missing upstream or a
-network error, fail the standalone command.
+Inside a repository with `--no-push` or `push = false`, the new pages replace
+the destination, and `publish` stages only that directory and commits it on the
+current branch with `Refresh the public usage snapshot`. It refuses to run if
+the index already has staged changes, and then leaves the destination as it
+was. Repeating an unchanged export makes no commit; changes in generation time
+and page-load timing alone do not count. With pushing enabled but no remote
+configured, it does the same local commit.
 
-GitHub Pages deploys only the remote's default branch (`origin/HEAD`, here
-`main`). After pushing a project branch such as `usage-habit-report`, `publish`
-fetches the default branch and pushes `HEAD` to it as a fast-forward when every
-commit it lacks passes the same snapshot check. It never force-pushes. If the
-default branch has commits the project branch lacks, the default branch stays
-where it is. If the project branch holds other commits, the summary asks you to
-merge the project branch into the default branch; until then the public pages
-keep the last deployed snapshot. If `origin/HEAD` is not set, `publish` does
-not guess the default branch and says to run `git remote set-head origin
---auto`. On the default branch itself, the ordinary push is the deploy.
+With pushing enabled, `publish` deploys to the remote's default branch, which
+is what GitHub Pages serves. It picks `origin`, or the only remote when there
+is one, and reads the default branch from `origin/HEAD` (here `main`). If
+`origin/HEAD` is not set, it fails before writing anything and says to run
+`git remote set-head origin --auto`. It fetches `main`, writes the snapshot
+into a temporary tree, and builds a commit whose parent is the fetched tip of
+`origin/main` and whose only change is the destination directory. Timing
+retention compares against the pages on `origin/main`. `publish` pushes the
+commit to `origin/main` as a fast-forward and never force-pushes. If someone
+else pushed to `main` in the meantime, it fetches again and rebuilds on the new
+tip, up to two times. The checked-out branch does not matter: unpushed commits,
+project-branch commits awaiting review, and staged changes stay out of the
+snapshot commit. `HEAD`, the index, and the working tree's destination stay as
+they are.
 
-The summary reports the file count, commit result, push result or reason, and
-on a project branch the default branch result (`main fast-forwarded`, `main up
-to date`, `main not updated` with the reason, or `default branch not
-checked`).
+The one exception is a checkout of `main` that tracks `origin/main` and sat at
+its old tip. `publish` then runs `git merge --ff-only` so the local branch and
+the destination directory match the deploy. If local edits block the merge, the
+pushed commit stays on `origin/main` and the summary says the local branch was
+not fast-forwarded. Git failures, including a network error or a rejected push,
+fail the standalone command.
+
+The summary reports the file count, the commit result, and where it went:
+
+- `committed; pushed to origin/main`, with `; local main fast-forwarded` or
+  `; local main not fast-forwarded (git merge failed)` on a `main` checkout
+- `no commit; origin/main up to date`
+- `committed; not pushed (disabled)` or `no commit; not pushed (disabled)`
+- `committed; not pushed (no remote)` or `no commit; not pushed (no remote)`
+- `no commit; not pushed (not a git repository)`
 
 GitHub Pages copies `usage-habit-report/site/` to `/usage/`; the flight visualizer is at `/map/`.
 The deploy workflow uses committed HTML and does not build Rust. The checked-in
