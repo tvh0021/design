@@ -329,19 +329,18 @@ class SlurmAdapter:
             "-a",
             "-S",
             f"now-{days}days",
+            "-E",
+            "now",
             "--state=CD,F,TO,CA,OOM,NF,PR,R",
             f"--format={SACCT_WAIT_FORMAT}",
         ]
         sacct_outcome = self._run_command(cluster_entry, sacct_argv)
         if isinstance(sacct_outcome, str):
-            return ClusterWait(
-                cluster=cluster_entry.name,
-                fetched_at=None,
-                stale=False,
-                user_scoped=False,
-                error=sacct_outcome,
-                partitions=(),
-            )
+            history_error: str | None = sacct_outcome
+            sacct_stdout = ""
+        else:
+            history_error = None
+            sacct_stdout = sacct_outcome.stdout
 
         squeue_argv = [
             "env",
@@ -363,12 +362,13 @@ class SlurmAdapter:
                 stale=False,
                 user_scoped=False,
                 error=squeue_outcome,
+                history_error=None,
                 partitions=(),
             )
 
         try:
             partitions, distinct_users = parse_wait_partitions(
-                sacct_outcome.stdout,
+                sacct_stdout,
                 squeue_outcome.stdout,
                 days=days,
                 now=now,
@@ -380,6 +380,7 @@ class SlurmAdapter:
                 stale=False,
                 user_scoped=False,
                 error=str(exc),
+                history_error=None,
                 partitions=(),
             )
 
@@ -391,6 +392,7 @@ class SlurmAdapter:
             stale=False,
             user_scoped=user_scoped,
             error=None,
+            history_error=history_error,
             partitions=partitions,
         )
 
