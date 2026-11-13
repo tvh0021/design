@@ -87,6 +87,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         default=False,
         help=refresh_help,
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=False,
+        help=json_help,
+    )
     subparsers = parser.add_subparsers(dest="subcommand", required=True, parser_class=_CliParser)
 
     status_summary = "Show partition CPU, GPU, and node utilization."
@@ -109,7 +116,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help=refresh_help,
     )
-    status_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=argparse.SUPPRESS,
+        help=json_help,
+    )
 
     queue_summary = "Show running/pending job counts and top pending reasons."
     queue_parser = subparsers.add_parser(
@@ -131,7 +144,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help=refresh_help,
     )
-    queue_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
+    queue_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=argparse.SUPPRESS,
+        help=json_help,
+    )
 
     def _parse_days(raw: str) -> int:
         has_digits = (
@@ -173,7 +192,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         metavar="N",
         help="Lookback window in days (integer >= 1, default: 7).",
     )
-    wait_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
+    wait_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=argparse.SUPPRESS,
+        help=json_help,
+    )
 
     def _account_arg(raw: str) -> str:
         try:
@@ -209,7 +234,13 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         metavar="NAME",
         help="List all jobs charged to the named Slurm account.",
     )
-    mine_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
+    mine_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=argparse.SUPPRESS,
+        help=json_help,
+    )
     return parser
 
 

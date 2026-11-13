@@ -2058,14 +2058,16 @@ class StatusCliTests(unittest.TestCase):
                     "--help",
                     "--cluster",
                     "--refresh",
+                    "--json",
                     "status",
                     "queue",
                     "wait",
                     "mine",
                     "Query only the named configured cluster entry.",
                     "Bypass the 5-minute cache and fetch fresh data.",
+                    "Emit JSON output.",
                 ),
-                ("--json", "--days", "--account"),
+                ("--days", "--account"),
             ),
             (
                 ["status", "--help"],
@@ -2153,6 +2155,222 @@ class StatusCliTests(unittest.TestCase):
                     for flag in unexpected_flags:
                         self.assertNotIn(flag, rendered)
             self.assertEqual(runner.calls, [])
+
+    def test_json_flag_works_before_or_after_subcommand_for_all_subcommands(self) -> None:
+        mine_fields = (
+            "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+            "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+            "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+            "StartTime:0|,Reason:0|,Name:0|"
+        )
+        queue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
+        )
+        wait_squeue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-t",
+            "PD",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
+        )
+        mine_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", mine_fields)
+
+        expected_status = {
+            "schema_version": 1,
+            "command": "status",
+            "clusters": [
+                {
+                    "cluster": "cluster-a",
+                    "fetched_at": "2026-11-12T20:00:00Z",
+                    "stale": False,
+                    "user_scoped": False,
+                    "error": None,
+                    "partitions": [
+                        {
+                            "partition": "cpu",
+                            "default": False,
+                            "cpus_alloc": 64,
+                            "cpus_total": 64,
+                            "cpus_utilization": 1.0,
+                            "gpus_alloc": 0,
+                            "gpus_total": 0,
+                            "gpus_utilization": None,
+                            "nodes_alloc": 1,
+                            "nodes_mixed": 0,
+                            "nodes_idle": 0,
+                            "nodes_down": 0,
+                            "nodes_drained": 0,
+                            "nodes_draining": 0,
+                            "nodes_other": 0,
+                            "nodes_total": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        expected_queue = {
+            "schema_version": 1,
+            "command": "queue",
+            "clusters": [
+                {
+                    "cluster": "cluster-a",
+                    "fetched_at": "2026-11-12T20:00:00Z",
+                    "stale": False,
+                    "user_scoped": False,
+                    "error": None,
+                    "partitions": [
+                        {
+                            "partition": "cpu",
+                            "running_jobs": 1,
+                            "pending_jobs": 1,
+                            "top_reasons": [{"reason": "Resources", "count": 1}],
+                        }
+                    ],
+                }
+            ],
+        }
+        expected_wait = {
+            "schema_version": 1,
+            "command": "wait",
+            "days": 7,
+            "clusters": [
+                {
+                    "cluster": "cluster-a",
+                    "fetched_at": "2026-11-12T20:00:00Z",
+                    "stale": False,
+                    "user_scoped": False,
+                    "error": None,
+                    "partitions": [
+                        {
+                            "partition": "cpu",
+                            "n": 1,
+                            "p50_seconds": 60.0,
+                            "p90_seconds": 60.0,
+                            "oldest_pending_seconds": None,
+                        }
+                    ],
+                }
+            ],
+        }
+        expected_mine = {
+            "schema_version": 1,
+            "command": "mine",
+            "account": None,
+            "clusters": [
+                {
+                    "cluster": "cluster-a",
+                    "fetched_at": "2026-11-12T20:00:00Z",
+                    "stale": False,
+                    "user_scoped": False,
+                    "error": None,
+                    "slurm_user": "alice",
+                    "account_filter": None,
+                    "jobs": [
+                        {
+                            "job_id": "2001",
+                            "name": "me_job",
+                            "user": "alice",
+                            "account": "proj-1",
+                            "partition": "cpu",
+                            "state": "R",
+                            "cpus": 16,
+                            "gpus": 0,
+                            "nodes": 1,
+                            "elapsed_seconds": 600,
+                            "time_limit_seconds": 3600,
+                            "reason": None,
+                            "estimated_start": None,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n\n'
+                '[[clusters]]\nname = "cluster-b"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sinfo"): "cpu|node01|allocated|64/0/0/64|(null)|(null)|\n",
+                    ("cluster-a", *queue_argv): (
+                        "1001|alice|cpu|R|None|\n"
+                        "1002|bob|cpu|PD|Resources|\n"
+                    ),
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                    ("cluster-a", "sacct"): (
+                        "3001|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
+                        "3002|bob|cpu|CANCELLED|1794501000|None|\n"
+                    ),
+                    ("cluster-a", *wait_squeue_argv): "3003|bob|cpu|PD|JobHeldUser|1794510000|\n",
+                    ("cluster-a", *mine_argv): (
+                        "2001|alice|proj-1|cpu|R|10:00|01:00:00|1|16|1|"
+                        "cpu=16|N/A|N/A|N/A|1794513000|None|me_job|\n"
+                    ),
+                }
+            )
+
+            cases: tuple[tuple[list[str], dict[str, object]], ...] = (
+                (["--json", "--cluster", "cluster-a", "status"], expected_status),
+                (["status", "--cluster", "cluster-a", "--json"], expected_status),
+                (["--json", "status", "--cluster", "cluster-a", "--json"], expected_status),
+                (["--json", "--cluster", "cluster-a", "queue"], expected_queue),
+                (["queue", "--cluster", "cluster-a", "--json"], expected_queue),
+                (["--json", "--cluster", "cluster-a", "wait", "--days", "7"], expected_wait),
+                (["wait", "--days", "7", "--cluster", "cluster-a", "--json"], expected_wait),
+                (["--json", "--cluster", "cluster-a", "mine"], expected_mine),
+                (["mine", "--cluster", "cluster-a", "--json"], expected_mine),
+            )
+            for argv, expected_payload in cases:
+                with self.subTest(argv=argv):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    rc = main(
+                        argv,
+                        env=make_test_env(root),
+                        runner=runner,
+                        clock=lambda: FIXED_NOW,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(stderr.getvalue(), "")
+                    self.assertEqual(json.loads(stdout.getvalue()), expected_payload)
+
+            # Without --json in either position, plain-text table remains the default.
+            plain_out = io.StringIO()
+            plain_err = io.StringIO()
+            plain_rc = main(
+                ["--cluster", "cluster-a", "status"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=plain_out,
+                stderr=plain_err,
+            )
+            self.assertEqual(plain_rc, 0)
+            self.assertEqual(plain_err.getvalue(), "")
+            self.assertEqual(
+                plain_out.getvalue(),
+                "cluster-a\n"
+                "  PARTITION  CPUS          GPUS  NODES  ALLOC  MIXED  IDLE  DOWN  DRAINED  DRAINING  OTHER\n"
+                "  cpu        64/64 (100%)  -     1      1      0      0     0     0        0         0\n",
+            )
 
 
 if __name__ == "__main__":
