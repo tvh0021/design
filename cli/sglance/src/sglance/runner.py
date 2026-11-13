@@ -12,17 +12,8 @@ if TYPE_CHECKING:
 _ALLOWED_BINARIES = frozenset({"sinfo", "squeue", "sacct", "scontrol"})
 CLUSTER_TIMEOUT_SECONDS = 25.0
 _SSH_BASE_ARGS = (
-    "ssh",
-    "-T",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=5",
-    "-o",
-    "RemoteCommand=none",
-    "-o",
-    "LogLevel=ERROR",
-    "--",
+    "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+    "-o", "RemoteCommand=none", "-o", "LogLevel=ERROR", "--",
 )
 
 
@@ -34,27 +25,19 @@ class TransportError(Exception):
     """Raised when reaching or executing on a cluster fails at the transport layer."""
 
 
+def last_line(text: str, default: str = "") -> str:
+    return next((s for line in reversed(text.splitlines()) if (s := line.strip())), default)
+
+
 def format_transport_error(exc: BaseException) -> str:
     msg = str(exc).strip()
     if not msg:
         return "unreachable"
-    if msg.startswith("unreachable"):
-        return msg
-    return f"unreachable ({msg})"
+    return msg if msg.startswith("unreachable") else f"unreachable ({msg})"
 
 
 def format_ssh_exit_255(stderr: str) -> str:
-    last_line = next(
-        (line.strip() for line in reversed(stderr.splitlines()) if line.strip()),
-        "exit 255",
-    )
-    if last_line.startswith("ssh: "):
-        last_line = last_line[len("ssh: ") :]
-    return f"unreachable (ssh: {last_line})"
-
-
-def _format_timeout_seconds(seconds: float) -> str:
-    return str(int(seconds)) if float(seconds).is_integer() else str(seconds)
+    return f"unreachable (ssh: {last_line(stderr, 'exit 255').removeprefix('ssh: ')})"
 
 
 @dataclass(frozen=True)
@@ -98,83 +81,31 @@ class AllowlistedRunner:
         return self._inner.run(cluster_entry, argv)
 
 
-class SshRunner:
-    """Executes allowlisted Slurm commands on a remote cluster entry over OpenSSH."""
-
-    def __init__(self, *, timeout_seconds: float = CLUSTER_TIMEOUT_SECONDS) -> None:
-        self._timeout_seconds = timeout_seconds
-
-    def run(self, cluster_entry: ClusterEntry, argv: Sequence[str]) -> CommandResult:
-        if not cluster_entry.ssh or cluster_entry.ssh.startswith("-"):
-            raise TransportError("unreachable (invalid ssh destination)")
-        remote_command = shlex.join(argv)
-        ssh_argv = [*_SSH_BASE_ARGS, cluster_entry.ssh, remote_command]
-        try:
-            proc = subprocess.run(
-                ssh_argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self._timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            label = _format_timeout_seconds(self._timeout_seconds)
-            raise TransportError(f"unreachable (timed out after {label}s)") from exc
-        except OSError as exc:
-            raise TransportError(
-                f"unreachable (could not run ssh: {exc.strerror or exc})"
-            ) from exc
-
-        if proc.returncode == 255:
-            raise TransportError(format_ssh_exit_255(proc.stderr))
-        if proc.returncode < 0:
-            raise TransportError(f"unreachable (ssh killed by signal {-proc.returncode})")
-        return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
-
-
-class LocalRunner:
-    """Executes allowlisted Slurm commands directly on a local login node."""
-
-    def __init__(self, *, timeout_seconds: float = CLUSTER_TIMEOUT_SECONDS) -> None:
-        self._timeout_seconds = timeout_seconds
-
-    def run(self, cluster_entry: ClusterEntry, argv: Sequence[str]) -> CommandResult:
-        try:
-            proc = subprocess.run(
-                list(argv),
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self._timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            label = _format_timeout_seconds(self._timeout_seconds)
-            raise TransportError(f"unreachable (timed out after {label}s)") from exc
-        except OSError as exc:
-            raise TransportError(
-                f"unreachable (could not run command: {exc.strerror or exc})"
-            ) from exc
-
-        if proc.returncode < 0:
-            raise TransportError(f"unreachable (command killed by signal {-proc.returncode})")
-        return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
-
-
 class TransportDispatcher:
-    """Dispatches cluster entries to LocalRunner (local=True) or SshRunner (local=False)."""
-
-    def __init__(self, *, timeout_seconds: float = CLUSTER_TIMEOUT_SECONDS) -> None:
-        self._ssh = SshRunner(timeout_seconds=timeout_seconds)
-        self._local = LocalRunner(timeout_seconds=timeout_seconds)
+    """Executes allowlisted Slurm commands locally or over OpenSSH."""
 
     def run(self, cluster_entry: ClusterEntry, argv: Sequence[str]) -> CommandResult:
         if cluster_entry.local:
-            return self._local.run(cluster_entry, argv)
-        return self._ssh.run(cluster_entry, argv)
-
+            cmd, kind = list(argv), "command"
+        else:
+            if not cluster_entry.ssh or cluster_entry.ssh.startswith("-"):
+                raise TransportError("unreachable (invalid ssh destination)")
+            cmd, kind = [*_SSH_BASE_ARGS, cluster_entry.ssh, shlex.join(argv)], "ssh"
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=CLUSTER_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TransportError("unreachable (timed out after 25s)") from exc
+        except OSError as exc:
+            raise TransportError(f"unreachable (could not run {kind}: {exc.strerror or exc})") from exc
+        if proc.returncode < 0:
+            raise TransportError(f"unreachable ({kind} killed by signal {-proc.returncode})")
+        return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)

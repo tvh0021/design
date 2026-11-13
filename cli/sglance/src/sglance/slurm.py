@@ -26,6 +26,7 @@ from sglance.runner import (
     TransportError,
     format_ssh_exit_255,
     format_transport_error,
+    last_line,
 )
 from sglance.wait import SACCT_WAIT_FORMAT, SQUEUE_WAIT_FIELDS, parse_wait_partitions
 
@@ -56,9 +57,8 @@ def _stamp(now: datetime) -> str:
 
 
 def _format_command_failure(tool: str, result: CommandResult) -> str:
-    last = next((s for line in reversed(result.stderr.splitlines()) if (s := line.strip())), "")
-    last = last.removeprefix(f"{tool}: ")
-    return f"{tool} exited {result.returncode}: {last}" if last else f"{tool} exited {result.returncode}"
+    detail = last_line(result.stderr).removeprefix(f"{tool}: ")
+    return f"{tool} exited {result.returncode}: {detail}" if detail else f"{tool} exited {result.returncode}"
 
 
 def _is_unsupported_me_stderr(stderr: str) -> bool:
