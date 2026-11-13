@@ -22,13 +22,13 @@
 Install in an isolated environment with `pipx`:
 
 ```sh
-pipx install "git+https://github.com/OWNER/design#subdirectory=cli/sglance"
+pipx install "git+https://github.com/tvh0021/design#subdirectory=cli/sglance"
 ```
 
 Or install with `pip`, for example inside a virtual environment:
 
 ```sh
-python3 -m pip install "git+https://github.com/OWNER/design#subdirectory=cli/sglance"
+python3 -m pip install "git+https://github.com/tvh0021/design#subdirectory=cli/sglance"
 ```
 
 ## Configure
@@ -192,7 +192,7 @@ On an always-on Linux box such as a Raspberry Pi where interactive users or loca
 
 ```sh
 sudo apt update && sudo apt install -y pipx openssh-client
-pipx install "git+https://github.com/OWNER/design#subdirectory=cli/sglance"
+pipx install "git+https://github.com/tvh0021/design#subdirectory=cli/sglance"
 ```
 
 2. Symlink the binary into `/usr/local/bin/sglance` so processes that do not add `~/.local/bin` to `PATH` can run it directly:
