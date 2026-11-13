@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 import os
+import re
 import sys
 from typing import NoReturn, TextIO
 
@@ -23,11 +24,70 @@ from sglance.models import (
 from sglance.runner import AllowlistError, CommandRunner, TransportDispatcher
 from sglance.slurm import SlurmAdapter
 
+_COMMAND_SUMMARIES = {
+    "status": "Show partition CPU, GPU, and node utilization.",
+    "queue": "Show running/pending job counts and top pending reasons.",
+    "wait": "Show wait-time percentiles and oldest pending job age.",
+    "mine": "Show your jobs or an account's jobs and start estimates.",
+}
+
 
 class _ParserExit(Exception):
     def __init__(self, status: int) -> None:
         super().__init__(status)
         self.status = status
+
+
+def _parse_days(raw: str) -> int:
+    if not re.fullmatch(r"[+-]?[0-9]+", raw) or int(raw) < 1:
+        raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
+    return int(raw)
+
+
+def _account_arg(raw: str) -> str:
+    try:
+        return validate_safe_token(raw, field_name="--account")
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _add_options(p: argparse.ArgumentParser, command: str | None = None) -> None:
+    sup = argparse.SUPPRESS
+    p.add_argument(
+        "--cluster",
+        default=None if command is None else sup,
+        metavar="NAME",
+        help="Query only the named configured cluster entry.",
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False if command is None else sup,
+        help="Bypass the 5-minute cache and fetch fresh data.",
+    )
+    if command == "wait":
+        p.add_argument(
+            "--days",
+            type=_parse_days,
+            default=7,
+            metavar="N",
+            help="Lookback window in days (integer >= 1, default: 7).",
+        )
+    if command == "mine":
+        p.add_argument(
+            "--account",
+            type=_account_arg,
+            default=None,
+            metavar="NAME",
+            help="List all jobs charged to the named Slurm account.",
+        )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=False if command is None else sup,
+        help="Emit JSON output.",
+    )
 
 
 def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
@@ -37,192 +97,22 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
             self.color = False
 
         def _print_message(self, message: str, file: TextIO | None = None) -> None:
-            if not message:
-                return
-            target = stdout if file is sys.stdout else stderr
-            target.write(message)
+            if message:
+                (stdout if file is sys.stdout else stderr).write(message)
 
         def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
             if message:
                 self._print_message(message, sys.stderr)
             raise _ParserExit(status)
 
-    cluster_help = "Query only the named configured cluster entry."
-    refresh_help = "Bypass the 5-minute cache and fetch fresh data."
-    json_help = "Emit JSON output."
-
     parser = _CliParser(
         prog="sglance",
         description="Read-only inspection of Slurm cluster capacity, queues, wait times, and jobs.",
     )
-    parser.add_argument(
-        "--cluster",
-        dest="cluster",
-        default=None,
-        metavar="NAME",
-        help=cluster_help,
-    )
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        dest="refresh",
-        default=False,
-        help=refresh_help,
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        default=False,
-        help=json_help,
-    )
+    _add_options(parser)
     subparsers = parser.add_subparsers(dest="subcommand", required=True, parser_class=_CliParser)
-
-    status_summary = "Show partition CPU, GPU, and node utilization."
-    status_parser = subparsers.add_parser(
-        "status",
-        help=status_summary,
-        description=status_summary,
-    )
-    status_parser.add_argument(
-        "--cluster",
-        dest="cluster",
-        default=argparse.SUPPRESS,
-        metavar="NAME",
-        help=cluster_help,
-    )
-    status_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        dest="refresh",
-        default=argparse.SUPPRESS,
-        help=refresh_help,
-    )
-    status_parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        default=argparse.SUPPRESS,
-        help=json_help,
-    )
-
-    queue_summary = "Show running/pending job counts and top pending reasons."
-    queue_parser = subparsers.add_parser(
-        "queue",
-        help=queue_summary,
-        description=queue_summary,
-    )
-    queue_parser.add_argument(
-        "--cluster",
-        dest="cluster",
-        default=argparse.SUPPRESS,
-        metavar="NAME",
-        help=cluster_help,
-    )
-    queue_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        dest="refresh",
-        default=argparse.SUPPRESS,
-        help=refresh_help,
-    )
-    queue_parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        default=argparse.SUPPRESS,
-        help=json_help,
-    )
-
-    def _parse_days(raw: str) -> int:
-        has_digits = (
-            raw[1:].isascii() and raw[1:].isdigit()
-            if raw[:1] in {"+", "-"}
-            else raw.isascii() and raw.isdigit()
-        )
-        if not raw or not has_digits:
-            raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
-        value = int(raw, 10)
-        if value < 1:
-            raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
-        return value
-
-    wait_summary = "Show wait-time percentiles and oldest pending job age."
-    wait_parser = subparsers.add_parser(
-        "wait",
-        help=wait_summary,
-        description=wait_summary,
-    )
-    wait_parser.add_argument(
-        "--cluster",
-        dest="cluster",
-        default=argparse.SUPPRESS,
-        metavar="NAME",
-        help=cluster_help,
-    )
-    wait_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        dest="refresh",
-        default=argparse.SUPPRESS,
-        help=refresh_help,
-    )
-    wait_parser.add_argument(
-        "--days",
-        type=_parse_days,
-        default=7,
-        metavar="N",
-        help="Lookback window in days (integer >= 1, default: 7).",
-    )
-    wait_parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        default=argparse.SUPPRESS,
-        help=json_help,
-    )
-
-    def _account_arg(raw: str) -> str:
-        try:
-            return validate_safe_token(raw, field_name="--account")
-        except ConfigError as exc:
-            raise argparse.ArgumentTypeError(str(exc)) from exc
-
-    mine_summary = "Show your jobs or an account's jobs and start estimates."
-    mine_parser = subparsers.add_parser(
-        "mine",
-        help=mine_summary,
-        description=mine_summary,
-    )
-    mine_parser.add_argument(
-        "--cluster",
-        dest="cluster",
-        default=argparse.SUPPRESS,
-        metavar="NAME",
-        help=cluster_help,
-    )
-    mine_parser.add_argument(
-        "--refresh",
-        action="store_true",
-        dest="refresh",
-        default=argparse.SUPPRESS,
-        help=refresh_help,
-    )
-    mine_parser.add_argument(
-        "--account",
-        dest="account",
-        type=_account_arg,
-        default=None,
-        metavar="NAME",
-        help="List all jobs charged to the named Slurm account.",
-    )
-    mine_parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        default=argparse.SUPPRESS,
-        help=json_help,
-    )
+    for name, summary in _COMMAND_SUMMARIES.items():
+        _add_options(subparsers.add_parser(name, help=summary, description=summary), name)
     return parser
 
 
