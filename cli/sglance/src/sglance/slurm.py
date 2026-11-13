@@ -259,13 +259,25 @@ class SlurmAdapter:
             "squeue",
             *cluster_flag,
             "-h",
-            "-r",
             *scope_flags,
             "-O",
             MINE_SQUEUE_FIELDS,
         ]
         outcome = self._run_command(cluster_entry, argv)
         if isinstance(outcome, str):
+            if account is None and outcome.startswith("squeue exited "):
+                _, _, last_stderr = outcome.partition(": ")
+                lowered = last_stderr.lower()
+                if re.search(r"--\s*me\b", lowered) and any(
+                    phrase in lowered
+                    for phrase in (
+                        "unrecognized option",
+                        "unknown option",
+                        "invalid option",
+                        "illegal option",
+                    )
+                ):
+                    outcome = "squeue does not support --me (needs Slurm 20.11 or newer)"
             return ClusterMine(
                 cluster=cluster_entry.name,
                 fetched_at=None,
@@ -277,7 +289,7 @@ class SlurmAdapter:
                 jobs=(),
             )
         try:
-            jobs, distinct_users, first_user = parse_squeue_mine(outcome.stdout)
+            jobs, distinct_users, first_user = parse_squeue_mine(outcome.stdout, now=now)
         except MineParseError as exc:
             return ClusterMine(
                 cluster=cluster_entry.name,
