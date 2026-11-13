@@ -35,36 +35,23 @@ _SQUEUE_QUEUE_FIELDS = "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason
 _JOB_SCOPING_PRIVATE_DATA_FLAGS = frozenset({"jobs", "all"})
 
 
-def scoping_private_data_flags(
-    command: str, *, account_scoped: bool = False
-) -> frozenset[str]:
-    if command in {"queue", "wait"}:
-        return _JOB_SCOPING_PRIVATE_DATA_FLAGS
-    if command == "mine":
-        return _JOB_SCOPING_PRIVATE_DATA_FLAGS if account_scoped else frozenset()
-    if command == "status":
-        return frozenset()
-    raise ValueError(f"unknown sglance command {command!r}")
-
-
 def is_user_scoped(
-    command: str,
-    *,
-    private_data: frozenset[str],
-    distinct_users: Collection[str],
-    account_scoped: bool = False,
+    private_data: Collection[str], distinct_users: Collection[str]
 ) -> bool:
-    flags = scoping_private_data_flags(command, account_scoped=account_scoped)
-    if not flags:
-        return False
     nonempty_users = {user for user in distinct_users if user}
-    return bool(private_data & flags) or len(nonempty_users) == 1
+    has_job_flag = any(
+        tok.strip().lower() in _JOB_SCOPING_PRIVATE_DATA_FLAGS for tok in private_data
+    )
+    return has_job_flag or len(nonempty_users) == 1
 
 
 def _parse_scontrol_private_data(stdout: str) -> frozenset[str]:
     flags: frozenset[str] = frozenset()
     for raw_line in stdout.splitlines():
-        key, sep, value = raw_line.partition("=")
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("CLUSTER: "):
+            continue
+        key, sep, value = stripped.partition("=")
         if sep != "=" or key.strip().lower() != "privatedata":
             continue
         tokens = {tok.strip().lower() for tok in value.split(",") if tok.strip()}
@@ -81,6 +68,8 @@ def _format_command_failure(tool: str, result: CommandResult) -> str:
         (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
         "",
     )
+    if last_stderr:
+        last_stderr = last_stderr.removeprefix(f"{tool}: ")
     if last_stderr:
         return f"{tool} exited {result.returncode}: {last_stderr}"
     return f"{tool} exited {result.returncode}"
@@ -143,21 +132,13 @@ class SlurmAdapter:
 
     def detect_user_scoped(
         self,
-        cluster_entry: ClusterEntry,
-        *,
-        command: str,
+        entry: ClusterEntry,
         distinct_users: Collection[str],
-        account_scoped: bool = False,
     ) -> bool:
-        if not scoping_private_data_flags(command, account_scoped=account_scoped):
-            return False
-        private_data = self.query_private_data(cluster_entry)
-        return is_user_scoped(
-            command,
-            private_data=private_data,
-            distinct_users=distinct_users,
-            account_scoped=account_scoped,
-        )
+        nonempty_users = {user for user in distinct_users if user}
+        if len(nonempty_users) == 1:
+            return True
+        return is_user_scoped(self.query_private_data(entry), nonempty_users)
 
     def query_status(self, cluster_entry: ClusterEntry, *, now: datetime) -> ClusterStatus:
         cluster_flag = (
@@ -243,11 +224,7 @@ class SlurmAdapter:
                 error=str(exc),
                 partitions=(),
             )
-        user_scoped = self.detect_user_scoped(
-            cluster_entry,
-            command="queue",
-            distinct_users=distinct_users,
-        )
+        user_scoped = self.detect_user_scoped(cluster_entry, distinct_users)
         fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return ClusterQueue(
             cluster=cluster_entry.name,
@@ -316,11 +293,10 @@ class SlurmAdapter:
                 account_filter=account,
                 jobs=(),
             )
-        user_scoped = self.detect_user_scoped(
-            cluster_entry,
-            command="mine",
-            distinct_users=distinct_users,
-            account_scoped=(account is not None),
+        user_scoped = (
+            False
+            if account is None
+            else self.detect_user_scoped(cluster_entry, distinct_users)
         )
         fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return ClusterMine(
@@ -407,11 +383,7 @@ class SlurmAdapter:
                 partitions=(),
             )
 
-        user_scoped = self.detect_user_scoped(
-            cluster_entry,
-            command="wait",
-            distinct_users=distinct_users,
-        )
+        user_scoped = self.detect_user_scoped(cluster_entry, distinct_users)
         fetched_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return ClusterWait(
             cluster=cluster_entry.name,

@@ -12,7 +12,7 @@ import time
 import unittest
 
 from sglance import CommandResult, TransportError, main
-from tests.fakes import FakeRunner
+from tests.fakes import FakeRunner, make_test_env
 
 BASE_TIME = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
 
@@ -598,7 +598,7 @@ class CacheCliTests(unittest.TestCase):
                 stderr=err3,
             )
             self.assertEqual(rc3, 0)
-            self.assertIn("cluster-b: sinfo exited 1: sinfo: error: controller busy", out3.getvalue())
+            self.assertIn("cluster-b: sinfo exited 1: error: controller busy", out3.getvalue())
 
     def test_cache_falls_back_to_home_dot_cache_and_isolates_cluster_target_changes(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1136,6 +1136,323 @@ class CacheCliTests(unittest.TestCase):
                     0o600,
                     f"expected 0o600 after refresh for {path.name}",
                 )
+
+    def test_single_xdg_cache_home_isolates_subcommands_and_options_and_serves_hits_for_all_four(
+        self,
+    ) -> None:
+        mine_fields = (
+            "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+            "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+            "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+            "StartTime:0|,Reason:0|,Name:0|"
+        )
+        queue_squeue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
+        )
+        mine_me_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", mine_fields)
+        mine_acct_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-A",
+            "proj-123",
+            "-O",
+            mine_fields,
+        )
+        wait_sacct_7d_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "sacct",
+            "-X",
+            "-P",
+            "-n",
+            "-a",
+            "-S",
+            "now-7days",
+            "--state=CD,F,TO,CA,OOM,NF,PR,R",
+            "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
+        )
+        wait_sacct_14d_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "sacct",
+            "-X",
+            "-P",
+            "-n",
+            "-a",
+            "-S",
+            "now-14days",
+            "--state=CD,F,TO,CA,OOM,NF,PR,R",
+            "--format=JobID,User,Partition,State,Eligible,Start,AllocTRES",
+        )
+        wait_squeue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-t",
+            "PD",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
+        )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                encoding="utf-8",
+            )
+            env = make_test_env(root)
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sinfo"): SINFO_INITIAL,
+                    ("cluster-a", *queue_squeue_argv): (
+                        "1001|alice|cpu|R|None|\n"
+                        "1002|bob|cpu|PD|Resources|\n"
+                    ),
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                    ("cluster-a", *mine_me_argv): (
+                        "2001|alice|proj-123|cpu|R|10:00|01:00:00|1|16|1|"
+                        "cpu=16|N/A|N/A|N/A|1794513000|None|me_job|\n"
+                    ),
+                    ("cluster-a", *mine_acct_argv): (
+                        "2001|alice|proj-123|cpu|R|10:00|01:00:00|1|16|1|"
+                        "cpu=16|N/A|N/A|N/A|1794513000|None|me_job|\n"
+                        "2002|bob|proj-123|cpu|PD|0:00|01:00:00|1|8|1|"
+                        "cpu=8|N/A|N/A|N/A|N/A|Priority|acct_job|\n"
+                    ),
+                    ("cluster-a", *wait_sacct_7d_argv): (
+                        "3001|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
+                        "3002|bob|cpu|COMPLETED|1794501000|1794501120|cpu=8\n"
+                    ),
+                    ("cluster-a", *wait_sacct_14d_argv): (
+                        "3001|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n"
+                        "3002|bob|cpu|COMPLETED|1794501000|1794501120|cpu=8\n"
+                        "3003|alice|cpu|COMPLETED|1793600000|1793600300|cpu=8\n"
+                    ),
+                    ("cluster-a", *wait_squeue_argv): "",
+                }
+            )
+
+            def invoke(argv: list[str], offset_seconds: int) -> dict[str, object]:
+                out, err = io.StringIO(), io.StringIO()
+                rc = main(
+                    argv,
+                    env=env,
+                    runner=runner,
+                    clock=lambda: BASE_TIME + timedelta(seconds=offset_seconds),
+                    stdout=out,
+                    stderr=err,
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(err.getvalue(), "")
+                return json.loads(out.getvalue())
+
+            # status then queue do not share an entry; each repeats from cache within 5 minutes.
+            status_1 = invoke(["status", "--json"], 0)
+            self.assertEqual(len(runner.calls), 1)
+            self.assertFalse(status_1["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(status_1["clusters"][0]["partitions"][0]["cpus_alloc"], 64)  # type: ignore[index]
+
+            queue_1 = invoke(["queue", "--json"], 10)
+            self.assertEqual(len(runner.calls), 3)
+            self.assertFalse(queue_1["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(
+                queue_1["clusters"][0]["partitions"][0]["running_jobs"],  # type: ignore[index]
+                1,
+            )
+
+            status_2 = invoke(["status", "--json"], 20)
+            self.assertEqual(len(runner.calls), 3)
+            self.assertTrue(status_2["clusters"][0]["stale"])  # type: ignore[index]
+
+            queue_2 = invoke(["queue", "--json"], 30)
+            self.assertEqual(len(runner.calls), 3)
+            self.assertTrue(queue_2["clusters"][0]["stale"])  # type: ignore[index]
+
+            # mine vs mine --account proj-123 do not share; each repeats from cache within 5 minutes.
+            mine_1 = invoke(["mine", "--json"], 40)
+            self.assertEqual(len(runner.calls), 4)
+            self.assertFalse(mine_1["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(len(mine_1["clusters"][0]["jobs"]), 1)  # type: ignore[index]
+
+            mine_acct_1 = invoke(["mine", "--account", "proj-123", "--json"], 50)
+            self.assertEqual(len(runner.calls), 6)
+            self.assertFalse(mine_acct_1["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(len(mine_acct_1["clusters"][0]["jobs"]), 2)  # type: ignore[index]
+
+            mine_2 = invoke(["mine", "--json"], 60)
+            self.assertEqual(len(runner.calls), 6)
+            self.assertTrue(mine_2["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(len(mine_2["clusters"][0]["jobs"]), 1)  # type: ignore[index]
+
+            mine_acct_2 = invoke(["mine", "--account", "proj-123", "--json"], 70)
+            self.assertEqual(len(runner.calls), 6)
+            self.assertTrue(mine_acct_2["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(len(mine_acct_2["clusters"][0]["jobs"]), 2)  # type: ignore[index]
+
+            # wait --days 7 vs wait --days 14 do not share; each repeats from cache within 5 minutes.
+            wait_7_1 = invoke(["wait", "--days", "7", "--json"], 80)
+            self.assertEqual(len(runner.calls), 9)
+            self.assertFalse(wait_7_1["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(wait_7_1["clusters"][0]["partitions"][0]["n"], 2)  # type: ignore[index]
+            self.assertEqual(wait_7_1["clusters"][0]["partitions"][0]["p50_seconds"], 90.0)  # type: ignore[index]
+
+            wait_14_1 = invoke(["wait", "--days", "14", "--json"], 90)
+            self.assertEqual(len(runner.calls), 12)
+            self.assertFalse(wait_14_1["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(wait_14_1["clusters"][0]["partitions"][0]["n"], 3)  # type: ignore[index]
+            self.assertEqual(wait_14_1["clusters"][0]["partitions"][0]["p50_seconds"], 120.0)  # type: ignore[index]
+
+            wait_7_2 = invoke(["wait", "--days", "7", "--json"], 100)
+            self.assertEqual(len(runner.calls), 12)
+            self.assertTrue(wait_7_2["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(wait_7_2["clusters"][0]["partitions"][0]["n"], 2)  # type: ignore[index]
+
+            wait_14_2 = invoke(["wait", "--days", "14", "--json"], 110)
+            self.assertEqual(len(runner.calls), 12)
+            self.assertTrue(wait_14_2["clusters"][0]["stale"])  # type: ignore[index]
+            self.assertEqual(wait_14_2["clusters"][0]["partitions"][0]["n"], 3)  # type: ignore[index]
+
+    def test_cache_write_prunes_entries_older_than_one_day_and_ignores_foreign_files_and_errors(
+        self,
+    ) -> None:
+        from unittest import mock
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                encoding="utf-8",
+            )
+            env = make_test_env(root)
+            runner = _DynamicFakeRunner(
+                {
+                    ("cluster-a", "sinfo"): SINFO_INITIAL,
+                    ("cluster-a", "squeue"): (
+                        "1001|alice|cpu|R|None|\n"
+                        "1002|bob|cpu|PD|Resources|\n"
+                    ),
+                    ("cluster-a", "scontrol"): "PrivateData = none\n",
+                }
+            )
+
+            # t = 0: write status snapshot.
+            out1, err1 = io.StringIO(), io.StringIO()
+            rc1 = main(
+                ["status", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: BASE_TIME,
+                stdout=out1,
+                stderr=err1,
+            )
+            self.assertEqual(rc1, 0)
+            cache_sglance_dir = Path(env["XDG_CACHE_HOME"]) / "sglance"
+            initial_jsons = [p for p in cache_sglance_dir.iterdir() if p.suffix == ".json"]
+            self.assertEqual(len(initial_jsons), 1)
+            status_json = initial_jsons[0]
+
+            # Add foreign files/dirs inside cache/sglance and parent XDG_CACHE_HOME with 5-day-old mtimes.
+            old_ts = (BASE_TIME - timedelta(days=5)).timestamp()
+            foreign_txt = cache_sglance_dir / "notes.txt"
+            foreign_txt.write_text("user note\n", encoding="utf-8")
+            foreign_json = cache_sglance_dir / "custom.json"
+            foreign_json.write_text('{"custom": 1}\n', encoding="utf-8")
+            foreign_hex_json = cache_sglance_dir / ("a" * 64 + ".json")
+            foreign_hex_json.write_text('{"foreign": true}\n', encoding="utf-8")
+            foreign_subdir = cache_sglance_dir / "subdir"
+            foreign_subdir.mkdir()
+            (foreign_subdir / "nested.json").write_text("{}\n", encoding="utf-8")
+            parent_file = Path(env["XDG_CACHE_HOME"]) / "outside.json"
+            parent_file.write_text("{}\n", encoding="utf-8")
+            for p in (foreign_txt, foreign_json, foreign_hex_json, parent_file):
+                os.utime(p, (old_ts, old_ts))
+
+            # t = +12h (< 1 day): writing queue snapshot keeps 12h-old status snapshot.
+            t_12h = BASE_TIME + timedelta(hours=12)
+            out2, err2 = io.StringIO(), io.StringIO()
+            rc2 = main(
+                ["queue", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: t_12h,
+                stdout=out2,
+                stderr=err2,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertTrue(status_json.exists())
+            sglance_jsons_at_12h = {
+                p
+                for p in cache_sglance_dir.iterdir()
+                if p.suffix == ".json" and p not in {foreign_json, foreign_hex_json}
+            }
+            self.assertEqual(len(sglance_jsons_at_12h), 2)
+            queue_json = next(p for p in sglance_jsons_at_12h if p != status_json)
+
+            # t = +1d + 1s: status_json is > 1 day old (86401s); queue_json is 12h 1s old.
+            t_over_1d = BASE_TIME + timedelta(days=1, seconds=1)
+            mine_fields = (
+                "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+                "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+                "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+                "StartTime:0|,Reason:0|,Name:0|"
+            )
+            mine_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", mine_fields)
+            runner.set_response(
+                ("cluster-a", *mine_argv),
+                "2001|alice|proj-123|cpu|R|10:00|01:00:00|1|16|1|"
+                "cpu=16|N/A|N/A|N/A|1794513000|None|me_job|\n",
+            )
+            out3, err3 = io.StringIO(), io.StringIO()
+            rc3 = main(
+                ["mine", "--json"],
+                env=env,
+                runner=runner,
+                clock=lambda: t_over_1d,
+                stdout=out3,
+                stderr=err3,
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(err3.getvalue(), "")
+            self.assertFalse(status_json.exists())
+            self.assertTrue(queue_json.exists())
+            self.assertTrue(foreign_txt.exists())
+            self.assertTrue(foreign_json.exists())
+            self.assertTrue(foreign_hex_json.exists())
+            self.assertTrue(foreign_subdir.is_dir())
+            self.assertTrue(parent_file.exists())
+
+            # Best-effort: unlink OSError during pruning is ignored and live write still succeeds.
+            t_over_2d = BASE_TIME + timedelta(days=2, seconds=2)
+            with mock.patch("sglance.cache.os.unlink", side_effect=PermissionError("denied")):
+                out4, err4 = io.StringIO(), io.StringIO()
+                rc4 = main(
+                    ["status", "--refresh", "--json"],
+                    env=env,
+                    runner=runner,
+                    clock=lambda: t_over_2d,
+                    stdout=out4,
+                    stderr=err4,
+                )
+            self.assertEqual(rc4, 0)
+            self.assertEqual(err4.getvalue(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 

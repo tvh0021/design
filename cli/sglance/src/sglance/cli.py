@@ -65,61 +65,73 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
                 self._print_message(message, sys.stderr)
             raise _ParserExit(status)
 
+    cluster_help = "Query only the named configured cluster entry."
+    refresh_help = "Bypass the 5-minute cache and fetch fresh data."
+    json_help = "Emit JSON output."
+
     parser = _CliParser(
         prog="sglance",
-        description="Read-only inspection of Slurm cluster capacity, queues, and wait times.",
+        description="Read-only inspection of Slurm cluster capacity, queues, wait times, and jobs.",
     )
     parser.add_argument(
         "--cluster",
         dest="cluster",
         default=None,
         metavar="NAME",
-        help="Query only the named configured cluster entry.",
+        help=cluster_help,
     )
     parser.add_argument(
         "--refresh",
         action="store_true",
         dest="refresh",
         default=False,
-        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+        help=refresh_help,
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True, parser_class=_CliParser)
-    status_parser = subparsers.add_parser("status", help="Show partition CPU, GPU, and node utilization.")
+
+    status_summary = "Show partition CPU, GPU, and node utilization."
+    status_parser = subparsers.add_parser(
+        "status",
+        help=status_summary,
+        description=status_summary,
+    )
     status_parser.add_argument(
         "--cluster",
         dest="cluster",
         default=argparse.SUPPRESS,
         metavar="NAME",
-        help="Query only the named configured cluster entry.",
+        help=cluster_help,
     )
     status_parser.add_argument(
         "--refresh",
         action="store_true",
         dest="refresh",
         default=argparse.SUPPRESS,
-        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+        help=refresh_help,
     )
-    status_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+    status_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
 
+    queue_summary = "Show running/pending job counts and top pending reasons."
     queue_parser = subparsers.add_parser(
         "queue",
-        help="Show running and pending job counts and top pending reasons per partition.",
+        help=queue_summary,
+        description=queue_summary,
     )
     queue_parser.add_argument(
         "--cluster",
         dest="cluster",
         default=argparse.SUPPRESS,
         metavar="NAME",
-        help="Query only the named configured cluster entry.",
+        help=cluster_help,
     )
     queue_parser.add_argument(
         "--refresh",
         action="store_true",
         dest="refresh",
         default=argparse.SUPPRESS,
-        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+        help=refresh_help,
     )
-    queue_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+    queue_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
 
     def _parse_days(raw: str) -> int:
         has_digits = (
@@ -134,32 +146,34 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
             raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {raw!r}")
         return value
 
+    wait_summary = "Show wait-time percentiles and oldest pending job age."
     wait_parser = subparsers.add_parser(
         "wait",
-        help="Show historical wait-time percentiles and oldest eligible pending job age per partition.",
+        help=wait_summary,
+        description=wait_summary,
     )
     wait_parser.add_argument(
         "--cluster",
         dest="cluster",
         default=argparse.SUPPRESS,
         metavar="NAME",
-        help="Query only the named configured cluster entry.",
+        help=cluster_help,
     )
     wait_parser.add_argument(
         "--refresh",
         action="store_true",
         dest="refresh",
         default=argparse.SUPPRESS,
-        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+        help=refresh_help,
     )
     wait_parser.add_argument(
         "--days",
         type=_parse_days,
         default=7,
         metavar="N",
-        help="Lookback window in days for historical wait times (integer >= 1, default: 7).",
+        help="Lookback window in days (integer >= 1, default: 7).",
     )
-    wait_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+    wait_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
 
     def _account_arg(raw: str) -> str:
         try:
@@ -167,23 +181,25 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         except ConfigError as exc:
             raise argparse.ArgumentTypeError(str(exc)) from exc
 
+    mine_summary = "Show your jobs or an account's jobs and start estimates."
     mine_parser = subparsers.add_parser(
         "mine",
-        help="Show caller or account jobs with backfill estimated start times.",
+        help=mine_summary,
+        description=mine_summary,
     )
     mine_parser.add_argument(
         "--cluster",
         dest="cluster",
         default=argparse.SUPPRESS,
         metavar="NAME",
-        help="Query only the named configured cluster entry.",
+        help=cluster_help,
     )
     mine_parser.add_argument(
         "--refresh",
         action="store_true",
         dest="refresh",
         default=argparse.SUPPRESS,
-        help="Bypass the 5-minute response cache and fetch fresh Slurm data.",
+        help=refresh_help,
     )
     mine_parser.add_argument(
         "--account",
@@ -193,7 +209,7 @@ def _build_parser(stdout: TextIO, stderr: TextIO) -> argparse.ArgumentParser:
         metavar="NAME",
         help="List all jobs charged to the named Slurm account.",
     )
-    mine_parser.add_argument("--json", action="store_true", dest="json_output", help="Emit JSON output.")
+    mine_parser.add_argument("--json", action="store_true", dest="json_output", help=json_help)
     return parser
 
 

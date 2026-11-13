@@ -342,15 +342,6 @@ class QueueCliTests(unittest.TestCase):
             "show",
             "config",
         ]
-        dash_m_scontrol_argv = [
-            "env",
-            "SLURM_TIME_FORMAT=%s",
-            "scontrol",
-            "-M",
-            "prod",
-            "show",
-            "config",
-        ]
         failure_cases = [
             (
                 "ssh-timeout",
@@ -370,7 +361,7 @@ class QueueCliTests(unittest.TestCase):
                     "squeue: warning: ignoring deprecated config key\n"
                     "squeue: error: Slurm controller not responding\n",
                 ),
-                "squeue exited 1: squeue: error: Slurm controller not responding",
+                "squeue exited 1: error: Slurm controller not responding",
             ),
         ]
 
@@ -495,7 +486,6 @@ class QueueCliTests(unittest.TestCase):
             filtered_runner = FakeRunner(
                 {
                     ("cluster-b", "squeue"): "200|alice|gpu|PD|Priority|\n",
-                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
                 }
             )
             for argv in (["queue", "--cluster", "cluster-b"], ["--cluster", "cluster-b", "queue"]):
@@ -521,9 +511,7 @@ class QueueCliTests(unittest.TestCase):
                 filtered_runner.calls,
                 [
                     ("cluster-b", "ssh", "cluster-b", dash_m_argv),
-                    ("cluster-b", "ssh", "cluster-b", dash_m_scontrol_argv),
                     ("cluster-b", "ssh", "cluster-b", dash_m_argv),
-                    ("cluster-b", "ssh", "cluster-b", dash_m_scontrol_argv),
                 ],
             )
 
@@ -904,7 +892,7 @@ class QueueCliTests(unittest.TestCase):
                             "fetched_at": None,
                             "stale": False,
                             "user_scoped": False,
-                            "error": "squeue exited 1: squeue: error: Invalid user",
+                            "error": "squeue exited 1: error: Invalid user",
                             "partitions": [],
                         }
                     ],
@@ -926,7 +914,7 @@ class QueueCliTests(unittest.TestCase):
             self.assertNotIn("warning", table_out.getvalue())
             self.assertEqual(
                 table_out.getvalue(),
-                "cluster-a: squeue exited 1: squeue: error: Invalid user\n",
+                "cluster-a: squeue exited 1: error: Invalid user\n",
             )
 
     def test_queue_skips_dash_m_cluster_banner_line(self) -> None:

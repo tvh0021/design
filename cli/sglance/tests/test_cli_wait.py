@@ -545,7 +545,7 @@ class WaitCliTests(unittest.TestCase):
             )
             runner = FakeRunner(
                 {
-                    # cluster-a: slurmdbd restricts sacct to alice while slurmctld omits jobs/all and squeue shows bob too.
+                    # cluster-a: slurmdbd restricts sacct to alice while squeue shows bob too -> 1 distinct sacct user -> True without scontrol.
                     ("cluster-a", "sacct"): (
                         "9001|alice|gpu|COMPLETED|1794500000|1794500060|gres/gpu=1\n"
                         "9002|alice|gpu|RUNNING|1794501000|1794501180|gres/gpu=1\n"
@@ -554,7 +554,6 @@ class WaitCliTests(unittest.TestCase):
                         "9010|alice|gpu|PD|Resources|1794513000|\n"
                         "9011|bob|gpu|PD|Priority|1794513300|\n"
                     ),
-                    ("cluster-a", "scontrol"): "PrivateData             = usage,accounts\n",
                     # cluster-b: sacct returns alice (started) and bob (cancelled while pending) -> 2 distinct sacct users -> False.
                     ("cluster-b", "sacct"): (
                         "9101|alice|cpu|COMPLETED|1794500000|1794500030|cpu=4\n"
@@ -562,12 +561,11 @@ class WaitCliTests(unittest.TestCase):
                     ),
                     ("cluster-b", "squeue"): "",
                     ("cluster-b", "scontrol"): "PrivateData             = none\n",
-                    # cluster-c: sacct has only alice on a cancelled-pending job row, scontrol omits jobs/all -> 1 distinct sacct user -> True.
+                    # cluster-c: sacct has only alice on a cancelled-pending job row -> 1 distinct sacct user -> True without scontrol.
                     ("cluster-c", "sacct"): (
                         "9201|alice|cpu|CANCELLED|1794500000|1794500300|\n"
                     ),
                     ("cluster-c", "squeue"): "",
-                    ("cluster-c", "scontrol"): "PrivateData             = usage\n",
                     # cluster-d: empty sacct, scontrol has PrivateData = jobs -> True.
                     ("cluster-d", "sacct"): "",
                     ("cluster-d", "squeue"): "",
@@ -592,6 +590,10 @@ class WaitCliTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                sorted(call[0] for call in runner.calls if call[3][2] == "scontrol"),
+                ["cluster-b", "cluster-d", "cluster-e"],
+            )
             clusters = json.loads(stdout.getvalue())["clusters"]
             by_name = {item["cluster"]: item for item in clusters}
             scoping = {name: item["user_scoped"] for name, item in by_name.items()}
@@ -1167,7 +1169,7 @@ class WaitCliTests(unittest.TestCase):
                 "  PARTITION  N  P50    P90    OLDEST PENDING\n"
                 "  gpu        2  2m 0s  2m 0s  5m 0s\n"
                 "\n"
-                "cluster-b: squeue exited 1: squeue: error: controller busy\n",
+                "cluster-b: squeue exited 1: error: controller busy\n",
             )
 
             # Run 3 at t = 90s with --days 3 on cluster-a: distinct options={"days": 3} misses cache!
@@ -1188,9 +1190,8 @@ class WaitCliTests(unittest.TestCase):
             self.assertEqual(payload3["days"], 3)
             self.assertFalse(payload3["clusters"][0]["stale"])
 
-            # Run 4 at t = 120s after cluster-b recovers: cluster-a hits 7d cache, cluster-b succeeds.
+            # Run 4 at t = 120s after cluster-b recovers: cluster-a hits 7d cache, cluster-b succeeds (1 user -> skips scontrol).
             runner._responses[("cluster-b", "squeue")] = ""
-            runner._responses[("cluster-b", "scontrol")] = "PrivateData = none\n"
             t_rec = FIXED_NOW + timedelta(seconds=120)
             out4, err4 = io.StringIO(), io.StringIO()
             rc4 = main(
@@ -1202,7 +1203,7 @@ class WaitCliTests(unittest.TestCase):
                 stderr=err4,
             )
             self.assertEqual(rc4, 0)
-            self.assertEqual(len(runner.calls), 13)
+            self.assertEqual(len(runner.calls), 12)
             clusters4 = json.loads(out4.getvalue())["clusters"]
             self.assertTrue(clusters4[0]["stale"])
             self.assertFalse(clusters4[1]["stale"])
@@ -1220,7 +1221,7 @@ class WaitCliTests(unittest.TestCase):
                 stderr=err5,
             )
             self.assertEqual(rc5, 0)
-            self.assertEqual(len(runner.calls), 16)
+            self.assertEqual(len(runner.calls), 15)
             self.assertFalse(json.loads(out5.getvalue())["clusters"][0]["stale"])
 
 

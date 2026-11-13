@@ -202,18 +202,8 @@ class PrivateDataScopingCliTests(unittest.TestCase):
                         "1002_1|alice|cpu|PD|Resources|\n"
                         "1002_2|alice|cpu|PD|Resources|\n"
                     ),
-                    ("cluster-a", "scontrol"): (
-                        "PrivateData             = usage,accounts,users,nodes,partitions,reservations\n"
-                    ),
                     ("cluster-b", "squeue"): "2001|alice|gpu|R|None|\n",
-                    ("cluster-b", "scontrol"): CommandResult(
-                        1, "", "scontrol: error: Permission denied\n"
-                    ),
                     ("cluster-c", "squeue"): "3001|bob|debug|PD|Priority|\n",
-                    ("cluster-c", "scontrol"): (
-                        "Configuration data as of 2026-11-12T20:00:00\n"
-                        "SlurmctldPort           = 6817\n"
-                    ),
                     ("cluster-d", "squeue"): (
                         "4001|alice|cpu|R|None|\n"
                         "4002|bob|cpu|PD|Priority|\n"
@@ -237,6 +227,10 @@ class PrivateDataScopingCliTests(unittest.TestCase):
 
             self.assertEqual(json_rc, 0)
             self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                sorted(call[0] for call in runner.calls if call[3][2] == "scontrol"),
+                ["cluster-d", "cluster-e"],
+            )
             self.assertEqual(
                 json.loads(json_out.getvalue()),
                 {
@@ -335,6 +329,10 @@ class PrivateDataScopingCliTests(unittest.TestCase):
             self.assertEqual(table_rc, 0)
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(
+                sorted(call[0] for call in runner.calls if call[3][2] == "scontrol"),
+                ["cluster-d", "cluster-d", "cluster-e", "cluster-e"],
+            )
+            self.assertEqual(
                 table_out.getvalue(),
                 "cluster-a [user-scoped]\n"
                 "  PARTITION  RUNNING  PENDING  TOP REASONS\n"
@@ -376,7 +374,6 @@ class PrivateDataScopingCliTests(unittest.TestCase):
                         255, "", "ssh: Connection reset by peer\n"
                     ),
                     ("cluster-b", "squeue"): "2001|alice|cpu|CG|None|\n",
-                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
                 }
             )
 
@@ -393,6 +390,10 @@ class PrivateDataScopingCliTests(unittest.TestCase):
 
             self.assertEqual(json_rc, 0)
             self.assertEqual(json_err.getvalue(), "")
+            self.assertEqual(
+                [call[0] for call in runner.calls if call[3][2] == "scontrol"],
+                ["cluster-a"],
+            )
             self.assertEqual(
                 json.loads(json_out.getvalue()),
                 {
@@ -575,6 +576,203 @@ class PrivateDataScopingCliTests(unittest.TestCase):
             self.assertEqual(table_err.getvalue(), "")
             self.assertEqual(len(runner.calls), 2)
             self.assertNotIn("[user-scoped]", table_out.getvalue())
+
+    def test_single_user_skips_scontrol_while_status_and_plain_mine_hardcode_false(self) -> None:
+        mine_fields = (
+            "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+            "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+            "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+            "StartTime:0|,Reason:0|,Name:0|"
+        )
+        queue_squeue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|",
+        )
+        mine_me_argv = ("env", "SLURM_TIME_FORMAT=%s", "squeue", "-h", "--me", "-O", mine_fields)
+        mine_acct_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-A",
+            "proj-123",
+            "-O",
+            mine_fields,
+        )
+        wait_squeue_argv = (
+            "env",
+            "SLURM_TIME_FORMAT=%s",
+            "squeue",
+            "-h",
+            "-r",
+            "-t",
+            "PD",
+            "-O",
+            "JobID:0|,UserName:0|,Partition:0|,StateCompact:0|,Reason:0|,EligibleTime:0|",
+        )
+        mine_one_user_row = (
+            "1001|alice|proj-123|cpu|R|10:00|01:00:00|1|16|1|"
+            "cpu=16|N/A|N/A|N/A|1794513000|None|job_a|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                encoding="utf-8",
+            )
+            # No ("cluster-a", "scontrol") entry is configured: any scontrol call raises UnmatchedFakeRequest.
+            runner = FakeRunner(
+                {
+                    ("cluster-a", "sinfo"): "cpu|node01|allocated|64/0/0/64|(null)|(null)|\n",
+                    ("cluster-a", *mine_me_argv): mine_one_user_row,
+                    ("cluster-a", *mine_acct_argv): mine_one_user_row,
+                    ("cluster-a", *queue_squeue_argv): "2001|alice|cpu|R|None|\n",
+                    ("cluster-a", "sacct"): "3001|alice|cpu|COMPLETED|1794500000|1794500060|cpu=8\n",
+                    ("cluster-a", *wait_squeue_argv): "",
+                }
+            )
+
+            for idx, (argv, expected_scoped) in enumerate(
+                [
+                    (["status", "--json"], False),
+                    (["mine", "--json"], False),
+                    (["mine", "--account", "proj-123", "--json"], True),
+                    (["queue", "--json"], True),
+                    (["wait", "--json"], True),
+                ]
+            ):
+                sub_root = root / f"run_{idx}"
+                (sub_root / "config" / "sglance").mkdir(parents=True)
+                (sub_root / "config" / "sglance" / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                    encoding="utf-8",
+                )
+                out, err = io.StringIO(), io.StringIO()
+                rc = main(
+                    argv,
+                    env=make_test_env(sub_root),
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=out,
+                    stderr=err,
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(err.getvalue(), "")
+                self.assertEqual(
+                    json.loads(out.getvalue())["clusters"][0]["user_scoped"],
+                    expected_scoped,
+                )
+
+            self.assertEqual(
+                [call[3][2] for call in runner.calls],
+                ["sinfo", "squeue", "squeue", "squeue", "sacct", "squeue"],
+            )
+
+    def test_queue_private_data_parsing_edge_cases_table(self) -> None:
+        two_user_squeue = (
+            "1001|alice|cpu|R|None|\n"
+            "1002|bob|cpu|PD|Resources|\n"
+        )
+        cases: list[tuple[str, str, bool]] = [
+            (
+                "jobs-and-usage",
+                "PrivateData = jobs,usage\n",
+                True,
+            ),
+            (
+                "none",
+                "PrivateData = none\n",
+                False,
+            ),
+            (
+                "null",
+                "PrivateData = (null)\n",
+                False,
+            ),
+            (
+                "case-and-no-spaces",
+                "PrivateData=Jobs\n",
+                True,
+            ),
+            (
+                "prefix-mismatch-key",
+                "PrivateDataXyz = jobs\n",
+                False,
+            ),
+            (
+                "nojobs-token",
+                "PrivateData = nojobs\n",
+                False,
+            ),
+            (
+                "alljobs-token",
+                "PrivateData = alljobs\n",
+                False,
+            ),
+            (
+                "nojobs-and-alljobs-tokens",
+                "PrivateData = nojobs,alljobs\n",
+                False,
+            ),
+            (
+                "all-token",
+                "PrivateData = all\n",
+                True,
+            ),
+            (
+                "banner-with-jobs",
+                "CLUSTER: cluster-a\nPrivateData = jobs,usage\n",
+                True,
+            ),
+            (
+                "banner-with-none",
+                "CLUSTER: cluster-a\nPrivateData = none\n",
+                False,
+            ),
+        ]
+
+        for label, scontrol_stdout, expected_scoped in cases:
+            with self.subTest(case=label), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_dir = root / "config" / "sglance"
+                config_dir.mkdir(parents=True)
+                (config_dir / "config.toml").write_text(
+                    '[[clusters]]\nname = "cluster-a"\nssh = "cluster-a.example"\n',
+                    encoding="utf-8",
+                )
+                runner = FakeRunner(
+                    {
+                        ("cluster-a", "squeue"): two_user_squeue,
+                        ("cluster-a", "scontrol"): scontrol_stdout,
+                    }
+                )
+                out, err = io.StringIO(), io.StringIO()
+                rc = main(
+                    ["queue", "--json"],
+                    env=make_test_env(root),
+                    runner=runner,
+                    clock=lambda: FIXED_NOW,
+                    stdout=out,
+                    stderr=err,
+                )
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(err.getvalue(), "")
+                self.assertEqual(
+                    [call[3][2] for call in runner.calls],
+                    ["squeue", "scontrol"],
+                )
+                self.assertEqual(
+                    json.loads(out.getvalue())["clusters"][0]["user_scoped"],
+                    expected_scoped,
+                )
 
 
 if __name__ == "__main__":

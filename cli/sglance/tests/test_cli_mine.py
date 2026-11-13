@@ -393,7 +393,6 @@ class MineCliTests(unittest.TestCase):
                     ("cluster-a", "squeue"): "",
                     ("cluster-a", "scontrol"): "PrivateData             = jobs,usage\n",
                     ("cluster-b", "squeue"): cluster_b_squeue,
-                    ("cluster-b", "scontrol"): "PrivateData             = none\n",
                     ("cluster-c", "squeue"): cluster_c_squeue,
                     ("cluster-c", "scontrol"): "PrivateData             = none\n",
                 }
@@ -460,12 +459,6 @@ class MineCliTests(unittest.TestCase):
                             "-O",
                             MINE_SQUEUE_FIELDS,
                         ],
-                    ),
-                    (
-                        "cluster-b",
-                        "ssh",
-                        "cluster-b",
-                        ["env", "SLURM_TIME_FORMAT=%s", "scontrol", "-M", "prod", "show", "config"],
                     ),
                 ],
             )
