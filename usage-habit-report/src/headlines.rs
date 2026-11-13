@@ -86,8 +86,11 @@ fn codex_db(dir: &Path) -> Result<Titles> {
             .and_then(normalize)
             .map(|s| (s, "codex-name"))
             .or_else(|| {
+                // Codex stores the raw opening prompt here, which can be an
+                // injected preamble rather than anything the user typed.
                 title
                     .as_deref()
+                    .filter(|t| !crate::codex::is_injected(t))
                     .and_then(normalize)
                     .map(|s| (s, "codex-title"))
             })
@@ -177,11 +180,15 @@ pub fn refresh(conn: &mut Connection, sources: &Sources) -> Result<usize> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The Codex SQLite `title` is only the opening prompt, so a T3 title
+    // beats it; every other harness headline beats T3.
     for (tool, id, raw, t3) in rows {
-        let chosen = titles
-            .get(&(tool.clone(), id.clone()))
+        let harness = titles.get(&(tool.clone(), id.clone()));
+        let chosen = harness
+            .filter(|v| v.1 != "codex-title")
             .cloned()
-            .or_else(|| t3.as_deref().and_then(normalize).map(|s| (s, "t3")));
+            .or_else(|| t3.as_deref().and_then(normalize).map(|s| (s, "t3")))
+            .or_else(|| harness.cloned());
         let (title, source) = match chosen {
             Some((title, source)) => (Some(title), source),
             None => (raw.as_deref().and_then(normalize), "first-line"),
@@ -220,21 +227,35 @@ pub fn set_manual_title(
          WHERE tool = ?1 AND session_id = ?2",
         params![tool, session_id, title],
     )?;
+    conn.execute(
+        "UPDATE sessions SET label = ?3, label_source = 'headline'
+         WHERE tool = ?1 AND session_id = ?2 AND parent_session_id IS NULL
+           AND (label IS NULL OR label_source = 'headline')",
+        params![tool, session_id, crate::labels::classify(&title)],
+    )?;
     Ok(before)
 }
 
 /// Root sessions (top-level ones, and subagents whose parent is unknown) whose
 /// opening prompt was never seen (no user turn in the log, or logs ingested
 /// before labels existed) have no task label. When such a session has a
-/// headline, classify that instead, under `label_source =
-/// 'headline'`, so its requests leave the `unlabelled` column. A hand-set label
-/// still wins at query time, and a later rule label is never overwritten here.
+/// headline, classify that instead, under `label_source = 'headline'`, so its
+/// requests leave the `unlabelled` column. A headline label follows its
+/// headline: it is recomputed when the headline changes and cleared when the
+/// headline goes away or the session becomes a subagent. A hand-set label
+/// still wins at query time, and a rule label is never overwritten here.
 fn label_from_headlines(tx: &rusqlite::Transaction) -> Result<usize> {
+    let mut n = tx.execute(
+        "UPDATE sessions SET label = NULL, label_source = NULL
+         WHERE label_source = 'headline'
+           AND (display_title IS NULL OR parent_session_id IS NOT NULL)",
+        [],
+    )?;
     let rows = tx
         .prepare(
             "SELECT tool, session_id, display_title FROM sessions
-             WHERE label IS NULL AND parent_session_id IS NULL
-               AND display_title IS NOT NULL",
+             WHERE (label IS NULL OR label_source = 'headline')
+               AND parent_session_id IS NULL AND display_title IS NOT NULL",
         )?
         .query_map([], |r| {
             Ok((
@@ -244,12 +265,13 @@ fn label_from_headlines(tx: &rusqlite::Transaction) -> Result<usize> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut n = 0;
     for (tool, id, title) in rows {
         let label = crate::labels::classify(&title);
         n += tx.execute(
             "UPDATE sessions SET label = ?3, label_source = 'headline'
-             WHERE tool = ?1 AND session_id = ?2 AND label IS NULL",
+             WHERE tool = ?1 AND session_id = ?2
+               AND (label IS NULL OR label_source = 'headline')
+               AND (label IS NOT ?3 OR label_source IS NOT 'headline')",
             params![tool, id, label],
         )?;
     }

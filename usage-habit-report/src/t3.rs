@@ -1,11 +1,11 @@
-//! T3 enrichment reads legacy thread metadata and v2 cross-provider delegation
+//! T3 enrichment reads v1 and v2 thread metadata and v2 cross-provider delegation
 //! records. Native session ids resolve lineage across all supported harnesses.
 //! Databases are opened read-only with `immutable=1`, ignoring WAL files.
 
 use crate::antigravity::sqlite_uri;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// What T3 knows about one harness session.
@@ -24,12 +24,13 @@ pub type Links = HashMap<(String, String), Link>;
 pub struct T3Report {
     pub databases_read: u64,
     pub databases_unreadable: u64,
-    /// Sessions that got a T3 thread id this run.
+    /// Sessions that got a new or changed T3 thread id this run.
     pub sessions_linked: u64,
 }
 
 /// T3 state databases that exist on this machine, in priority order: the
-/// standard `~/.t3` install, then the `~/.t3-personal` profile.
+/// standard `~/.t3` install, then the `~/.t3-personal` profile. Within a
+/// profile the live v2 database comes before a frozen v1 snapshot.
 pub fn default_paths() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
@@ -37,77 +38,213 @@ pub fn default_paths() -> Vec<PathBuf> {
     [".t3", ".t3-personal"]
         .iter()
         .flat_map(|d| {
-            ["state.sqlite", "statev2.sqlite"].map(|name| home.join(d).join("userdata").join(name))
+            ["statev2.sqlite", "state.sqlite"].map(|name| home.join(d).join("userdata").join(name))
         })
         .filter(|p| p.is_file())
         .collect()
 }
 
-/// Read every Codex and Antigravity session link from one state database.
-pub fn load(path: &Path) -> Result<Links> {
+/// Open a state database read-only and fail early when it is not SQLite, so
+/// the optional-table checks below cannot mistake a corrupt file for an
+/// empty one.
+fn open(path: &Path) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(sqlite_uri(path, "mode=ro&immutable=1"), flags)
         .with_context(|| format!("opening {}", path.display()))?;
-    let mut stmt = conn.prepare(
-        r#"SELECT r.thread_id, r.provider_name, r.resume_cursor_json,
-                  t.title, t.worktree_path, p.workspace_root
-           FROM provider_session_runtime r
-           LEFT JOIN projection_threads t ON t.thread_id = r.thread_id
-           LEFT JOIN projection_projects p ON p.project_id = t.project_id
-           WHERE r.provider_name IN ('codex', 'antigravity')
-           ORDER BY r.thread_id"#,
-    )?;
-    let mut rows = stmt.query([])?;
+    conn.prepare("SELECT 1 FROM sqlite_master LIMIT 1")?
+        .query([])?
+        .next()?;
+    Ok(conn)
+}
+
+fn nonempty(s: Option<String>) -> Option<String> {
+    s.filter(|s| !s.is_empty())
+}
+
+/// T3 copies the raw opening lines of an imported external transcript into
+/// the thread title instead of generating a headline, so those titles are
+/// dropped.
+fn imported(thread_id: &str, history_origin: Option<&str>) -> bool {
+    thread_id.starts_with("import:") || history_origin == Some("v1_import")
+}
+
+/// Read every session link from one state database: v2 provider threads
+/// first (newest first), then legacy `provider_session_runtime` rows for
+/// sessions v2 does not name.
+pub fn load(path: &Path) -> Result<Links> {
+    let conn = open(path)?;
+    let projects = has_table(&conn, "projection_projects");
     let mut out = Links::new();
-    while let Some(r) = rows.next()? {
-        let thread_id: String = r.get(0)?;
-        let provider: String = r.get(1)?;
-        let cursor: Option<String> = r.get(2)?;
-        let Some(session_id) = cursor.as_deref().and_then(|c| session_id(&provider, c)) else {
-            continue;
+    if has_table(&conn, "orchestration_v2_projection_provider_threads")
+        && has_table(&conn, "orchestration_v2_projection_threads")
+    {
+        let (root, join) = if projects {
+            (
+                "p.workspace_root",
+                "LEFT JOIN projection_projects p ON p.project_id = t.project_id",
+            )
+        } else {
+            ("NULL", "")
         };
-        let nonempty = |s: Option<String>| s.filter(|s| !s.is_empty());
-        let title = nonempty(r.get(3)?);
-        let workspace = nonempty(r.get(4)?).or(nonempty(r.get(5)?));
-        out.entry((provider, session_id)).or_insert(Link {
-            thread_id,
-            title,
-            workspace,
-        });
+        let mut stmt = conn.prepare(&format!(
+            "SELECT pt.thread_id, pt.provider, pt.payload_json, t.title, t.payload_json, {root}
+             FROM orchestration_v2_projection_provider_threads pt
+             LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = pt.thread_id
+             {join}
+             ORDER BY pt.updated_at DESC, pt.provider_thread_id DESC"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let Some(thread_id) = nonempty(r.get(0)?) else {
+                continue;
+            };
+            let provider: String = r.get(1)?;
+            let payload: Option<String> = r.get(2)?;
+            let native = payload
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                .and_then(|v| {
+                    v.pointer("/nativeThreadRef/nativeId")?
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                });
+            let (Some(tool), Some(native)) = (tool_name(&provider), native) else {
+                continue;
+            };
+            let thread: Option<serde_json::Value> = r
+                .get::<_, Option<String>>(4)?
+                .and_then(|p| serde_json::from_str(&p).ok());
+            let field = |name: &str| {
+                thread
+                    .as_ref()
+                    .and_then(|v| v.pointer(name)?.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            let title = nonempty(r.get(3)?)
+                .filter(|_| !imported(&thread_id, field("/historyOrigin").as_deref()));
+            let workspace = field("/worktreePath").or(nonempty(r.get(5)?));
+            out.entry((tool.to_owned(), native)).or_insert(Link {
+                thread_id,
+                title,
+                workspace,
+            });
+        }
+    }
+    if has_table(&conn, "provider_session_runtime") {
+        let threads = has_table(&conn, "projection_threads");
+        let (cols, joins) = match (threads, projects) {
+            (true, true) => (
+                "t.title, t.worktree_path, p.workspace_root",
+                "LEFT JOIN projection_threads t ON t.thread_id = r.thread_id
+                 LEFT JOIN projection_projects p ON p.project_id = t.project_id",
+            ),
+            (true, false) => (
+                "t.title, t.worktree_path, NULL",
+                "LEFT JOIN projection_threads t ON t.thread_id = r.thread_id",
+            ),
+            _ => ("NULL, NULL, NULL", ""),
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT r.thread_id, r.provider_name, r.resume_cursor_json, {cols}
+             FROM provider_session_runtime r {joins}
+             ORDER BY r.thread_id"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let thread_id: String = r.get(0)?;
+            let provider: String = r.get(1)?;
+            let cursor: Option<String> = r.get(2)?;
+            let Some(key) = cursor.as_deref().and_then(|c| cursor_session(&provider, c)) else {
+                continue;
+            };
+            let title = nonempty(r.get(3)?).filter(|_| !imported(&thread_id, None));
+            let workspace = nonempty(r.get(4)?).or(nonempty(r.get(5)?));
+            out.entry(key).or_insert(Link {
+                thread_id,
+                title,
+                workspace,
+            });
+        }
     }
     Ok(out)
 }
 
-/// Historical worktree ownership, including deleted worktrees and native
-/// sessions that have no provider-session link. Conflicting roots are omitted.
-pub fn project_aliases(path: &Path) -> Result<std::collections::BTreeMap<String, String>> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
-    let conn = Connection::open_with_flags(sqlite_uri(path, "mode=ro&immutable=1"), flags)?;
-    let mut stmt = conn.prepare(
-        "SELECT t.worktree_path, MIN(p.workspace_root)
-         FROM projection_threads t JOIN projection_projects p ON p.project_id = t.project_id
-         WHERE t.worktree_path IS NOT NULL AND t.worktree_path != '' AND p.workspace_root != ''
-         GROUP BY t.worktree_path HAVING COUNT(DISTINCT p.workspace_root) = 1",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+/// Historical worktree ownership from v1 and v2 threads, including deleted
+/// worktrees and native sessions that have no provider-session link. A
+/// worktree recorded under more than one workspace root is omitted.
+pub fn project_aliases(path: &Path) -> Result<BTreeMap<String, String>> {
+    let conn = open(path)?;
+    let mut roots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if !has_table(&conn, "projection_projects") {
+        return Ok(BTreeMap::new());
+    }
+    if has_table(&conn, "projection_threads") {
+        let mut stmt = conn.prepare(
+            "SELECT t.worktree_path, p.workspace_root
+             FROM projection_threads t JOIN projection_projects p ON p.project_id = t.project_id
+             WHERE t.worktree_path IS NOT NULL AND t.worktree_path != '' AND p.workspace_root != ''",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (worktree, root) = row?;
+            insert_alias(&mut roots, &worktree, &root);
+        }
+    }
+    if has_table(&conn, "orchestration_v2_projection_threads") {
+        let mut stmt = conn.prepare(
+            "SELECT t.payload_json, p.workspace_root
+             FROM orchestration_v2_projection_threads t
+             JOIN projection_projects p ON p.project_id = t.project_id
+             WHERE p.workspace_root != ''",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (payload, root) = row?;
+            let worktree = payload
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                .and_then(|v| v.get("worktreePath")?.as_str().map(str::to_owned));
+            if let Some(worktree) = worktree {
+                insert_alias(&mut roots, &worktree, &root);
+            }
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .filter(|(_, r)| r.len() == 1)
+        .filter_map(|(w, r)| Some((w, r.into_iter().next()?)))
+        .collect())
 }
 
-/// The harness session id in a `resume_cursor_json`: Codex rows carry
-/// `{"threadId": ...}`, Antigravity rows `{"schemaVersion": 1, "sessionId": ...}`.
-fn session_id(provider: &str, cursor: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(cursor).ok()?;
+/// Record one worktree-to-root pair when both are absolute, non-root paths,
+/// the rule `config.rs` applies to hand-written aliases, so relative or `/`
+/// paths in T3 metadata cannot capture project resolution.
+fn insert_alias(roots: &mut BTreeMap<String, BTreeSet<String>>, worktree: &str, root: &str) {
+    let ok = |p: &str| Path::new(p).is_absolute() && p != "/";
+    let (worktree, root) = (worktree.trim(), root.trim());
+    if ok(worktree) && ok(root) {
+        roots
+            .entry(worktree.to_owned())
+            .or_default()
+            .insert(root.to_owned());
+    }
+}
+
+/// The harness session named by a legacy `resume_cursor_json`: Claude rows
+/// carry `{"resume": ...}`, Codex rows `{"threadId": ...}`, Antigravity rows
+/// `{"schemaVersion": 1, "sessionId": ...}`.
+fn cursor_session(provider: &str, cursor: &str) -> Option<SessionKey> {
     let field = match provider {
+        "claudeAgent" | "claude-code" => "resume",
         "codex" => "threadId",
         "antigravity" => "sessionId",
         _ => return None,
     };
-    v.get(field)?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let v: serde_json::Value = serde_json::from_str(cursor).ok()?;
+    let id = v.get(field)?.as_str().filter(|s| !s.is_empty())?;
+    Some((tool_name(provider)?.to_owned(), id.to_owned()))
 }
 
 /// Add `more` to `links`; a session already linked by an earlier database keeps
@@ -118,13 +255,15 @@ pub fn merge(links: &mut Links, more: Links) {
     }
 }
 
-/// Write thread ids and titles. A session that has no link yet gets one; a
-/// session already linked to the same thread gets the current title. Returns
-/// the number of sessions newly linked.
+/// Write thread ids and titles. A session with no link, or linked to another
+/// thread (such as a frozen v1 or `import:` thread now superseded by v2), takes
+/// the winning thread and its title; a session already linked to the same
+/// thread gets the current title. Returns the number of sessions newly linked
+/// or relinked.
 pub fn apply(tx: &Transaction, links: &Links) -> Result<u64> {
     let mut link = tx.prepare(
         "UPDATE sessions SET t3_thread_id = ?3, t3_title = ?4
-         WHERE tool = ?1 AND session_id = ?2 AND t3_thread_id IS NULL",
+         WHERE tool = ?1 AND session_id = ?2 AND t3_thread_id IS NOT ?3",
     )?;
     let mut retitle = tx.prepare(
         "UPDATE sessions SET t3_title = ?4
@@ -296,6 +435,219 @@ mod tests {
     }
 
     #[test]
+    fn links_v2_threads_drops_imported_titles_and_folds_v2_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("statev2.sqlite");
+        fixture::build(
+            &db,
+            &[("proj-a", "A", "/work/a"), ("proj-b", "B", "/work/b")],
+            &[
+                (
+                    "v1-claude",
+                    "claudeAgent",
+                    r#"{"resume":"cc-1"}"#,
+                    "V1 claude",
+                    None,
+                    "proj-a",
+                ),
+                (
+                    "v1-shadowed",
+                    "claudeAgent",
+                    r#"{"resume":"cc-2"}"#,
+                    "Old",
+                    None,
+                    "proj-a",
+                ),
+                (
+                    "import:v1",
+                    "codex",
+                    r#"{"threadId":"cx-imp"}"#,
+                    "<raw opening>",
+                    None,
+                    "proj-a",
+                ),
+                (
+                    "v1-wt",
+                    "codex",
+                    r#"{"threadId":"cx-wt"}"#,
+                    "Wt",
+                    Some("/wt/conflict"),
+                    "proj-a",
+                ),
+            ],
+        );
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE orchestration_v2_projection_provider_threads (
+                 provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, provider TEXT NOT NULL,
+                 updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+             CREATE TABLE orchestration_v2_projection_threads (
+                 thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                 payload_json TEXT NOT NULL);",
+        )
+        .unwrap();
+        let native =
+            |id: &str| serde_json::json!({"nativeThreadRef": {"nativeId": id}}).to_string();
+        for (pt, thread, provider, updated, payload) in [
+            ("p1", Some("t-claude"), "claudeAgent", "2", native("cc-2")),
+            ("p2", Some("t-codex"), "codex", "2", native("cx-1")),
+            ("p3", Some("t-codex-old"), "codex", "1", native("cx-1")),
+            ("p4", Some("t-ag"), "antigravity", "2", native("ag-1")),
+            ("p5", Some("t-imported"), "codex", "2", native("cx-v1imp")),
+            ("p6", None, "codex", "2", native("cx-orphan")),
+            ("p7", Some("t-codex"), "codex", "2", "{}".into()),
+        ] {
+            c.execute(
+                "INSERT INTO orchestration_v2_projection_provider_threads VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pt, thread, provider, updated, payload],
+            )
+            .unwrap();
+        }
+        for (tid, project, title, payload) in [
+            (
+                "t-claude",
+                "proj-b",
+                "V2 claude",
+                r#"{"worktreePath":"/wt/deleted"}"#,
+            ),
+            ("t-codex", "proj-a", "V2 codex", "{}"),
+            ("t-codex-old", "proj-a", "Older codex", "{}"),
+            ("t-ag", "proj-b", "", r#"{"worktreePath":""}"#),
+            (
+                "t-imported",
+                "proj-a",
+                "<raw opening>",
+                r#"{"historyOrigin":"v1_import"}"#,
+            ),
+            (
+                "t-conflict",
+                "proj-b",
+                "X",
+                r#"{"worktreePath":"/wt/conflict"}"#,
+            ),
+            ("t-relative", "proj-a", "R", r#"{"worktreePath":"rel/wt"}"#),
+            ("t-root", "proj-b", "R", r#"{"worktreePath":"/"}"#),
+        ] {
+            c.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES (?1, ?2, ?3, ?4)",
+                params![tid, project, title, payload],
+            )
+            .unwrap();
+        }
+        drop(c);
+
+        let links = load(&db).unwrap();
+        let get = |tool: &str, sid: &str| {
+            let l = &links[&(tool.to_string(), sid.to_string())];
+            (
+                l.thread_id.as_str(),
+                l.title.as_deref(),
+                l.workspace.as_deref(),
+            )
+        };
+        assert_eq!(links.len(), 7);
+        assert_eq!(
+            get("claude-code", "cc-1"),
+            ("v1-claude", Some("V1 claude"), Some("/work/a"))
+        );
+        // v2 wins over v1 within one database, and the newest provider thread wins.
+        assert_eq!(
+            get("claude-code", "cc-2"),
+            ("t-claude", Some("V2 claude"), Some("/wt/deleted"))
+        );
+        assert_eq!(
+            get("codex", "cx-1"),
+            ("t-codex", Some("V2 codex"), Some("/work/a"))
+        );
+        assert_eq!(get("antigravity", "ag-1"), ("t-ag", None, Some("/work/b")));
+        assert_eq!(
+            get("codex", "cx-v1imp"),
+            ("t-imported", None, Some("/work/a"))
+        );
+        assert_eq!(get("codex", "cx-imp"), ("import:v1", None, Some("/work/a")));
+
+        let aliases = project_aliases(&db).unwrap();
+        assert_eq!(
+            aliases.get("/wt/deleted").map(String::as_str),
+            Some("/work/b")
+        );
+        assert!(!aliases.contains_key("/wt/conflict"));
+        assert!(!aliases.contains_key("rel/wt") && !aliases.contains_key("/"));
+
+        // A stored imported title is cleared on the next apply.
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO sessions (tool, session_id, t3_thread_id, t3_title)
+                 VALUES ('codex', 'cx-v1imp', 't-imported', '<raw opening>'),
+                        ('codex', 'cx-imp', 'import:v1', '<raw opening>');",
+            )
+            .unwrap();
+        let tx = store.conn.transaction().unwrap();
+        apply(&tx, &links).unwrap();
+        tx.commit().unwrap();
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE t3_title IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0);
+
+        // A session linked by an earlier scan to a frozen v1 thread, with a
+        // poisoned title, moves to the winning v2 thread. An orphan provider
+        // thread (null thread_id) still resolves a delegation's child through
+        // its provider_thread_id.
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE orchestration_v2_projection_subagents (
+                 subagent_id TEXT, thread_id TEXT, child_thread_id TEXT, provider TEXT,
+                 started_at TEXT, provider_thread_id TEXT);
+             INSERT INTO orchestration_v2_projection_subagents
+                 VALUES ('d-orphan', 't-codex', NULL, 'codex', '2026-01-01T00:01:00Z', 'p6'),
+                        ('d-empty', 't-codex', '', 'codex', NULL, '');",
+        )
+        .unwrap();
+        drop(c);
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO sessions (tool, session_id, t3_thread_id, t3_title)
+                 VALUES ('codex', 'cx-1', 'v1-old', '<recommended_plugins>');
+                 INSERT INTO sessions (tool, session_id) VALUES ('codex', 'cx-orphan');",
+            )
+            .unwrap();
+        let r = crate::project::enrich(&mut store.conn, std::slice::from_ref(&db)).unwrap();
+        assert_eq!(r.t3.sessions_linked, 1);
+        let got: (String, String, String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT p.t3_thread_id, p.t3_title, c.parent_session_id, c.lineage_source, c.lineage_id
+                 FROM sessions p, sessions c
+                 WHERE p.session_id = 'cx-1' AND c.session_id = 'cx-orphan'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            (
+                "t-codex".into(),
+                "V2 codex".into(),
+                "cx-1".into(),
+                "t3".into(),
+                "d-orphan".into()
+            )
+        );
+        let r = crate::project::enrich(&mut store.conn, &[db]).unwrap();
+        assert_eq!(r.t3.sessions_linked, 0);
+    }
+
+    #[test]
     fn unreadable_database_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         let bad = tmp.path().join("state.sqlite");
@@ -365,12 +717,7 @@ fn has_table(conn: &Connection, table: &str) -> bool {
 }
 
 fn load_delegations(path: &Path) -> Result<Vec<Delegation>> {
-    let conn = Connection::open_with_flags(
-        sqlite_uri(path, "mode=ro&immutable=1"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    let conn = open(path)?;
     if !has_table(&conn, "orchestration_v2_projection_subagents") {
         return Ok(vec![]);
     }
@@ -382,25 +729,8 @@ fn load_delegations(path: &Path) -> Result<Vec<Delegation>> {
         while let Some(r) = rows.next()? {
             let provider: String = r.get(1)?;
             let cursor: Option<String> = r.get(2)?;
-            if let (Some(tool), Some(id)) = (
-                tool_name(&provider),
-                cursor.as_deref().and_then(|v| {
-                    let value: serde_json::Value = serde_json::from_str(v).ok()?;
-                    let field = if provider == "claudeAgent" {
-                        "resume"
-                    } else if provider == "codex" {
-                        "threadId"
-                    } else {
-                        "sessionId"
-                    };
-                    value
-                        .get(field)?
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                }),
-            ) {
-                threads.insert(r.get(0)?, (tool.into(), id));
+            if let Some(key) = cursor.as_deref().and_then(|c| cursor_session(&provider, c)) {
+                threads.insert(r.get(0)?, key);
             }
         }
     }
@@ -408,8 +738,13 @@ fn load_delegations(path: &Path) -> Result<Vec<Delegation>> {
         let mut stmt = conn.prepare("SELECT thread_id, provider, payload_json, provider_thread_id FROM orchestration_v2_projection_provider_threads ORDER BY updated_at, provider_thread_id")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
+            // Orphan and subagent provider threads have no T3 thread id.
+            let thread_id = nonempty(r.get(0)?);
             let provider: String = r.get(1)?;
-            let payload: String = r.get(2)?;
+            let Some(payload) = nonempty(r.get(2)?) else {
+                continue;
+            };
+            let provider_thread_id = nonempty(r.get(3)?);
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else {
                 continue;
             };
@@ -420,8 +755,12 @@ fn load_delegations(path: &Path) -> Result<Vec<Delegation>> {
                     .filter(|s| !s.is_empty()),
             ) {
                 let key = (tool.to_owned(), id.to_owned());
-                provider_threads.insert(r.get(3)?, key.clone());
-                threads.insert(r.get(0)?, key);
+                if let Some(pt) = provider_thread_id {
+                    provider_threads.insert(pt, key.clone());
+                }
+                if let Some(t) = thread_id {
+                    threads.insert(t, key);
+                }
             }
         }
     }
@@ -440,14 +779,16 @@ fn load_delegations(path: &Path) -> Result<Vec<Delegation>> {
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
-        let parent: String = r.get(0)?;
-        let child: Option<String> = r.get(1)?;
+        let Some(parent) = nonempty(r.get(0)?) else {
+            continue;
+        };
+        let child = nonempty(r.get(1)?);
         let provider: String = r.get(2)?;
         let started: Option<String> = r.get(3)?;
         let (Some(parent), Some(child_tool)) = (threads.get(&parent), tool_name(&provider)) else {
             continue;
         };
-        let provider_thread: Option<String> = r.get(5)?;
+        let provider_thread = nonempty(r.get(5)?);
         out.push(Delegation {
             id: r.get(4)?,
             parent: parent.clone(),

@@ -53,14 +53,15 @@ remains in `sessions.title` and JSON `title`.
 | Codex | `~/.codex/state_*.sqlite`, highest numeric suffix | `threads.name`, then `threads.title` |
 | Codex fallback | `~/.codex/session_index.jsonl` | `thread_name` by `id` |
 | Antigravity | `~/.gemini/antigravity/conversation_summaries.db` | `title` by `conversation_id` |
-| T3 | Existing configured state databases | Stored `t3_title` |
+| T3 | Default or `--t3-state` databases | Stored `t3_title` |
 | Opening prompt | Existing transcript sources | Stored first-line `title` |
 
-A hand-set title (`usage-habit-report title`) wins over everything.
-Codex `name` wins over the index; an index headline wins over the weak SQLite
-`title`. Both `name` and index headlines use `codex-name` provenance. Harness
-headlines win over T3 titles, then the opening line is used.
-Claude Code keeps its opening line unless a T3 title is available. The JSON
+A hand-set title (`usage-habit-report title`) wins over everything. Next come
+Codex names and Antigravity summaries, then the T3 title, then the weak Codex
+SQLite `title` (only the opening prompt), then the opening line. Codex `name`
+wins over the index `thread_name`; both use `codex-name` provenance.
+Claude Code has no harness headline, so it keeps its opening line unless a
+hand-set or T3 title is available. The JSON
 `title_source` values are `manual`, `codex-name`, `codex-title`,
 `antigravity-summary`, `t3`, and `first-line`. A session without any title has a null `display_title`
 and `first-line` provenance. Private session lists and fan-outs use the display
@@ -793,25 +794,35 @@ A mapping for `/work/arena` does not match `/work/arena-other`.
 The next scan or `reindex` applies changed mappings to historical sessions.
 Shared container directories such as `/work` are not inferred as projects.
 
-**T3.** T3 Code keeps a state database at `~/.t3/userdata/state.sqlite` (and
-`~/.t3-personal/userdata/state.sqlite` for a second profile).
-`--t3-state FILE` (repeatable) replaces both; a path that does not exist is
-skipped silently, so `--t3-state /nonexistent` turns the step off. Each
-database is opened with `immutable=1`, read-only, and never written. One that
-fails to open or read gets one `notice:` line on stderr and is skipped;
+**T3.** T3 Code keeps state databases at `~/.t3/userdata/statev2.sqlite` and
+`state.sqlite` (and the same pair under `~/.t3-personal/userdata` for a second
+profile). Within a profile the live v2 database is read before the frozen v1
+one. `--t3-state FILE` (repeatable) replaces the list; a path that does not
+exist is skipped silently, so `--t3-state /nonexistent` turns the step off.
+Each database is opened with `immutable=1`, read-only, and never written. One
+that fails to open or read gets one `notice:` line on stderr and is skipped;
 nothing else changes.
 
-- `provider_session_runtime.resume_cursor_json` names the harness session:
-  `{"threadId": "<codex session id>"}` for `codex` rows,
-  `{"schemaVersion": 1, "sessionId": "<conversation id>"}` for `antigravity`
-  rows. Other providers are ignored; Claude Code sessions get no T3 link.
-- `sessions.t3_thread_id` is the row's `thread_id` and `sessions.t3_title`
-  the `projection_threads.title`. A later scan refreshes the title of a
-  session already linked to the same thread. When a session appears in more
-  than one database, the first database in the list wins.
-- A session with no recorded `cwd` uses the thread's `worktree_path`, else
-  its project's `projection_projects.workspace_root`, for project resolution.
-  Recorded worktree ownership then folds that path into the parent project.
+- v2 rows in `orchestration_v2_projection_provider_threads` name the harness
+  session at `payload_json` `/nativeThreadRef/nativeId`, for `claudeAgent`,
+  `codex`, and `antigravity` providers. When one session has several provider
+  threads, the most recently updated wins.
+- v1 rows in `provider_session_runtime.resume_cursor_json` name it as
+  `{"resume": ...}` for `claudeAgent`, `{"threadId": ...}` for `codex`, and
+  `{"schemaVersion": 1, "sessionId": ...}` for `antigravity`. Other providers
+  are ignored. Within one database a v2 link wins over a v1 link.
+- `sessions.t3_thread_id` is the thread id and `sessions.t3_title` the thread
+  title. A later scan refreshes the title of a session already linked to the
+  same thread. Imported external transcripts (thread ids starting with
+  `import:`, or v2 `historyOrigin` `v1_import`) get no title, because T3 copies
+  their raw opening lines; a stored title for such a thread is cleared. When a
+  session appears in more than one database, the first database in the list
+  wins.
+- A session with no recorded `cwd` uses the thread's worktree (v1
+  `worktree_path` or v2 `payload_json` `worktreePath`), else its project's
+  `projection_projects.workspace_root`, for project resolution. Recorded
+  worktree ownership from v1 and v2 threads then folds that path into the
+  parent project; a worktree recorded under two different roots is ignored.
   That directory is not written to `cwd`.
 
 **Session keys.** `query::resolve_session(key)` finds a session by exact
@@ -971,12 +982,12 @@ usage-habit-report publish [--no-push] [--out DIR] [--no-scan]
 ```
 
 `publish` runs the same catch-up as `query`: scan, enrich, headline refresh,
-and pricing. `--no-scan` exports the existing store. It writes all 16 pages
+and pricing. `--no-scan` exports the existing store. It writes all 17 pages
 into a temporary sibling directory and checks every file for private store
 values, both raw and HTML-escaped. The guard checks paths, session and T3
 thread ids, titles of at least 12 characters, and the home directory. A guard
-failure leaves the previous export untouched and runs no git commands.
-After the guard passes, the new pages replace the destination, including stale files.
+failure leaves the previous export untouched, creates no commit, and pushes
+nothing.
 
 Set the destination in `~/.config/usage-habit-report/config.toml`:
 
@@ -989,42 +1000,56 @@ push = true
 Paths use the same quoted scalar syntax as `[sources]`, including `~/`
 expansion. `push` accepts `true` or `false` and defaults to `true`.
 `--out` overrides `dir`; without either destination, `publish` fails.
+The destination must be a directory below the repository root. `publish`
+refuses a path inside `.git`, a path through an existing file or symlink, and,
+when pushing, a path that `origin/main` tracks as a file or submodule.
 
 When `dir` is configured, `serve` publishes before binding its port.
 `serve --no-publish` skips this step. Without a publish destination, `serve`
 behaves as before. Publish errors print a warning on stderr and the dashboard
 still starts. The server opens the store read-only after the startup step.
 
-Inside a git repository, `publish` stages only the destination and commits
-changes with `Refresh the public usage snapshot`. It refuses to commit if
-there are already staged changes. Repeating an unchanged export makes no
-commit; changes in generation time and page-load timing alone do not count. Outside a repository,
-it only writes the files.
+Outside a git repository, the new pages replace the destination, including
+stale files, and nothing else happens.
 
-Before pushing, it checks every commit in `@{u}..HEAD`. Each must be a
-snapshot commit: the snapshot commit message, one parent, and no changed,
-added, deleted, or renamed path outside the destination directory. A commit
-amended or reworded to carry other files fails the check, and so does a commit
-whose change a later commit reverts. If other commits exist, it keeps the
-snapshot commit locally and reports their count. `--no-push` or `push = false`
-always disables pushing. Git failures, including a missing upstream or a
-network error, fail the standalone command.
+Inside a repository with `--no-push` or `push = false`, the new pages replace
+the destination, and `publish` stages only that directory and commits it on the
+current branch with `Refresh the public usage snapshot`. It refuses to run if
+the index already has staged changes, and then leaves the destination as it
+was. Repeating an unchanged export makes no commit; changes in generation time
+and page-load timing alone do not count. With pushing enabled but no remote
+configured, it does the same local commit.
 
-GitHub Pages deploys only the remote's default branch (`origin/HEAD`, here
-`main`). After pushing a project branch such as `usage-habit-report`, `publish`
-fetches the default branch and pushes `HEAD` to it as a fast-forward when every
-commit it lacks passes the same snapshot check. It never force-pushes. If the
-default branch has commits the project branch lacks, the default branch stays
-where it is. If the project branch holds other commits, the summary asks you to
-merge the project branch into the default branch; until then the public pages
-keep the last deployed snapshot. If `origin/HEAD` is not set, `publish` does
-not guess the default branch and says to run `git remote set-head origin
---auto`. On the default branch itself, the ordinary push is the deploy.
+With pushing enabled, `publish` deploys to the remote's default branch, which
+is what GitHub Pages serves. It picks `origin`, or the only remote when there
+is one, and reads the default branch from `origin/HEAD` (here `main`). If
+`origin/HEAD` is not set, it fails before writing anything and says to run
+`git remote set-head origin --auto`. It fetches `main`, writes the snapshot
+into a temporary tree, and builds a commit whose parent is the fetched tip of
+`origin/main` and whose only change is the destination directory. Timing
+retention compares against the pages on `origin/main`. `publish` pushes the
+commit to `origin/main` as a fast-forward and never force-pushes. If someone
+else pushed to `main` in the meantime, it fetches again and rebuilds on the new
+tip, up to two times. The checked-out branch does not matter: unpushed commits,
+project-branch commits awaiting review, and staged changes stay out of the
+snapshot commit. `HEAD`, the index, and the working tree's destination stay as
+they are.
 
-The summary reports the file count, commit result, push result or reason, and
-on a project branch the default branch result (`main fast-forwarded`, `main up
-to date`, `main not updated` with the reason, or `default branch not
-checked`).
+The one exception is a checkout of `main` that tracks `origin/main` and sat at
+its old tip. `publish` then runs `git merge --ff-only` so the local branch and
+the destination directory match the deploy. If local edits block the merge, the
+pushed commit stays on `origin/main` and the summary says the local branch was
+not fast-forwarded. Git failures, including a network error or a rejected push,
+fail the standalone command.
+
+The summary reports the file count, the commit result, and where it went:
+
+- `committed; pushed to origin/main`, with `; local main fast-forwarded` or
+  `; local main not fast-forwarded (git merge failed)` on a `main` checkout
+- `no commit; origin/main up to date`
+- `committed; not pushed (disabled)` or `no commit; not pushed (disabled)`
+- `committed; not pushed (no remote)` or `no commit; not pushed (no remote)`
+- `no commit; not pushed (not a git repository)`
 
 GitHub Pages copies `usage-habit-report/site/` to `/usage/`; the flight visualizer is at `/map/`.
 The deploy workflow uses committed HTML and does not build Rust. The checked-in
@@ -1166,7 +1191,9 @@ user prompt by deterministic keyword rules in `src/labels.rs`: `research`,
   opening prompt never reached the log (no user
   turn, or logs ingested before labels existed) is classified from its
   headline instead, once the headline refresh has one, under
-  `label_source = 'headline'`. A hand-set label still wins.
+  `label_source = 'headline'`. That label follows the headline: it changes
+  when the headline changes, clears when the headline goes away, and gives
+  way to a later rule label. A hand-set label still wins.
 - Subagent sessions report under their root session's label, following
   parent links across harnesses (an Antigravity subagent started from a
   Claude Code thread counts under that thread's label).
