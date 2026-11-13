@@ -13,9 +13,10 @@ from tests.fakes import FakeRunner, make_test_env
 FIXED_NOW = datetime(2026, 11, 12, 20, 0, 0, tzinfo=UTC)
 
 MINE_SQUEUE_FIELDS = (
-    "JobID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
-    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,"
-    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,StartTime:0|,Reason:0|,Name:0|"
+    "JobArrayID:0|,UserName:0|,Account:0|,Partition:0|,StateCompact:0|,"
+    "TimeUsed:0|,TimeLimit:0|,NumNodes:0|,NumCPUs:0|,NumTasks:0|,"
+    "tres-alloc:0|,tres-per-node:0|,tres-per-job:0|,tres-per-task:0|,"
+    "StartTime:0|,Reason:0|,Name:0|"
 )
 
 
@@ -26,20 +27,20 @@ class MineCliTests(unittest.TestCase):
         # cluster-a: caller is "alice"; running job (StartTime epoch ignored -> null)
         # plus pending job with epoch 1794536100 (2026-11-12 21:15:00 EST / 2026-11-13T02:15:00Z).
         cluster_a_squeue = (
-            "1001|alice|proj-123|gpu|R|45:30|04:00:00|2|64|"
-            "cpu=64,mem=256G,node=2,gres/gpu=8|N/A|N/A|1794510870|None|train_llm|\n"
-            "1002_1|alice|proj-123|gpu|PD|0:00|UNLIMITED|1|16|"
-            "cpu=16,mem=64G,node=1,gres/gpu=2|N/A|N/A|1794536100|Resources|eval_sweep|\n"
+            "1001|alice|proj-123|gpu|R|45:30|04:00:00|2|64|8|"
+            "cpu=64,mem=256G,node=2,gres/gpu=8|N/A|N/A|N/A|1794510870|None|train_llm|\n"
+            "1002_1|alice|proj-123|gpu|PD|0:00|UNLIMITED|1|16|2|"
+            "cpu=16,mem=64G,node=1,gres/gpu=2|N/A|N/A|N/A|1794536100|Resources|eval_sweep|\n"
         )
         # cluster-b: caller is "alice_hpc" on a UTC-5 site; running multi-day job with
         # Partition_Limit plus pending jobs with N/A and Unknown StartTime.
         cluster_b_squeue = (
-            "5001|alice_hpc|bio-lab|cpu|R|1-02:30:15|Partition_Limit|1|32|"
-            "cpu=32,mem=128G,node=1|N/A|N/A|1794418185|None|preprocess|\n"
-            "5002|alice_hpc|bio-lab|cpu|PD|0:00|2-00:00:00|1|8|"
-            "cpu=8,mem=32G,node=1|N/A|N/A|N/A|Priority|postproc|\n"
-            "5003|alice_hpc|bio-lab|debug|PD|0:00|01:00:00|1|4|"
-            "(null)|N/A|N/A|Unknown|Dependency| wait_dep |\n"
+            "5001|alice_hpc|bio-lab|cpu|R|1-02:30:15|Partition_Limit|1|32|1|"
+            "cpu=32,mem=128G,node=1|N/A|N/A|N/A|1794418185|None|preprocess|\n"
+            "5002|alice_hpc|bio-lab|cpu|PD|0:00|2-00:00:00|1|8|1|"
+            "cpu=8,mem=32G,node=1|N/A|N/A|N/A|N/A|Priority|postproc|\n"
+            "5003|alice_hpc|bio-lab|debug|PD|0:00|01:00:00|1|4|1|"
+            "(null)|N/A|N/A|N/A|Unknown|Dependency| wait_dep |\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -209,12 +210,12 @@ class MineCliTests(unittest.TestCase):
 
     def test_mine_table_renders_aligned_jobs_and_empty_cluster_without_ansi(self) -> None:
         cluster_a_squeue = (
-            "1001|alice|proj-123|gpu|R|45:30|04:00:00|2|64|"
-            "cpu=64,gres/gpu=8|N/A|N/A|1794510870|None|train_llm|\n"
-            "1002_1|alice|proj-123|gpu|PD|0:00|UNLIMITED|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794536100|Resources|eval_sweep|\n"
-            "1003|alice|proj-123|cpu|R|1-02:05:09|2-00:00:00|2|128|"
-            "cpu=128|N/A|N/A|1794419691|None|long_sim|\n"
+            "1001|alice|proj-123|gpu|R|45:30|04:00:00|2|64|8|"
+            "cpu=64,gres/gpu=8|N/A|N/A|N/A|1794510870|None|train_llm|\n"
+            "1002_1|alice|proj-123|gpu|PD|0:00|UNLIMITED|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794536100|Resources|eval_sweep|\n"
+            "1003|alice|proj-123|cpu|R|1-02:05:09|2-00:00:00|2|128|2|"
+            "cpu=128|N/A|N/A|N/A|1794419691|None|long_sim|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -263,16 +264,16 @@ class MineCliTests(unittest.TestCase):
         self,
     ) -> None:
         squeue_output = (
-            "2001|alice|proj-123|gpu|R|10:00|02:00:00|1|32|"
+            "2001|alice|proj-123|gpu|R|10:00|02:00:00|1|32|4|"
             "cpu=32,mem=128G,gres/gpu=4,gres/gpu:a100=4,gres/gpumem=160G,gres/gpuutil=100,gres/shard=8|"
-            "N/A|N/A|1794513000|None|both_untyped_and_typed|\n"
-            "2002|alice|proj-123|gpu|R|05:00|01:00:00|1|24|"
-            "cpu=24,mem=96G,gres/gpu:a100=2,gres/gpu:v100=1|N/A|N/A|1794513300|None|typed_only_sum|\n"
-            "2003|alice|proj-123|cpu,gpu|RQ|0:00|00:30:00|1|8|"
+            "N/A|N/A|N/A|1794513000|None|both_untyped_and_typed|\n"
+            "2002|alice|proj-123|gpu|R|05:00|01:00:00|1|24|3|"
+            "cpu=24,mem=96G,gres/gpu:a100=2,gres/gpu:v100=1|N/A|N/A|N/A|1794513300|None|typed_only_sum|\n"
+            "2003|alice|proj-123|cpu,gpu|RQ|0:00|00:30:00|1|8|1|"
             "cpu=8,mem=32G,gres/gpumem=40G,gres/gpuutil=50,gres/shard=2,gres/shard:a100=2|"
-            "N/A|N/A|None|Resources|shards_and_multipart|\n"
-            "2004|alice|proj-123|gpu*|CF|0:05|01:00:00|1|16|"
-            "cpu=16,gres/gpu=1|N/A|N/A|1794513595|None|configuring_job|\n"
+            "N/A|N/A|N/A|None|Resources|shards_and_multipart|\n"
+            "2004|alice|proj-123|gpu*|CF|0:05|01:00:00|1|16|1|"
+            "cpu=16,gres/gpu=1|N/A|N/A|N/A|1794513595|None|configuring_job|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -368,14 +369,14 @@ class MineCliTests(unittest.TestCase):
         self,
     ) -> None:
         cluster_b_squeue = (
-            "3001|alice|proj-123|gpu|R|15:00|01:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794512700|None|sim_a|\n"
-            "3002|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794536100|Priority|sim_b|\n"
+            "3001|alice|proj-123|gpu|R|15:00|01:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794512700|None|sim_a|\n"
+            "3002|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794536100|Priority|sim_b|\n"
         )
         cluster_c_squeue = (
-            "4001|alice|proj-123|cpu|R|05:00|00:30:00|1|8|cpu=8|N/A|N/A|1794513300|None|fit_a|\n"
-            "4002|bob|proj-123|cpu|PD|0:00|00:30:00|1|8|cpu=8|N/A|N/A|N/A|Resources|fit_b|\n"
+            "4001|alice|proj-123|cpu|R|05:00|00:30:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513300|None|fit_a|\n"
+            "4002|bob|proj-123|cpu|PD|0:00|00:30:00|1|8|1|cpu=8|N/A|N/A|N/A|N/A|Resources|fit_b|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -572,16 +573,16 @@ class MineCliTests(unittest.TestCase):
     ) -> None:
         cluster_a_squeue = (
             "CLUSTER: prod\n"
-            "6001|alice|proj-123|gpu|PD|0:00|04:00:00|1|16|"
-            "cpu=16,gres/gpu=1|N/A|N/A|0|JobHeldAdmin|a|b|\n"
-            "6002|alice|proj-123|cpu|RH|0:00|01:00:00|1|4|cpu=4|N/A|N/A|N/A||blank_reason|\n"
-            "|alice|proj-123|cpu|R|01:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|missing_id|\n"
-            "6091|alice|proj-123| , |R|01:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|missing_part|\n"
-            "bad-id|alice|proj-123|cpu|R|01:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|invalid_id|\n"
-            "6092|alice|proj-123|(null)|R|01:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|null_part|\n"
-            "6093|alice|proj-123|cpu||01:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|empty_state|\n"
-            "6094|alice|proj-123|cpu|??|01:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|bad_state|\n"
-            "6095|alice|proj-123|cpu|CD|10:00|02:00:00|1|8|cpu=8|N/A|N/A|1794513000|None|finished_cd|\n"
+            "6001|alice|proj-123|gpu|PD|0:00|04:00:00|1|16|1|"
+            "cpu=16,gres/gpu=1|N/A|N/A|N/A|0|JobHeldAdmin|a|b|\n"
+            "6002|alice|proj-123|cpu|RH|0:00|01:00:00|1|4|1|cpu=4|N/A|N/A|N/A|N/A||blank_reason|\n"
+            "|alice|proj-123|cpu|R|01:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|missing_id|\n"
+            "6091|alice|proj-123| , |R|01:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|missing_part|\n"
+            "bad-id|alice|proj-123|cpu|R|01:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|invalid_id|\n"
+            "6092|alice|proj-123|(null)|R|01:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|null_part|\n"
+            "6093|alice|proj-123|cpu||01:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|empty_state|\n"
+            "6094|alice|proj-123|cpu|??|01:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|bad_state|\n"
+            "6095|alice|proj-123|cpu|CD|10:00|02:00:00|1|8|1|cpu=8|N/A|N/A|N/A|1794513000|None|finished_cd|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -689,10 +690,10 @@ class MineCliTests(unittest.TestCase):
         self,
     ) -> None:
         squeue_output = (
-            "6101|alice|proj-123|gpu|R|INVALID|02:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794513000|None|bad_elapsed|\n"
-            "6102|alice|proj-123|cpu|R|05:00|INVALID|2-4|N/A|"
-            "cpu=8,gres/gpu=INVALID|N/A|N/A|1794513300|None|bad_counts|\n"
+            "6101|alice|proj-123|gpu|R|INVALID|02:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794513000|None|bad_elapsed|\n"
+            "6102|alice|proj-123|cpu|R|05:00|INVALID|2-4|N/A|N/A|"
+            "cpu=8,gres/gpu=INVALID|N/A|N/A|N/A|1794513300|None|bad_counts|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -777,10 +778,10 @@ class MineCliTests(unittest.TestCase):
     def test_mine_suppresses_past_pending_start_time_relative_to_injected_clock(self) -> None:
         # FIXED_NOW is 2026-11-12T20:00:00Z (epoch 1794513600).
         squeue_output = (
-            "6201|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|cpu=8,gres/gpu=1|N/A|N/A|1794510000|Priority|stale_est|\n"
-            "6202|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|cpu=8,gres/gpu=1|N/A|N/A|1794513599|Resources|one_sec_past|\n"
-            "6203|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|cpu=8,gres/gpu=1|N/A|N/A|1794513600|Resources|at_now|\n"
-            "6204|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|cpu=8,gres/gpu=1|N/A|N/A|1794517200|Resources|future_est|\n"
+            "6201|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|cpu=8,gres/gpu=1|N/A|N/A|N/A|1794510000|Priority|stale_est|\n"
+            "6202|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|cpu=8,gres/gpu=1|N/A|N/A|N/A|1794513599|Resources|one_sec_past|\n"
+            "6203|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|cpu=8,gres/gpu=1|N/A|N/A|N/A|1794513600|Resources|at_now|\n"
+            "6204|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|cpu=8,gres/gpu=1|N/A|N/A|N/A|1794517200|Resources|future_est|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -821,18 +822,18 @@ class MineCliTests(unittest.TestCase):
     ) -> None:
         squeue_output = (
             # 1 node, tres-alloc cpu=8, tres-per-node gres/gpu:2 -> 2 GPUs
-            "6301|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|cpu=8|gres/gpu:2|N/A|N/A|Resources|per_node_1|\n"
+            "6301|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|cpu=8|gres/gpu:2|N/A|N/A|N/A|Resources|per_node_1|\n"
             # tres-per-job gres/gpu:a100:4 on 2 nodes -> 4 GPUs (whole-job, not multiplied)
-            "6302|alice|proj-123|gpu|PD|0:00|01:00:00|2|16|cpu=16|N/A|gres/gpu:a100:4|N/A|Resources|per_job_4|\n"
-            # both tres-per-node and tres-per-job N/A -> 0 GPUs
-            "6303|alice|proj-123|cpu|PD|0:00|01:00:00|1|8|cpu=8|N/A|N/A|N/A|Priority|both_na|\n"
+            "6302|alice|proj-123|gpu|PD|0:00|01:00:00|2|16|4|cpu=16|N/A|gres/gpu:a100:4|N/A|N/A|Resources|per_job_4|\n"
+            # all tres-per-* N/A -> 0 GPUs
+            "6303|alice|proj-123|cpu|PD|0:00|01:00:00|1|8|1|cpu=8|N/A|N/A|N/A|N/A|Priority|both_na|\n"
             # multi-node + older gres:gpu: + comma-separated entries: (2 + 1) * 3 = 9 GPUs
-            "6304|alice|proj-123|gpu|PD|0:00|02:00:00|3|48|cpu=48,mem=192G|"
-            "gres:gpu:a100:2,gres:gpu:v100:1||N/A|Resources|per_node_multi|\n"
+            "6304|alice|proj-123|gpu|PD|0:00|02:00:00|3|48|9|cpu=48,mem=192G|"
+            "gres:gpu:a100:2,gres:gpu:v100:1|||N/A|Resources|per_node_multi|\n"
             # tres-alloc already has gres/gpu=2 -> ignore tres-per-node gres/gpu:4 on 2 nodes -> 2 GPUs
-            "6305|alice|proj-123|gpu|R|05:00|02:00:00|2|16|cpu=16,gres/gpu=2|gres/gpu:4|N/A|1794513300|None|alloc_wins|\n"
+            "6305|alice|proj-123|gpu|R|05:00|02:00:00|2|16|2|cpu=16,gres/gpu=2|gres/gpu:4|N/A|N/A|1794513300|None|alloc_wins|\n"
             # tres-per-node with unknown node count (2-4) -> gpus None
-            "6306|alice|proj-123|gpu|PD|0:00|01:00:00|2-4|16|cpu=16|gres/gpu:2|N/A|N/A|Resources|unknown_nodes|\n"
+            "6306|alice|proj-123|gpu|PD|0:00|01:00:00|2-4|16|2|cpu=16|gres/gpu:2|N/A|N/A|N/A|Resources|unknown_nodes|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -874,10 +875,11 @@ class MineCliTests(unittest.TestCase):
         self,
     ) -> None:
         squeue_output = (
-            "123_4|alice|proj-123|gpu|R|02:00|01:00:00|1|8|cpu=8,gres/gpu=1|N/A|N/A|1794513480|None|sweep|\n"
-            "123_[5-50000%10]|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|cpu=8|gres/gpu:1|N/A|N/A|JobArrayTaskLimit|sweep|\n"
-            "124_[5-50000]|alice|proj-123|cpu|PD|0:00|01:00:00|1|4|cpu=4|N/A|N/A|N/A|Resources|cpu_arr|\n"
-            "125_[]|alice|proj-123|cpu|PD|0:00|01:00:00|1|4|cpu=4|N/A|N/A|N/A|Resources|bad_arr|\n"
+            "123_4|alice|proj-123|gpu|R|02:00|01:00:00|1|8|1|cpu=8,gres/gpu=1|N/A|N/A|N/A|1794513480|None|sweep|\n"
+            "123_[5-50000%10]|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|cpu=8|gres/gpu:1|N/A|N/A|N/A|JobArrayTaskLimit|sweep|\n"
+            "124_[5-50000]|alice|proj-123|cpu|PD|0:00|01:00:00|1|4|1|cpu=4|N/A|N/A|N/A|N/A|Resources|cpu_arr|\n"
+            "126+0|alice|proj-123|gpu|R|01:00|01:00:00|1|8|1|cpu=8,gres/gpu=1|N/A|N/A|N/A|1794513540|None|het_lead|\n"
+            "125_[]|alice|proj-123|cpu|PD|0:00|01:00:00|1|4|1|cpu=4|N/A|N/A|N/A|N/A|Resources|bad_arr|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -903,6 +905,7 @@ class MineCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(stderr.getvalue(), "")
             self.assertNotIn("-r", runner.calls[0][3])
+            self.assertEqual(runner.calls[0][3][-2:], ["-O", MINE_SQUEUE_FIELDS])
             jobs = json.loads(stdout.getvalue())["clusters"][0]["jobs"]
             self.assertEqual(
                 [(job["job_id"], job["state"], job["gpus"]) for job in jobs],
@@ -910,6 +913,7 @@ class MineCliTests(unittest.TestCase):
                     ("123_4", "R", 1),
                     ("123_[5-50000%10]", "PD", 1),
                     ("124_[5-50000]", "PD", 0),
+                    ("126+0", "R", 1),
                 ],
             )
 
@@ -917,23 +921,23 @@ class MineCliTests(unittest.TestCase):
         self,
     ) -> None:
         me_initial = (
-            "7001|alice|proj-123|gpu|R|10:00|02:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794513000|None|job_me_1|\n"
+            "7001|alice|proj-123|gpu|R|10:00|02:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794513000|None|job_me_1|\n"
         )
         me_refreshed = (
-            "7001|alice|proj-123|gpu|R|12:00|02:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794513000|None|job_me_1|\n"
-            "7002|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|"
-            "cpu=8,gres/gpu=1|N/A|N/A|1794536100|Priority|job_me_2|\n"
+            "7001|alice|proj-123|gpu|R|12:00|02:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794513000|None|job_me_1|\n"
+            "7002|alice|proj-123|gpu|PD|0:00|01:00:00|1|8|1|"
+            "cpu=8,gres/gpu=1|N/A|N/A|N/A|1794536100|Priority|job_me_2|\n"
         )
         account_rows = (
-            "7001|alice|proj-123|gpu|R|11:30|02:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794513000|None|job_me_1|\n"
-            "7010|bob|proj-123|gpu|R|05:00|02:00:00|1|16|"
-            "cpu=16,gres/gpu=2|N/A|N/A|1794513300|None|teammate_job|\n"
+            "7001|alice|proj-123|gpu|R|11:30|02:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794513000|None|job_me_1|\n"
+            "7010|bob|proj-123|gpu|R|05:00|02:00:00|1|16|2|"
+            "cpu=16,gres/gpu=2|N/A|N/A|N/A|1794513300|None|teammate_job|\n"
         )
         cluster_b_recovered = (
-            "8001|alice_hpc|proj-123|cpu|PD|0:00|01:00:00|1|4|cpu=4|N/A|N/A|N/A|Resources|remote_job|\n"
+            "8001|alice_hpc|proj-123|cpu|PD|0:00|01:00:00|1|4|1|cpu=4|N/A|N/A|N/A|N/A|Resources|remote_job|\n"
         )
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1067,12 +1071,18 @@ class MineCliTests(unittest.TestCase):
                     ("cluster-a", "squeue"): CommandResult(
                         returncode=1,
                         stdout="",
-                        stderr="squeue: unrecognized option '--me'\n",
+                        stderr=(
+                            "squeue: unrecognized option '--me'\n"
+                            'Try "squeue --help" for more information\n'
+                        ),
                     ),
                     ("cluster-b", "squeue"): CommandResult(
                         returncode=1,
                         stdout="",
-                        stderr="slurm_load_jobs error: Unable to contact slurm controller\n",
+                        stderr=(
+                            "squeue: error: slurm_receive_msg: Socket timed out\n"
+                            "slurm_load_jobs error: Unable to contact slurm controller\n"
+                        ),
                     ),
                 }
             )
@@ -1116,3 +1126,66 @@ class MineCliTests(unittest.TestCase):
                 "cluster-a: squeue does not support --me (needs Slurm 20.11 or newer)\n\n"
                 "cluster-b: squeue exited 1: slurm_load_jobs error: Unable to contact slurm controller\n",
             )
+
+    def test_mine_counts_tres_per_task_gpus_multiplied_by_num_tasks_in_fallback_order(
+        self,
+    ) -> None:
+        squeue_output = (
+            # empty tres-alloc/per-node/per-job, tres-per-task gres/gpu:1, 4 tasks -> 4 GPUs
+            "6401|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|4||||gres/gpu:1|N/A|Resources|per_task_slash|\n"
+            # gres:gpu:1 form with 4 tasks -> 4 GPUs
+            "6402|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|4|N/A|N/A|N/A|gres:gpu:1|N/A|Resources|per_task_colon|\n"
+            # gpu:1 form with 4 tasks -> 4 GPUs
+            "6403|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|4|(null)|(null)|(null)|gpu:1|N/A|Resources|per_task_bare|\n"
+            # typed gres/gpu:a100:2 with 3 tasks -> 6 GPUs
+            "6404|alice|proj-123|gpu|PD|0:00|01:00:00|2|32|3|cpu=32|N/A|N/A|gres/gpu:a100:2|N/A|Resources|per_task_typed|\n"
+            # fallback order: tres-per-job (2) beats tres-per-node (3*2=6) and tres-per-task (1*4=4)
+            "6405|alice|proj-123|gpu|PD|0:00|01:00:00|2|16|4|cpu=16|gres/gpu:3|gres/gpu:2|gres/gpu:1|N/A|Resources|per_job_wins|\n"
+            # fallback order: tres-per-node (3*2=6) beats tres-per-task (1*4=4)
+            "6406|alice|proj-123|gpu|PD|0:00|01:00:00|2|16|4|cpu=16|gres/gpu:3|N/A|gres/gpu:1|N/A|Resources|per_node_wins|\n"
+            # unknown NumTasks multiplier (N/A) -> null
+            "6407|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|N/A|cpu=16|N/A|N/A|gres/gpu:1|N/A|Resources|unknown_tasks|\n"
+            # unknown NumNodes multiplier (2-4) on tres-per-node -> null (does not fall through to tres-per-task)
+            "6408|alice|proj-123|gpu|PD|0:00|01:00:00|2-4|16|4|cpu=16|gres/gpu:2|N/A|gres/gpu:1|N/A|Resources|unknown_nodes_stops|\n"
+            # malformed tres-per-task -> null, plus pipe in trailing Name after 17 fields
+            "6409|alice|proj-123|gpu|PD|0:00|01:00:00|1|16|4|cpu=16|N/A|N/A|gres/gpu:INVALID|N/A|Resources|bad|task|\n"
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "sglance"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                '[[clusters]]\nname = "cluster-a"\nlocal = true\n',
+                encoding="utf-8",
+            )
+            runner = FakeRunner({("cluster-a", "squeue"): squeue_output})
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            exit_code = main(
+                ["mine", "--json"],
+                env=make_test_env(root),
+                runner=runner,
+                clock=lambda: FIXED_NOW,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            jobs = json.loads(stdout.getvalue())["clusters"][0]["jobs"]
+            self.assertEqual(
+                [(job["job_id"], job["name"], job["gpus"]) for job in jobs],
+                [
+                    ("6401", "per_task_slash", 4),
+                    ("6402", "per_task_colon", 4),
+                    ("6403", "per_task_bare", 4),
+                    ("6404", "per_task_typed", 6),
+                    ("6405", "per_job_wins", 2),
+                    ("6406", "per_node_wins", 6),
+                    ("6407", "unknown_tasks", None),
+                    ("6408", "unknown_nodes_stops", None),
+                    ("6409", "bad|task", None),
+                ],
+            )
+
