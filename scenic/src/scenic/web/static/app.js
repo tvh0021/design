@@ -1682,9 +1682,8 @@
     });
     document.addEventListener("keydown", (ev) => {
       if (!(ev.metaKey || ev.ctrlKey) || ev.key !== "Enter") return;
-      ev.preventDefault();
-      if (state.mode === "ab" && !$("find").disabled) findRoutes();
-      else if (state.mode === "loop" && !$("find-loop").disabled) findLoops();
+      if (state.mode === "ab" && !$("find").disabled) { ev.preventDefault(); findRoutes(); }
+      else if (state.mode === "loop" && !$("find-loop").disabled) { ev.preventDefault(); findLoops(); }
     });
     for (const b of document.querySelectorAll(".sample-ab")) {
       b.addEventListener("click", () => {
@@ -1747,7 +1746,8 @@
       if (ev.key !== "Enter") return;
       ev.preventDefault();
       const v = Number($("min-custom").value.trim());
-      if (Number.isFinite(v) && v > 0) setMinutes(v, true);
+      if (!(Number.isFinite(v) && v > 0)) return;
+      setMinutes(v, true);
       if (!$("find-loop").disabled) findLoops();
     });
     $("swap").addEventListener("click", () => {

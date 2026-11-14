@@ -155,7 +155,7 @@ def _extract_member_rel(raw_name: str) -> tuple[str, str] | None:
     if any(p in ("", ".", "..") for p in parts) or raw_name.startswith("/"):
         raise ValueError(f"Unsafe archive path: {raw_name!r}")
     m = _ALLOWED_MEMBER.match(norm)
-    if not m:
+    if not m or m.group(2).startswith("._"):  # skip macOS AppleDouble files
         return None
     return m.group(1), m.group(2)
 
@@ -176,30 +176,31 @@ def _write_atomic(stream, dest: Path) -> int:
 
 
 def install_bundle(source: str | Path, data_root: Path | None = None, out: TextIO = sys.stdout) -> Path:
-    """Unpack prebuilt graph/score files from a local archive or HTTP(S) URL and verify."""
+    """Unpack prebuilt graph/score files from a local archive or HTTPS URL.
+
+    Files are unpacked into a staging folder and verified there; the live data
+    folder changes only after the bundle loads cleanly."""
     from .fetch import download
     from .search import Context
 
     with _with_data_root(data_root) as root:
         root.mkdir(parents=True, exist_ok=True)
         src_str = str(source)
-        tmp_download: Path | None = None
+        stage = Path(tempfile.mkdtemp(dir=root, prefix=".bundle-"))
         try:
-            if src_str.startswith(("https://", "http://")):
+            if src_str.startswith("http://"):
+                raise ValueError("Bundle URLs must use https://")
+            if src_str.startswith("https://"):
                 out.write(f"Downloading bundle from {src_str}\n")
                 out.flush()
                 suffix = ".zip" if src_str.lower().endswith(".zip") else ".tar.gz"
-                fd, name = tempfile.mkstemp(dir=root, prefix="bundle.", suffix=suffix)
-                os.close(fd)
-                tmp_download = Path(name)
-                tmp_download.unlink(missing_ok=True)
-                archive = download(src_str, tmp_download)
+                archive = download(src_str, stage / f"bundle{suffix}")
             else:
                 archive = Path(source).expanduser().resolve()
                 if not archive.is_file():
                     raise FileNotFoundError(f"Bundle not found: {archive}")
 
-            extracted: list[Path] = []
+            staged: list[tuple[str, str]] = []
             total_bytes = 0
             if zipfile.is_zipfile(archive):
                 with zipfile.ZipFile(archive) as zf:
@@ -212,10 +213,9 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
                         rel = _extract_member_rel(info.filename)
                         if rel is None:
                             continue
-                        dest = root / rel[0] / rel[1]
                         with zf.open(info, "r") as src_fp:
-                            total_bytes += _write_atomic(src_fp, dest)
-                        extracted.append(dest)
+                            total_bytes += _write_atomic(src_fp, stage / rel[0] / rel[1])
+                        staged.append(rel)
             elif tarfile.is_tarfile(archive):
                 with tarfile.open(archive, "r:*") as tf:
                     for member in tf.getmembers():
@@ -229,28 +229,34 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
                         src_fp = tf.extractfile(member)
                         if src_fp is None:
                             continue
-                        dest = root / rel[0] / rel[1]
                         with src_fp:
-                            total_bytes += _write_atomic(src_fp, dest)
-                        extracted.append(dest)
+                            total_bytes += _write_atomic(src_fp, stage / rel[0] / rel[1])
+                        staged.append(rel)
             else:
                 raise ValueError(f"Unsupported archive format (expected .tar.gz, .tar, or .zip): {archive}")
 
-            _, _, missing = missing_serve_files(root / "graph", root / "score")
+            _, _, missing = missing_serve_files(stage / "graph", stage / "score")
             if missing:
                 names = ", ".join(p.name for p in missing)
                 raise ValueError(f"Archive did not contain required runtime files ({names})")
+            ctx = Context.load(stage / "graph", stage / "score")
 
-            ctx = Context.load(root / "graph", root / "score")
+            # Verified: drop optional runtime files the bundle lacks (they would
+            # not match its edges), then move the staged files into place.
+            for sub, name in OPTIONAL_RUNTIME:
+                if (sub, name) not in staged:
+                    (root / sub / name).unlink(missing_ok=True)
+            for sub, name in staged:
+                (root / sub).mkdir(parents=True, exist_ok=True)
+                os.replace(stage / sub / name, root / sub / name)
             out.write(
-                f"Unpacked {len(extracted)} files ({_fmt_size(total_bytes)}) into {root}\n"
+                f"Unpacked {len(staged)} files ({_fmt_size(total_bytes)}) into {root}\n"
                 f"Verified {ctx.g.n_edges:,} road edges and {len(ctx.moments.id):,} scenic moments.\n"
                 "Ready. Start the map in your browser with: scenic serve --open\n"
             )
             return root
         finally:
-            if tmp_download is not None:
-                tmp_download.unlink(missing_ok=True)
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def run_setup(

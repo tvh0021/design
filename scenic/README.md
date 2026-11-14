@@ -19,13 +19,13 @@ With Python 3.11 or newer, install directly from GitHub without cloning using
 `uv` or `pipx`:
 
 ```sh
-uv tool install "git+https://github.com/tvh0021/design.git@scenic#subdirectory=scenic"
+uv tool install "git+https://github.com/tvh0021/design.git#subdirectory=scenic"
 ```
 
 Or with `pipx`:
 
 ```sh
-pipx install "git+https://github.com/tvh0021/design.git@scenic#subdirectory=scenic"
+pipx install "git+https://github.com/tvh0021/design.git#subdirectory=scenic"
 ```
 
 Inside a local clone of this repository, create a virtual environment in
@@ -35,6 +35,7 @@ Inside a local clone of this repository, create a virtual environment in
 cd scenic
 python3 -m venv .venv
 .venv/bin/pip install -e '.[test]'
+source .venv/bin/activate   # puts `scenic` on your PATH
 ```
 
 ### 2. Prepare the New York route data
