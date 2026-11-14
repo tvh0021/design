@@ -41,6 +41,16 @@
   const PIN_TITLES = { a: "Start", b: "End", h: "Start and finish", x: "Place or scenic feature" };
   const POINT_PINS = { from: "a", to: "b", start: "h", anchor: "x" };
   const LOOP_DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  const SAMPLES_AB = {
+    "finger-lakes": { from: [43.1566, -77.6088], fromLabel: "Rochester", to: [42.3806, -76.8733], toLabel: "Watkins Glen" },
+    catskills: { from: [41.9270, -73.9974], fromLabel: "Kingston", to: [42.4529, -75.0638], toLabel: "Oneonta" },
+    adirondacks: { from: [43.4262, -73.7123], fromLabel: "Lake George", to: [44.2795, -73.9799], toLabel: "Lake Placid" },
+  };
+  const SAMPLES_LOOP = {
+    auburn: { start: [42.9318, -76.5661], label: "Auburn", minutes: 120 },
+    ithaca: { start: [42.4440, -76.5019], label: "Ithaca", minutes: 120 },
+    "lake-placid": { start: [44.2795, -73.9799], label: "Lake Placid", minutes: 120 },
+  };
 
   function emptySlot() {
     return { search: null, selected: null, visible: {}, waypoints: {}, lastError: null };
@@ -55,11 +65,12 @@
     gen: 0, // bumped whenever A or B changes; a search answer for an older generation is dropped
     loopGen: 0, // bumped whenever loop inputs change
     search: null, selected: null, visible: {}, waypoints: {},
-    busy: false, lastError: null, presets: null, preset: null,
+    busy: false, lastError: null, presets: null, preset: null, pendingSampleRun: null,
     units: store.get(UNITS_KEY) === "km" ? "km" : "mi",
   };
   let searchToken = 0; // the latest route request; older answers are dropped
   let chipToken = 0;
+  let busyTimer = null;
 
   // ---- map -------------------------------------------------------------------
 
@@ -213,17 +224,32 @@
 
   function fmt(lat, lon) { return `${lat.toFixed(5)}, ${lon.toFixed(5)}`; }
 
+  function syncStarters() {
+    $("empty-ab").hidden = DEMO || state.mode !== "ab" || state.busy || !!state.search;
+    $("empty-loop").hidden = DEMO || state.mode !== "loop" || state.busy || !!state.search;
+  }
+
+  function syncMapCursor() {
+    const picking = !DEMO && (state.mode === "ab" ? (!state.a || !state.b)
+      : (!state.h || state.loop.steer === "anchor"));
+    $("map").classList.toggle("picking", picking);
+  }
+
   function onPointsChanged() {
     state.gen += 1;
+    state.pendingSampleRun = null;
     if (state.mode === "ab") {
       if (state.busy) { searchToken += 1; setBusy(false); } // the pending search is for the old points
       if (state.search) clearResults(); // routes and Maps links were for the old points
-      setBadPin(null);
+      if (state.badPin) showError("");
+      else setBadPin(null);
     } else {
       state.byMode.ab = emptySlot();
     }
     updateFind();
     updateHome();
+    syncStarters();
+    syncMapCursor();
     // keep the link in step with the points (not before a #from=…&to=… link has been read)
     if (DEMO || hashDone) writeHash();
     $("hint").textContent = !state.a ? "Click the map to set the start, then the end."
@@ -233,10 +259,12 @@
 
   function onLoopChanged(refreshAnchorChips) {
     state.loopGen += 1;
+    state.pendingSampleRun = null;
     if (state.mode === "loop") {
       if (state.busy) { searchToken += 1; setBusy(false); }
       if (state.search) clearResults();
-      setBadPin(null);
+      if (state.badPin) showError("");
+      else setBadPin(null);
     } else {
       state.byMode.loop = emptySlot();
     }
@@ -245,6 +273,8 @@
     updateFind();
     updateHome();
     updateLoopHint();
+    syncStarters();
+    syncMapCursor();
     if (refreshAnchorChips && state.mode === "loop" && state.loop.steer === "anchor") refreshChips();
     if (hashDone) writeHash();
   }
@@ -392,8 +422,19 @@
 
   function setBusy(on, text) {
     state.busy = on;
+    if (busyTimer) { clearInterval(busyTimer); busyTimer = null; }
     $("busy").hidden = !on;
-    if (text) $("busy-text").textContent = text;
+    if (on && text) {
+      const t0 = Date.now();
+      $("busy-text").textContent = text;
+      busyTimer = setInterval(() => {
+        const s = Math.floor((Date.now() - t0) / 1000);
+        if (s >= 2) $("busy-text").textContent = `${text} (${s} s)`;
+      }, 500);
+    } else if (text) {
+      $("busy-text").textContent = text;
+    }
+    syncStarters();
     updateFind();
   }
 
@@ -412,13 +453,20 @@
         $("loading").hidden = true;
         updateFind();
         maybeRunFromHash();
+        if (state.pendingSampleRun === "ab" && state.mode === "ab" && state.a && state.b) {
+          state.pendingSampleRun = null;
+          findRoutes();
+        } else if (state.pendingSampleRun === "loop" && state.mode === "loop" && state.h && steerReady()) {
+          state.pendingSampleRun = null;
+          findLoops();
+        }
         if (state.mode === "loop" && state.loop.steer === "anchor" && state.h) refreshChips();
         return;
       }
       if (h.status === "error") {
         $("loading").className = "banner error";
         $("loading-text").textContent = "The route data failed to load: " + (h.error || "unknown error") +
-          ". Check the data folders and restart `scenic serve`.";
+          ". Run `scenic setup --check` to inspect the data files, then restart `scenic serve`.";
         $("loading").querySelector(".spinner")?.remove();
         return;
       }
@@ -531,6 +579,8 @@
     updateHome();
     updateFind();
     updateLoopHint();
+    syncStarters();
+    syncMapCursor();
     if (mode === "loop" && state.loop.steer === "anchor" && state.ready && state.h) refreshChips();
     renderAll(false);
     if (hashDone) writeHash();
@@ -719,6 +769,13 @@
     return r.role === 0 || x <= 0 ? "—" : `+${x}`;
   }
 
+  function revealResults() {
+    if (DEMO || $("results").hidden) return;
+    const panel = $("panel"), res = $("results");
+    const pr = panel.getBoundingClientRect(), rr = res.getBoundingClientRect();
+    if (rr.top > pr.bottom - 72) res.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
   async function findRoutes() {
     if (!state.ready || !state.a || !state.b) return;
     const token = ++searchToken, gen = state.gen;
@@ -735,6 +792,7 @@
       state.selected = pick.key;
       writeHash();
       renderAll(true);
+      revealResults();
     } catch (e) {
       if (token !== searchToken || gen !== state.gen || state.mode !== "ab") return;
       showError(e, e.point);
@@ -784,6 +842,7 @@
       state.selected = data.routes[0].key;
       writeHash();
       renderAll(true);
+      revealResults();
     } catch (e) {
       if (token !== searchToken || gen !== state.loopGen || state.mode !== "loop") return;
       showError(e, e.point);
@@ -797,6 +856,7 @@
     routeLayer.clearLayers(); scenicLayer.clearLayers(); momentLayer.clearLayers(); waypointLayer.clearLayers();
     $("results").hidden = true;
     showMapKey(false);
+    syncStarters();
   }
 
   function renderAll(fit) {
@@ -956,9 +1016,16 @@
     return sw;
   }
 
+  function selectFromKeyboard(key) {
+    select(key);
+    const row = $("routes").querySelector(`tr.route[data-key="${key}"]`);
+    if (row) row.focus();
+  }
+
   function renderTable() {
     const s = state.search;
     $("results").hidden = !s;
+    syncStarters();
     if (!s) return;
     const isLoop = s.mode === "loop";
     $("route-head").textContent = isLoop ? "Loop" : "Route";
@@ -971,6 +1038,9 @@
     for (const r of s.routes) {
       const selCls = r.key === state.selected ? " selected" : "";
       const tr = el("tr", "route" + selCls);
+      tr.dataset.key = r.key;
+      tr.tabIndex = 0;
+      tr.setAttribute("aria-selected", String(r.key === state.selected));
       const name = el("td", "name");
       const cb = el("input"); cb.type = "checkbox"; cb.checked = !!state.visible[r.key];
       cb.title = "Show on map";
@@ -990,6 +1060,18 @@
       td.appendChild(el("div", "roads", roadsText(r))); // OSM road names: textContent only
       sub.appendChild(td);
       for (const row of [tr, sub]) row.addEventListener("click", () => select(r.key));
+      tr.addEventListener("keydown", (ev) => {
+        if (ev.target !== tr) return;
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          selectFromKeyboard(r.key);
+        } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+          ev.preventDefault();
+          const idx = s.routes.findIndex((x) => x.key === r.key);
+          const next = s.routes[idx + (ev.key === "ArrowDown" ? 1 : -1)];
+          if (next) selectFromKeyboard(next.key);
+        }
+      });
       tb.appendChild(tr);
       tb.appendChild(sub);
     }
@@ -1524,11 +1606,54 @@
 
   // ---- wiring ----------------------------------------------------------------
 
+  function wireDropdownKeys(inputId, listId) {
+    const inp = $(inputId), list = $(listId);
+    inp.addEventListener("input", () => {
+      for (const li of list.querySelectorAll(".kb-active")) li.classList.remove("kb-active");
+      if (!inp.value.trim()) list.hidden = true;
+    });
+    inp.addEventListener("keydown", (ev) => {
+      if (list.hidden) return;
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        list.hidden = true;
+        return;
+      }
+      const items = [...list.querySelectorAll("li:not(.none)")];
+      if (!items.length) return;
+      const cur = items.findIndex((li) => li.classList.contains("kb-active"));
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        ev.preventDefault();
+        for (const li of items) li.classList.remove("kb-active");
+        const next = cur < 0 ? (ev.key === "ArrowDown" ? 0 : items.length - 1)
+          : (cur + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
+        items[next].classList.add("kb-active");
+        items[next].scrollIntoView({ block: "nearest" });
+      } else if (ev.key === "Enter" && cur >= 0) {
+        ev.preventDefault();
+        items[cur].click();
+      }
+    });
+  }
+
+  $("map-toggle").addEventListener("click", () => {
+    const on = document.body.classList.toggle("map-expanded");
+    $("map-toggle").setAttribute("aria-pressed", String(on));
+    $("map-toggle").textContent = on ? "Smaller map" : "Larger map";
+    setTimeout(() => map.invalidateSize(), 60);
+  });
   $("by-s").addEventListener("change", () => { renderLegend(); renderMap(false); writeHash(); });
   $("u-mi").addEventListener("click", () => { setUnits("mi"); if (DEMO && state.presets) renderPresets(); });
   $("u-km").addEventListener("click", () => { setUnits("km"); if (DEMO && state.presets) renderPresets(); });
   $("tab-ab").addEventListener("click", () => setMode("ab"));
   $("tab-loop").addEventListener("click", () => setMode("loop"));
+  $("mode-tabs").addEventListener("keydown", (ev) => {
+    if (ev.key !== "ArrowRight" && ev.key !== "ArrowLeft") return;
+    ev.preventDefault();
+    const next = state.mode === "ab" ? "loop" : "ab";
+    setMode(next);
+    $(next === "ab" ? "tab-ab" : "tab-loop").focus();
+  });
   for (const b of document.querySelectorAll("#budget .seg button")) {
     b.addEventListener("click", () => setMinutes(Number(b.dataset.min), false));
   }
@@ -1547,6 +1672,42 @@
     wireSearch("b");
     wireSearch("h");
     wireAnchorSearch();
+    wireDropdownKeys("q-a", "res-a");
+    wireDropdownKeys("q-b", "res-b");
+    wireDropdownKeys("q-h", "res-h");
+    wireDropdownKeys("q-x", "res-x");
+    document.addEventListener("click", (ev) => {
+      if (ev.target.closest && ev.target.closest(".place")) return;
+      for (const id of ["res-a", "res-b", "res-h", "res-x"]) $(id).hidden = true;
+    });
+    document.addEventListener("keydown", (ev) => {
+      if (!(ev.metaKey || ev.ctrlKey) || ev.key !== "Enter") return;
+      if (state.mode === "ab" && !$("find").disabled) { ev.preventDefault(); findRoutes(); }
+      else if (state.mode === "loop" && !$("find-loop").disabled) { ev.preventDefault(); findLoops(); }
+    });
+    for (const b of document.querySelectorAll(".sample-ab")) {
+      b.addEventListener("click", () => {
+        const s = SAMPLES_AB[b.dataset.sample];
+        if (!s) return;
+        setPoint("a", s.from, s.fromLabel);
+        setPoint("b", s.to, s.toLabel);
+        map.fitBounds(L.latLngBounds([s.from, s.to]), { padding: [40, 40] });
+        if (state.ready) findRoutes();
+        else { state.pendingSampleRun = "ab"; $("hint").textContent = "Points set. Searching as soon as the graph finishes loading…"; }
+      });
+    }
+    for (const b of document.querySelectorAll(".sample-loop")) {
+      b.addEventListener("click", () => {
+        const s = SAMPLES_LOOP[b.dataset.sampleLoop];
+        if (!s) return;
+        setMinutes(s.minutes, false);
+        setSteer("any");
+        setPoint("h", s.start, s.label);
+        map.setView(s.start, 10);
+        if (state.ready) findLoops();
+        else { state.pendingSampleRun = "loop"; $("hint-loop").textContent = "Start set. Searching as soon as the graph finishes loading…"; }
+      });
+    }
     $("find").addEventListener("click", findRoutes);
     $("find-loop").addEventListener("click", findLoops);
     $("clear").addEventListener("click", () => {
@@ -1581,6 +1742,14 @@
       const v = Number(raw);
       if (Number.isFinite(v)) setMinutes(v, true);
     });
+    $("min-custom").addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      const v = Number($("min-custom").value.trim());
+      if (!(Number.isFinite(v) && v > 0)) return;
+      setMinutes(v, true);
+      if (!$("find-loop").disabled) findLoops();
+    });
     $("swap").addEventListener("click", () => {
       const a = state.a, b = state.b, qa = $("q-a").value, qb = $("q-b").value;
       if (!a && !b) return;
@@ -1603,6 +1772,8 @@
     }
     onPointsChanged();
     updateLoopHint();
+    syncStarters();
+    syncMapCursor();
     pollHealth();
   }
 })();
