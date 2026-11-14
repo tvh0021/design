@@ -29,8 +29,11 @@
       <h1>Maps for Wanderers</h1>
       <p class="kind">Scenic drives across New York State</p>
     </div>
-    <div class="units" role="group" aria-label="Distance units">
-      <button type="button" id="u-mi" aria-pressed="true">mi</button><button type="button" id="u-km" aria-pressed="false">km</button>
+    <div class="head-controls">
+      <button type="button" id="map-toggle" class="small map-toggle" aria-pressed="false">Larger map</button>
+      <div class="units" role="group" aria-label="Distance units">
+        <button type="button" id="u-mi" aria-pressed="true">mi</button><button type="button" id="u-km" aria-pressed="false">km</button>
+      </div>
     </div>
   </header>
 
@@ -49,7 +52,7 @@
     <ul id="preset-list" class="preset-list"></ul>
   </section>
 
-  <div id="loading" class="banner info"><span class="spinner"></span> <span id="loading-text">Loading the road graph and scenery scores&hellip;</span></div>
+  <div id="loading" class="banner info" role="status" aria-live="polite"><span class="spinner"></span> <span id="loading-text">Loading the road graph and scenery scores (~1 s). You can already pick points on the map.</span></div>
 
   <section class="points" id="panel-ab">
     <form id="form-a" class="place" autocomplete="off">
@@ -81,9 +84,18 @@
     </form>
     <p class="hint" id="hint">Click the map to set the start, then the end. Drag the markers to adjust.</p>
     <div class="actions">
-      <button id="find" class="primary" disabled>Find routes</button>
+      <button id="find" class="primary" disabled title="Shortcut: Cmd/Ctrl + Enter">Find routes</button>
       <button id="swap" type="button" title="Swap start and end">Swap</button>
       <button id="clear" type="button">Clear</button>
+    </div>
+    <div class="starter" id="empty-ab">
+      <p class="starter-copy">Compares the fastest route with scenic detours under +15%, +30%, and +50% extra time, then builds an editable Google Maps link.</p>
+      <div class="starter-row">
+        <span class="starter-label">Try an example:</span>
+        <button type="button" class="chip sample-ab" data-sample="finger-lakes">Rochester to Watkins Glen</button>
+        <button type="button" class="chip sample-ab" data-sample="catskills">Kingston to Oneonta</button>
+        <button type="button" class="chip sample-ab" data-sample="adirondacks">Lake George to Lake Placid</button>
+      </div>
     </div>
   </section>
 
@@ -152,13 +164,22 @@
 
     <p class="hint" id="hint-loop">Click the map to set the start, or use From home.</p>
     <div class="actions">
-      <button id="find-loop" class="primary" type="button" disabled>Find loops</button>
+      <button id="find-loop" class="primary" type="button" disabled title="Shortcut: Cmd/Ctrl + Enter">Find loops</button>
       <button id="clear-loop" type="button">Clear</button>
+    </div>
+    <div class="starter" id="empty-loop">
+      <p class="starter-copy">Finds up to three circular drives starting and ending at S without retracing the same road.</p>
+      <div class="starter-row">
+        <span class="starter-label">Try 2 h from:</span>
+        <button type="button" class="chip sample-loop" data-sample-loop="auburn">Auburn</button>
+        <button type="button" class="chip sample-loop" data-sample-loop="ithaca">Ithaca</button>
+        <button type="button" class="chip sample-loop" data-sample-loop="lake-placid">Lake Placid</button>
+      </div>
     </div>
   </section>
 
-  <div id="error" class="banner error" hidden></div>
-  <div id="busy" class="banner info" hidden><span class="spinner"></span> <span id="busy-text">Searching&hellip;</span></div>
+  <div id="error" class="banner error" role="alert" hidden></div>
+  <div id="busy" class="banner info" role="status" aria-live="polite" hidden><span class="spinner"></span> <span id="busy-text">Searching&hellip;</span></div>
 
   <section id="results" hidden>
     <table id="routes">
