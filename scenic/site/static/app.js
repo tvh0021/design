@@ -1,8 +1,8 @@
 /* Maps for Wanderers: one page, Leaflet, no build step. The server is scenic/web/server.py.
  *
  * Two modes. Live (default): the page talks to `scenic serve` through /api/*. Demo
- * (<html data-mode="demo">, written by `scenic demo build`): read-only preset routes from
- * data/*.json by relative path; no /api calls, no geocoding, no point picking.
+ * (<html data-mode="demo">, written by `scenic demo build`): read-only preset A-to-B routes and
+ * precomputed Drive-around loops from data/*.json by relative path; no /api calls, no geocoding.
  *
  * Text from OpenStreetMap or Nominatim (moment labels, road names, place names) goes into
  * the page only through textContent or DOM nodes, never as an HTML string: Leaflet treats a
@@ -37,15 +37,29 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* storage off: keep it for this page */ } },
   };
 
+  const PIN_LETTERS = { a: "A", b: "B", h: "S", x: "P" };
+  const PIN_TITLES = { a: "Start", b: "End", h: "Start and finish", x: "Place or scenic feature" };
+  const POINT_PINS = { from: "a", to: "b", start: "h", anchor: "x" };
+  const LOOP_DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+
+  function emptySlot() {
+    return { search: null, selected: null, visible: {}, waypoints: {}, lastError: null };
+  }
+
   const state = {
-    ready: false, health: null,
-    a: null, b: null, markerA: null, markerB: null, badPin: null,
+    ready: false, health: null, mode: "ab", loopOpenedOnce: false,
+    a: null, b: null, h: null, x: null,
+    markers: { a: null, b: null, h: null, x: null }, badPin: null,
+    loop: { minutes: 120, steer: "any", dir: null, feature: null, featurePoint: null, chips: [] },
+    byMode: { ab: emptySlot(), loop: emptySlot() },
     gen: 0, // bumped whenever A or B changes; a search answer for an older generation is dropped
+    loopGen: 0, // bumped whenever loop inputs change
     search: null, selected: null, visible: {}, waypoints: {},
     busy: false, lastError: null, presets: null, preset: null,
     units: store.get(UNITS_KEY) === "km" ? "km" : "mi",
   };
   let searchToken = 0; // the latest route request; older answers are dropped
+  let chipToken = 0;
 
   // ---- map -------------------------------------------------------------------
 
@@ -81,6 +95,7 @@
   const waypointLayer = L.layerGroup().addTo(map);
 
   // small key for the marks drawn over the routes, shown with results
+  let splitKeyRow = null, splitKeyPin = null;
   const mapKey = L.control({ position: "bottomleft" });
   mapKey.onAdd = () => {
     const div = el("div", "map-key");
@@ -89,9 +104,13 @@
       r.appendChild(mark);
       r.appendChild(el("span", null, text));
       div.appendChild(r);
+      return r;
     };
     row(el("span", "k-stop"), "Scenic stop");
     row(el("span", "wp-pin", "1"), "Google Maps waypoint");
+    splitKeyPin = el("span", "wp-pin split", "7");
+    splitKeyRow = row(splitKeyPin, "Part handoff waypoint");
+    splitKeyRow.hidden = true;
     row(el("span", "wp-pin weak", "2"), "Weaker waypoint (near a junction)");
     L.DomEvent.disableClickPropagation(div);
     return div;
@@ -104,44 +123,90 @@
   }
 
   function pinIcon(which) {
-    const div = el("div", `ab-pin ${which}${state.badPin === which ? " bad" : ""}`, which.toUpperCase());
+    const div = el("div", `ab-pin ${which}${state.badPin === which ? " bad" : ""}`, PIN_LETTERS[which] || which.toUpperCase());
     return L.divIcon({ className: "", html: div, iconSize: [26, 26], iconAnchor: [13, 13] });
   }
 
   function setBadPin(which) {
     if (state.badPin === which) return;
     state.badPin = which;
-    for (const w of ["a", "b"]) {
-      const m = state[w === "a" ? "markerA" : "markerB"];
+    for (const w of ["a", "b", "h", "x"]) {
+      const m = state.markers[w];
       if (m) m.setIcon(pinIcon(w));
+    }
+  }
+
+  function syncMarkers() {
+    const want = {
+      a: state.mode === "ab" ? state.a : null,
+      b: state.mode === "ab" ? state.b : null,
+      h: state.mode === "loop" ? state.h : null,
+      x: state.mode === "loop" && state.loop.steer === "anchor" ? (state.x || state.loop.featurePoint) : null,
+    };
+    for (const [w, pt] of Object.entries(want)) {
+      const m = state.markers[w];
+      if (!pt) {
+        if (m && map.hasLayer(m)) map.removeLayer(m);
+        continue;
+      }
+      if (!m) {
+        const mk = L.marker(pt, { draggable: !DEMO, icon: pinIcon(w), autoPan: true,
+          title: PIN_TITLES[w], zIndexOffset: w === "x" ? 950 : 1000 }).addTo(map);
+        mk.on("dragend", (e) => {
+          const p = e.target.getLatLng();
+          if (w === "x") {
+            state.x = [p.lat, p.lng];
+            state.loop.feature = null;
+            state.loop.featurePoint = null;
+            $("q-x").value = fmt(p.lat, p.lng);
+            $("anchor-note").hidden = true;
+            syncChipSelection();
+            onLoopChanged(false);
+          } else if (w === "h") {
+            state.h = [p.lat, p.lng];
+            $("q-h").value = fmt(p.lat, p.lng);
+            onLoopChanged(true);
+          } else {
+            state[w] = [p.lat, p.lng];
+            $("q-" + w).value = fmt(p.lat, p.lng);
+            onPointsChanged();
+          }
+        });
+        state.markers[w] = mk;
+      } else {
+        m.setLatLng(pt);
+        m.setIcon(pinIcon(w));
+        if (!map.hasLayer(m)) m.addTo(map);
+      }
     }
   }
 
   function setPoint(which, latlng, label) {
     const ll = L.latLng(latlng);
-    const key = which === "a" ? "markerA" : "markerB";
     state[which] = [ll.lat, ll.lng];
-    if (!state[key]) {
-      state[key] = L.marker(ll, { draggable: !DEMO, icon: pinIcon(which), autoPan: true,
-        title: which === "a" ? "Start" : "End", zIndexOffset: 1000 }).addTo(map);
-      state[key].on("dragend", (e) => {
-        const p = e.target.getLatLng();
-        state[which] = [p.lat, p.lng];
-        $("q-" + which).value = fmt(p.lat, p.lng);
-        onPointsChanged();
-      });
-    } else {
-      state[key].setLatLng(ll);
+    if (which === "x") {
+      state.loop.feature = null;
+      state.loop.featurePoint = null;
+      $("anchor-note").hidden = true;
+      syncChipSelection();
     }
     $("q-" + which).value = label || fmt(ll.lat, ll.lng);
     $("res-" + which).hidden = true;
-    onPointsChanged();
+    syncMarkers();
+    if (which === "a" || which === "b") onPointsChanged();
+    else onLoopChanged(which === "h");
   }
 
   function removePoint(which) {
-    const k = which === "a" ? "markerA" : "markerB";
-    if (state[k]) { map.removeLayer(state[k]); state[k] = null; }
+    if (state.markers[which]) { map.removeLayer(state.markers[which]); state.markers[which] = null; }
     state[which] = null;
+    if (which === "x") {
+      state.loop.feature = null;
+      state.loop.featurePoint = null;
+      $("anchor-note").hidden = true;
+      syncChipSelection();
+      $("clear-x").hidden = true;
+    }
     $("q-" + which).value = "";
     $("res-" + which).hidden = true;
   }
@@ -150,9 +215,13 @@
 
   function onPointsChanged() {
     state.gen += 1;
-    if (state.busy) { searchToken += 1; setBusy(false); } // the pending search is for the old points
-    if (state.search) clearResults(); // routes and Maps links were for the old points
-    setBadPin(null);
+    if (state.mode === "ab") {
+      if (state.busy) { searchToken += 1; setBusy(false); } // the pending search is for the old points
+      if (state.search) clearResults(); // routes and Maps links were for the old points
+      setBadPin(null);
+    } else {
+      state.byMode.ab = emptySlot();
+    }
     updateFind();
     updateHome();
     // keep the link in step with the points (not before a #from=…&to=… link has been read)
@@ -162,12 +231,52 @@
       : "Drag the markers to adjust, or press Find routes.";
   }
 
+  function onLoopChanged(refreshAnchorChips) {
+    state.loopGen += 1;
+    if (state.mode === "loop") {
+      if (state.busy) { searchToken += 1; setBusy(false); }
+      if (state.search) clearResults();
+      setBadPin(null);
+    } else {
+      state.byMode.loop = emptySlot();
+    }
+    $("clear-x").hidden = !(state.x || state.loop.feature);
+    syncMarkers();
+    updateFind();
+    updateHome();
+    updateLoopHint();
+    if (refreshAnchorChips && state.mode === "loop" && state.loop.steer === "anchor") refreshChips();
+    if (hashDone) writeHash();
+  }
+
+  function steerReady() {
+    if (state.loop.steer === "compass") return !!state.loop.dir;
+    if (state.loop.steer === "anchor") return !!(state.x || state.loop.feature);
+    return true;
+  }
+
   function updateFind() {
     $("find").disabled = !(state.ready && state.a && state.b && !state.busy);
+    $("find-loop").disabled = !(state.ready && state.h && steerReady() && !state.busy);
+  }
+
+  function updateLoopHint() {
+    $("hint-loop").textContent = !state.h ? "Click the map to set the start, or use From home."
+      : state.loop.steer === "compass" && !state.loop.dir ? "Pick a compass direction above."
+      : state.loop.steer === "anchor" && !state.x && !state.loop.feature
+        ? "Pick a scenic feature chip, search a place, or click the map (water is fine)."
+      : state.loop.steer === "anchor" ? "Click the map or drag P to move the place, or press Find loops."
+      : "Drag S to adjust the start, or press Find loops.";
   }
 
   map.on("click", (e) => {
     if (DEMO) return; // read-only: the presets set A and B
+    if (state.mode === "loop") {
+      if (!state.h) setPoint("h", e.latlng);
+      else if (state.loop.steer === "anchor") setPoint("x", e.latlng);
+      else $("hint-loop").textContent = "The start is set. Drag the marker to move it.";
+      return;
+    }
     if (!state.a) setPoint("a", e.latlng);
     else if (!state.b) setPoint("b", e.latlng);
     else $("hint").textContent = "Both points are set. Drag a marker to move it, or press Clear to start over.";
@@ -202,10 +311,14 @@
 
   function updateHome() {
     const h = loadHome();
-    $("home-a").disabled = !h;
-    $("home-a").title = h ? `Start from ${h.label || fmt(h.lat, h.lon)}` : "Set a home point first";
+    const title = h ? `Start from ${h.label || fmt(h.lat, h.lon)}` : "Set a home point first";
+    for (const id of ["home-a", "home-h"]) {
+      $(id).disabled = !h;
+      $(id).title = title;
+    }
     $("home-set-a").disabled = !state.a;
     $("home-set-b").disabled = !state.b;
+    $("home-set-h").disabled = !state.h;
   }
 
   function setHome(which) {
@@ -214,13 +327,15 @@
     const label = $("q-" + which).value.trim() || fmt(p[0], p[1]);
     store.set(HOME_KEY, JSON.stringify({ lat: p[0], lon: p[1], label }));
     updateHome();
-    $("hint").textContent = `Home saved: ${label}. "From home" puts it in A.`;
+    if (which === "h") $("hint-loop").textContent = `Home saved: ${label}. "From home" puts it in S.`;
+    else $("hint").textContent = `Home saved: ${label}. "From home" puts it in A.`;
   }
 
-  function fromHome() {
+  function fromHome(target) {
+    const which = typeof target === "string" ? target : "a";
     const h = loadHome();
     if (!h) return;
-    setPoint("a", [h.lat, h.lon], h.label);
+    setPoint(which, [h.lat, h.lon], h.label);
     map.panTo([h.lat, h.lon]);
   }
 
@@ -240,7 +355,7 @@
     try { data = await r.json(); } catch (e) { /* not JSON */ }
     if (!r.ok) {
       const err = new Error(cap((data && data.error) || `HTTP ${r.status}. Try again.`));
-      err.point = data && data.point === "from" ? "a" : data && data.point === "to" ? "b" : null;
+      err.point = (data && POINT_PINS[data.point]) || null;
       err.data = data; // raw numbers (snap_m, limit_m) for messages in the page's units
       throw err;
     }
@@ -251,9 +366,16 @@
   function errorText(err) {
     const d = err && err.data;
     if (d && d.code === "snap_far" && Number.isFinite(d.snap_m) && Number.isFinite(d.limit_m)) {
-      const [which, pin] = d.point === "to" ? ["end", "B"] : ["start", "A"];
+      const [which, pin] = d.point === "to" ? ["end", "B"]
+        : d.point === "start" ? ["start", "S"]
+        : d.point === "anchor" ? ["anchor", "P"]
+        : ["start", "A"];
       return `The ${which} point is ${dist(d.snap_m / 1000, 1)} from the nearest road in the graph ` +
         `(limit ${dist(d.limit_m / 1000, 1)}). Drag ${pin} onto a road.`;
+    }
+    if (d && d.code === "anchor_out_of_reach" && Number.isFinite(d.round_trip_min) && Number.isFinite(d.needed_min)) {
+      return `That place is at least ${Math.round(d.round_trip_min)} min out and back from the start. ` +
+        `Try ${Math.round(d.needed_min)} min or more, or pick a closer place.`;
     }
     return err && err.message !== undefined ? err.message : err || "";
   }
@@ -283,9 +405,14 @@
       state.health = h;
       if (h.status === "ready") {
         state.ready = true;
+        if (h.loop) {
+          $("min-custom").min = String(h.loop.min_minutes || 30);
+          $("min-custom").max = String(h.loop.max_minutes || 360);
+        }
         $("loading").hidden = true;
         updateFind();
         maybeRunFromHash();
+        if (state.mode === "loop" && state.loop.steer === "anchor" && state.h) refreshChips();
         return;
       }
       if (h.status === "error") {
@@ -342,7 +469,248 @@
     });
   }
 
-  // ---- routes ------------------------------------------------------------------
+  function setMode(mode, wantRoute) {
+    if ((mode !== "ab" && mode !== "loop") || mode === state.mode) return;
+    if (DEMO && mode === "loop" && !(state.presets && state.presets.loop)) return;
+    if (state.busy) {
+      searchToken += 1;
+      presetToken += 1;
+      setBusy(false);
+    }
+    state.byMode[state.mode] = {
+      search: state.search, selected: state.selected,
+      visible: state.visible, waypoints: state.waypoints, lastError: state.lastError,
+    };
+    state.mode = mode;
+    for (const [m, tabId] of [["ab", "tab-ab"], ["loop", "tab-loop"]]) {
+      const on = m === mode;
+      $(tabId).classList.toggle("active", on);
+      $(tabId).setAttribute("aria-selected", String(on));
+    }
+    $("presets").hidden = !(DEMO && mode === "ab");
+    $("panel-ab").hidden = DEMO || mode !== "ab";
+    $("panel-loop").hidden = mode !== "loop";
+    if (!DEMO && mode === "loop" && !state.loopOpenedOnce) {
+      state.loopOpenedOnce = true;
+      if (!state.h && state.a) {
+        state.h = state.a.slice();
+        $("q-h").value = $("q-a").value;
+      }
+    }
+    const slot = state.byMode[mode] || emptySlot();
+    state.search = slot.search;
+    state.selected = slot.selected;
+    state.visible = slot.visible;
+    state.waypoints = slot.waypoints;
+    state.lastError = slot.lastError;
+    if (DEMO) {
+      if (mode === "loop") {
+        state.h = state.presets.loop.start.slice();
+        syncDemoLoopControls();
+        if (!state.search || wantRoute) {
+          loadDemoLoop(wantRoute || null);
+          return;
+        }
+      } else if (!state.search) {
+        const first = state.presets && state.presets.presets && state.presets.presets[0];
+        if (first) {
+          loadPreset(first.id, wantRoute || null);
+          return;
+        }
+      }
+      syncMarkers();
+      if (state.lastError) showError(state.lastError);
+      else showError("");
+      renderAll(true);
+      writeHash();
+      return;
+    }
+    syncMarkers();
+    if (state.lastError) showError(state.lastError);
+    else showError("");
+    updateHome();
+    updateFind();
+    updateLoopHint();
+    if (mode === "loop" && state.loop.steer === "anchor" && state.ready && state.h) refreshChips();
+    renderAll(false);
+    if (hashDone) writeHash();
+  }
+
+  function clampMinutes(v) {
+    const lo = (state.health && state.health.loop && state.health.loop.min_minutes) || 30;
+    const hi = (state.health && state.health.loop && state.health.loop.max_minutes) || 360;
+    return Math.max(lo, Math.min(hi, Math.round(v)));
+  }
+
+  function setMinutes(mins, fromCustom) {
+    if (!Number.isFinite(mins)) return;
+    if (DEMO) {
+      const lp = state.presets && state.presets.loop;
+      const m = Math.round(mins);
+      if (!lp || !lp.budgets.includes(m)) return;
+      state.loop.minutes = m;
+      syncDemoLoopControls();
+      if (state.mode === "loop") loadDemoLoop();
+      return;
+    }
+    const m = clampMinutes(mins);
+    state.loop.minutes = m;
+    for (const b of document.querySelectorAll("#budget .seg button")) {
+      b.setAttribute("aria-pressed", String(!fromCustom && Number(b.dataset.min) === m));
+    }
+    $("min-custom").value = fromCustom || ![60, 120, 180].includes(m) ? String(m) : "";
+    onLoopChanged(true);
+  }
+
+  function setSteer(steer) {
+    if (!["any", "compass", "anchor"].includes(steer)) return;
+    if (DEMO) {
+      state.loop.steer = steer;
+      syncDemoLoopControls();
+      if (state.mode === "loop") loadDemoLoop();
+      return;
+    }
+    state.loop.steer = steer;
+    for (const b of document.querySelectorAll("#steer > .seg button")) {
+      b.setAttribute("aria-pressed", String(b.dataset.steer === steer));
+    }
+    $("rose").hidden = steer !== "compass";
+    $("anchor-box").hidden = steer !== "anchor";
+    onLoopChanged(steer === "anchor");
+  }
+
+  function setDir(dir) {
+    const d = LOOP_DIRS.includes(dir) ? dir : null;
+    if (DEMO) {
+      if (!d) return;
+      state.loop.dir = d;
+      syncDemoLoopControls();
+      if (state.mode === "loop") loadDemoLoop();
+      return;
+    }
+    state.loop.dir = d;
+    for (const b of document.querySelectorAll("#rose button")) {
+      b.setAttribute("aria-pressed", String(b.dataset.dir === d));
+    }
+    onLoopChanged(false);
+  }
+
+  function syncChipSelection() {
+    for (const b of document.querySelectorAll("#chips button.chip")) {
+      b.setAttribute("aria-pressed", String(!!state.loop.feature && b.dataset.feature === state.loop.feature));
+    }
+  }
+
+  function selectFeature(feat, pan) {
+    state.x = null;
+    state.loop.feature = feat.name;
+    state.loop.featurePoint = Array.isArray(feat.point) ? feat.point.slice() : null;
+    $("q-x").value = feat.name;
+    $("res-x").hidden = true;
+    $("anchor-note").hidden = true;
+    syncChipSelection();
+    if (pan && state.loop.featurePoint) map.panTo(state.loop.featurePoint);
+    onLoopChanged(false);
+  }
+
+  async function refreshChips() {
+    const ul = $("chips");
+    if (!state.ready || !state.h) { ul.replaceChildren(); return; }
+    const tok = ++chipToken;
+    try {
+      const data = await api("/api/loop/features", { start: state.h, minutes: state.loop.minutes, limit: 8 });
+      if (tok !== chipToken) return;
+      const fits = (data.features || []).filter((f) => f.fits).slice(0, 8);
+      state.loop.chips = fits;
+      ul.replaceChildren();
+      for (const f of fits) {
+        const li = el("li");
+        const btn = el("button", "chip", f.name); // OSM feature text: textContent only
+        btn.type = "button";
+        btn.dataset.feature = f.name;
+        btn.title = `About ${Math.round(f.round_trip_min)} min out and back`;
+        btn.setAttribute("aria-pressed", String(state.loop.feature === f.name));
+        btn.addEventListener("click", () => selectFeature(f, true));
+        li.appendChild(btn);
+        ul.appendChild(li);
+      }
+      if (state.loop.feature && !state.loop.featurePoint) {
+        const hit = fits.find((f) => f.name.toLowerCase() === state.loop.feature.toLowerCase());
+        if (hit && Array.isArray(hit.point)) {
+          state.loop.featurePoint = hit.point.slice();
+          syncMarkers();
+        }
+      }
+    } catch (e) {
+      if (tok === chipToken) ul.replaceChildren();
+    }
+  }
+
+  function wireAnchorSearch() {
+    let anchorSearchToken = 0;
+    $("form-x").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const q = $("q-x").value.trim();
+      const list = $("res-x");
+      if (!q) return;
+      const m = COORD_RE.exec(q);
+      if (m) {
+        anchorSearchToken++;
+        const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+        setPoint("x", [lat, lon]);
+        map.panTo([lat, lon]);
+        return;
+      }
+      const tok = ++anchorSearchToken;
+      showError("");
+      list.hidden = false;
+      list.replaceChildren(el("li", "none", "Searching…"));
+      const featCall = state.ready && state.h
+        ? api("/api/loop/features", { start: state.h, minutes: state.loop.minutes, q, limit: 8 })
+        : Promise.resolve({ features: [] });
+      const [fr, gr] = await Promise.allSettled([featCall, api("/api/geocode", { q })]);
+      if (tok !== anchorSearchToken) return;
+      const feats = fr.status === "fulfilled" && fr.value && Array.isArray(fr.value.features) ? fr.value.features : [];
+      const places = gr.status === "fulfilled" && gr.value && Array.isArray(gr.value.results) ? gr.value.results : [];
+      list.replaceChildren();
+      if (!feats.length && !places.length) {
+        if (gr.status === "rejected") {
+          list.hidden = true;
+          showError(gr.reason);
+          return;
+        }
+        list.appendChild(el("li", "none", "No scenic features or New York places match that name."));
+        return;
+      }
+      if (feats.length) {
+        list.appendChild(el("li", "none group-head", "Scenic features"));
+        for (const f of feats) {
+          const li = el("li");
+          li.appendChild(el("span", null, f.name)); // OSM feature text: textContent only
+          const meta = f.fits
+            ? ` · ~${Math.round(f.round_trip_min)} min out and back`
+            : ` · needs about ${Math.round(f.needed_min)} min`;
+          li.appendChild(el("span", "meta", meta));
+          li.addEventListener("click", () => selectFeature(f, true));
+          list.appendChild(li);
+        }
+      }
+      if (places.length) {
+        list.appendChild(el("li", "none group-head", "Places"));
+        for (const r of places) {
+          const li = el("li", null, r.name); // Nominatim text: textContent only
+          li.addEventListener("click", () => {
+            setPoint("x", [r.lat, r.lon], r.name);
+            map.setView([r.lat, r.lon], Math.max(map.getZoom(), 11));
+          });
+          list.appendChild(li);
+        }
+        list.appendChild(el("li", "none attr", "Place search: Nominatim, © OpenStreetMap contributors"));
+      }
+    });
+  }
+
+  // ---- routes and loops --------------------------------------------------------
 
   function roleColor(r) { return ROLE_COLORS[r.role] || "#444"; }
   function routeName(r) { return r.labels.join(" = "); }
@@ -358,7 +726,7 @@
     setBusy(true, "Searching for scenic routes… (a few seconds)");
     try {
       const data = await api("/api/route", { from: state.a, to: state.b });
-      if (token !== searchToken || gen !== state.gen) return; // points changed or a newer search started
+      if (token !== searchToken || gen !== state.gen || state.mode !== "ab") return; // points changed or a newer search started
       state.search = data;
       state.waypoints = {};
       state.visible = {};
@@ -368,7 +736,56 @@
       writeHash();
       renderAll(true);
     } catch (e) {
-      if (token !== searchToken || gen !== state.gen) return;
+      if (token !== searchToken || gen !== state.gen || state.mode !== "ab") return;
+      showError(e, e.point);
+    } finally {
+      if (token === searchToken) setBusy(false);
+    }
+  }
+
+  async function findLoops() {
+    if (!state.ready || !state.h || !steerReady()) return;
+    const token = ++searchToken, gen = state.loopGen;
+    showError("");
+    $("anchor-note").hidden = true;
+    setBusy(true, "Looking for loops… (a few seconds)");
+    const body = { start: state.h, minutes: state.loop.minutes, steer: state.loop.steer };
+    if (state.loop.steer === "compass") {
+      body.direction = state.loop.dir;
+    } else if (state.loop.steer === "anchor") {
+      if (state.loop.feature) body.feature = state.loop.feature;
+      else body.anchor = state.x;
+    }
+    try {
+      const data = await api("/api/loop", body);
+      if (token !== searchToken || gen !== state.loopGen || state.mode !== "loop") return;
+      if (data.steer && data.steer.mode === "anchor") {
+        if (data.steer.kind === "shore" && data.steer.name) {
+          state.x = null;
+          state.loop.feature = data.steer.name;
+          state.loop.featurePoint = Array.isArray(data.steer.point) ? data.steer.point : null;
+          $("q-x").value = data.steer.name;
+          $("clear-x").hidden = false;
+          syncChipSelection();
+          syncMarkers();
+          if (data.note) {
+            $("anchor-note").textContent = data.note;
+            $("anchor-note").hidden = false;
+          }
+        } else if (data.steer.kind === "feature" && Array.isArray(data.steer.point)) {
+          state.loop.featurePoint = data.steer.point;
+          syncMarkers();
+        }
+      }
+      state.search = data;
+      state.waypoints = {};
+      state.visible = {};
+      for (const r of data.routes) state.visible[r.key] = true;
+      state.selected = data.routes[0].key;
+      writeHash();
+      renderAll(true);
+    } catch (e) {
+      if (token !== searchToken || gen !== state.loopGen || state.mode !== "loop") return;
       showError(e, e.point);
     } finally {
       if (token === searchToken) setBusy(false);
@@ -394,6 +811,7 @@
     routeLayer.clearLayers(); scenicLayer.clearLayers(); momentLayer.clearLayers(); waypointLayer.clearLayers();
     const s = state.search;
     showMapKey(!!s);
+    if (splitKeyRow) splitKeyRow.hidden = true;
     if (!s) return;
     const bySel = $("by-s").checked;
     const bounds = L.latLngBounds([]);
@@ -429,7 +847,13 @@
       drawMoments(sel);
       drawWaypoints(sel);
     }
-    if (fit && bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
+    if (fit && bounds.isValid()) {
+      if (state.mode === "loop" && state.loop.steer === "anchor") {
+        const xp = state.x || state.loop.featurePoint;
+        if (xp) bounds.extend(xp);
+      }
+      map.fitBounds(bounds, { padding: [30, 30] });
+    }
   }
 
   function drawScenery(r) {
@@ -471,12 +895,28 @@
   function drawWaypoints(r) {
     const w = state.waypoints[r.key];
     if (!w || !w.data) return;
+    const splitAt = new Map();
+    if (Array.isArray(w.data.parts)) {
+      for (const pt of w.data.parts) {
+        if (pt.handoff_n) splitAt.set(pt.handoff_n, pt.part);
+      }
+    }
+    let firstSplitN = 0;
     for (const p of w.data.waypoints) {
-      const icon = L.divIcon({ className: "", html: el("div", "wp-pin" + (p.tier > 1 ? " weak" : ""), String(p.n)),
+      if (p.split && !firstSplitN) firstSplitN = p.n;
+      const partEnd = splitAt.get(p.n) || (p.split ? 1 : 0);
+      const cls = "wp-pin" + (p.split ? " split" : "") + (p.tier > 1 ? " weak" : "");
+      const icon = L.divIcon({ className: "", html: el("div", cls, String(p.n)),
         iconSize: [22, 22], iconAnchor: [11, 11] });
-      L.marker([p.lat, p.lon], { icon, zIndexOffset: 500, title: `Waypoint ${p.n}` })
-        .bindTooltip(textNode(`Waypoint ${p.n} on ${p.road}${p.tier > 1 ? " (weaker spot, near a junction)" : ""}`))
+      const splitNote = partEnd ? `, Part ${partEnd} ends and Part ${partEnd + 1} starts here` : "";
+      const weakNote = p.tier > 1 ? ", weaker spot near a junction" : "";
+      L.marker([p.lat, p.lon], { icon, zIndexOffset: p.split ? 550 : 500, title: `Waypoint ${p.n}` })
+        .bindTooltip(textNode(`Waypoint ${p.n} on ${p.road}${splitNote}${weakNote}`))
         .addTo(waypointLayer);
+    }
+    if (splitKeyRow && firstSplitN) {
+      splitKeyPin.textContent = String(firstSplitN);
+      splitKeyRow.hidden = false;
     }
   }
 
@@ -520,6 +960,12 @@
     const s = state.search;
     $("results").hidden = !s;
     if (!s) return;
+    const isLoop = s.mode === "loop";
+    $("route-head").textContent = isLoop ? "Loop" : "Route";
+    $("extra-head").hidden = isLoop;
+    $("caption").textContent = isLoop
+      ? "Scenic min: drive time on roads scenier than a typical New York road, weighted by how much scenier they are."
+      : "Scenic min: drive time on roads scenier than the fastest route’s average, weighted by how much scenier they are.";
     const tb = $("routes").querySelector("tbody");
     tb.replaceChildren();
     for (const r of s.routes) {
@@ -534,12 +980,12 @@
       name.appendChild(el("span", "labels", routeName(r)));
       tr.appendChild(name);
       tr.appendChild(el("td", "num", r.minutes.toFixed(0)));
-      tr.appendChild(el("td", "num", extraMin(r)));
+      if (!isLoop) tr.appendChild(el("td", "num", extraMin(r)));
       tr.appendChild(el("td", "num", dist(r.km).split(" ")[0]));
       tr.appendChild(el("td", "num", r.scenic_minutes.toFixed(0)));
       const sub = el("tr", "sub" + selCls);
       const td = el("td");
-      td.colSpan = 5;
+      td.colSpan = isLoop ? 4 : 5;
       td.appendChild(sceneryStrip(r));
       td.appendChild(el("div", "roads", roadsText(r))); // OSM road names: textContent only
       sub.appendChild(td);
@@ -547,11 +993,24 @@
       tb.appendChild(tr);
       tb.appendChild(sub);
     }
-    let det = `Details: ${s.kept} candidate routes compared in ${s.search_s} s.`;
-    s.snap_m.forEach((m, i) => {
-      if (m > SNAP_NOTE_M) det += ` ${i ? "B" : "A"} is ${dist(m / 1000, 1)} from the nearest road.`;
-    });
-    $("details").textContent = det;
+    if (isLoop) {
+      let det = `Details: ${s.kept} loops compared in ${s.search_s} s.`;
+      if (Array.isArray(s.snap_m) && s.snap_m[0] > SNAP_NOTE_M) {
+        det += ` Start is ${dist(s.snap_m[0] / 1000, 1)} from the nearest road.`;
+      }
+      if (s.note) det += ` ${s.note}`;
+      const sel = s.routes.find((x) => x.key === state.selected);
+      if (sel && Number.isFinite(sel.stem_km) && sel.stem_km >= 1) {
+        det += ` Leaves and returns on the same road for the first ${dist(sel.stem_km, 1)}.`;
+      }
+      $("details").textContent = det;
+    } else {
+      let det = `Details: ${s.kept} candidate routes compared in ${s.search_s} s.`;
+      s.snap_m.forEach((m, i) => {
+        if (m > SNAP_NOTE_M) det += ` ${i ? "B" : "A"} is ${dist(m / 1000, 1)} from the nearest road.`;
+      });
+      $("details").textContent = det;
+    }
     renderLegend();
   }
 
@@ -579,7 +1038,7 @@
     const s = state.search;
     const r = s && s.routes.find((x) => x.key === state.selected);
     if (!r) return;
-    const extra = extraMin(r);
+    const extra = s.mode === "loop" ? "—" : extraMin(r);
     d.appendChild(el("h3", null, `${routeName(r)}: ${Math.round(r.minutes)} min` +
       `${extra === "—" ? "" : ` (${extra} min)`}, ${dist(r.km)}`));
     const scen = r.mean_S_pct === null || r.mean_S_pct === undefined
@@ -653,7 +1112,8 @@
       btn.addEventListener("click", () => getWaypoints(r.key));
       box.appendChild(btn);
       if (w && w.error) box.appendChild(el("div", "banner error", w.error));
-      else box.appendChild(el("div", "note", "Places up to 9 waypoints so Google Maps follows this route."));
+      else box.appendChild(el("div", "note",
+        "Places waypoints so Google Maps follows this route. Long drives split into 2 links so Google Maps stays editable."));
       return box;
     }
     if (w.pending) {
@@ -664,9 +1124,16 @@
       return box;
     }
     const x = w.data;
+    const parts = Array.isArray(x.parts) && x.parts.length > 1 ? x.parts : null;
     const pct = Math.round(x.summary.overlap * 100);
-    box.appendChild(el("div", "note", `${x.waypoints.length} waypoint${x.waypoints.length === 1 ? "" : "s"} ` +
-      `(numbered on the map). With them, Google's route follows ${pct}% of this one.`));
+    if (parts) {
+      box.appendChild(el("div", "note",
+        `${x.waypoints.length} waypoints numbered on the map, split into ${parts.length} links so each stays under ` +
+        `Google Maps' stop limit and remains editable. Together they follow ${pct}% of this route.`));
+    } else {
+      box.appendChild(el("div", "note", `${x.waypoints.length} waypoint${x.waypoints.length === 1 ? "" : "s"} ` +
+        `(numbered on the map). With them, Google's route follows ${pct}% of this one.`));
+    }
     if (!x.meets_target) {
       box.appendChild(el("div", "banner warn",
         `Google may not follow this route closely: the waypoints reproduce ${pct}% of it ` +
@@ -674,15 +1141,43 @@
     }
     if (x.notes.length) { // technical notes from the waypoint placer, folded away
       const det = el("details", "note");
-      det.appendChild(el("summary", null, `Notes on ${x.notes.length} waypoint${x.notes.length === 1 ? "" : "s"}`));
+      det.appendChild(el("summary", null, `${x.notes.length} placement note${x.notes.length === 1 ? "" : "s"}`));
       const ul = el("ul");
       for (const n of x.notes) ul.appendChild(el("li", null, n));
       det.appendChild(ul);
       box.appendChild(det);
     }
-    const a = el("a", "open", "Open in Google Maps ↗");
-    a.href = x.url; a.target = "_blank"; a.rel = "noopener noreferrer";
-    box.appendChild(a);
+    if (parts) {
+      const wrap = el("div", "gm-parts");
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        const prev = i > 0 ? parts[i - 1] : null;
+        const item = el("div", "gm-part");
+        const a = el("a", "open", `Open Part ${p.part} in Google Maps ↗`);
+        a.href = p.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+        item.appendChild(a);
+        const fromLbl = prev && prev.handoff_n ? `Waypoint ${prev.handoff_n}` : "Start";
+        const toLbl = p.handoff_n
+          ? `waypoint ${p.handoff_n}${p.handoff_road ? ` on ${p.handoff_road}` : ""}`
+          : "finish";
+        item.appendChild(el("div", "note part-sub", // OSM road name: textContent only
+          `${fromLbl} to ${toLbl}, ${Math.round(p.eta_min)} min, ${dist(p.km)}`));
+        wrap.appendChild(item);
+      }
+      box.appendChild(wrap);
+      if (x.single && x.single.url) {
+        const spct = Math.round(x.single.overlap * 100);
+        const kind = spct >= 99 ? "Single-link version" : "Rough 1-link overview";
+        const sub = el("a", "open-sub",
+          `${kind}: ${x.single.waypoints} waypoint${x.single.waypoints === 1 ? "" : "s"}, ${spct}% match ↗`);
+        sub.href = x.single.url; sub.target = "_blank"; sub.rel = "noopener noreferrer";
+        box.appendChild(sub);
+      }
+    } else {
+      const a = el("a", "open", "Open in Google Maps ↗");
+      a.href = x.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      box.appendChild(a);
+    }
     return box;
   }
 
@@ -722,10 +1217,35 @@
 
   function writeHash() {
     const parts = [];
-    if (DEMO && state.preset) {
+    if (DEMO && state.mode === "loop") {
+      parts.push("mode=loop", "min=" + state.loop.minutes);
+      if (state.loop.steer === "compass" && state.loop.dir) {
+        parts.push("steer=compass", "dir=" + encodeURIComponent(state.loop.dir));
+      } else if (state.loop.steer === "anchor" && state.loop.feature) {
+        parts.push("steer=anchor", "feature=" + encodeURIComponent(state.loop.feature));
+      }
+      const sel = state.search && state.search.routes.find((r) => r.key === state.selected);
+      if (sel) parts.push("route=" + encodeURIComponent(sel.labels[0]));
+    } else if (DEMO && state.preset) {
       parts.push("preset=" + encodeURIComponent(state.preset));
       const sel = state.search && state.search.routes.find((r) => r.key === state.selected);
       if (sel) parts.push("route=" + encodeURIComponent(sel.labels[0]));
+    } else if (!DEMO && state.mode === "loop") {
+      parts.push("mode=loop");
+      if (state.h) {
+        parts.push(`start=${state.h[0].toFixed(5)},${state.h[1].toFixed(5)}`);
+        parts.push("min=" + state.loop.minutes);
+        if (state.loop.steer === "compass") {
+          parts.push("steer=compass");
+          if (state.loop.dir) parts.push("dir=" + encodeURIComponent(state.loop.dir));
+        } else if (state.loop.steer === "anchor") {
+          parts.push("steer=anchor");
+          if (state.loop.feature) parts.push("feature=" + encodeURIComponent(state.loop.feature));
+          else if (state.x) parts.push(`anchor=${state.x[0].toFixed(5)},${state.x[1].toFixed(5)}`);
+        }
+        const sel = state.search && state.search.routes.find((r) => r.key === state.selected);
+        if (sel) parts.push("route=" + encodeURIComponent(sel.labels[0]));
+      }
     } else if (!DEMO && state.a && state.b) {
       parts.push(`from=${state.a[0].toFixed(5)},${state.a[1].toFixed(5)}`, `to=${state.b[0].toFixed(5)},${state.b[1].toFixed(5)}`);
       const sel = state.search && state.search.routes.find((r) => r.key === state.selected);
@@ -748,12 +1268,44 @@
   let hashDone = false;
   function maybeRunFromHash() {
     if (hashDone) return;
-    hashDone = true;
     const h = new URLSearchParams(location.hash.slice(1));
+    if (h.get("mode") === "loop") {
+      state.loopOpenedOnce = true;
+      setMode("loop");
+      const m = Number(h.get("min"));
+      if (Number.isFinite(m) && m > 0) setMinutes(m, ![60, 120, 180].includes(Math.round(m)));
+      const st = h.get("steer") || (h.get("dir") ? "compass" : (h.get("feature") || h.get("feat") || h.get("anchor") ? "anchor" : "any"));
+      if (st === "compass") {
+        setSteer("compass");
+        if (h.get("dir")) setDir(h.get("dir").toUpperCase());
+      } else if (st === "anchor") {
+        setSteer("anchor");
+        const feat = (h.get("feature") || h.get("feat") || "").trim();
+        const px = COORD_RE.exec(h.get("anchor") || "");
+        if (feat) selectFeature({ name: feat, point: null }, false);
+        else if (px) setPoint("x", [parseFloat(px[1]), parseFloat(px[2])]);
+      }
+      const ps = COORD_RE.exec(h.get("start") || h.get("from") || "");
+      if (ps) setPoint("h", [parseFloat(ps[1]), parseFloat(ps[2])]);
+      hashDone = true;
+      writeHash();
+      if (!ps || !steerReady()) return;
+      const want = h.get("route");
+      findLoops().then(() => {
+        if (!want || !state.search) return;
+        const r = state.search.routes.find((x) => x.labels.includes(want));
+        if (r) select(r.key);
+      });
+      return;
+    }
     const pa = COORD_RE.exec(h.get("from") || ""), pb = COORD_RE.exec(h.get("to") || "");
-    if (!pa || !pb) return;
+    if (!pa || !pb) {
+      hashDone = true;
+      return;
+    }
     setPoint("a", [parseFloat(pa[1]), parseFloat(pa[2])]);
     setPoint("b", [parseFloat(pb[1]), parseFloat(pb[2])]);
+    hashDone = true;
     const want = h.get("route");
     findRoutes().then(() => {
       if (!want || !state.search) return;
@@ -762,9 +1314,7 @@
     });
   }
 
-  // ---- wiring ----------------------------------------------------------------
-
-  // ---- demo: preset routes from data/*.json ------------------------------------
+  // ---- demo: preset routes and Drive-around loops from data/*.json --------------
 
   async function demoFetch(file) { // relative path, so the site works under any folder
     const r = await fetch(file, { cache: "no-cache" });
@@ -789,7 +1339,117 @@
     }
   }
 
+  function syncDemoLoopControls() {
+    const lp = state.presets && state.presets.loop;
+    if (!lp) return;
+    if (!lp.budgets.includes(state.loop.minutes)) state.loop.minutes = lp.default_min;
+    const byMin = (lp.by_min && lp.by_min[String(state.loop.minutes)]) || { compass: {}, features: [] };
+    const compassMap = byMin.compass || {};
+    const feats = byMin.features || [];
+
+    for (const b of document.querySelectorAll("#budget .seg button")) {
+      const bm = Number(b.dataset.min);
+      b.hidden = !lp.budgets.includes(bm);
+      b.setAttribute("aria-pressed", String(bm === state.loop.minutes));
+    }
+
+    const hasCompass = Object.keys(compassMap).length > 0;
+    const hasFeats = feats.length > 0;
+    $("steer-compass").disabled = !hasCompass;
+    $("steer-anchor").disabled = !hasFeats;
+    if ((state.loop.steer === "compass" && !hasCompass) || (state.loop.steer === "anchor" && !hasFeats)) {
+      state.loop.steer = "any";
+    }
+    for (const b of document.querySelectorAll("#steer > .seg button")) {
+      b.setAttribute("aria-pressed", String(b.dataset.steer === state.loop.steer));
+    }
+    $("rose").hidden = state.loop.steer !== "compass";
+    $("anchor-box").hidden = state.loop.steer !== "anchor";
+
+    if (state.loop.steer === "compass" && (!state.loop.dir || !compassMap[state.loop.dir])) {
+      state.loop.dir = LOOP_DIRS.find((d) => !!compassMap[d]) || null;
+    }
+    for (const b of document.querySelectorAll("#rose button")) {
+      b.disabled = !compassMap[b.dataset.dir];
+      b.setAttribute("aria-pressed", String(b.dataset.dir === state.loop.dir));
+    }
+
+    if (state.loop.steer === "anchor" && hasFeats) {
+      const cur = (state.loop.feature || "").toLowerCase();
+      const match = feats.find((f) => f.name.toLowerCase() === cur || f.id === cur) || feats[0];
+      state.loop.feature = match.name;
+      state.loop.featurePoint = Array.isArray(match.point) ? match.point.slice() : null;
+    }
+    const ul = $("chips");
+    ul.replaceChildren();
+    for (const f of feats) {
+      const li = el("li");
+      const btn = el("button", "chip", f.name); // OSM feature text: textContent only
+      btn.type = "button";
+      btn.dataset.feature = f.name;
+      btn.title = `About ${Math.round(f.round_trip_min)} min out and back`;
+      btn.setAttribute("aria-pressed", String(state.loop.feature === f.name));
+      btn.addEventListener("click", () => {
+        state.loop.feature = f.name;
+        state.loop.featurePoint = Array.isArray(f.point) ? f.point.slice() : null;
+        syncChipSelection();
+        loadDemoLoop();
+      });
+      li.appendChild(btn);
+      ul.appendChild(li);
+    }
+  }
+
+  function demoLoopFile() {
+    const lp = state.presets && state.presets.loop;
+    const byMin = lp && lp.by_min && lp.by_min[String(state.loop.minutes)];
+    if (!byMin) return null;
+    if (state.loop.steer === "compass") return (state.loop.dir && byMin.compass && byMin.compass[state.loop.dir]) || null;
+    if (state.loop.steer === "anchor") {
+      const hit = (byMin.features || []).find((f) => f.name === state.loop.feature);
+      return (hit && hit.file) || null;
+    }
+    return byMin.any || null;
+  }
+
   let presetToken = 0;
+  async function loadDemoLoop(wantRoute) {
+    const file = demoLoopFile();
+    if (!file) return;
+    const token = ++presetToken;
+    showError("");
+    $("anchor-note").hidden = true;
+    setBusy(true, "Loading the loops…");
+    try {
+      const data = await demoFetch(file);
+      if (token !== presetToken || state.mode !== "loop") return;
+      state.h = data.search.start.slice();
+      if (state.loop.steer === "anchor" && data.search.steer && Array.isArray(data.search.steer.point)) {
+        state.loop.featurePoint = data.search.steer.point.slice();
+      }
+      if (state.loop.steer === "anchor" && data.search.note) {
+        $("anchor-note").textContent = data.search.note;
+        $("anchor-note").hidden = false;
+      }
+      syncMarkers();
+      state.search = data.search;
+      state.waypoints = {};
+      for (const [k, w] of Object.entries(data.waypoints || {})) {
+        state.waypoints[k] = w.error ? { error: w.error } : { data: w };
+      }
+      state.visible = {};
+      for (const r of data.search.routes) state.visible[r.key] = true;
+      const pick = (wantRoute && data.search.routes.find((r) => r.labels.includes(wantRoute))) || data.search.routes[0];
+      state.selected = pick.key;
+      writeHash();
+      renderAll(true);
+    } catch (e) {
+      if (token === presetToken) showError(e);
+    } finally {
+      if (token === presetToken) setBusy(false);
+    }
+  }
+
   async function loadPreset(id, wantRoute) {
     const p = state.presets.presets.find((x) => x.id === id);
     if (!p) return;
@@ -832,8 +1492,31 @@
       showError(e);
       return;
     }
+    const lp = state.presets.loop || null;
+    if (lp) {
+      $("demo-loop-name").textContent = lp.name;
+      $("demo-loop-origin").hidden = false;
+      state.loop.minutes = lp.default_min;
+      syncDemoLoopControls();
+    } else {
+      $("mode-tabs").hidden = true;
+    }
     renderPresets();
     const h = new URLSearchParams(location.hash.slice(1));
+    if (lp && h.get("mode") === "loop") {
+      const wantMin = Number(h.get("min"));
+      if (lp.budgets.includes(wantMin)) state.loop.minutes = wantMin;
+      const st = h.get("steer") || (h.get("dir") ? "compass" : (h.get("feature") || h.get("feat") ? "anchor" : "any"));
+      state.loop.steer = ["any", "compass", "anchor"].includes(st) ? st : "any";
+      if (state.loop.steer === "compass" && h.get("dir")) {
+        state.loop.dir = h.get("dir").toUpperCase();
+      } else if (state.loop.steer === "anchor") {
+        const wantFeat = (h.get("feature") || h.get("feat") || "").trim();
+        if (wantFeat) state.loop.feature = wantFeat;
+      }
+      setMode("loop", h.get("route"));
+      return;
+    }
     const want = h.get("preset");
     const first = state.presets.presets.find((p) => p.id === want) || state.presets.presets[0];
     if (first) loadPreset(first.id, want === first.id ? h.get("route") : null);
@@ -844,6 +1527,17 @@
   $("by-s").addEventListener("change", () => { renderLegend(); renderMap(false); writeHash(); });
   $("u-mi").addEventListener("click", () => { setUnits("mi"); if (DEMO && state.presets) renderPresets(); });
   $("u-km").addEventListener("click", () => { setUnits("km"); if (DEMO && state.presets) renderPresets(); });
+  $("tab-ab").addEventListener("click", () => setMode("ab"));
+  $("tab-loop").addEventListener("click", () => setMode("loop"));
+  for (const b of document.querySelectorAll("#budget .seg button")) {
+    b.addEventListener("click", () => setMinutes(Number(b.dataset.min), false));
+  }
+  for (const b of document.querySelectorAll("#steer > .seg button")) {
+    b.addEventListener("click", () => setSteer(b.dataset.steer));
+  }
+  for (const b of document.querySelectorAll("#rose button")) {
+    b.addEventListener("click", () => setDir(b.dataset.dir));
+  }
   setUnits(state.units);
 
   if (DEMO) {
@@ -851,7 +1545,10 @@
   } else {
     wireSearch("a");
     wireSearch("b");
+    wireSearch("h");
+    wireAnchorSearch();
     $("find").addEventListener("click", findRoutes);
+    $("find-loop").addEventListener("click", findLoops);
     $("clear").addEventListener("click", () => {
       removePoint("a");
       removePoint("b");
@@ -859,6 +1556,30 @@
       showError("");
       writeHash();
       onPointsChanged();
+    });
+    $("clear-loop").addEventListener("click", () => {
+      removePoint("h");
+      removePoint("x");
+      $("chips").replaceChildren();
+      clearResults();
+      showError("");
+      onLoopChanged(false);
+      writeHash();
+    });
+    $("clear-x").addEventListener("click", () => {
+      removePoint("x");
+      onLoopChanged(false);
+    });
+    $("min-custom").addEventListener("change", () => {
+      const raw = $("min-custom").value.trim();
+      if (raw === "") {
+        if (![60, 120, 180].includes(Math.round(state.loop.minutes))) {
+          $("min-custom").value = String(Math.round(state.loop.minutes));
+        }
+        return;
+      }
+      const v = Number(raw);
+      if (Number.isFinite(v)) setMinutes(v, true);
     });
     $("swap").addEventListener("click", () => {
       const a = state.a, b = state.b, qa = $("q-a").value, qb = $("q-b").value;
@@ -871,11 +1592,17 @@
       showError("");
       onPointsChanged();
     });
-    $("home-a").addEventListener("click", fromHome);
+    $("home-a").addEventListener("click", () => fromHome("a"));
+    $("home-h").addEventListener("click", () => fromHome("h"));
     $("home-set-a").addEventListener("click", () => setHome("a"));
     $("home-set-b").addEventListener("click", () => setHome("b"));
-    $("tab-loop").addEventListener("click", (ev) => ev.preventDefault());
+    $("home-set-h").addEventListener("click", () => setHome("h"));
+    if (new URLSearchParams(location.hash.slice(1)).get("mode") === "loop") {
+      state.loopOpenedOnce = true;
+      setMode("loop");
+    }
     onPointsChanged();
+    updateLoopHint();
     pollHealth();
   }
 })();

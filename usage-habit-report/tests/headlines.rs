@@ -382,3 +382,67 @@ fn unlabelled_top_level_sessions_take_a_label_from_their_headline() {
     assert_eq!(get("child").1, None);
     assert_eq!(get("empty").1, None);
 }
+
+#[test]
+fn t3_title_beats_weak_codex_title_but_not_real_headlines() {
+    let mut s = Store::open_in_memory().unwrap();
+    seed(&s);
+    s.conn
+        .execute(
+            "UPDATE sessions SET t3_title = 'T3 demo helpers' WHERE session_id = ?1",
+            [B],
+        )
+        .unwrap();
+    headlines::set_manual_title(&s.conn, "codex", "t3-only", "Manual demo title", 5).unwrap();
+    headlines::refresh(&mut s.conn, &sources()).unwrap();
+    let got = titles(&s);
+    for (id, title, source) in [
+        (B, "T3 demo helpers", "t3"),
+        (A, "Repair the demo parser", "codex-name"),
+        ("t3-only", "Manual demo title", "manual"),
+    ] {
+        assert!(
+            got.contains(&(id.into(), Some(title.into()), source.into())),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn headline_labels_follow_their_headline() {
+    let mut s = Store::open_in_memory().unwrap();
+    seed(&s);
+    let set_t3 = |s: &Store, id: &str, t3: Option<&str>| {
+        s.conn
+            .execute(
+                "UPDATE sessions SET t3_title = ?2 WHERE session_id = ?1",
+                params![id, t3],
+            )
+            .unwrap();
+    };
+    let label = |s: &Store, id: &str| -> (Option<String>, Option<String>) {
+        s.conn
+            .query_row(
+                "SELECT label, label_source FROM sessions WHERE session_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    set_t3(&s, "empty", Some("Review demo helpers"));
+    headlines::refresh(&mut s.conn, &sources()).unwrap();
+    assert_eq!(
+        label(&s, "empty"),
+        (Some("review".into()), Some("headline".into()))
+    );
+    // A new headline relabels the session; losing it clears the label.
+    set_t3(&s, "empty", Some("Write the demo report"));
+    headlines::refresh(&mut s.conn, &sources()).unwrap();
+    assert_eq!(
+        label(&s, "empty"),
+        (Some("other".into()), Some("headline".into()))
+    );
+    set_t3(&s, "empty", None);
+    headlines::refresh(&mut s.conn, &sources()).unwrap();
+    assert_eq!(label(&s, "empty"), (None, None));
+}

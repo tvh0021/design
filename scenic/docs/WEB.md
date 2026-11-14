@@ -1,8 +1,8 @@
 # Web UI: Maps for Wanderers
 
-`scenic serve` runs Maps for Wanderers, a map page for A-to-B route search, on
-your own machine. The same page also runs as a read-only static demo with
-preset routes (`scenic demo build`, see `docs/PUBLISH.md`).
+`scenic serve` runs Maps for Wanderers, a map page for A-to-B route search and
+drive-around loops, on your own machine. The same page also runs as a read-only
+static demo with preset routes (`scenic demo build`, see `docs/PUBLISH.md`).
 
 ```
 scenic serve [--port 8765] [--graph DIR] [--score DIR] [--verbose]
@@ -12,8 +12,8 @@ Open http://127.0.0.1:8765/. The server listens on 127.0.0.1 only and has no
 login, so it is not reachable from other machines. It needs the same data as
 `scenic route`: `data/graph/` and `data/score/` (scores and moments). The
 route data loads in the background in about a second. The page shows a
-loading banner until it is ready, and builds the waypoint index (about 3 s)
-just after that.
+loading banner until it is ready, and builds the reverse time matrix and
+waypoint index (about 3.5 s) just after that.
 
 ## Using it
 
@@ -21,9 +21,9 @@ just after that.
   markers to adjust. You can also type a place name and press Search (or
   Enter), then pick a result. Typing `43.1566, -77.6088` sets a point
   directly. Clear starts over and Swap reverses the trip.
-- **Home.** "Set as home" next to A or B saves that point in the browser
-  (localStorage key `scenic.home`, `{lat, lon, label}`; a future loop mode
-  can start from it). "From home" puts it in A.
+- **Home.** "Set as home" next to A, B or S saves that point in the browser
+  (localStorage key `scenic.home`, `{lat, lon, label}`). "From home" puts it
+  in A or in the loop start S.
 - **Units.** The mi / km switch (top of the panel) sets every distance on
   the page. Miles are the default; the choice is kept in localStorage
   (`scenic.units`). Server errors send distances as numbers (`snap_m`,
@@ -78,28 +78,53 @@ just after that.
   terms). The USGS layers have tiles to zoom 16 and are enlarged beyond it.
   Satellite shows shorelines and lakes under the routes. The attribution
   always credits OpenStreetMap for the routes, whatever the base layer.
-- **Drive-around (loop)** is a placeholder; loops are not built yet.
+- **Drive-around (`docs/LOOP_SPEC.md`).** Switch to the Drive-around tab to
+  plan loops starting and ending at `S` (copied from `A` on first open if `A`
+  is already set). Pick a budget (`1 h`, `2 h`, `3 h`, or a custom 30 to
+  360 minutes) and choose "Which way":
+  - **Any way** spreads up to three loops across compass directions.
+  - **Direction** opens an 8-point compass rose (`N` through `NW`) and steers
+    into a 135 degree cone around that bearing.
+  - **Pass by** anchors the trip on a scenic feature chip within reach, a
+    place or feature search, or a map pin `P` (clicking open water snaps to
+    the nearest mapped lake or river shore).
+  Loop rows omit the extra-minutes column, draw in the three budget colours
+  (`role` 1 to 3), and note shared out-and-back stems of 1 km or more in the
+  detail line. Switching between A to B and Drive-around keeps each tab's
+  pins and last search in memory. The static demo hides Drive-around because
+  it has no server.
 
 The page URL keeps the trip, for example
 `#from=43.15660,-77.60880&to=43.04810,-76.14740&route=%2B50%25&scenery=0&layer=topo`
-(`scenery=0` when colouring is off; `layer` is `topo` or `satellite`).
-Opening such a link runs the search as soon as the data is loaded.
+in A-to-B mode or `#mode=loop&start=43.15660,-77.60880&min=120&steer=compass&dir=NE&route=Northeast%20loop`
+(or `steer=anchor&feature=Lake%20Ontario` / `steer=anchor&anchor=lat,lon`) in
+Drive-around mode (`scenery=0` when colouring is off; `layer` is `topo` or
+`satellite`). Opening such a link runs the search as soon as the data is loaded.
 
-A search answer that arrives after A or B has changed (a drag, Swap, Clear,
-or a newer search) is dropped, and so is a waypoint answer for a search
-that has since been replaced.
+A search answer that arrives after the active tab's pins or controls have
+changed (a drag, Swap, Clear, budget or steer edit, or a newer search) is
+dropped, and so is a waypoint answer for a search that has since been
+replaced.
 
 ## Errors
 
 Messages start with a capital and say what to do next. When the problem is
-one point, the server names it (`"point": "from"` or `"to"`) and the page
-puts a pulsing red ring on that pin. The page shows the server's message for:
+one point, the server names it (`"point": "from"`, `"to"`, `"start"`, or
+`"anchor"`) and the page puts a pulsing red ring on that pin (`A`, `B`, `S`,
+or `P`). The page shows the server's message for:
 
 - a point outside New York State's bounding box (422, "Drag A into New York"),
 - a point more than 2 km from the nearest road in the graph, such as one out
-  in a lake (422, "Drag A onto a road"; `code` `snap_far` with `snap_m` and
+  in a lake for `A`, `B` or `S` (422, `code` `snap_far` with `snap_m` and
   `limit_m`, which the page words in miles or km),
-- no route, for example when both points snap to the same junction (404),
+- an anchor pin over 2 km from any road with no mapped water shore within
+  45 km (422, `code` `anchor_far`), an unknown feature name (422, `code`
+  `unknown_feature`), or an anchor too far for the chosen budget (422, `code`
+  `anchor_out_of_reach` with `round_trip_min` and `needed_min`),
+- no loop fitting the budget or compass cone (422, `code` `no_loop` or
+  `no_loop_that_way`),
+- no route between `A` and `B`, for example when both points snap to the same
+  junction (404),
 - a search sent while the data is still loading (503),
 - a place search that Nominatim could not answer (502).
 
@@ -123,18 +148,23 @@ Nominatim usage policy asks.
 ## API
 
 All bodies are JSON; POST requests must send `Content-Type:
-application/json`. Errors are `{"error": "...", "point": "from" | "to",
-"code": "...", ...}`, with `point` only when the message is about one point
-and `code` only for errors the page words itself (now `snap_far`, which
-adds `snap_m` and `limit_m` in metres). Responses over 1 KB are gzipped when the client accepts
-it. Coordinates are `[lat, lon]` with 5 decimals.
+application/json`. Errors are `{"error": "...", "point": "from" | "to" |
+"start" | "anchor", "code": "...", ...}`, with `point` only when the message
+is about one point and `code` for machine-readable error kinds (`snap_far`,
+`bad_minutes`, `anchor_out_of_reach`, `anchor_far`, `unknown_feature`,
+`no_loop`, `no_loop_that_way`). Responses over 1 KB are gzipped when the
+client accepts it. Coordinates are `[lat, lon]` with 5 decimals.
 
 `GET /api/health`
 
 ```
 {"status": "loading" | "ready" | "error", "bbox": [s, w, n, e], "max_snap_m": 2000,
  "edges": 825892, "moments": 3820, "s_breaks": [0.17, 0.377, 0.585, 0.792],
- "budgets": ["+15%", "+30%", "+50%"], "load_s": 0.8, "error": "..."}
+ "budgets": ["+15%", "+30%", "+50%"], "load_s": 0.8,
+ "loop": {"budgets_min": [60, 120, 180], "default_min": 120, "min_minutes": 30,
+          "max_minutes": 360, "directions": ["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+          "n_loops": 3},
+ "error": "..."}
 ```
 
 `POST /api/geocode` with `{"q": "Watkins Glen"}`
@@ -177,7 +207,37 @@ consecutive stops with the same `parent_feature`, as index ranges that
 cover every stop once; a stop with no feature is its own run. A group's
 `feature` is that parent. `line` is simplified per S run with a tolerance that starts at about
 0.5 m and doubles until the route has at most 5,000 points. Run ends stay
-exact. The server keeps the last 8 searches for `/api/waypoints`.
+exact. The server keeps the last 8 route and loop searches for `/api/waypoints`.
+
+`POST /api/loop` with `{"start": [lat, lon], "minutes": 120, "steer": "any" | "compass" | "anchor", ...}`
+
+```
+{"id": "a19f02cd8810", "mode": "loop", "start": [...], "snap_m": [12], "minutes": 120,
+ "steer": {"mode": "compass", "direction": "NE", "bearing": 45},
+ "s_base": 0.5, "kept": 36, "built": 72, "search_s": 1.4, "seconds": {...},
+ "s_breaks": [...], "note": null,
+ "routes": [
+   {"key": "r0", "labels": ["Northeast loop"], "role": 1, ...,
+    "direction": "NE", "bearing": 41.2, "off_deg": 3.8, "stem_km": 0.4, "tier": 1},
+   ...]}
+```
+
+Returns up to 3 loops with `role` 1 to 3 (never 0) and `s_base` 0.50 as the
+scenic-minute baseline. For `"steer": "compass"`, pass `"direction"` (`"N"`
+through `"NW"`). For `"steer": "anchor"`, pass either `"anchor": [lat, lon]`
+or `"feature": "Lake Ontario"`.
+
+`POST /api/loop/features` with `{"start": [lat, lon], "minutes": 120, "q": "lake", "limit": 8}`
+
+```
+{"features": [{"name": "Lake Ontario", "count": 21, "best_m": 1.0, "types": ["water"],
+               "round_trip_min": 19, "fits": true, "needed_min": 22,
+               "point": [43.25702, -77.60331], "bearing": 2.1, "direction": "N"}, ...]}
+```
+
+Local lookup over `moments.parquet` with no external network call. Without `q`
+it returns features that fit the budget; with `q` it returns substring matches
+with fitting features first.
 
 `POST /api/waypoints` with `{"id": "<search id>", "key": "r3"}`
 
@@ -187,11 +247,20 @@ exact. The server keeps the last 8 searches for `/api/waypoints`.
  "waypoints": [{"n": 1, "lat": 43.26804, "lon": -77.40274, "road": "CR 1", "tier": 1}, ...],
  "meets_target": true, "follow_target": 0.9,
  "summary": {"waypoints": 3, "overlap": 0.9923, "eta_min": 124.5, ...},
- "notes": [], "seconds": 0.61}
+ "notes": [], "parts": [], "seconds": 0.61}
 ```
 
-`reduce_to_waypoints` runs with `max_waypoints=9` and `follow_target=0.9`.
-Results are cached per search and route.
+Google Maps counts stop boxes (origin, waypoints, and destination, even when
+`origin` equals `destination` on a closed loop) and locks route editing at 10
+stops (`"Maximum number of destinations reached"` or `"Route cannot be modified
+further"`). `split_waypoints` caps single links at 7 intermediate waypoints (9
+stops, `follow_target=0.9`). When a long route or loop needs more than 7
+waypoints or would create a U-turn under the cap, `split_waypoints` splits the
+full waypoint chain into 2 or more balanced links in `parts` (each with at most
+7 intermediate waypoints, sharing a `"split": true` handoff waypoint) and keeps
+the 7-waypoint single-link summary in `single`. On a closed loop `origin`
+equals `destination` and the server requires at least one waypoint. Results are
+cached per search and route.
 
 ## Design
 

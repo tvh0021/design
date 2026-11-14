@@ -266,6 +266,93 @@ moment_minutes = 5.0      # a full moment (m = 1) is worth 5 scenic minutes
 pick_max_overlap = 0.8
 pick_min_score_frac = 0.85  # ... if it scores at least this share of the best; else it repeats the pick (shared)
 
+[loop]
+# Mode 2 drive-around loops (docs/LOOP_SPEC.md).
+budgets_min = [60, 120, 180]   # presets in the UI
+default_min = 120
+min_minutes = 30
+max_minutes = 360
+min_time_frac = 0.75           # keep a loop when min_time_frac*B <= time <= max_time_frac*B
+max_time_frac = 1.05           # also the reach cut: dH + dR <= max_time_frac*B
+n_loops = 3
+
+# leg cost and anti-retrace
+lambdas = [3.0, 1.0, 0.0]      # cost = time * (1 + lambda * (1 - S)); first that fits is used
+reuse_radius_m = 120.0         # edges with a midpoint this close to the driven path ...
+reuse_penalty = 4.0            # ... cost (1 + reuse_penalty) times as much on later legs
+uturn_ban_cost = 1e12
+
+# score
+s_base = 0.50                  # scenic minutes count S above this; also s_fast for waypoints
+
+# candidate via arcs
+seed_cell_m = 4000.0
+seed_min_S = 0.6
+seed_min_length_m = 150.0
+seed_full_m = 20000.0          # sum(len * S) of qualifying edges in a cell that earns seed_value
+seed_value = 0.25
+
+# pairing, steer = any
+any_sector_deg = 30.0
+any_per_sector = 2
+first_rt_frac = [0.30, 0.90]
+partner_tight = [0.65, 0.92]   # estimate window, as a fraction of B
+partner_wide = [0.60, 0.95]
+partner_tight_k = 2
+partner_k = 4
+partner_sep_deg = [25.0, 150.0]
+partner_min_gain = 1.15        # estimate >= this * max(rt of either via)
+
+# steer = compass
+cone_deg = 30.0
+depth_quantile = 0.9
+depth_frac = 0.5
+apex_k = 8
+anchor_gap_m = 3000.0
+partner_half_plane_deg = 90.0
+straddle_offset_deg = [15.0, 90.0]
+straddle_left_k = 4
+straddle_right_k = 3
+straddle_max_skew_deg = 60.0
+compass_tol_deg = 67.5
+compass_tol_fallback_deg = 90.0
+compass_full_weight_deg = 22.5
+compass_weight_span_deg = 45.0
+compass_min_weight = 0.5
+
+# steer = anchor
+anchor_snap_m = 2000.0
+shore_snap_km = 45.0
+shore_targets = 3
+feature_targets = 4
+feature_target_gap_m = 5000.0
+target_max_rt_frac = 0.90
+anchor_reach_frac = 0.95
+lens_rt_frac = [0.45, 0.95]
+anchor_partner_k = 4
+anchor_partner_sector_deg = 45.0
+anchor_partner_window = [0.65, 0.92]
+
+# validity
+sample_step_m = 75.0
+doubled_radius_m = 150.0
+doubled_min_sep_m = 1500.0
+max_net_doubled_frac = 0.10
+stem_start_m = 1500.0
+stem_gap_m = 300.0
+stem_frac_tier1 = 0.12
+stem_frac_tier2 = 0.40
+
+# selection
+max_overlap = 0.5
+max_overlap_anchor = 0.6
+max_overlap_relaxed = 0.7
+min_bearing_sep_deg = [60.0, 30.0, 0.0]   # steer = any, tried in order
+
+# work cap
+dijkstra_work_arcs = 5.0e7
+dijkstra_count_range = [80, 600]
+
 [output]
 heatmap_cell_m = 500.0
 heatmap_width_px = 3000

@@ -1,5 +1,5 @@
 """Command line for Maps for Wanderers (the `scenic` command): scenic fetch | build-graph | fastest |
-route | serve | demo build | calibrate | fetch-layers | score."""
+route | loop | serve | demo build | calibrate | fetch-layers | score."""
 
 from __future__ import annotations
 
@@ -77,6 +77,48 @@ def cmd_route(args) -> int:
         print(f"wrote {args.json}")
     if args.png:
         print(f"wrote {plot_routes(ctx, res, args.png)}")
+    return 0
+
+
+def cmd_loop(args) -> int:
+    from .loop import LoopError, Steer, format_table, geojson, loop_config, loops, plot_loops, result_json
+    from .search import Context
+
+    cfg = loop_config()
+    minutes = args.minutes if args.minutes is not None else cfg["default_min"]
+    if args.direction:
+        steer = Steer(mode="compass", direction=args.direction)
+    elif args.anchor:
+        steer = Steer(mode="anchor", point=args.anchor)
+    elif args.feature:
+        steer = Steer(mode="anchor", feature=args.feature)
+    else:
+        steer = Steer(mode="any")
+
+    t0 = time.monotonic()
+    ctx = Context.load(args.graph, args.score)
+    t1 = time.monotonic()
+    try:
+        res = loops(ctx, args.from_, minutes, steer=steer, cfg=cfg)
+    except (LoopError, ValueError) as exc:
+        msg = exc.message if isinstance(exc, LoopError) else str(exc)
+        print(msg)
+        return 1
+
+    print(f"loaded in {t1 - t0:.1f} s; snapped start {res.snap_m:.0f} m")
+    if res.anchor is not None:
+        anc = res.anchor
+        desc = anc.name or f"({anc.point[0]:.5f}, {anc.point[1]:.5f})"
+        print(f"anchor ({anc.kind}): {desc}, moved {anc.moved_m:.0f} m")
+    print(format_table(ctx, res))
+    if args.geojson:
+        Path(args.geojson).write_text(json.dumps(geojson(ctx, res)))
+        print(f"wrote {args.geojson}")
+    if args.json:
+        Path(args.json).write_text(json.dumps(result_json(ctx, res), indent=1))
+        print(f"wrote {args.json}")
+    if args.png:
+        print(f"wrote {plot_loops(ctx, res, args.png)}")
     return 0
 
 
@@ -158,6 +200,25 @@ def main(argv: list[str] | None = None) -> int:
     rt.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     rt.add_argument("--score", type=Path, help="score directory (default data/score)")
     rt.set_defaults(func=cmd_route)
+
+    lp = sub.add_parser("loop", help="scenic drive-around loops starting and ending at the same point")
+    lp.add_argument("--from", dest="from_", type=_latlon, required=True, metavar="LAT,LNG")
+    lp.add_argument("--minutes", type=float, help="time budget in minutes (default 120, range 30..360)")
+    steer_grp = lp.add_mutually_exclusive_group()
+    steer_grp.add_argument(
+        "--direction",
+        type=lambda s: s.strip().upper(),
+        choices=["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+        help="compass direction from the start",
+    )
+    steer_grp.add_argument("--anchor", type=_latlon, metavar="LAT,LNG", help="anchor location to pass")
+    steer_grp.add_argument("--feature", help="named scenic feature to pass (e.g. 'Lake Ontario')")
+    lp.add_argument("--geojson", type=Path, help="write the loops and their moments as GeoJSON")
+    lp.add_argument("--png", type=Path, help="write a map of the loops")
+    lp.add_argument("--json", type=Path, help="write the summary table as JSON")
+    lp.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    lp.add_argument("--score", type=Path, help="score directory (default data/score)")
+    lp.set_defaults(func=cmd_loop)
 
     sv = sub.add_parser("serve", help="Maps for Wanderers, the local map UI (http://127.0.0.1:PORT/, docs/WEB.md)")
     sv.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765)")

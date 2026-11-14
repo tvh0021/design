@@ -102,7 +102,7 @@ the T3 thread id stage. Flags: `--rows`, `--since`, `--json`.
 | `idle_gap_seconds` | integer (900) |
 | `parent` | object?: `{tool: string, session_id: string, lineage_source: string?}` |
 | `display_title` | string? |
-| `title_source` | string?: `codex-name`, `codex-title`, `antigravity-summary`, `t3`, `first-line` |
+| `title_source` | string?: `manual`, `codex-name`, `codex-title`, `antigravity-summary`, `t3`, `first-line` |
 
 `parent` identifies the parent across tools. `lineage_source` is `t3` or
 `timing` for imported T3 delegations, and null for harness-recorded parents.
@@ -311,9 +311,10 @@ time. Manual labels survive. This exclusion adds no JSON fields.
 
 Session reports, ambiguous session candidates, and `heaviest_fanouts[]` add
 nullable `display_title` and `title_source`. Existing `title` stays the raw
-first line of the opening prompt. The display title uses the harness headline,
-then the T3 title, then the first line. Codex `name` or index `thread_name`
-uses `codex-name`; the weaker SQLite `title` uses `codex-title`.
+first line of the opening prompt. The display title uses a Codex name or
+Antigravity summary, then the T3 title, then the weak Codex SQLite `title`,
+then the first line. Codex `name` or index `thread_name` uses `codex-name`;
+the SQLite `title` uses `codex-title`.
 Antigravity summaries use `antigravity-summary`. Remaining sources are `t3`
 and `first-line`. Display titles collapse whitespace and keep at most 120
 characters. With no title, `display_title` is null and the source is

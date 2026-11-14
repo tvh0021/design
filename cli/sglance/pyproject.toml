@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sglance"
+version = "0.1.0"
+description = "Read-only inspection of Slurm cluster capacity, queues, and scheduling delays."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+sglance = "sglance.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sglance"]

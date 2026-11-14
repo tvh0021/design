@@ -1,7 +1,9 @@
 # Scenic route planner: plan
 
-Status: preliminary, 2026-11-02. Nothing built yet. Revised after review (see
-"Review changes" at the end), then changed to need no Google API key.
+Status: original plan from 2026-11-02 (revised after review to need no Google
+API key). Both Mode 1 (`scenic route`, `docs/SCORE_V02.md`) and Mode 2
+(`scenic loop`, `docs/LOOP_SPEC.md`) are now built, along with `scenic serve`
+(`docs/WEB.md`).
 
 ## Goal
 
@@ -153,6 +155,12 @@ Start with anchor loops; add a full solver only if they fall short.
 4. **Deferred: OR-Tools orienteering.** Only if anchor loops miss obvious good
    stops. If built, its time matrix must use the scenic leg times, not the
    fastest ones, or tours will overrun the budget.
+
+Built (`scenic loop`, `scenic.loop`, `scenic serve` Drive-around tab; see
+`docs/LOOP_SPEC.md` for full design and measurements). Loops use scenic moment
+and road vias with corridor-penalised return legs, U-turn and retracing gates,
+and three steering modes: `any` (compass spread), `compass` (8-point cone), and
+`anchor` (named scenic feature, shore snap for water pins, or road pin).
 
 ## Speed
 

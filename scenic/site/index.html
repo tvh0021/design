@@ -36,24 +36,23 @@
   </header>
 
   <div id="demo-note" class="banner info" hidden>
-    Preset demo routes. The interactive planner runs locally; see the
+    Preset demo routes. The interactive planner runs locally; this page shows five A-to-B drives and 1-, 2-, and 3-hour Finger Lakes loops from Auburn. See the
     <a href="https://github.com/tvh0021/design/tree/main/scenic" target="_blank" rel="noopener noreferrer">source on GitHub</a>.
   </div>
+
+  <nav class="tabs" id="mode-tabs" role="tablist">
+    <button type="button" role="tab" class="tab active" aria-selected="true" aria-controls="panel-ab" id="tab-ab">A to B</button>
+    <button type="button" role="tab" class="tab" aria-selected="false" aria-controls="panel-loop" id="tab-loop">Drive-around</button>
+  </nav>
 
   <section id="presets" hidden>
     <h2 class="presets-head">Pick a drive</h2>
     <ul id="preset-list" class="preset-list"></ul>
   </section>
 
-  <nav class="tabs" role="tablist">
-    <button role="tab" class="tab active" aria-selected="true" id="tab-ab">A to B</button>
-    <button role="tab" class="tab" aria-selected="false" aria-disabled="true" disabled id="tab-loop"
-            title="Loops are not built yet">Drive-around (loop) <span class="soon">coming soon</span></button>
-  </nav>
-
   <div id="loading" class="banner info"><span class="spinner"></span> <span id="loading-text">Loading the road graph and scenery scores&hellip;</span></div>
 
-  <section class="points">
+  <section class="points" id="panel-ab">
     <form id="form-a" class="place" autocomplete="off">
       <div class="labelrow">
         <label for="q-a"><span class="pin pin-a">A</span> Start</label>
@@ -89,15 +88,85 @@
     </div>
   </section>
 
+  <section class="points loop" id="panel-loop" hidden>
+    <div id="demo-loop-origin" class="demo-origin" hidden>
+      <span class="pin pin-h">S</span>
+      <span>Start and finish: <strong id="demo-loop-name"></strong></span>
+    </div>
+    <form id="form-h" class="place" autocomplete="off">
+      <div class="labelrow">
+        <label for="q-h"><span class="pin pin-h">S</span> Start and finish</label>
+        <span class="home">
+          <button type="button" class="link" id="home-h" disabled title="Set a home point first">From home</button>
+          <button type="button" class="link" id="home-set-h" disabled>Set as home</button>
+        </span>
+      </div>
+      <div class="row">
+        <input id="q-h" name="q" type="text" placeholder="Click the map, or type a place">
+        <button type="submit" class="small">Search</button>
+      </div>
+      <ul class="results" id="res-h" hidden></ul>
+    </form>
+
+    <div id="budget" class="field">
+      <div class="labelrow"><label for="min-custom">How long</label></div>
+      <div class="budget-row">
+        <div class="seg" role="group" aria-label="Loop duration">
+          <button type="button" data-min="60" aria-pressed="false">1 h</button><button type="button" data-min="120" aria-pressed="true">2 h</button><button type="button" data-min="180" aria-pressed="false">3 h</button>
+        </div>
+        <label class="custom-min"><input id="min-custom" type="number" min="30" max="360" step="5" placeholder="custom" aria-label="Custom minutes"><span>min</span></label>
+      </div>
+    </div>
+
+    <div id="steer" class="field">
+      <div class="labelrow"><span class="field-label">Which way</span></div>
+      <div class="seg seg-full" role="group" aria-label="Loop direction or place">
+        <button type="button" id="steer-any" data-steer="any" aria-pressed="true">Any way</button><button type="button" id="steer-compass" data-steer="compass" aria-pressed="false">A direction</button><button type="button" id="steer-anchor" data-steer="anchor" aria-pressed="false">Past a place</button>
+      </div>
+      <div id="rose" class="rose" role="group" aria-label="Compass direction" hidden>
+        <button type="button" data-dir="NW" aria-pressed="false" title="Northwest">NW</button>
+        <button type="button" data-dir="N" aria-pressed="false" title="North">N</button>
+        <button type="button" data-dir="NE" aria-pressed="false" title="Northeast">NE</button>
+        <button type="button" data-dir="W" aria-pressed="false" title="West">W</button>
+        <span class="rose-center" aria-hidden="true" title="Start and finish">&middot;</span>
+        <button type="button" data-dir="E" aria-pressed="false" title="East">E</button>
+        <button type="button" data-dir="SW" aria-pressed="false" title="Southwest">SW</button>
+        <button type="button" data-dir="S" aria-pressed="false" title="South">S</button>
+        <button type="button" data-dir="SE" aria-pressed="false" title="Southeast">SE</button>
+      </div>
+      <div id="anchor-box" class="anchor-box" hidden>
+        <form id="form-x" class="place" autocomplete="off">
+          <div class="labelrow">
+            <label for="q-x"><span class="pin pin-x">P</span> Place or scenic feature</label>
+            <button type="button" class="link" id="clear-x" hidden>Clear place</button>
+          </div>
+          <div class="row">
+            <input id="q-x" name="q" type="text" placeholder="Lake, bay, falls, town&hellip;">
+            <button type="submit" class="small">Search</button>
+          </div>
+          <ul class="results" id="res-x" hidden></ul>
+        </form>
+        <ul id="chips" class="chips" aria-label="Nearby scenic features"></ul>
+        <p id="anchor-note" class="hint" hidden></p>
+      </div>
+    </div>
+
+    <p class="hint" id="hint-loop">Click the map to set the start, or use From home.</p>
+    <div class="actions">
+      <button id="find-loop" class="primary" type="button" disabled>Find loops</button>
+      <button id="clear-loop" type="button">Clear</button>
+    </div>
+  </section>
+
   <div id="error" class="banner error" hidden></div>
   <div id="busy" class="banner info" hidden><span class="spinner"></span> <span id="busy-text">Searching&hellip;</span></div>
 
   <section id="results" hidden>
     <table id="routes">
-      <thead><tr><th>Route</th><th class="num">min</th><th class="num">extra min</th><th class="num" id="dist-head">mi</th><th class="num">scenic min</th></tr></thead>
+      <thead><tr><th id="route-head">Route</th><th class="num">min</th><th class="num" id="extra-head">extra min</th><th class="num" id="dist-head">mi</th><th class="num">scenic min</th></tr></thead>
       <tbody></tbody>
     </table>
-    <p class="caption">Scenic min: drive time on roads scenier than the fastest route&rsquo;s average, weighted by how much scenier they are.</p>
+    <p class="caption" id="caption">Scenic min: drive time on roads scenier than the fastest route&rsquo;s average, weighted by how much scenier they are.</p>
     <p class="details" id="details"></p>
     <label class="toggle"><input type="checkbox" id="by-s" checked> Color the selected route by scenery</label>
     <div id="legend" hidden></div>

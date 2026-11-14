@@ -2,9 +2,10 @@
 
 The interactive planner (`scenic serve`, `docs/WEB.md`) runs only on your own
 machine. For the public site there is a static demo instead: five preset
-drives, computed ahead of time and shown by the same page in a read-only
-demo mode. It has no server code and makes no outside requests except the
-visitor's map tiles.
+point-to-point drives plus 1-, 2-, and 3-hour Drive-around loops starting and
+finishing in Auburn in the Finger Lakes, all computed ahead of time and shown
+by the same page in a read-only demo mode. It has no server code and makes no
+outside requests except the visitor's map tiles.
 
 ## Build
 
@@ -12,15 +13,20 @@ visitor's map tiles.
 scenic demo build [--out DIR] [--presets FILE] [--graph DIR] [--score DIR] [--max-points N]
 ```
 
-It reads the presets from `config/demo_routes.toml` (id, name, from, to and
-labels for each end). For each preset it runs the real search (`/api/route`)
-and places Google Maps waypoints (`/api/waypoints`) for every route it
-picks, in the same process and with the same code as `scenic serve`. It then
-writes the site to `scenic/site/` by default. A build takes about 40 s
-(about 1 s to load, then 3 to 17 s per preset).
+It reads the presets and optional `[loop]` block from `config/demo_routes.toml`.
+For each `[[preset]]` it runs `/api/route`, and for `[loop]` it runs
+`/api/loop` across every configured duration (`60`, `120`, and `180` minutes
+from Auburn) for `Any way`, all eight compass directions, and up to eight
+nearby scenic features (`Cayuga Lake`, `Owasco Lake`, `Skaneateles Lake`,
+`Seneca Lake`, `Keuka Lake`, `Canandaigua Lake`, `Lake Ontario`, and others).
+Every recommended route or loop also gets its Google Maps waypoints
+(`/api/waypoints`), split into editable multi-part links whenever a route
+needs more than 7 waypoints. Identical edge paths share cached waypoint
+reductions during the build. The builder writes the site to `scenic/site/` by
+default in roughly two minutes.
 
-All routes are computed before anything is written. The output folder is
-then cleared and rewritten. The builder only clears a folder that holds its
+All routes and loops are computed before anything is written. The output folder
+is then cleared and rewritten. The builder only clears a folder that holds its
 own `.maps-for-wanderers-demo` marker (or is empty), and refuses any other.
 
 Layout:
@@ -30,17 +36,18 @@ site/index.html                      static/index.html with data-mode="demo" and
 site/static/app.js, app.css          the same frontend as scenic serve
 site/static/vendor/leaflet-1.9.4/    self-hosted Leaflet (JS, CSS, images, LICENSE)
 site/static/vendor/spectral/         self-hosted Spectral woff2 files (latin subset) and OFL.txt
-site/data/presets.json               the preset list (about 1.4 KB)
-site/data/<id>.json                  one preset: route payload + waypoints per route
+site/data/presets.json               the preset list and the Drive-around loop index
+site/data/<id>.json                  one A-to-B preset: /api/route payload + waypoints per route
+site/data/loop-<min>-any.json        one Drive-around Any way search + waypoints per loop
+site/data/loop-<min>-dir-<d>.json    one Drive-around compass direction search + waypoints
+site/data/loop-<min>-feat-<slug>.json one Drive-around scenic feature search + waypoints
 ```
 
-Each preset file holds `{"preset", "search", "waypoints"}`. `search` is the
-`/api/route` payload (`docs/WEB.md`) without the timing breakdown and
-`points_raw`. `waypoints` maps each route key to the `/api/waypoints`
-answer, or to `{"error": ...}`. Route lines are simplified to at most 1,500
-points (`--max-points`), with coordinates at 5 decimals. The 2026-11-03
-build is 515 KB of JSON in all, or 12 to 30 KB per preset gzipped. A
-visitor loads only the preset they pick.
+Each preset or loop file holds `search` (without the timing breakdown and
+`points_raw`) and `waypoints` (mapping each route key to the `/api/waypoints`
+answer, or to `{"error": ...}`). Route lines are simplified to at most 1,500
+points (`--max-points`), with coordinates at 5 decimals. Visitors load only
+`presets.json` and the individual drives or loops they open.
 
 Every path is relative, so the site works from any folder, such as
 `/design/wanderers/` on GitHub Pages. The headless check below served it
@@ -50,35 +57,33 @@ from that path.
 
 `<html data-mode="demo">` switches `app.js` to demo mode:
 
-- The panel lists the presets ("Pick a drive"), and a note says "Preset demo
-  routes. The interactive planner runs locally; see the source on GitHub."
-- Choosing a preset loads `data/<id>.json` and shows everything the live
-  page shows after a search. That means the fastest route and the picks,
-  the scenery colouring and strips, and the stops (grouped by feature). It
-  also means the waypoints and the "Open in Google Maps" link.
-- There is no place search, no point picking (map clicks do nothing, A and
-  B can't be dragged), no Find routes, Swap, Clear or home, and no health
-  polling. `api()` throws in demo mode. The only fetches are `data/*.json`.
-- The URL hash keeps the view: `#preset=finger-lakes&route=%2B50%25&layer=topo`.
-- The units switch, route selection, scenery colouring and base layers work
+- The `A to B` tab lists the five point-to-point presets ("Pick a drive"), and
+  the `Drive-around` tab shows Auburn as the fixed start and finish (`S`) with
+  `1 h`, `2 h`, and `3 h` budgets, `Any way`, `A direction` (8-way compass
+  rose), and `Past a place` (clickable Finger Lakes feature chips).
+- Choosing a preset or loop loads its `data/*.json` file and shows everything
+  the live page shows after a search: the picks, scenery coloring and strips,
+  scenic stops grouped by feature, numbered waypoints, and editable Google Maps
+  links (single-link or Part 1 / Part 2 when split).
+- There is no place search, no map-click point picking (markers cannot be
+  dragged), no custom minute input, no Find/Swap/Clear/home buttons, and no
+  health polling. `api()` throws in demo mode. The only fetches are
+  `data/*.json`.
+- The URL hash keeps the view in both tabs:
+  `#preset=finger-lakes&route=%2B30%25&layer=topo` or
+  `#mode=loop&min=180&steer=anchor&feature=Keuka%20Lake`.
+- The units switch, route selection, scenery coloring, and base layers work
   as in the live page.
 
-## Putting it on GitHub Pages
+## GitHub Pages deployment
 
-This is not wired up yet. `.github/workflows/deploy.yml` builds the Pages
-site from folders committed on `main`, and the demo can't be built in CI,
-which has no road data. The usage dashboard works the same way: it is
-generated by hand and committed. To publish:
+`.github/workflows/deploy.yml` copies `scenic/site/.` into `_site/wanderers/`
+and links to it from `site/index.html`. Because CI does not carry the New York
+road graph, rebuild and commit `scenic/site/` locally whenever preset routes,
+loop recommendations, moments, or waypoint logic change:
 
-1. Rebuild the demo once the search, moments and waypoints code has settled:
-   `scenic demo build`.
-2. Commit `scenic/site/`.
-3. Add two lines to the "Prepare Site Distribution" step:
-   `mkdir -p _site/wanderers` and `cp -r scenic/site/. _site/wanderers/`.
-   Optionally, add a link from `site/index.html`.
-
-The marker file `.maps-for-wanderers-demo` is harmless on the site. Leave
-it out of the copy if you prefer.
+1. Run `scenic demo build` inside `scenic/`.
+2. Commit the updated `scenic/site/` directory.
 
 ## Third-party resources
 
