@@ -523,3 +523,13 @@ def test_split_waypoints_splits_open_routes_and_closed_loops_under_editable_cap(
     assert all(len(p.waypoints) <= 7 for p in parts8)
 
 
+def test_reducer_row_eviction_preserves_waypoints(monkeypatch):
+    from scenic.waypoints import _Reducer
+
+    g, _, open_nodes, _ = _chain_detour_graph(10)
+    ref_single, ref_full, ref_parts = split_waypoints(g, open_nodes)
+    monkeypatch.setattr(_Reducer, "MAX_ROWS", 2)
+    ev_single, ev_full, ev_parts = split_waypoints(g, open_nodes)
+    assert ev_single.url == ref_single.url and ev_full.url == ref_full.url
+    assert [p.url for p in ev_parts] == [p.url for p in ref_parts]
+

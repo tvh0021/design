@@ -912,15 +912,18 @@ def load_samples(path: Path, fingerprint: str) -> dict:
     return {k: z[k] for k in ("x", "y", "edge")}
 
 
-def load(edges_path: Path | None = None, scores_path: Path | None = None):
+def load(edges_path: Path | None = None, scores_path: Path | None = None,
+         columns: list[str] | None = None, edges_table=None):
     """scores.parquet as a pyarrow table, after checking it lines up row for
     row with `edges_path` (default data/graph/edges.parquet)."""
     import pyarrow.parquet as pq
 
     edges_path = Path(edges_path or data_dir() / "graph" / "edges.parquet")
     scores_path = Path(scores_path or data_dir() / "score" / "scores.parquet")
-    t = pq.read_table(scores_path)
-    check_alignment(t, pq.read_table(edges_path, columns=["u", "v", "way_id"]))
+    read_cols = list(dict.fromkeys(["u", "v", "way_id", *columns])) if columns is not None else None
+    t = pq.read_table(scores_path, columns=read_cols)
+    ref = edges_table if edges_table is not None else pq.read_table(edges_path, columns=["u", "v", "way_id"])
+    check_alignment(t, ref)
     return t
 
 

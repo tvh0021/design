@@ -139,9 +139,9 @@ def _waypoints_for_search(app: App, search: dict, wp_cache: dict[tuple[bytes, fl
     for r in search["routes"]:
         cache_key = None
         if wp_cache is not None and stored is not None:
-            sr = stored["routes"].get(r["key"])
-            if sr is not None:
-                cache_key = (np.asarray(sr.edges, dtype=np.int64).tobytes(), round(float(stored["res"].s_fast), 6))
+            edges = stored["edges"].get(r["key"])
+            if edges is not None:
+                cache_key = (np.asarray(edges, dtype=np.int64).tobytes(), round(float(stored["s_fast"]), 6))
                 if cache_key in wp_cache:
                     cached = wp_cache[cache_key]
                     waypoints[r["key"]] = {**cached, "key": r["key"]} if "error" not in cached else dict(cached)

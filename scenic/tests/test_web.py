@@ -232,6 +232,9 @@ def test_old_searches_expire(app):
     ids = [app.api("POST", "/api/route", {"from": A, "to": B})[1]["id"] for _ in range(web.KEEP_RESULTS + 1)]
     assert app.api("POST", "/api/waypoints", {"id": ids[0], "key": "r0"})[0] == 404
     assert ids[-1] in app.results and len(app.results) == web.KEEP_RESULTS
+    stored = app.results[ids[-1]]
+    assert set(stored) == {"s_fast", "edges", "waypoints"}
+    assert all(v.dtype == np.int32 for v in stored["edges"].values())
 
 
 # ---- display geometry ------------------------------------------------------------

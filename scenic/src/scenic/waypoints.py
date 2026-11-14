@@ -228,6 +228,9 @@ def maps_url(origin: tuple[float, float], destination: tuple[float, float],
 
 
 class _Index:
+    CELL_M = 2000.0
+    _CHUNK_EDGES = 100_000
+
     def __init__(self, g):
         self.g = g
         self.lat0 = float(np.radians(g.node_lat.mean())) if g.n_nodes else 0.0
@@ -237,46 +240,101 @@ class _Index:
         a = np.minimum(g.u, g.v)
         b = np.maximum(g.u, g.v)
         keep = a != b
-        pairs = np.unique(np.stack([a[keep], b[keep]], axis=1), axis=0) if keep.any() else np.zeros((0, 2), int)
-        deg = np.bincount(pairs.ravel(), minlength=g.n_nodes)
+        if keep.any():
+            pk = a[keep].astype(np.int64) * g.n_nodes + b[keep]
+            pk.sort()
+            uniq = np.ones(len(pk), dtype=bool)
+            uniq[1:] = pk[1:] != pk[:-1]
+            pk = pk[uniq]
+            deg = (np.bincount((pk // g.n_nodes).astype(np.int32), minlength=g.n_nodes)
+                   + np.bincount((pk % g.n_nodes).astype(np.int32), minlength=g.n_nodes))
+            del pk, uniq
+        else:
+            deg = np.zeros(g.n_nodes, dtype=np.int64)
+        del a, b, keep
         self.junction = deg >= 3
         jn = np.flatnonzero(self.junction)
         self.junction_tree = cKDTree(self.xy(g.node_lon[jn], g.node_lat[jn])) if len(jn) else None
 
-        # Edge polylines (u -> v), flat.
+        # Edge polylines (u -> v), flat; compute per-edge projected lengths and bboxes in chunks.
         if g.geom_off is not None:
-            self.off = np.asarray(g.geom_off, dtype=np.int64)
+            self.off = np.asarray(g.geom_off)
             self.plon = np.asarray(g.geom_lon, dtype=np.float64)
             self.plat = np.asarray(g.geom_lat, dtype=np.float64)
         else:
-            self.off = np.arange(g.n_edges + 1, dtype=np.int64) * 2
+            self.off = np.arange(g.n_edges + 1, dtype=np.int32) * 2
             self.plon = np.column_stack([g.node_lon[g.u], g.node_lon[g.v]]).ravel()
             self.plat = np.column_stack([g.node_lat[g.u], g.node_lat[g.v]]).ravel()
-        self.pxy = self.xy(self.plon, self.plat)
-        n_pts = len(self.plon)
-        edge_of_pt = np.repeat(np.arange(g.n_edges), np.diff(self.off))
-        seg_ok = edge_of_pt[:-1] == edge_of_pt[1:]
-        seg_len = np.where(seg_ok, np.hypot(*(self.pxy[1:] - self.pxy[:-1]).T), 0.0)
-        cs = np.concatenate([[0.0], np.cumsum(seg_len)])
-        self.cum = cs[:n_pts] - cs[self.off[edge_of_pt]]  # distance along its edge at each point
-        self.proj_len = cs[self.off[1:] - 1] - cs[self.off[:-1]]
 
-        # Search index: samples along every segment, at most INDEX_STEP_M apart.
-        self.seg = np.flatnonzero(seg_ok)  # segment i runs from point i to point i + 1
-        self.seg_edge = edge_of_pt[self.seg]
-        k = np.maximum(1, np.ceil(seg_len[self.seg] / INDEX_STEP_M).astype(np.int64))
-        sid = np.repeat(np.arange(len(self.seg)), k)
-        first = np.concatenate([[0], np.cumsum(k)[:-1]])
-        frac = (np.arange(len(sid)) - first[sid] + 0.5) / k[sid]
-        p0 = self.pxy[self.seg[sid]]
-        p1 = self.pxy[self.seg[sid] + 1]
-        self.sample_seg = sid
-        self.sample_tree = cKDTree(p0 + (p1 - p0) * frac[:, None])
-        self.sample_half = float(INDEX_STEP_M / 2)
+        n_e = g.n_edges
+        self.proj_len = np.zeros(n_e, dtype=np.float64)
+        self.xmin = np.zeros(n_e, dtype=np.float32)
+        self.ymin = np.zeros(n_e, dtype=np.float32)
+        self.xmax = np.zeros(n_e, dtype=np.float32)
+        self.ymax = np.zeros(n_e, dtype=np.float32)
+        k_lon = EARTH_RADIUS_M * (math.pi / 180.0) * self.coslat0
+        k_lat = EARTH_RADIUS_M * (math.pi / 180.0)
+
+        for e0 in range(0, n_e, self._CHUNK_EDGES):
+            e1 = min(e0 + self._CHUNK_EDGES, n_e)
+            sub_off = self.off[e0:e1 + 1].astype(np.int64)
+            p0, p1 = int(sub_off[0]), int(sub_off[-1])
+            if p1 <= p0:
+                continue
+            x = self.plon[p0:p1] * k_lon
+            y = self.plat[p0:p1] * k_lat
+            cnt = np.diff(sub_off)
+            pos = cnt > 0
+            rel = sub_off[:-1] - p0
+            if np.all(pos):
+                self.xmin[e0:e1] = np.minimum.reduceat(x, rel) - 1.0
+                self.xmax[e0:e1] = np.maximum.reduceat(x, rel) + 1.0
+                self.ymin[e0:e1] = np.minimum.reduceat(y, rel) - 1.0
+                self.ymax[e0:e1] = np.maximum.reduceat(y, rel) + 1.0
+            elif np.any(pos):
+                idx_pos = np.flatnonzero(pos)
+                self.xmin[e0 + idx_pos] = np.minimum.reduceat(x, rel[pos]) - 1.0
+                self.xmax[e0 + idx_pos] = np.maximum.reduceat(x, rel[pos]) + 1.0
+                self.ymin[e0 + idx_pos] = np.minimum.reduceat(y, rel[pos]) - 1.0
+                self.ymax[e0 + idx_pos] = np.maximum.reduceat(y, rel[pos]) + 1.0
+            edge_of = np.repeat(np.arange(e1 - e0, dtype=np.int32), cnt)
+            if len(edge_of) > 1:
+                same = edge_of[:-1] == edge_of[1:]
+                sl = np.where(same, np.hypot(np.diff(x), np.diff(y)), 0.0)
+                cs = np.concatenate([[0.0], np.cumsum(sl)])
+                valid_end = np.maximum(sub_off[1:] - p0 - 1, rel)
+                self.proj_len[e0:e1] = np.where(pos, cs[valid_end] - cs[rel], 0.0)
+
+        # Flat CSR spatial grid over edge bounding boxes.
+        if n_e:
+            ix0 = np.floor(self.xmin / self.CELL_M).astype(np.int32)
+            ix1 = np.floor(self.xmax / self.CELL_M).astype(np.int32)
+            iy0 = np.floor(self.ymin / self.CELL_M).astype(np.int32)
+            iy1 = np.floor(self.ymax / self.CELL_M).astype(np.int32)
+            ny = iy1 - iy0 + 1
+            ncells = (ix1 - ix0 + 1) * ny
+            e_rep = np.repeat(np.arange(n_e, dtype=np.int32), ncells)
+            starts = np.repeat(np.cumsum(ncells) - ncells, ncells)
+            local = np.arange(len(e_rep), dtype=np.int32) - starts
+            ny_rep = ny[e_rep]
+            cx = ix0[e_rep] + (local // ny_rep)
+            cy = iy0[e_rep] + (local % ny_rep)
+            ckey = (cx.astype(np.int64) << 32) | (cy.astype(np.int64) & 0xFFFFFFFF)
+            order = np.argsort(ckey, kind="stable")
+            ckey_s = ckey[order]
+            self.cell_edges = e_rep[order]
+            umask = np.ones(len(ckey_s), dtype=bool)
+            umask[1:] = ckey_s[1:] != ckey_s[:-1]
+            self.cell_keys = ckey_s[umask]
+            self.cell_off = np.concatenate([np.flatnonzero(umask), [len(ckey_s)]]).astype(np.int32)
+        else:
+            self.cell_edges = np.zeros(0, dtype=np.int32)
+            self.cell_keys = np.zeros(0, dtype=np.int64)
+            self.cell_off = np.zeros(1, dtype=np.int32)
 
         # Arcs by (tail, head) pair, for patching a few matrix entries.
-        arc_key = g.arc_tail * g.n_nodes + g.arc_head
-        self.arc_order = np.argsort(arc_key, kind="stable")
+        arc_key = g.arc_tail.astype(np.int64) * g.n_nodes + g.arc_head
+        self.arc_order = np.argsort(arc_key, kind="stable").astype(np.int32)
         self.arc_key_sorted = arc_key[self.arc_order]
 
         t = g.edges_table
@@ -289,6 +347,14 @@ class _Index:
         lon = np.radians(np.asarray(lon, dtype=np.float64))
         lat = np.radians(np.asarray(lat, dtype=np.float64))
         return np.column_stack([EARTH_RADIUS_M * lon * self.coslat0, EARTH_RADIUS_M * lat])
+
+    def _edge_xy_cum(self, e: int) -> tuple[np.ndarray, np.ndarray]:
+        lo, hi = int(self.off[e]), int(self.off[e + 1])
+        pts = self.xy(self.plon[lo:hi], self.plat[lo:hi])
+        if len(pts) < 2:
+            return pts, np.zeros(len(pts), dtype=np.float64)
+        seg = np.hypot(*(pts[1:] - pts[:-1]).T)
+        return pts, np.concatenate([[0.0], np.cumsum(seg)])
 
     def attr(self, col: str, e: int) -> str:
         c = self._cols.get(col)
@@ -307,45 +373,75 @@ class _Index:
     def point_on_edge(self, e: int, a_m: float) -> tuple[np.ndarray, float, float, float]:
         """Point `a_m` (length_m units) from u along edge e: (xy, lon, lat, bearing)."""
         lo, hi = int(self.off[e]), int(self.off[e + 1])
+        pts, cum = self._edge_xy_cum(e)
+        if hi - lo < 2:
+            p0 = pts[0] if len(pts) else np.zeros(2, dtype=np.float64)
+            return p0, float(self.plon[lo]), float(self.plat[lo]), 0.0
         L = float(self.g.length_m[e])
         d = self.proj_len[e] * (a_m / L) if L > 0 else 0.0
-        cum = self.cum[lo:hi]
         i = int(np.clip(np.searchsorted(cum, d, side="right") - 1, 0, max(hi - lo - 2, 0)))
-        if hi - lo < 2:
-            return self.pxy[lo], float(self.plon[lo]), float(self.plat[lo]), 0.0
         seg = cum[i + 1] - cum[i]
         f = 0.0 if seg <= 0 else float(np.clip((d - cum[i]) / seg, 0.0, 1.0))
-        p0, p1 = self.pxy[lo + i], self.pxy[lo + i + 1]
+        p0, p1 = pts[i], pts[i + 1]
         lon = self.plon[lo + i] + f * (self.plon[lo + i + 1] - self.plon[lo + i])
         lat = self.plat[lo + i] + f * (self.plat[lo + i + 1] - self.plat[lo + i])
         brg = math.degrees(math.atan2(p1[0] - p0[0], p1[1] - p0[1]))
         return p0 + f * (p1 - p0), float(lon), float(lat), brg
 
     def _segments_near(self, p: np.ndarray, r: float):
-        """(segment ids, distance, bearing, along-edge distance of the foot) within r of p."""
-        ids = self.sample_tree.query_ball_point(p, r + self.sample_half)
-        if not ids:
-            return np.zeros(0, np.int64), np.zeros(0), np.zeros(0), np.zeros(0)
-        s = np.unique(self.sample_seg[np.asarray(ids)])
-        i = self.seg[s]
-        a, b = self.pxy[i], self.pxy[i + 1]
-        ab = b - a
-        L2 = np.maximum((ab ** 2).sum(1), 1e-12)
-        t = np.clip(((p - a) * ab).sum(1) / L2, 0.0, 1.0)
-        foot = a + ab * t[:, None]
-        d = np.hypot(*(p - foot).T)
-        brg = np.degrees(np.arctan2(ab[:, 0], ab[:, 1]))
-        along = self.cum[i] + t * np.sqrt(L2)
-        return s, d, brg, along
+        """(edge ids, distance, bearing, along-edge distance of the foot) within r of p."""
+        if not len(self.cell_keys):
+            return np.zeros(0, np.int32), np.zeros(0), np.zeros(0), np.zeros(0)
+        px, py = float(p[0]), float(p[1])
+        gx0 = int(math.floor((px - r) / self.CELL_M))
+        gx1 = int(math.floor((px + r) / self.CELL_M))
+        gy0 = int(math.floor((py - r) / self.CELL_M))
+        gy1 = int(math.floor((py + r) / self.CELL_M))
+        cand = []
+        for gx in range(gx0, gx1 + 1):
+            for gy in range(gy0, gy1 + 1):
+                qk = (gx << 32) | (gy & 0xFFFFFFFF)
+                pos = int(np.searchsorted(self.cell_keys, qk))
+                if pos < len(self.cell_keys) and int(self.cell_keys[pos]) == qk:
+                    cand.append(self.cell_edges[self.cell_off[pos]:self.cell_off[pos + 1]])
+        if not cand:
+            return np.zeros(0, np.int32), np.zeros(0), np.zeros(0), np.zeros(0)
+        es = np.unique(np.concatenate(cand))
+        es = es[(self.xmin[es] - r <= px) & (px <= self.xmax[es] + r)
+                & (self.ymin[es] - r <= py) & (py <= self.ymax[es] + r)]
+        if not len(es):
+            return np.zeros(0, np.int32), np.zeros(0), np.zeros(0), np.zeros(0)
+        out_e, out_d, out_b, out_a = [], [], [], []
+        for oe in es.tolist():
+            pts, cum = self._edge_xy_cum(oe)
+            if len(pts) < 2:
+                continue
+            a, b = pts[:-1], pts[1:]
+            ab = b - a
+            L2 = np.maximum((ab ** 2).sum(1), 1e-12)
+            t = np.clip(((p - a) * ab).sum(1) / L2, 0.0, 1.0)
+            foot = a + ab * t[:, None]
+            d = np.hypot(*(p - foot).T)
+            hit = d <= r
+            if not np.any(hit):
+                continue
+            ab_h = ab[hit]
+            out_e.append(np.full(int(hit.sum()), oe, dtype=np.int32))
+            out_d.append(d[hit])
+            out_b.append(np.degrees(np.arctan2(ab_h[:, 0], ab_h[:, 1])))
+            out_a.append(cum[:-1][hit] + t[hit] * np.sqrt(L2[hit]))
+        if not out_e:
+            return np.zeros(0, np.int32), np.zeros(0), np.zeros(0), np.zeros(0)
+        return np.concatenate(out_e), np.concatenate(out_d), np.concatenate(out_b), np.concatenate(out_a)
 
     def snap(self, lat: float, lon: float, r: float = 200.0) -> tuple[int, float, float] | None:
         """Nearest edge to a point: (edge, distance from u in length_m units, metres off)."""
         p = self.xy([lon], [lat])[0]
-        s, d, _, along = self._segments_near(p, r)
-        if not len(s):
+        es, d, _, along = self._segments_near(p, r)
+        if not len(es):
             return None
         k = int(np.argmin(d))
-        e = int(self.seg_edge[s[k]])
+        e = int(es[k])
         scale = self.g.length_m[e] / self.proj_len[e] if self.proj_len[e] > 0 else 0.0
         return e, float(along[k] * scale), float(d[k])
 
@@ -359,15 +455,15 @@ class _Index:
         """Nearest other drivable edge within PARALLEL_M of p, and the
         distance to edge e's other carriageway (inf if not that close). Edges in `skip`, edges of the
         same OSM way and the other carriageway don't count."""
-        s, d, sb, _ = self._segments_near(p, PARALLEL_M)
+        es, d, sb, _ = self._segments_near(p, PARALLEL_M)
         best, carriageway = math.inf, math.inf
-        if not len(s):
+        if not len(es):
             return best, carriageway
         g = self.g
         for k in np.argsort(d):
             if d[k] > PARALLEL_M:
                 break
-            o = int(self.seg_edge[s[k]])
+            o = int(es[k])
             if o == e or o in skip or self.way_id[o] == self.way_id[e]:
                 continue
             if g.oneway[e] and g.oneway[o]:
@@ -479,7 +575,8 @@ def _slowed_matrix(g, edges: np.ndarray, factor: float, base=None):
     edges = np.asarray(edges, dtype=np.int64)
     cost = np.array(g.time_s, dtype=np.float64)
     cost[edges] *= factor
-    u, v = g.u[edges], g.v[edges]
+    u = g.u[edges].astype(np.int64)
+    v = g.v[edges].astype(np.int64)
     two = ~g.oneway[edges]
     touched = np.unique(np.concatenate([u * n + v, (v * n + u)[two]]))
     lo = np.searchsorted(ix.arc_key_sorted, touched, side="left")
@@ -515,18 +612,19 @@ def _corridor(g, target: "_Target", time_margin: float):
     Returns (matrix, arc per entry, indptr) and each node's travel time to
     the destination (0 outside the corridor), the potential that lets
     `_Reducer.row` search toward the destination only."""
-    m, sel, indptr = g._matrix(g.time_s)
+    m, sel, _ = g._matrix(g.time_s)
     o, d = int(target.nodes[0]), int(target.nodes[-1])
     bound = ((1 + UTURN_MARGIN) * (1 + time_margin) * float(target.cum_time[-1])
              + UTURN_MARGIN_S + 2 * ROW_SLACK_S)
     d_o = dijkstra(m, directed=True, indices=o, limit=bound)
-    d_d = dijkstra(m.T.tocsr(), directed=True, indices=d, limit=bound)
+    d_d = dijkstra(g.rev_time_matrix(), directed=True, indices=d, limit=bound)
     region = d_o + d_d <= bound
     region[target.nodes] = True
-    rows = np.repeat(np.arange(g.n_nodes, dtype=np.int64), np.diff(m.indptr))
+    rows = np.repeat(np.arange(g.n_nodes, dtype=np.int32), np.diff(m.indptr))
     keep = region[rows] & region[m.indices]
-    ip = np.concatenate([[0], np.cumsum(np.bincount(rows[keep], minlength=g.n_nodes))])
+    ip = np.concatenate([[0], np.cumsum(np.bincount(rows[keep], minlength=g.n_nodes), dtype=np.int32)]).astype(np.int32, copy=False)
     pot = np.where(region & np.isfinite(d_d), d_d, 0.0)
+    del d_o, d_d, region, rows
     return (csr_matrix((m.data[keep], m.indices[keep], ip), shape=m.shape), sel[keep], ip), pot
 
 
@@ -598,6 +696,8 @@ class _Reducer:
     """Leg checks under one per-edge cost: travel time, or travel time with
     the target's own edges made slower (see `time_margin`)."""
 
+    MAX_ROWS = 256
+
     def __init__(self, g, target: _Target, leg_follow: float, leg_slack_m: float, cost=None,
                  matrix=None, max_gap_m: float = math.inf, potential=None):
         self.g = g
@@ -607,18 +707,28 @@ class _Reducer:
         self.mat = matrix if matrix is not None else g._matrix(self.cost)
         self.m, self.edge_of = _arc_lookup(g, matrix=self.mat)
         self.keys = _entry_keys(self.m)
+        active = np.diff(self.m.indptr) > 0
+        active[self.m.indices] = True
+        active[target.nodes] = True
+        self._nodes_c = np.flatnonzero(active).astype(np.int32)
+        n_c = len(self._nodes_c)
+        self._to_c = np.full(g.n_nodes, -1, dtype=np.int32)
+        self._to_c[self._nodes_c] = np.arange(n_c, dtype=np.int32)
+        indptr_c = np.r_[self.m.indptr[self._nodes_c], self.m.nnz].astype(np.int32)
+        indices_c = self._to_c[self.m.indices]
         # Goal-directed search (A* by reweighting): with a potential pi that
         # never overestimates the time left to the destination, arcs cost
         # c + pi(head) - pi(tail) >= 0 and the same paths are shortest, but a
         # limited Dijkstra reaches only nodes on the way to the destination.
         self.pot = potential
         if potential is not None:
-            heads = self.m.indices
-            tails = np.repeat(np.arange(g.n_nodes, dtype=np.int64), np.diff(self.m.indptr))
-            red = np.maximum(self.m.data + potential[heads] - potential[tails], MIN_COST)
-            self.m_search = csr_matrix((red, heads, self.m.indptr), shape=self.m.shape)
+            self._pot_c = potential[self._nodes_c]
+            tails_c = np.repeat(np.arange(n_c, dtype=np.int32), np.diff(indptr_c))
+            red = np.maximum(self.m.data + self._pot_c[indices_c] - self._pot_c[tails_c], MIN_COST)
+            self.m_search = csr_matrix((red, indices_c, indptr_c), shape=(n_c, n_c))
         else:
-            self.m_search = self.m
+            self._pot_c = None
+            self.m_search = csr_matrix((self.m.data, indices_c, indptr_c), shape=(n_c, n_c))
         self.leg_follow = leg_follow
         self.leg_slack_m = leg_slack_m
         self.max_gap_m = max_gap_m
@@ -626,7 +736,7 @@ class _Reducer:
         self.horizon_m = math.inf  # pruning only joins legs over at most this much scenic road
         tc = self.cost[target.edges].astype(np.float64)
         self.cum_cost = np.concatenate([[0.0], np.cumsum(tc)])
-        self.rows: dict[int, tuple[np.ndarray, np.ndarray, float]] = {}
+        self.rows: dict[int, tuple[np.ndarray | None, np.ndarray, np.ndarray, float]] = {}
         self.dijkstras = 0
         t = target
         self.origin = _Loc((0, 0.0), [(int(t.nodes[0]), 0.0, [], False)], [(int(t.nodes[0]), 0.0, [], False)])
@@ -658,24 +768,70 @@ class _Reducer:
         x = max((c for _, c, _, _ in A.exits), default=0.0)
         return float(v.max()) + (1 + UTURN_MARGIN) * x + UTURN_MARGIN_S + ROW_SLACK_S
 
+    @staticmethod
+    def _sparse_pred(hit: np.ndarray, p: np.ndarray) -> np.ndarray:
+        ph = p[hit]
+        valid = ph >= 0
+        pos = hit.searchsorted(np.where(valid, ph, 0)).astype(np.int32)
+        ok = valid & (pos < len(hit))
+        if np.any(ok):
+            ok_idx = np.flatnonzero(ok)
+            ok[ok_idx] = hit[pos[ok_idx]] == ph[ok_idx]
+        return np.where(ok, pos, -1).astype(np.int32)
+
     def row(self, node: int, reach: float | None = None):
-        """(distances, predecessors) from node, exact for every node n with
-        d(node, n) + pi(n) <= reach (pi = 0 without a potential). Default:
-        a row already searched, else the whole target."""
-        r = self.rows.get(node)
-        if r is None or (reach is not None and r[2] < reach):
+        """Cached (hit, distances, predecessors, reach) from node in compact
+        corridor coordinates; `hit` is None for dense rows or sorted int32
+        compact indices when fewer than 75% of corridor nodes are reached."""
+        ci = int(self._to_c[node])
+        if ci < 0:
+            return None
+        r = self.rows.get(ci)
+        if r is None or (reach is not None and r[3] < reach):
             if reach is None:
                 reach = self.reach(self.origin, self.dest.pos)
-            if self.pot is None:
-                d, p = dijkstra(self.m, directed=True, indices=node, return_predecessors=True, limit=reach)
+            if self._pot_c is None:
+                d, p = dijkstra(self.m_search, directed=True, indices=ci, return_predecessors=True, limit=reach)
+                fin = np.isfinite(d)
+                if int(fin.sum()) * 16 < len(d) * 12:
+                    hit = np.flatnonzero(fin).astype(np.int32)
+                    entry = (hit, d[hit], self._sparse_pred(hit, p), reach)
+                    del d, p
+                else:
+                    entry = (None, d, p, reach)
             else:  # reduced distance d' = d + pi(n) - pi(node)
-                pn = float(self.pot[node])
-                d, p = dijkstra(self.m_search, directed=True, indices=node, return_predecessors=True,
+                pn = float(self._pot_c[ci])
+                d, p = dijkstra(self.m_search, directed=True, indices=ci, return_predecessors=True,
                                 limit=max(reach - pn, ROW_SLACK_S))
-                d = d - self.pot + pn
-            r = self.rows[node] = (d, p, reach)
+                fin = np.isfinite(d)
+                if int(fin.sum()) * 16 < len(d) * 12:
+                    hit = np.flatnonzero(fin).astype(np.int32)
+                    d_hit = d[hit] - self._pot_c[hit] + pn
+                    p_idx = self._sparse_pred(hit, p)
+                    del d, p
+                    entry = (hit, d_hit, p_idx, reach)
+                else:
+                    d -= self._pot_c
+                    d += pn
+                    entry = (None, d, p, reach)
+            if ci in self.rows:
+                self.rows.pop(ci)
+            elif len(self.rows) >= self.MAX_ROWS:
+                self.rows.pop(next(iter(self.rows)))
+            r = self.rows[ci] = entry
             self.dijkstras += 1
-        return r[0], r[1]
+        else:
+            self.rows.pop(ci)
+            self.rows[ci] = r
+        return r
+
+    @staticmethod
+    def _dist_at(r, yi: int) -> float:
+        hit, d, _, _ = r
+        if hit is None:
+            return float(d[yi])
+        idx = int(hit.searchsorted(yi))
+        return float(d[idx]) if idx < len(hit) and int(hit[idx]) == yi else math.inf
 
     def node_loc(self, k: int) -> _Loc:
         """Target node N[k], k >= 1, as an arrival point."""
@@ -703,18 +859,40 @@ class _Reducer:
         t = self.t
         return self.edge_loc(int(t.edges[j]), int(t.nodes[j]), int(t.nodes[j + 1]), s, (j, s))
 
-    def tree_pieces(self, pred: np.ndarray, x: int, y: int) -> list | None:
-        path = [y]
-        while path[-1] != x:
-            p = int(pred[path[-1]])
-            if p < 0:
-                return None
-            path.append(p)
-        if len(path) < 2:
+    def tree_pieces(self, row_entry, x: int, y: int) -> list | None:
+        if x == y:
             return []
-        path.reverse()
-        a = np.asarray(path[:-1], dtype=np.int64)
-        b = np.asarray(path[1:], dtype=np.int64)
+        if row_entry is None:
+            return None
+        xi, yi = int(self._to_c[x]), int(self._to_c[y])
+        if xi < 0 or yi < 0:
+            return None
+        hit, _, pred, _ = row_entry
+        if hit is None:
+            path = [yi]
+            while path[-1] != xi:
+                p = int(pred[path[-1]])
+                if p < 0:
+                    return None
+                path.append(p)
+            path.reverse()
+            c_nodes = np.asarray(path, dtype=np.int32)
+        else:
+            n_h = len(hit)
+            xi_idx = int(hit.searchsorted(xi))
+            yi_idx = int(hit.searchsorted(yi))
+            if xi_idx >= n_h or int(hit[xi_idx]) != xi or yi_idx >= n_h or int(hit[yi_idx]) != yi:
+                return None
+            idx_path = [yi_idx]
+            while idx_path[-1] != xi_idx:
+                p = int(pred[idx_path[-1]])
+                if p < 0:
+                    return None
+                idx_path.append(p)
+            idx_path.reverse()
+            c_nodes = hit[np.asarray(idx_path, dtype=np.int32)]
+        nodes = self._nodes_c[c_nodes].astype(np.int64)
+        a, b = nodes[:-1], nodes[1:]
         e = self.g.arc_edge[self.mat[1][np.searchsorted(self.keys, a * self.g.n_nodes + b)]]
         L = self.g.length_m[e]
         return list(zip(zip(a.tolist(), b.tolist()), L.tolist(), e.tolist()))
@@ -733,10 +911,16 @@ class _Reducer:
             combos.append((c, False, None, [(t.keys[ja][:2], sb - sa, e)], False, None, [], False))
         reach = self.reach(A, max(B.pos, self.horizon(A)))
         for xn, xc, xp, xb in A.exits:
-            dist, _ = self.row(xn, reach)
+            r = self.row(xn, reach)
             for yn, yc, yp, yb in B.entries:
-                d = dist[yn]
-                if np.isfinite(d):
+                if yn == xn:
+                    d = 0.0
+                elif r is None:
+                    d = math.inf
+                else:
+                    yi = int(self._to_c[yn])
+                    d = self._dist_at(r, yi) if yi >= 0 else math.inf
+                if math.isfinite(d):
                     combos.append((xc + d + yc, xb or yb, xn, xp, xb, yn, yp, yb))
         if not combos:
             return None
@@ -749,7 +933,7 @@ class _Reducer:
         else:
             risk = True
         c, _, xn, xp, xb, yn, yp, yb = best
-        mid = [] if xn is None else self.tree_pieces(self.row(xn)[1], xn, yn)
+        mid = [] if xn is None or xn == yn else self.tree_pieces(self.row(xn), xn, yn)
         if mid is None:
             return None
         pieces = list(xp) + mid + list(yp)
@@ -765,19 +949,46 @@ class _Reducer:
         _, _, xn, xp, xb, yn, yp, yb = combo
         if xn == yn:  # out to one junction and straight back (A and B on one edge)
             return True
-        pred = self.row(xn)[1]
-        if xb:  # left A backwards to its tail xn; xp's key is (head, tail)
-            head = xp[0][0][0]
-            y = yn
-            while y != xn and int(pred[y]) != xn:
-                y = int(pred[y])
-                if y < 0:
+        r = self.row(xn)
+        if r is None:
+            return False
+        xi, yi = int(self._to_c[xn]), int(self._to_c[yn])
+        if xi < 0 or yi < 0:
+            return False
+        hit, _, pred, _ = r
+        if hit is None:
+            if xb:  # left A backwards to its tail xn; xp's key is (head, tail)
+                head_i = int(self._to_c[xp[0][0][0]])
+                y = yi
+                while y != xi and int(pred[y]) != xi:
+                    y = int(pred[y])
+                    if y < 0:
+                        return False
+                if head_i >= 0 and y != xi and y == head_i:
+                    return True
+            if yb:  # reached B from its head yn; yp's key is (head, tail)
+                tail_i = int(self._to_c[yp[0][0][1]])
+                if tail_i >= 0 and yi != xi and int(pred[yi]) == tail_i:
+                    return True
+            return False
+        n_h = len(hit)
+        xi_idx = int(hit.searchsorted(xi))
+        yi_idx = int(hit.searchsorted(yi))
+        if xi_idx >= n_h or int(hit[xi_idx]) != xi or yi_idx >= n_h or int(hit[yi_idx]) != yi:
+            return False
+        if xb:
+            head_i = int(self._to_c[xp[0][0][0]])
+            y_idx = yi_idx
+            while y_idx != xi_idx and int(pred[y_idx]) != xi_idx:
+                y_idx = int(pred[y_idx])
+                if y_idx < 0:
                     return False
-            if y != xn and y == head:
+            if head_i >= 0 and y_idx != xi_idx and int(hit[y_idx]) == head_i:
                 return True
-        if yb:  # reached B from its head yn; yp's key is (head, tail)
-            tail = yp[0][0][1]
-            if yn != xn and int(pred[yn]) == tail:
+        if yb:
+            tail_i = int(self._to_c[yp[0][0][1]])
+            py_idx = int(pred[yi_idx])
+            if tail_i >= 0 and yi_idx != xi_idx and py_idx >= 0 and int(hit[py_idx]) == tail_i:
                 return True
         return False
 
@@ -1343,7 +1554,7 @@ def _url_cap() -> int:
 def _scenic_mask(g, target: _Target, r: "_Reducer", scenic, s_fast) -> np.ndarray:
     """Target edges the spacing rule applies to (see `reduce_to_waypoints`)."""
     o, d = int(target.nodes[0]), int(target.nodes[-1])
-    fast = r.tree_pieces(r.row(o, r.reach(r.origin, r.dest.pos))[1], o, d) if o != d else []
+    fast = r.tree_pieces(r.row(o, r.reach(r.origin, r.dest.pos)), o, d) if o != d else []
     fast_edges = np.asarray([e for _, _, e in fast or []], dtype=np.int64)
     mask = ~np.isin(target.edges, fast_edges)
     if scenic is not None:

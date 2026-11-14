@@ -247,13 +247,7 @@ def _norm_name(s: str | None) -> str:
 
 
 def _rev_time_matrix(g: RoadGraph) -> csr_matrix:
-    m, _, _ = g._matrix(g.time_s)
-    cached = getattr(g, "_rev_time_cache", None)
-    if cached is not None and cached[0] is m:
-        return cached[1]
-    mt = m.T.tocsr()
-    g._rev_time_cache = (m, mt)
-    return mt
+    return g.rev_time_matrix()
 
 
 # --------------------------------------------------------------------------

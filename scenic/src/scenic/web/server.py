@@ -629,8 +629,9 @@ class App:
                                 "or be disconnected. Move A or B to a different road.")
         payload, sr_by_key = route_payload(ctx, res, self.breaks, self.grid, self.max_points)
         rid = uuid.uuid4().hex[:12]
+        edges_by_key = {k: np.asarray(sr.edges, dtype=np.int32) for k, sr in sr_by_key.items()}
         with self._rlock:
-            self.results[rid] = {"res": res, "routes": sr_by_key, "waypoints": {}}
+            self.results[rid] = {"s_fast": float(res.s_fast), "edges": edges_by_key, "waypoints": {}}
             while len(self.results) > KEEP_RESULTS:
                 self.results.popitem(last=False)
         return {
@@ -698,8 +699,9 @@ class App:
 
         payload, sr_by_key = loop_payload(ctx, res, self.breaks, self.grid, self.max_points)
         rid = uuid.uuid4().hex[:12]
+        edges_by_key = {k: np.asarray(sr.edges, dtype=np.int32) for k, sr in sr_by_key.items()}
         with self._rlock:
-            self.results[rid] = {"res": res, "routes": sr_by_key, "waypoints": {}}
+            self.results[rid] = {"s_fast": float(res.s_fast), "edges": edges_by_key, "waypoints": {}}
             while len(self.results) > KEEP_RESULTS:
                 self.results.popitem(last=False)
         min_val: int | float = int(minutes) if float(minutes).is_integer() else round(float(minutes), 1)
@@ -766,23 +768,24 @@ class App:
                 return stored["waypoints"][key]
         if stored is None:
             raise ApiError(404, "That search has expired. Search again.")
-        sr = stored["routes"].get(key)
-        if sr is None:
+        raw_edges = stored["edges"].get(key)
+        if raw_edges is None:
             raise ApiError(404, f"No route '{key}' in that search. Search again.")
         from ..waypoints import split_waypoints
 
-        edges = np.asarray(sr.edges, dtype=np.int64)
+        edges = np.asarray(raw_edges, dtype=np.int64)
+        s_fast = stored["s_fast"]
         with self.lock:
             t0 = time.monotonic()
             # only roads scenier than the fastest route (or s_base on loops) count toward spacing
             if self._waypoints is not None:
                 wr = self._waypoints(ctx.g, edge_path=edges, scenic=ctx.S,
-                                     s_fast=stored["res"].s_fast, **WAYPOINT_OPTS)
+                                     s_fast=s_fast, **WAYPOINT_OPTS)
                 full, parts = wr, []
             else:
                 wr, full, parts = split_waypoints(
                     ctx.g, edge_path=edges, scenic=ctx.S,
-                    s_fast=stored["res"].s_fast, follow_target=WAYPOINT_OPTS["follow_target"],
+                    s_fast=s_fast, follow_target=WAYPOINT_OPTS["follow_target"],
                 )
             secs = time.monotonic() - t0
         if wr.origin == wr.destination and len(wr.waypoints) == 0 and not parts:

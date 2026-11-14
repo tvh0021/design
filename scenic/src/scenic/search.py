@@ -65,6 +65,8 @@ class CostGraph:
     node pair under `edge_cost`, as forward and reverse CSR matrices.
     Dijkstra trees are cached per (root, direction)."""
 
+    MAX_TREES = 8
+
     def __init__(self, g: RoadGraph, arcs: np.ndarray, edge_cost: np.ndarray):
         n = g.n_nodes
         c = np.maximum(np.asarray(edge_cost, dtype=np.float64)[g.arc_edge[arcs]], MIN_COST)
@@ -75,23 +77,36 @@ class CostGraph:
         first[1:] = (t[1:] != t[:-1]) | (h[1:] != h[:-1])
         t, h, c, a = t[first], h[first], c[first], a[first]
         self.n = n
-        self.arc = a
-        self.key = t * n + h  # sorted
-        indptr = np.concatenate([[0], np.cumsum(np.bincount(t, minlength=n))])
-        self.fwd = csr_matrix((c, h, indptr), shape=(n, n))
-        o2 = np.lexsort((t, h))
-        indptr2 = np.concatenate([[0], np.cumsum(np.bincount(h, minlength=n))])
-        self.rev = csr_matrix((c[o2], t[o2], indptr2), shape=(n, n))
+        self.arc = a.astype(np.int32, copy=False)
+        self.key = t.astype(np.int64) * n + h  # sorted
+        indptr = np.zeros(n + 1, dtype=np.int32)
+        np.cumsum(np.bincount(t, minlength=n), out=indptr[1:])
+        self.fwd = csr_matrix((c, h.astype(np.int32, copy=False), indptr), shape=(n, n))
+        self._rev: csr_matrix | None = None
         self._trees: dict = {}
 
-    def tree(self, root: int, reverse: bool = False) -> tuple[np.ndarray, np.ndarray]:
-        """(dist, pred) from `root` (reverse: to `root`; pred is then the next
-        node towards it)."""
+    @property
+    def rev(self) -> csr_matrix:
+        if self._rev is None:
+            self._rev = self.fwd.T.tocsr()
+        return self._rev
+
+    def tree(self, root: int, reverse: bool = False) -> tuple[np.ndarray, np.ndarray | None]:
+        """(dist, pred) from `root` (reverse: distances to `root`, pred is None)."""
         k = (int(root), bool(reverse))
-        if k not in self._trees:
-            self._trees[k] = dijkstra(self.rev if reverse else self.fwd, directed=True, indices=int(root),
-                                      return_predecessors=True)
-        return self._trees[k]
+        hit = self._trees.pop(k, None)
+        if hit is not None:
+            self._trees[k] = hit
+            return hit
+        if reverse:
+            d = dijkstra(self.rev, directed=True, indices=int(root), return_predecessors=False)
+            hit = (d, None)
+        else:
+            hit = dijkstra(self.fwd, directed=True, indices=int(root), return_predecessors=True)
+        if len(self._trees) >= self.MAX_TREES:
+            self._trees.pop(next(iter(self._trees)))
+        self._trees[k] = hit
+        return hit
 
     def arcs_between(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         q = np.asarray(a, dtype=np.int64) * self.n + np.asarray(b, dtype=np.int64)
@@ -114,9 +129,9 @@ class CostGraph:
 def edge_arcs(g: RoadGraph) -> tuple[np.ndarray, np.ndarray]:
     """For every edge, its forward arc (u -> v) and reverse arc (v -> u, -1
     on oneway edges and self loops)."""
-    fwd = np.full(g.n_edges, -1, np.int64)
-    rev = np.full(g.n_edges, -1, np.int64)
-    idx = np.arange(len(g.arc_edge))
+    fwd = np.full(g.n_edges, -1, np.int32)
+    rev = np.full(g.n_edges, -1, np.int32)
+    idx = np.arange(len(g.arc_edge), dtype=np.int32)
     fwd[g.arc_edge[~g.arc_rev]] = idx[~g.arc_rev]
     rev[g.arc_edge[g.arc_rev]] = idx[g.arc_rev]
     return fwd, rev
@@ -143,15 +158,15 @@ class Moments:
 
     @classmethod
     def from_table(cls, t, n_edges: int) -> "Moments":
-        of_edge = np.full(n_edges, -1, np.int64)
+        of_edge = np.full(n_edges, -1, np.int32)
         ids = t.column("id").to_numpy().astype(np.int64)
         for i, mem in zip(ids, t.column("members").to_pylist()):
-            of_edge[np.asarray(mem, dtype=np.int64)] = i
+            of_edge[np.asarray(mem, dtype=np.int64)] = int(i)
         order = np.argsort(ids)
         if not np.array_equal(ids[order], np.arange(len(ids))):
             raise ValueError("moment ids must be 0..n-1")
         col = lambda c: np.asarray(t.column(c).to_pylist(), dtype=object)[order]  # noqa: E731
-        num = lambda c: t.column(c).to_numpy()[order]  # noqa: E731
+        num = lambda c: np.array(t.column(c).to_numpy()[order], copy=True)  # noqa: E731
         named = lambda a: np.asarray([f if f and f not in GENERIC_FEATURES else None for f in a],  # noqa: E731
                                      dtype=object)
         feat = named(col("feature"))
@@ -170,7 +185,7 @@ class Moments:
     def empty(cls, n_edges: int) -> "Moments":
         z = np.zeros(0)
         return cls(np.zeros(0, np.int64), z, z, z, z, z, np.zeros(0, np.int64), np.zeros(0, object),
-                   np.zeros(0, object), np.full(n_edges, -1, np.int64), np.zeros(0, object), np.zeros(0, object))
+                   np.zeros(0, object), np.full(n_edges, -1, np.int32), np.zeros(0, object), np.zeros(0, object))
 
 
 @dataclass
@@ -183,6 +198,8 @@ class Context:
     @classmethod
     def load(cls, graph_dir: Path | None = None, score_dir: Path | None = None, cfg: dict | None = None,
              g: RoadGraph | None = None) -> "Context":
+        import pyarrow as pa
+
         from . import data_dir
         from .graph import edges_fingerprint, read_edges_fingerprint
         from .moments import load_moments
@@ -191,14 +208,19 @@ class Context:
         graph_dir = Path(graph_dir or data_dir() / "graph")
         score_dir = Path(score_dir or data_dir() / "score")
         g = g or RoadGraph.load(graph_dir)
-        t = load(graph_dir / "edges.parquet", score_dir / "scores.parquet")
-        S = t.column("S").to_numpy().astype(np.float64)
+        t = load(graph_dir / "edges.parquet", score_dir / "scores.parquet",
+                 columns=["S"], edges_table=g.edges_table)
+        S = np.array(t.column("S").to_numpy(), dtype=np.float64, copy=True)
+        del t
         mp = score_dir / "moments.parquet"
         if mp.exists():
             fp = edges_fingerprint(g.edges_table) if g.edges_table is not None else read_edges_fingerprint(graph_dir)
-            mom = Moments.from_table(load_moments(mp, fp), g.n_edges)
+            mt = load_moments(mp, fp)
+            mom = Moments.from_table(mt, g.n_edges)
+            del mt
         else:
             mom = Moments.empty(g.n_edges)
+        pa.default_memory_pool().release_unused()
         cfg = cfg if cfg is not None else load_config()["route"]
         return cls(g=g, S=S, moments=mom, cfg=cfg)
 
@@ -580,10 +602,12 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     dA = dijkstra(m_full, directed=True, indices=src)
     if not np.isfinite(dA[dst]):
         return None
-    dB = dijkstra(m_full.T.tocsr(), directed=True, indices=dst)
     t0 = float(dA[dst])
-    region = (dA + dB) <= cap * t0 * (1 + 1e-9) + 1e-6
-    arcs = np.flatnonzero(region[g.arc_tail] & region[g.arc_head])
+    bound = cap * t0 * (1 + 1e-9) + 1e-6
+    dB = dijkstra(g.rev_time_matrix(), directed=True, indices=dst, limit=bound)
+    region = (dA + dB) <= bound
+    del dA, dB
+    arcs = np.flatnonzero(region[g.arc_tail] & region[g.arc_head]).astype(np.int32)
     secs["region"] = time.monotonic() - t_start
 
     t1 = time.monotonic()
@@ -595,14 +619,17 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     kept = _Kept(cap * fast.time_s, cfg)
     kept.add(fast, "fastest")
 
-    # 2. lambda sweep
-    graphs: dict[float, CostGraph] = {0.0: T}
+    # 2. lambda sweep (retain only via_lambda for step 4)
+    lam_v = float(cfg["via_lambda"])
+    GV: CostGraph | None = T if lam_v == 0.0 else None
     for lam in cfg["lambdas"]:
         G = CostGraph(g, arcs, g.time_s * (1 + lam * (1 - S)))
-        graphs[float(lam)] = G
         p = G.path(src, dst)
         if p is not None:
             kept.add(g.make_route(p, G.arcs_between(p[:-1], p[1:])), f"lambda {lam:g}")
+        if float(lam) == lam_v:
+            GV = G
+        del G
     secs["sweep"] = time.monotonic() - t1
 
     # 3. alternatives: penalise edges already used
@@ -617,6 +644,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
             p = G.path(src, dst)
             if p is not None:
                 kept.add(g.make_route(p, G.arcs_between(p[:-1], p[1:])), f"alt lambda {lam:g} #{r + 1}")
+            del G
     secs["alternatives"] = time.monotonic() - t1
 
     # 4. via moments
@@ -664,11 +692,12 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
             if int(i) not in seen:
                 seen.add(int(i))
                 seeds.append(tuple(int(v) for v in via_arcs[i]))
+    del dA_r, dB_r, fa, ra
     secs["via_rank"] = time.monotonic() - t1
 
     t1 = time.monotonic()
-    lam_v = float(cfg["via_lambda"])
-    GV = graphs.get(lam_v) or CostGraph(g, arcs, g.time_s * (1 + lam_v * (1 - S)))
+    if GV is None:
+        GV = CostGraph(g, arcs, g.time_s * (1 + lam_v * (1 - S)))
     m_by_id = mom.m ** float(cfg.get("moment_power", 1.0))
     for seed in seeds:
         seq = [seed]
@@ -712,6 +741,9 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
             rk = m_by_id[all_arcs[f, 3]] / np.maximum(best_delta[f] / 60, cfg["via_min_extra_min"])
             j = f[int(np.argmax(rk))]
             seq = seq[:best_gap[j]] + [tuple(int(v) for v in all_arcs[j])] + seq[best_gap[j]:]
+    region_nodes = int(region.sum())
+    via_candidates = int(len(via_arcs))
+    del T, GV, region, arcs, t_arc
     secs["via_build"] = time.monotonic() - t1
 
     # 5. score and pick
@@ -725,7 +757,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     secs["total"] = time.monotonic() - t_start
     return SearchResult(a=tuple(a_latlon), b=tuple(b_latlon), snap=snap, t0=t0, s_fast=s_fast, fastest=fastest,
                         kept=kept.routes, picks=picks, seconds={k: round(v, 2) for k, v in secs.items()},
-                        region_nodes=int(region.sum()), via_candidates=int(len(via_arcs)),
+                        region_nodes=region_nodes, via_candidates=via_candidates,
                         spur_rejections=kept.spur_rejections, shared=shared)
 
 

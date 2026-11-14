@@ -75,35 +75,37 @@ class RoadGraph:
                  lcc=None, geom_off=None, geom_lon=None, geom_lat=None, edges_table=None):
         self.node_lon = np.asarray(node_lon, dtype=np.float64)
         self.node_lat = np.asarray(node_lat, dtype=np.float64)
-        self.u = np.asarray(u, dtype=np.int64)
-        self.v = np.asarray(v, dtype=np.int64)
+        self.u = np.asarray(u, dtype=np.int32)
+        self.v = np.asarray(v, dtype=np.int32)
         self.oneway = np.asarray(oneway, dtype=bool)
         self.time_s = np.asarray(time_s, dtype=np.float64)
         self.length_m = np.asarray(length_m, dtype=np.float64)
         self.n_nodes = len(self.node_lon)
         self.n_edges = len(self.u)
         self.lcc = np.ones(self.n_nodes, bool) if lcc is None else np.asarray(lcc, dtype=bool)
-        self.geom_off = geom_off
+        self.geom_off = None if geom_off is None else np.asarray(geom_off, dtype=np.int32)
         self.geom_lon = geom_lon
         self.geom_lat = geom_lat
         self.edges_table = edges_table
 
         two = ~self.oneway
-        idx = np.arange(self.n_edges)
+        idx = np.arange(self.n_edges, dtype=np.int32)
         self.arc_tail = np.concatenate([self.u, self.v[two]])
         self.arc_head = np.concatenate([self.v, self.u[two]])
         self.arc_edge = np.concatenate([idx, idx[two]])
-        self.arc_rev = np.concatenate([np.zeros(self.n_edges, bool), np.ones(two.sum(), bool)])
+        self.arc_rev = np.concatenate([np.zeros(self.n_edges, bool), np.ones(int(two.sum()), bool)])
         loop = self.arc_tail == self.arc_head
         if loop.any():
+            keep = ~loop
             for name in ("arc_tail", "arc_head", "arc_edge", "arc_rev"):
-                setattr(self, name, getattr(self, name)[~loop])
+                setattr(self, name, getattr(self, name)[keep])
 
         self._lat0 = float(np.radians(self.node_lat.mean())) if self.n_nodes else 0.0
-        snap_nodes = np.flatnonzero(self.lcc)
+        snap_nodes = np.flatnonzero(self.lcc).astype(np.int32)
         self._snap_nodes = snap_nodes
         self._kdtree = cKDTree(self._project(self.node_lon[snap_nodes], self.node_lat[snap_nodes]))
         self._cache = None
+        self._rev_cache = None
 
     # ---- loading -----------------------------------------------------------
 
@@ -112,24 +114,41 @@ class RoadGraph:
         """Load data/graph. Travel time comes from edge_delays.parquet (free
         flow plus signal, stop and junction delays) when that file exists and
         `delays` is true, else from the free-flow time_s in edges.parquet."""
+        import pyarrow as pa
         import pyarrow.parquet as pq
 
         graph_dir = Path(graph_dir or data_dir() / "graph")
+        edges_path = graph_dir / "edges.parquet"
         nodes = np.load(graph_dir / "nodes.npz")
-        t = pq.read_table(graph_dir / "edges.parquet")
+        attr_cols = [c for c in pq.read_schema(edges_path).names if c not in ("lon", "lat")]
+        t = pq.read_table(edges_path, columns=attr_cols)
         time_s = t.column("time_s").to_numpy()
         delay_path = graph_dir / "edge_delays.parquet"
         if delays and delay_path.exists():
             time_s = load_delay_time(delay_path, t)
-        lon = t.column("lon").combine_chunks()
-        lat = t.column("lat").combine_chunks()
+        u = t.column("u").to_numpy()
+        v = t.column("v").to_numpy()
+        oneway = t.column("oneway").to_numpy()
+        length_m = t.column("length_m").to_numpy()
+
+        lon_col = pq.read_table(edges_path, columns=["lon"]).column(0).combine_chunks()
+        geom_off = np.array(lon_col.offsets.to_numpy(), dtype=np.int32, copy=True)
+        geom_lon = np.array(lon_col.values.to_numpy(), dtype=np.float64, copy=True)
+        del lon_col
+        pa.default_memory_pool().release_unused()
+
+        lat_col = pq.read_table(edges_path, columns=["lat"]).column(0).combine_chunks()
+        geom_lat = np.array(lat_col.values.to_numpy(), dtype=np.float64, copy=True)
+        del lat_col
+        pa.default_memory_pool().release_unused()
+
         return cls(
             nodes["lon"], nodes["lat"],
-            t.column("u").to_numpy(), t.column("v").to_numpy(), t.column("oneway").to_numpy(),
-            time_s, t.column("length_m").to_numpy(),
+            u, v, oneway,
+            time_s, length_m,
             lcc=nodes["lcc"],
-            geom_off=lon.offsets.to_numpy(), geom_lon=lon.values.to_numpy(), geom_lat=lat.values.to_numpy(),
-            edges_table=t.drop_columns(["lon", "lat"]),
+            geom_off=geom_off, geom_lon=geom_lon, geom_lat=geom_lat,
+            edges_table=t,
         )
 
     def set_time(self, time_s: np.ndarray) -> None:
@@ -139,6 +158,7 @@ class RoadGraph:
             raise ValueError(f"time_s must have shape ({self.n_edges},)")
         self.time_s = time_s
         self._cache = None
+        self._rev_cache = None
 
     # ---- snapping ----------------------------------------------------------
 
@@ -166,14 +186,22 @@ class RoadGraph:
         t, h = self.arc_tail[order], self.arc_head[order]
         first = np.ones(len(order), bool)
         first[1:] = (t[1:] != t[:-1]) | (h[1:] != h[:-1])
-        sel = order[first]
+        sel = order[first].astype(np.int32, copy=False)
         tail, head = self.arc_tail[sel], self.arc_head[sel]
-        indptr = np.concatenate([[0], np.cumsum(np.bincount(tail, minlength=self.n_nodes))])
+        indptr = np.zeros(self.n_nodes + 1, dtype=np.int32)
+        np.cumsum(np.bincount(tail, minlength=self.n_nodes), out=indptr[1:])
         m = csr_matrix((arc_cost[sel], head, indptr), shape=(self.n_nodes, self.n_nodes))
         out = (m, sel, indptr)
         if default:
             self._cache = out
         return out
+
+    def rev_time_matrix(self) -> csr_matrix:
+        """Cached transpose CSR of the travel-time matrix."""
+        m, _, _ = self._matrix(self.time_s)
+        if self._rev_cache is None or self._rev_cache[0] is not m:
+            self._rev_cache = (m, m.T.tocsr())
+        return self._rev_cache[1]
 
     def route(self, src: int, dst: int, edge_cost: np.ndarray | None = None) -> Route | None:
         """Cheapest path from node `src` to node `dst` under `edge_cost`

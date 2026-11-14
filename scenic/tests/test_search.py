@@ -399,3 +399,21 @@ def test_choose_picks_fastest_fallback_does_not_block_overlap():
     assert shared == {1.50: 1.30}
     picks, shared = choose_picks([F], [1.15, 1.30, 1.50], length, 0.8, 0.85)
     assert all(picks[b] is F for b in picks) and shared == {1.30: 1.15, 1.50: 1.15}
+
+
+def test_cost_graph_lazy_reverse_and_bounded_trees():
+    from scenic.search import CostGraph
+
+    n = CostGraph.MAX_TREES + 4
+    g = RoadGraph(np.linspace(-77.0, -76.9, n), np.full(n, 43.0),
+                  np.arange(n - 1), np.arange(1, n), np.zeros(n - 1, bool),
+                  np.ones(n - 1), np.full(n - 1, 100.0))
+    cg = CostGraph(g, np.arange(len(g.arc_tail), dtype=np.int32), g.time_s)
+    assert cg._rev is None
+    for i in range(n):
+        cg.tree(i)
+    assert len(cg._trees) == CostGraph.MAX_TREES
+    assert cg._rev is None
+    d_rev, pred_rev = cg.tree(n - 1, reverse=True)
+    assert cg._rev is not None and pred_rev is None and d_rev[0] == pytest.approx(n - 1)
+
