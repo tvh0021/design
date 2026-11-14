@@ -19,6 +19,9 @@ from . import data_dir
 REQUIRED_GRAPH = ("nodes.npz", "edges.parquet")
 REQUIRED_SCORE = ("scores.parquet",)
 OPTIONAL_RUNTIME = (("graph", "edge_delays.parquet"), ("score", "moments.parquet"))
+PREBUILT_URL = ("https://github.com/tvh0021/design/releases/download/"
+                "wanderers-data-v0.2/wanderers-ny-runtime-v0.2.tar.gz")
+PREBUILT_SHA256 = "49766cdb2fc6828f86eafd846e764a7612030acd616264b715d6d21040a3ba02"
 _ALLOWED_MEMBER = re.compile(r"^(?:[A-Za-z0-9_.-]+/)?(graph|score|boundary)/([A-Za-z0-9_.-]+)$")
 
 
@@ -62,11 +65,14 @@ def format_missing_data_message(
         f"{cmd_name}: New York route data is not built yet.",
         f"  Missing: {names}",
         "",
-        "To build all New York data in one idempotent step (~5.0 GB download, ~7.2 GB disk, ~6-10 min, ~15 GB RAM):",
+        "Fastest: download the prebuilt New York data (~160 MB, under a minute):",
+        "  scenic setup --prebuilt",
+        "",
+        "Or build all New York data yourself in one idempotent step (~5.0 GB download, ~7.2 GB disk, ~6-10 min, ~15 GB RAM):",
         "  scenic setup",
         "  scenic serve --setup --open   # build data if needed, then open the map",
         "",
-        "Or unpack a prebuilt runtime archive (~165 MB):",
+        "Or unpack another prebuilt runtime archive:",
         "  scenic setup --bundle <path-or-https-url>",
         "",
         "Or point at an existing data folder:",
@@ -139,7 +145,8 @@ def check_status(data_root: Path | None = None, out: TextIO = sys.stdout) -> int
 
     out.write(
         "\nNot ready for 'scenic serve' yet.\n"
-        "Run 'scenic setup' (~5.0 GB download, ~7.2 GB disk, ~6-10 min, ~15 GB peak RAM),\n"
+        "Run 'scenic setup --prebuilt' (~160 MB download, under a minute),\n"
+        "or 'scenic setup' to build it yourself (~5.0 GB download, ~7.2 GB disk, ~6-10 min, ~15 GB peak RAM),\n"
         "or 'scenic setup --bundle <archive>' to unpack prebuilt graph and score files.\n"
     )
     return 1
@@ -175,7 +182,8 @@ def _write_atomic(stream, dest: Path) -> int:
         raise
 
 
-def install_bundle(source: str | Path, data_root: Path | None = None, out: TextIO = sys.stdout) -> Path:
+def install_bundle(source: str | Path, data_root: Path | None = None, out: TextIO = sys.stdout,
+                   sha256: str | None = None) -> Path:
     """Unpack prebuilt graph/score files from a local archive or HTTPS URL.
 
     Files are unpacked into a staging folder and verified there; the live data
@@ -201,6 +209,14 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
                 archive = Path(source).expanduser().resolve()
                 if not archive.is_file():
                     raise FileNotFoundError(f"Bundle not found: {archive}")
+            if sha256:
+                import hashlib
+                h = hashlib.sha256()
+                with open(archive, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                if h.hexdigest() != sha256.lower():
+                    raise ValueError(f"Bundle checksum mismatch (expected sha256 {sha256})")
 
             staged: dict[tuple[str, str], None] = {}  # ordered, no duplicates
             total_bytes = 0
@@ -266,13 +282,17 @@ def run_setup(
     force: bool = False,
     bundle: str | None = None,
     check_only: bool = False,
+    prebuilt: bool = False,
     out: TextIO = sys.stdout,
 ) -> int:
     if check_only:
         return check_status(data_root=data_root, out=out)
+    sha = None
+    if prebuilt:
+        bundle, sha = PREBUILT_URL, PREBUILT_SHA256
     if bundle:
         try:
-            install_bundle(bundle, data_root=data_root, out=out)
+            install_bundle(bundle, data_root=data_root, out=out, sha256=sha)
         except Exception as exc:
             print(f"scenic setup: {exc}", file=sys.stderr)
             return 1

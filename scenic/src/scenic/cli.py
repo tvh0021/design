@@ -29,6 +29,7 @@ def cmd_setup(args) -> int:
         force=args.force,
         bundle=args.bundle,
         check_only=args.check,
+        prebuilt=args.prebuilt,
     )
 
 
@@ -225,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
 
     st = sub.add_parser("setup", help="download and build all New York data needed for scenic serve (idempotent)")
     st.add_argument("--data", type=Path, help="data directory (default $SCENIC_DATA or data/)")
+    st.add_argument("--prebuilt", action="store_true",
+                    help="download and verify the published New York runtime data (~160 MB) instead of building")
     st.add_argument("--bundle", metavar="PATH_OR_URL",
                     help="unpack a prebuilt graph+score archive (.tar.gz/.zip or https:// URL) instead of building")
     st.add_argument("--check", action="store_true", help="check whether data is ready without downloading or building")

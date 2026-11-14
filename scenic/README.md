@@ -40,7 +40,18 @@ source .venv/bin/activate   # puts `scenic` on your PATH
 
 ### 2. Prepare the New York route data
 
-If you have a prebuilt runtime archive containing `nodes.npz`, `edges.parquet`,
+Download the prebuilt New York data (about 160 MB; the checksum is verified
+before anything is unpacked):
+
+```sh
+scenic setup --prebuilt
+```
+
+The data is derived from OpenStreetMap (© OpenStreetMap contributors, ODbL)
+and is published as a
+[GitHub release](https://github.com/tvh0021/design/releases/tag/wanderers-data-v0.2).
+
+If you have another prebuilt runtime archive containing `nodes.npz`, `edges.parquet`,
 `edge_delays.parquet`, `scores.parquet`, and `moments.parquet`, unpack and
 verify it in a few seconds:
 
