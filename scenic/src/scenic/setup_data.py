@@ -186,6 +186,8 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
     with _with_data_root(data_root) as root:
         root.mkdir(parents=True, exist_ok=True)
         src_str = str(source)
+        for old in root.glob(".bundle-*"):  # left behind by a killed install
+            shutil.rmtree(old, ignore_errors=True)
         stage = Path(tempfile.mkdtemp(dir=root, prefix=".bundle-"))
         try:
             if src_str.startswith("http://"):
@@ -200,7 +202,7 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
                 if not archive.is_file():
                     raise FileNotFoundError(f"Bundle not found: {archive}")
 
-            staged: list[tuple[str, str]] = []
+            staged: dict[tuple[str, str], None] = {}  # ordered, no duplicates
             total_bytes = 0
             if zipfile.is_zipfile(archive):
                 with zipfile.ZipFile(archive) as zf:
@@ -215,7 +217,7 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
                             continue
                         with zf.open(info, "r") as src_fp:
                             total_bytes += _write_atomic(src_fp, stage / rel[0] / rel[1])
-                        staged.append(rel)
+                        staged[rel] = None
             elif tarfile.is_tarfile(archive):
                 with tarfile.open(archive, "r:*") as tf:
                     for member in tf.getmembers():
@@ -231,7 +233,7 @@ def install_bundle(source: str | Path, data_root: Path | None = None, out: TextI
                             continue
                         with src_fp:
                             total_bytes += _write_atomic(src_fp, stage / rel[0] / rel[1])
-                        staged.append(rel)
+                        staged[rel] = None
             else:
                 raise ValueError(f"Unsupported archive format (expected .tar.gz, .tar, or .zip): {archive}")
 
