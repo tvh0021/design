@@ -437,7 +437,8 @@ class _Index:
     def snap(self, lat: float, lon: float, r: float = 200.0) -> tuple[int, float, float] | None:
         """Nearest edge to a point: (edge, distance from u in length_m units, metres off)."""
         p = self.xy([lon], [lat])[0]
-        es, d, _, along = self._segments_near(p, r)
+        # The old sampled index reached up to half a sample step past r; keep that slack.
+        es, d, _, along = self._segments_near(p, r + INDEX_STEP_M / 2)
         if not len(es):
             return None
         k = int(np.argmin(d))
