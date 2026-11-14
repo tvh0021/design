@@ -1,10 +1,11 @@
-"""Command line for Maps for Wanderers (the `scenic` command): scenic fetch | build-graph | fastest |
-route | loop | serve | demo build | calibrate | fetch-layers | score."""
+"""Command line for Maps for Wanderers (the `scenic` command): scenic setup | serve |
+route | loop | fastest | demo build | fetch | build-graph | calibrate | fetch-layers | score."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,17 @@ def _latlon(s: str) -> tuple[float, float]:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise argparse.ArgumentTypeError(f"out of range: {s!r}")
     return lat, lon
+
+
+def cmd_setup(args) -> int:
+    from .setup_data import run_setup
+
+    return run_setup(
+        data_root=args.data,
+        force=args.force,
+        bundle=args.bundle,
+        check_only=args.check,
+    )
 
 
 def cmd_fetch(args) -> int:
@@ -36,6 +48,13 @@ def cmd_build_graph(args) -> int:
 
 def cmd_fastest(args) -> int:
     from .route import RoadGraph
+    from .setup_data import format_missing_data_message, missing_graph_files
+
+    gdir, missing = missing_graph_files(args.graph)
+    if missing:
+        print(format_missing_data_message(gdir, gdir.parent / "score", missing, cmd_name="scenic fastest"),
+              file=sys.stderr)
+        return 1
 
     t0 = time.monotonic()
     g = RoadGraph.load(args.graph)
@@ -59,6 +78,12 @@ def cmd_fastest(args) -> int:
 
 def cmd_route(args) -> int:
     from .search import Context, format_table, geojson, plot_routes, result_json, search
+    from .setup_data import format_missing_data_message, missing_serve_files
+
+    gdir, sdir, missing = missing_serve_files(args.graph, args.score)
+    if missing:
+        print(format_missing_data_message(gdir, sdir, missing, cmd_name="scenic route"), file=sys.stderr)
+        return 1
 
     t0 = time.monotonic()
     ctx = Context.load(args.graph, args.score)
@@ -83,6 +108,12 @@ def cmd_route(args) -> int:
 def cmd_loop(args) -> int:
     from .loop import LoopError, Steer, format_table, geojson, loop_config, loops, plot_loops, result_json
     from .search import Context
+    from .setup_data import format_missing_data_message, missing_serve_files
+
+    gdir, sdir, missing = missing_serve_files(args.graph, args.score)
+    if missing:
+        print(format_missing_data_message(gdir, sdir, missing, cmd_name="scenic loop"), file=sys.stderr)
+        return 1
 
     cfg = loop_config()
     minutes = args.minutes if args.minutes is not None else cfg["default_min"]
@@ -123,9 +154,27 @@ def cmd_loop(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    from .setup_data import format_missing_data_message, missing_serve_files, run_setup
+
+    gdir, sdir, missing = missing_serve_files(args.graph, args.score)
+    if missing:
+        if getattr(args, "setup", False) and args.graph is None and args.score is None:
+            rc = run_setup()
+            if rc != 0:
+                return rc
+        else:
+            print(format_missing_data_message(gdir, sdir, missing, cmd_name="scenic serve"), file=sys.stderr)
+            return 1
+
     from .web.server import serve
 
-    return serve(port=args.port, graph_dir=args.graph, score_dir=args.score, verbose=args.verbose)
+    return serve(
+        port=args.port,
+        graph_dir=args.graph,
+        score_dir=args.score,
+        verbose=args.verbose,
+        open_browser=args.open,
+    )
 
 
 def cmd_demo_build(args) -> int:
@@ -174,6 +223,23 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="scenic", description="Maps for Wanderers: scenic drives across New York State")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    st = sub.add_parser("setup", help="download and build all New York data needed for scenic serve (idempotent)")
+    st.add_argument("--data", type=Path, help="data directory (default $SCENIC_DATA or data/)")
+    st.add_argument("--bundle", metavar="PATH_OR_URL",
+                    help="unpack a prebuilt graph+score archive (.tar.gz/.zip or https:// URL) instead of building")
+    st.add_argument("--check", action="store_true", help="check whether data is ready without downloading or building")
+    st.add_argument("--force", action="store_true", help="redownload the OSM extract and rebuild all stages")
+    st.set_defaults(func=cmd_setup)
+
+    sv = sub.add_parser("serve", help="Maps for Wanderers, the local map UI (http://127.0.0.1:PORT/, docs/WEB.md)")
+    sv.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765)")
+    sv.add_argument("-o", "--open", action="store_true", help="open the map in your default browser")
+    sv.add_argument("--setup", action="store_true", help="run 'scenic setup' automatically if data is missing")
+    sv.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
+    sv.add_argument("--score", type=Path, help="score directory (default data/score)")
+    sv.add_argument("--verbose", action="store_true", help="log every request")
+    sv.set_defaults(func=cmd_serve)
+
     f = sub.add_parser("fetch", help="download the New York OSM extract")
     f.add_argument("--url", help="override the Geofabrik URL")
     f.add_argument("--force", action="store_true", help="download even if the md5 matches")
@@ -219,13 +285,6 @@ def main(argv: list[str] | None = None) -> int:
     lp.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     lp.add_argument("--score", type=Path, help="score directory (default data/score)")
     lp.set_defaults(func=cmd_loop)
-
-    sv = sub.add_parser("serve", help="Maps for Wanderers, the local map UI (http://127.0.0.1:PORT/, docs/WEB.md)")
-    sv.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765)")
-    sv.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
-    sv.add_argument("--score", type=Path, help="score directory (default data/score)")
-    sv.add_argument("--verbose", action="store_true", help="log every request")
-    sv.set_defaults(func=cmd_serve)
 
     dm = sub.add_parser("demo", help="static demo site with preset routes (docs/PUBLISH.md)")
     dsub = dm.add_subparsers(dest="demo_cmd", required=True)

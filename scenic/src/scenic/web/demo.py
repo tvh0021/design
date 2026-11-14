@@ -27,11 +27,12 @@ from typing import Callable
 
 import numpy as np
 
+from .. import _repo_root, config_dir
 from .server import CSP_BASE, STATIC_DIR, App
 
-PROJECT_DIR = Path(__file__).resolve().parents[3]
-DEFAULT_PRESETS = PROJECT_DIR / "config" / "demo_routes.toml"
-DEFAULT_OUT = PROJECT_DIR / "site"
+PROJECT_DIR = _repo_root()
+DEFAULT_PRESETS = config_dir() / "demo_routes.toml"
+DEFAULT_OUT = (PROJECT_DIR / "site") if PROJECT_DIR is not None else (Path.cwd() / "site")
 SOURCE_URL = "https://github.com/tvh0021/design/tree/main/scenic"
 DEMO_MAX_POINTS = 1500  # per route; ~20 m tolerance on a 200 km drive, fine up to zoom 13 or so
 MARKER = ".maps-for-wanderers-demo"  # marks a folder this builder owns and may clear

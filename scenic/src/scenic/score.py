@@ -33,10 +33,10 @@ from pathlib import Path
 
 import numpy as np
 
-from . import data_dir
+from . import config_dir, data_dir
 from .rasters import Grid
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+CONFIG_DIR = config_dir()
 SCORE_COLUMNS = ("W", "H", "V", "L", "Q", "C")
 
 
