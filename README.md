@@ -81,29 +81,16 @@ machines, as `Antigravity @rpi5: ...`. A machine that cannot be read shows as
 "Host"`. A provider a machine is merely not signed in to is left out when
 another machine has it. Without the file, output is as on one machine.
 
-Codex reads `$CODEX_HOME/auth.json`. If that file is missing, for example when
-T3 Code gives Codex a home without a login, it reads `~/.codex/auth.json`
-instead. To read more Codex logins on the same machine, name their homes in
-`codex-accounts.json` in the same directory as `hosts.json`:
+Codex uses `$CODEX_HOME` if it contains `auth.json`, otherwise `~/.codex`.
+To read more logins, add `codex-accounts.json` beside `hosts.json`:
 
 ```json
-{
-  "accounts": [
-    { "label": "Personal", "home": "~/.codex" },
-    { "label": "RIT", "home": "~/.codex-rit" }
-  ]
-}
+{"accounts":[{"label":"Personal","home":"~/.codex"},{"label":"RIT","home":"~/.codex-rit"}]}
 ```
 
-Each `home` is absolute or starts with `~/`, and no two labels may match.
-Create a second login with `CODEX_HOME=~/.codex-rit codex login`. Each account
-shows as `Codex · RIT`. In `--json` it keeps `"provider": "Codex"` and adds
-`"account_label": "RIT"`. An entry for the default home only names it, and
-listing `~/.codex` makes sure it is read even when `CODEX_HOME` points
-elsewhere. A home listed twice is read once. A configured home with no login
-shows `no Codex login`, and a broken file shows as `Codex ·
-codex-accounts.json`, while the other accounts are still read. `--local`
-still reads this file.
+The default home comes first; listing it only adds its label. Repeated homes
+are read once. Accounts show as `Codex · RIT`; JSON keeps `"provider":"Codex"`
+and adds `"account_label":"RIT"`. Without this file, output is unchanged.
 
 ## cli/scix_arxiv_radar
 

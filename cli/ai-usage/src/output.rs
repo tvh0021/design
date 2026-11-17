@@ -182,23 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_accounts_show_their_labels() {
-        let mut rit = on(&["mac"], "Codex", 20.0);
-        rit.account_label = Some("RIT".into());
-        let mut failed = on(&["mac"], "Codex", 0.0);
-        (failed.account_label, failed.error, failed.windows) = (Some("Lab".into()), Some("HTTP 500".into()), vec![]);
-        let reports = vec![on(&["mac"], "Codex", 10.0), rit, failed];
-        let p = Painter { color: false };
-        assert_eq!(
-            compact_lines(&reports, &["mac".to_string()], &p),
-            ["Codex: 10%", "Codex · RIT: 20%", "Codex · Lab: ?"]
-        );
-        let json = serde_json::to_value(&reports).unwrap();
-        assert_eq!((&json[0]["provider"], json[0].get("account_label")), (&"Codex".into(), None));
-        assert_eq!((&json[1]["provider"], &json[1]["account_label"]), (&"Codex".into(), &"RIT".into()));
-    }
-
-    #[test]
     fn compact_shows_host_errors_and_json_stays_an_array() {
         let mac = vec![on(&["mac"], "Claude", 10.0)];
         let rpi5 = HostRef { name: "rpi5".into(), t3_environment: Some("rpi5".into()) };

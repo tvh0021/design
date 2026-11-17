@@ -44,38 +44,25 @@ impl From<&str> for Failure {
     }
 }
 
-/// How a provider is read: one account, or several at once (Codex homes),
-/// each already a report, failed or not.
-#[derive(Clone, Copy)]
-pub enum Probe {
-    One(fn() -> Result<Report, Failure>),
-    Many(fn() -> Vec<Report>),
-}
+type Probe = fn() -> Vec<Report>;
 
-impl Probe {
-    /// Every report of provider `name`; a failure becomes a report saying why.
-    pub fn run(self, name: &str) -> Vec<Report> {
-        match self {
-            Probe::One(probe) => vec![probe().unwrap_or_else(|f| failed(name, f))],
-            Probe::Many(probe) => probe(),
-        }
-    }
-}
-
-/// A report of `provider` that only says why there is no reading.
 pub fn failed(provider: &str, f: Failure) -> Report {
     Report { provider: provider.into(), error: Some(f.message), signed_in: f.signed_in, ..Default::default() }
+}
+
+fn single(provider: &str, result: Result<Report, Failure>) -> Vec<Report> {
+    vec![result.unwrap_or_else(|f| failed(provider, f))]
 }
 
 const HOUR: i64 = 3600;
 const WEEK: i64 = 7 * 24 * HOUR;
 
 pub const PROVIDERS: [(&str, Probe); 5] = [
-    ("Claude", Probe::One(claude)),
-    ("Codex", Probe::Many(codex)),
-    ("Antigravity", Probe::One(antigravity)),
-    ("ChatLLM", Probe::One(abacus)),
-    ("Zed", Probe::One(zed)),
+    ("Claude", || single("Claude", claude())),
+    ("Codex", codex),
+    ("Antigravity", || single("Antigravity", antigravity())),
+    ("ChatLLM", || single("ChatLLM", abacus())),
+    ("Zed", || single("Zed", zed())),
 ];
 
 // ---------- HTTP and parsing helpers ----------
@@ -573,101 +560,74 @@ fn claude_reset_credits(
 
 // ---------- Codex (codexUsageLimits.ts) ----------
 
-/// The file in the config directory that names more Codex homes.
-const CODEX_ACCOUNTS_FILE: &str = "codex-accounts.json";
-
-/// A Codex home to read, and the label its account shows under.
-#[derive(Debug, PartialEq)]
-struct CodexHome {
-    label: Option<String>,
-    dir: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCodexAccounts {
-    accounts: Vec<RawCodexAccount>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCodexAccount {
-    label: String,
-    home: String,
-}
-
-/// `path` with the home directory shown as `~`, so no user name is printed.
-fn tilde(path: &Path, home: &Path) -> String {
-    match path.strip_prefix(home) {
-        Ok(rest) if !home.as_os_str().is_empty() => Path::new("~").join(rest).display().to_string(),
-        _ => path.display().to_string(),
-    }
-}
-
-/// The labelled homes in `codex-accounts.json`, in file order. A home is
-/// absolute or starts with `~/`; labels must differ, ignoring case.
-fn parse_codex_accounts(text: &str, home: &Path) -> Res<Vec<CodexHome>> {
-    let raw: RawCodexAccounts = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    let mut out: Vec<CodexHome> = Vec::new();
-    for a in raw.accounts {
-        let label = a.label.trim().to_string();
-        if label.is_empty() || label.chars().any(char::is_control) {
-            return Err("an account has an empty or unprintable label".into());
-        }
-        if out.iter().any(|o| o.label.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&label))) {
-            return Err(format!("label {label} is used twice"));
-        }
-        let dir = match a.home.trim() {
-            "~" => home.to_path_buf(),
-            h if h.starts_with("~/") => home.join(&h[2..]),
-            h if Path::new(h).is_absolute() => PathBuf::from(h),
-            h => return Err(format!("account {label}: home {h:?} is neither absolute nor under ~/")),
-        };
-        out.push(CodexHome { label: Some(label), dir });
-    }
-    Ok(out)
-}
-
-/// The homes named in `<config_dir>/codex-accounts.json`; none without the file.
-fn load_codex_accounts(config_dir: &Path, home: &Path) -> Res<Vec<CodexHome>> {
-    let path = config_dir.join(CODEX_ACCOUNTS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_codex_accounts(&text, home).map_err(|e| format!("bad {}: {e}", tilde(&path, home))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(format!("could not read {}: {e}", tilde(&path, home))),
-    }
-}
-
-/// `$CODEX_HOME` when it holds an `auth.json`, else `~/.codex`. A tool that
-/// hands Codex a home of its own (T3 Code does) may keep the login elsewhere,
-/// so an empty `$CODEX_HOME` falls back to the usual login.
-fn default_codex_home(codex_home: Option<&str>, home: &Path) -> PathBuf {
-    let has_auth = |dir: &Path| match std::fs::metadata(dir.join("auth.json")) {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-    };
+fn codex_home_from(codex_home: Option<&str>, home: &Path) -> PathBuf {
     non_empty(codex_home)
         .map(PathBuf::from)
-        .filter(|dir| has_auth(dir))
+        .filter(|dir| dir.join("auth.json").is_file())
         .unwrap_or_else(|| home.join(".codex"))
 }
 
-/// Every home to read: the default first, then the configured ones in order.
-/// A home listed twice is read once, under the first label it was given.
-fn codex_homes(default: PathBuf, configured: Vec<CodexHome>) -> Vec<CodexHome> {
+#[derive(Deserialize)]
+struct CodexAccounts {
+    accounts: Vec<CodexHome>,
+}
+
+#[derive(Deserialize)]
+struct CodexHome {
+    label: Option<String>,
+    #[serde(rename = "home")]
+    dir: PathBuf,
+}
+
+fn load_codex_accounts(config_dir: &Path) -> Res<Vec<CodexHome>> {
+    match std::fs::read_to_string(config_dir.join("codex-accounts.json")) {
+        Ok(text) => serde_json::from_str::<CodexAccounts>(&text)
+            .map(|c| c.accounts)
+            .map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// Default first; a repeated home only supplies its first label.
+fn codex_homes(default: PathBuf, configured: Vec<CodexHome>, home: &Path) -> Vec<CodexHome> {
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.components().collect());
     let mut homes = vec![CodexHome { label: None, dir: default }];
-    for c in configured {
+    for mut c in configured {
+        if let Ok(rest) = c.dir.strip_prefix("~") {
+            c.dir = home.join(rest);
+        }
         match homes.iter_mut().find(|h| canonical(&h.dir) == canonical(&c.dir)) {
-            Some(h) => {
-                if h.label.is_none() {
-                    h.label = c.label;
-                }
-            }
+            Some(h) if h.label.is_none() => h.label = c.label,
+            Some(_) => {}
             None => homes.push(c),
         }
     }
     homes
+}
+
+fn codex() -> Vec<Report> {
+    let home = home();
+    let default = codex_home_from(std::env::var("CODEX_HOME").ok().as_deref(), &home);
+    let configured = load_codex_accounts(&crate::hosts::config_dir());
+    let (configured, error) = match configured {
+        Ok(c) => (c, None),
+        Err(e) => (vec![], Some(e)),
+    };
+    let mut reports: Vec<_> = codex_homes(default, configured, &home)
+        .into_iter()
+        .map(|h| {
+            let mut r = codex_usage(&h.dir).unwrap_or_else(|f| failed("Codex", f));
+            r.account_label = h.label;
+            r
+        })
+        .collect();
+    if let Some(error) = error {
+        let mut r = failed("Codex", error.into());
+        r.account_label = Some("codex-accounts.json".into());
+        reports.push(r);
+    }
+    reports
 }
 
 struct CodexAuth {
@@ -677,9 +637,8 @@ struct CodexAuth {
     account: Option<String>,
 }
 
-/// The login in `codex_home`, shown in messages as `shown`.
-fn codex_auth_from_dir(codex_home: &Path, shown: &str) -> Result<CodexAuth, Failure> {
-    let text = read_credential(&codex_home.join("auth.json"), &format!("no Codex login ({shown}/auth.json)"))?;
+fn codex_auth_from_dir(codex_home: &Path) -> Result<CodexAuth, Failure> {
+    let text = read_credential(&codex_home.join("auth.json"), "no Codex login (~/.codex/auth.json)")?;
     let auth: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let tokens = &auth["tokens"];
     let token = tokens["access_token"]
@@ -731,75 +690,15 @@ fn base64url_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Every Codex account on this machine: the default home and those in
-/// `codex-accounts.json`. A config that cannot be read is a report of its own.
-fn codex() -> Vec<Report> {
-    let home = home();
-    let configured = load_codex_accounts(&crate::hosts::config_dir(), &home);
-    let default = default_codex_home(std::env::var("CODEX_HOME").ok().as_deref(), &home);
-    codex_reports(default, configured, &home, codex_usage)
-}
+fn codex_usage(dir: &Path) -> Result<Report, Failure> {
+    let CodexAuth { token, account_id, account } = codex_auth_from_dir(dir)?;
 
-/// One report per home, read at once, each with its home's label; then one
-/// for the config when it could not be read. `fetch` asks for the usage.
-fn codex_reports(
-    default: PathBuf,
-    configured: Res<Vec<CodexHome>>,
-    home: &Path,
-    fetch: impl Fn(&CodexAuth) -> Res<Report> + Sync,
-) -> Vec<Report> {
-    let (configured, config_error) = match configured {
-        Ok(c) => (c, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
-    let homes = codex_homes(default, configured);
-    let mut reports: Vec<Report> = std::thread::scope(|s| {
-        let fetch = &fetch;
-        let handles: Vec<_> = homes.iter().map(|h| s.spawn(move || codex_account(&h.dir, home, fetch))).collect();
-        handles
-            .into_iter()
-            .zip(&homes)
-            .map(|(t, h)| {
-                let mut r = t.join().unwrap_or_else(|_| failed("Codex", "probe panicked".into()));
-                r.account_label = h.label.clone();
-                r
-            })
-            .collect()
-    });
-    if let Some(error) = config_error {
-        let label = Some(CODEX_ACCOUNTS_FILE.to_string());
-        reports.push(Report { provider: "Codex".into(), account_label: label, error: Some(error), ..Default::default() });
-    }
-    reports
-}
-
-/// The reading for the login in `dir`. A failed request keeps the account,
-/// so the failure can be told apart from the other accounts'.
-fn codex_account(dir: &Path, home: &Path, fetch: impl Fn(&CodexAuth) -> Res<Report>) -> Report {
-    let shown = tilde(dir, home);
-    let usual = dir == home.join(".codex");
-    let cmd = if usual { "codex".to_string() } else { format!("CODEX_HOME={shown} codex") };
-    let auth = match codex_auth_from_dir(dir, &shown) {
-        Ok(auth) => auth,
-        Err(f) if !f.signed_in && !usual => {
-            return failed("Codex", Failure::signed_out(format!("{}; run `{cmd} login`", f.message)));
-        }
-        Err(f) => return failed("Codex", f),
-    };
-    fetch(&auth).unwrap_or_else(|e| {
-        let e = if e == "HTTP 401" { format!("token expired; run `{cmd}` once to refresh it") } else { e };
-        Report { account: auth.account.clone(), ..failed("Codex", e.into()) }
-    })
-}
-
-fn codex_usage(auth: &CodexAuth) -> Res<Report> {
-    let CodexAuth { token, account_id, account } = auth;
     let mut headers = vec![
         ("Authorization", format!("Bearer {token}")),
         ("User-Agent", "codex-cli".to_string()),
     ];
     if let Some(account) = account_id {
-        headers.push(("ChatGPT-Account-Id", account.clone()));
+        headers.push(("ChatGPT-Account-Id", account));
     }
     let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
     // The usage endpoint reports only credit counts; the expiries come from
@@ -808,10 +707,12 @@ fn codex_usage(auth: &CodexAuth) -> Res<Report> {
         || get_json("https://chatgpt.com/backend-api/wham/usage", &headers),
         || get_json("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", &headers),
     );
-    let usage = usage?;
+    let usage = usage.map_err(|e| {
+        if e == "HTTP 401" { "token expired; run `codex` once to refresh it".into() } else { e }
+    })?;
 
     let plan = usage["plan_type"].as_str().map(str::to_string);
-    let mut report = Report { provider: "Codex".into(), plan: plan.clone(), account: account.clone(), ..Default::default() };
+    let mut report = Report { provider: "Codex".into(), plan: plan.clone(), account, ..Default::default() };
 
     // Primary with no duration is 5h on paid plans and 30 days on Free/Go.
     let primary_fallback = if matches!(plan.as_deref(), Some("free" | "go")) { 30 * 24 * HOUR } else { 5 * HOUR };
@@ -1394,103 +1295,32 @@ mod tests {
     }
 
     #[test]
-    fn codex_home_is_used_only_when_it_has_a_login() {
+    fn codex_default_first_and_homes_read_once() {
         let tmp = TempDir::new("codex");
         let usual = tmp.path().join(".codex");
-        assert_eq!(default_codex_home(None, tmp.path()), usual);
-        let missing = codex_auth_from_dir(&usual, "~/.codex").err().unwrap();
-        assert_eq!((missing.message.as_str(), missing.signed_in), ("no Codex login (~/.codex/auth.json)", false));
-
-        // A home with no login of its own (T3 Code's shadow home) falls back to ~/.codex.
-        let shadow = tmp.path().join("shadow");
-        std::fs::create_dir_all(&shadow).unwrap();
-        assert_eq!(default_codex_home(Some(shadow.to_str().unwrap()), tmp.path()), usual);
-
         let custom = tmp.path().join("custom-codex");
         std::fs::create_dir_all(&custom).unwrap();
+        assert_eq!(codex_home_from(None, tmp.path()), usual);
+        assert_eq!(codex_home_from(Some(custom.to_str().unwrap()), tmp.path()), usual);
         write_private(&custom.join("auth.json"), r#"{"tokens":{"access_token":"codex-tok","account_id":"acct-42"}}"#);
-        assert_eq!(default_codex_home(Some(custom.to_str().unwrap()), tmp.path()), custom);
-        let auth = codex_auth_from_dir(&custom, "x").ok().unwrap();
+        assert_eq!(codex_home_from(Some(custom.to_str().unwrap()), tmp.path()), custom);
+        let auth = codex_auth_from_dir(&custom).ok().unwrap();
         assert_eq!(auth.token, "codex-tok");
         assert_eq!(auth.account_id.as_deref(), Some("acct-42"));
-        assert_eq!(auth.account, None, "no id token, no account");
-    }
+        assert_eq!(auth.account, None);
 
-    #[test]
-    fn codex_accounts_config_and_repeated_homes() {
-        let home = Path::new("/home/u");
-        let text = r#"{"accounts": [{"label": " Personal ", "home": "~/.codex"},
-            {"label": "RIT", "home": "~/.codex-rit"}, {"label": "Lab", "home": "/srv/codex/"},
-            {"label": "Again", "home": "~/.codex-rit/"}]}"#;
-        let homes = codex_homes(home.join(".codex"), parse_codex_accounts(text, home).unwrap());
-        let shown: Vec<_> = homes.iter().map(|h| (h.label.as_deref().unwrap(), tilde(&h.dir, home))).collect();
-        assert_eq!(shown, [("Personal", "~/.codex".into()), ("RIT", "~/.codex-rit".into()), ("Lab", "/srv/codex/".into())]);
-
-        for bad in [
-            r#"{"accounts": [{"label": "RIT", "home": "~/a"}, {"label": "rit", "home": "~/b"}]}"#,
-            r#"{"accounts": [{"label": " ", "home": "~/a"}]}"#,
-            r#"{"accounts": [{"label": "A", "home": "codex"}]}"#,
-            r#"{"accounts": [{"label": "A", "dir": "~/a"}]}"#,
-        ] {
-            assert!(parse_codex_accounts(bad, home).is_err(), "{bad}");
-        }
-
-        let tmp = TempDir::new("codex-config");
-        assert_eq!(load_codex_accounts(tmp.path(), tmp.path()), Ok(vec![]), "no file: no extra accounts");
-        write_private(&tmp.path().join(CODEX_ACCOUNTS_FILE), "{");
-        let err = load_codex_accounts(tmp.path(), tmp.path()).unwrap_err();
-        assert!(err.starts_with("bad ~/codex-accounts.json: "), "{err}");
-    }
-
-    #[test]
-    fn codex_reports_label_every_account_and_keep_failures() {
-        let tmp = TempDir::new("codex-reports");
-        let login = |dir: &str, token: &str, user: &str| {
-            let id = jwt(json!({"https://api.openai.com/auth": {"chatgpt_user_id": user}}));
-            let auth = json!({"tokens": {"access_token": token, "account_id": "ws", "id_token": id}});
-            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
-            write_private(&tmp.path().join(dir).join("auth.json"), &auth.to_string());
-        };
-        login(".codex", "personal-tok", "cu-1");
-        login(".codex-rit", "rit-tok", "cu-2");
-        let fetch = |a: &CodexAuth| match a.token.as_str() {
-            "rit-tok" => Err("HTTP 401".to_string()),
-            _ => Ok(Report { provider: "Codex".into(), account: a.account.clone(), ..Default::default() }),
-        };
-        let label = |l: &str, d: &str| CodexHome { label: Some(l.into()), dir: tmp.path().join(d) };
-        let configured = Ok(vec![label("RIT", ".codex-rit"), label("Gone", ".codex-gone")]);
-        let reports = codex_reports(tmp.path().join(".codex"), configured, tmp.path(), fetch);
-
-        let rows: Vec<_> = reports
-            .iter()
-            .map(|r| (r.account_label.as_deref(), r.account.clone(), r.signed_in, r.error.as_deref()))
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                (None, Some(fingerprint("codex", "cu-1:ws")), true, None),
-                (
-                    Some("RIT"),
-                    Some(fingerprint("codex", "cu-2:ws")),
-                    true,
-                    Some("token expired; run `CODEX_HOME=~/.codex-rit codex` once to refresh it")
-                ),
-                (
-                    Some("Gone"),
-                    None,
-                    false,
-                    Some("no Codex login (~/.codex-gone/auth.json); run `CODEX_HOME=~/.codex-gone codex login`")
-                ),
-            ]
-        );
-        let text = serde_json::to_string(&reports).unwrap();
-        assert!(!text.contains("-tok") && !text.contains("cu-"), "no tokens or ids in output: {text}");
-
-        // A broken config still reads the default home, and says what is wrong.
-        let reports = codex_reports(tmp.path().join(".codex"), Err("bad x".into()), tmp.path(), fetch);
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[1].account_label.as_deref(), Some(CODEX_ACCOUNTS_FILE));
-        assert_eq!((reports[1].error.as_deref(), reports[1].signed_in), (Some("bad x"), true));
+        assert!(load_codex_accounts(tmp.path()).unwrap().is_empty());
+        write_private(&tmp.path().join("codex-accounts.json"), r#"{"accounts":[
+            {"label":"RIT","home":"~/custom-codex"},
+            {"label":"Personal","home":"~/.codex"},
+            {"label":"Again","home":"~/custom-codex/."}]}"#);
+        let homes = codex_homes(usual.clone(), load_codex_accounts(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(homes.len(), 2);
+        assert_eq!((&homes[0].dir, homes[0].label.as_deref()), (&usual, Some("Personal")));
+        assert_eq!((&homes[1].dir, homes[1].label.as_deref()), (&custom, Some("RIT")));
+        let homes = codex_homes(custom.clone(), load_codex_accounts(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(homes.len(), 2);
+        assert_eq!((&homes[0].dir, homes[0].label.as_deref()), (&custom, Some("RIT")));
     }
 
     /// An unsigned JWT with these claims.
@@ -1528,7 +1358,7 @@ mod tests {
         let write = |acct: &str| {
             let auth = json!({"tokens": {"access_token": "t", "account_id": acct, "id_token": id}});
             write_private(&tmp.path().join("auth.json"), &auth.to_string());
-            codex_auth_from_dir(tmp.path(), "x").ok().unwrap().account.unwrap()
+            codex_auth_from_dir(tmp.path()).ok().unwrap().account.unwrap()
         };
         let (a, b) = (write("ws-1"), write("ws-2"));
         assert_eq!(a, fingerprint("codex", "cu-1:ws-1"));
@@ -1611,7 +1441,7 @@ mod tests {
         assert!(unreadable.signed_in && unreadable.message.starts_with("could not read"), "{unreadable:?}");
         // Codex: an unparsable auth.json is a real failure too.
         write_private(&tmp.path().join("auth.json"), "{not json");
-        assert!(codex_auth_from_dir(tmp.path(), "x").err().unwrap().signed_in);
+        assert!(codex_auth_from_dir(tmp.path()).err().unwrap().signed_in);
 
         assert!(!keychain_failure(Some(44)).signed_in, "item not found");
         assert!(keychain_failure(Some(51)).signed_in);

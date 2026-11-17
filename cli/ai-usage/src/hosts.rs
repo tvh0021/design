@@ -65,20 +65,19 @@ fn trimmed(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// `$XDG_CONFIG_HOME/ai-usage`, else `~/.config/ai-usage`, on macOS too.
-pub fn config_dir_from(xdg_config_home: Option<&str>, home: &Path) -> PathBuf {
+/// `$XDG_CONFIG_HOME/ai-usage/hosts.json`, else `~/.config/ai-usage/hosts.json`, on macOS too.
+pub fn config_path_from(xdg_config_home: Option<&str>, home: &Path) -> PathBuf {
     xdg_config_home
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"))
-        .join("ai-usage")
+        .join("ai-usage/hosts.json")
 }
 
-/// This machine's config directory, from the environment.
 pub fn config_dir() -> PathBuf {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    config_dir_from(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), &home)
+    config_path_from(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), &home).parent().unwrap().to_path_buf()
 }
 
 /// The config in `text`, or this machine alone when there is no file.
@@ -348,9 +347,9 @@ mod tests {
     #[test]
     fn config_defaults_and_overrides() {
         let home = Path::new("/home/u");
-        assert_eq!(config_dir_from(None, home), PathBuf::from("/home/u/.config/ai-usage"));
-        assert_eq!(config_dir_from(Some(" "), home), PathBuf::from("/home/u/.config/ai-usage"));
-        assert_eq!(config_dir_from(Some("/xdg"), home), PathBuf::from("/xdg/ai-usage"));
+        assert_eq!(config_path_from(None, home), PathBuf::from("/home/u/.config/ai-usage/hosts.json"));
+        assert_eq!(config_path_from(Some(" "), home), PathBuf::from("/home/u/.config/ai-usage/hosts.json"));
+        assert_eq!(config_path_from(Some("/xdg"), home), PathBuf::from("/xdg/ai-usage/hosts.json"));
 
         let none = parse_config(None, "box").unwrap();
         assert_eq!(none, Config { me: host("box"), hosts: vec![] });

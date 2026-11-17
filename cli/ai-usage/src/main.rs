@@ -24,10 +24,6 @@
 //! Every report carries a fingerprint of its account, so an account signed in
 //! on several machines shows once, listing them all, and different accounts
 //! of one provider show separately, tagged with their machine.
-//!
-//! More Codex logins on this machine are listed in
-//! `~/.config/ai-usage/codex-accounts.json` as `{"accounts": [{"label":
-//! "RIT", "home": "~/.codex-rit"}]}`. Each shows as its own `Codex · RIT`.
 
 mod hosts;
 mod output;
@@ -68,10 +64,8 @@ Each host runs `ai-usage --local --json` there. An account signed in on
 several hosts shows once; one that is not on every host is tagged with its
 hosts, as `Antigravity @rpi5`.
 
-Codex accounts: codex-accounts.json in the same directory names more Codex
-logins on this machine, read along with $CODEX_HOME (or ~/.codex), e.g.
-  {\"accounts\": [{\"label\": \"RIT\", \"home\": \"~/.codex-rit\"}]}
-Each shows as `Codex · RIT`; in --json, as \"account_label\": \"RIT\".";
+Codex: add {\"accounts\": [{\"label\": \"RIT\", \"home\": \"~/.codex-rit\"}]}
+to codex-accounts.json beside hosts.json to read more logins.";
 
 struct Options {
     json: bool,
@@ -129,8 +123,7 @@ fn collect_local(wanted: &[String], me: &HostRef) -> Vec<Report> {
         .collect();
     let now = Utc::now();
     std::thread::scope(|s| {
-        let handles: Vec<_> =
-            selected.iter().map(|&&(name, probe)| (name, s.spawn(move || probe.run(name)))).collect();
+        let handles: Vec<_> = selected.iter().map(|&&(name, probe)| (name, s.spawn(probe))).collect();
         handles
             .into_iter()
             .flat_map(|(name, h)| h.join().unwrap_or_else(|_| vec![failed(name, "probe panicked".into())]))
