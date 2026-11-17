@@ -23,14 +23,16 @@ impl Painter {
     }
 }
 
-/// The provider's name, tagged with its hosts when not every reachable host
-/// has this account (`Antigravity @rpi5`); for a host error, the host's name.
+/// The provider's name with its account label (`Codex · RIT`), tagged with
+/// its hosts when not every reachable host has this account (`Antigravity
+/// @rpi5`); for a host error, the host's name.
 fn name(r: &Report, reachable: &[String]) -> String {
     if r.provider == HOST_PROVIDER {
         let names: Vec<&str> = r.hosts.iter().map(|h| h.name.as_str()).collect();
         return names.join(",");
     }
-    format!("{}{}", r.provider, tag(r, reachable))
+    let label = r.account_label.as_deref().map(|l| format!(" · {l}")).unwrap_or_default();
+    format!("{}{label}{}", r.provider, tag(r, reachable))
 }
 
 /// What can be used now, then the compact line for every provider.
@@ -177,6 +179,23 @@ mod tests {
         );
         // One host read: no tags, as before.
         assert_eq!(compact_lines(&reports[..2], &both[..1], &p), ["Claude: 10%", "Antigravity: 20%"]);
+    }
+
+    #[test]
+    fn codex_accounts_show_their_labels() {
+        let mut rit = on(&["mac"], "Codex", 20.0);
+        rit.account_label = Some("RIT".into());
+        let mut failed = on(&["mac"], "Codex", 0.0);
+        (failed.account_label, failed.error, failed.windows) = (Some("Lab".into()), Some("HTTP 500".into()), vec![]);
+        let reports = vec![on(&["mac"], "Codex", 10.0), rit, failed];
+        let p = Painter { color: false };
+        assert_eq!(
+            compact_lines(&reports, &["mac".to_string()], &p),
+            ["Codex: 10%", "Codex · RIT: 20%", "Codex · Lab: ?"]
+        );
+        let json = serde_json::to_value(&reports).unwrap();
+        assert_eq!((&json[0]["provider"], json[0].get("account_label")), (&"Codex".into(), None));
+        assert_eq!((&json[1]["provider"], &json[1]["account_label"]), (&"Codex".into(), &"RIT".into()));
     }
 
     #[test]

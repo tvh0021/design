@@ -65,14 +65,20 @@ fn trimmed(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// `$XDG_CONFIG_HOME/ai-usage/hosts.json`, else `~/.config/ai-usage/hosts.json`, on macOS too.
-pub fn config_path_from(xdg_config_home: Option<&str>, home: &Path) -> PathBuf {
+/// `$XDG_CONFIG_HOME/ai-usage`, else `~/.config/ai-usage`, on macOS too.
+pub fn config_dir_from(xdg_config_home: Option<&str>, home: &Path) -> PathBuf {
     xdg_config_home
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"))
-        .join("ai-usage/hosts.json")
+        .join("ai-usage")
+}
+
+/// This machine's config directory, from the environment.
+pub fn config_dir() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    config_dir_from(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), &home)
 }
 
 /// The config in `text`, or this machine alone when there is no file.
@@ -123,8 +129,7 @@ pub fn local_config() -> Config {
 }
 
 pub fn load_config() -> Result<Config, String> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let path = config_path_from(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), &home);
+    let path = config_dir().join("hosts.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -205,11 +210,12 @@ fn provider_rank(name: &str) -> usize {
 /// tagged with it; each remote host's reports are tagged with that host.
 ///
 /// Within each provider (in the usual order, this machine first): a host
-/// that merely has no sign-in is left out when any host has one; reports of
-/// the same account collapse into one listing every host, keeping the first
-/// reading unless it is stale and a later one is not; reports
-/// with no known account never merge. A host that could not be read becomes
-/// one `Host` element at the end.
+/// that merely has no sign-in is left out when any host has one (for a
+/// labelled account, one with the same label); reports of the same account
+/// collapse into one listing every host once, keeping the first reading
+/// unless it is stale and a later one is not; reports with no known account
+/// never merge. A host that could not be read becomes one `Host` element at
+/// the end.
 pub fn merge(local: Vec<Report>, remotes: Vec<(HostRef, Result<Vec<Report>, String>)>) -> Vec<Report> {
     let mut all = local;
     let mut failed = Vec::new();
@@ -240,20 +246,36 @@ pub fn merge(local: Vec<Report>, remotes: Vec<(HostRef, Result<Vec<Report>, Stri
 
     let mut merged: Vec<Report> = Vec::new();
     for group in groups {
-        let any_signed_in = group.iter().any(|r| r.signed_in);
+        // A signed-in report covers a signed-out one with its label; an
+        // unlabelled signed-out one is also covered by any account signed in
+        // on another machine. On the same machine it stays, so `--local`
+        // always lists the default login first.
+        let covered = |r: &Report| {
+            group.iter().any(|x| {
+                x.signed_in
+                    && (x.account_label == r.account_label
+                        || (r.account_label.is_none() && x.hosts != r.hosts))
+            })
+        };
+        let keep: Vec<bool> = group.iter().map(|r| r.signed_in || !covered(r)).collect();
         let first = merged.len();
-        for mut r in group {
-            if !r.signed_in && any_signed_in {
+        for (r, keep) in group.into_iter().zip(keep) {
+            if !keep {
                 continue;
             }
-            // Not signed in anywhere: one line for the provider, as on one machine.
+            // Not signed in anywhere: one line per label, as on one machine.
             let same = merged[first..].iter_mut().find(|m| {
-                (r.account.is_some() && m.account == r.account) || (!r.signed_in && !m.signed_in)
+                (r.account.is_some() && m.account == r.account)
+                    || (!r.signed_in && !m.signed_in && m.account_label == r.account_label)
             });
             match same {
                 Some(m) => {
                     let mut hosts = std::mem::take(&mut m.hosts);
-                    hosts.append(&mut r.hosts);
+                    for h in &r.hosts {
+                        if !hosts.contains(h) {
+                            hosts.push(h.clone());
+                        }
+                    }
                     if m.stale && !r.stale {
                         *m = r;
                     }
@@ -326,9 +348,9 @@ mod tests {
     #[test]
     fn config_defaults_and_overrides() {
         let home = Path::new("/home/u");
-        assert_eq!(config_path_from(None, home), PathBuf::from("/home/u/.config/ai-usage/hosts.json"));
-        assert_eq!(config_path_from(Some(" "), home), PathBuf::from("/home/u/.config/ai-usage/hosts.json"));
-        assert_eq!(config_path_from(Some("/xdg"), home), PathBuf::from("/xdg/ai-usage/hosts.json"));
+        assert_eq!(config_dir_from(None, home), PathBuf::from("/home/u/.config/ai-usage"));
+        assert_eq!(config_dir_from(Some(" "), home), PathBuf::from("/home/u/.config/ai-usage"));
+        assert_eq!(config_dir_from(Some("/xdg"), home), PathBuf::from("/xdg/ai-usage"));
 
         let none = parse_config(None, "box").unwrap();
         assert_eq!(none, Config { me: host("box"), hosts: vec![] });
@@ -415,6 +437,35 @@ mod tests {
         failed.error = Some("HTTP 500".into());
         let merged = merge(mac, vec![(host("rpi5"), Ok(vec![failed]))]);
         assert_eq!(summary(&merged), ["Claude c1@mac", "Claude -@rpi5"]);
+    }
+
+    #[test]
+    fn codex_accounts_merge_by_label_and_list_each_host_once() {
+        let labelled = |mut r: Report, label: &str| {
+            r.account_label = Some(label.into());
+            r
+        };
+        // One login in two homes on one machine: one report, one host.
+        let mac = on(
+            "mac",
+            vec![
+                report("Codex", Some("x1"), 10.0),
+                labelled(report("Codex", Some("x1"), 10.0), "Personal"),
+                labelled(signed_out("Codex"), "RIT"),
+            ],
+        );
+        let merged = merge(mac, vec![]);
+        assert_eq!(summary(&merged), ["Codex x1@mac", "Codex -@mac"]);
+        assert_eq!(merged[1].account_label.as_deref(), Some("RIT"), "a configured login stays listed");
+
+        // Signed in to RIT elsewhere: the signed-out RIT and the unlabelled default drop out.
+        let mac = on("mac", vec![signed_out("Codex"), labelled(signed_out("Codex"), "RIT")]);
+        let pi = vec![labelled(report("Codex", Some("r1"), 5.0), "RIT")];
+        assert_eq!(summary(&merge(mac, vec![(host("rpi5"), Ok(pi))])), ["Codex r1@rpi5"]);
+
+        // `--local`: a signed-out default stays first beside a signed-in extra account.
+        let mac = on("mac", vec![signed_out("Codex"), labelled(report("Codex", Some("r1"), 5.0), "RIT")]);
+        assert_eq!(summary(&merge(mac, vec![])), ["Codex -@mac", "Codex r1@mac"]);
     }
 
     #[test]

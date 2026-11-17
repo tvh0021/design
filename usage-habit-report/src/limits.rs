@@ -11,6 +11,8 @@
 //! leaves the table alone. `--local` keeps them to this machine's accounts:
 //! with a hosts config, plain `ai-usage` also lists other machines, whose
 //! accounts (a second Antigravity sign-in, say) would mix into one series.
+//! For the same reason only the first report per provider counts: `ai-usage`
+//! lists the default login first and extra configured Codex accounts after it.
 
 use crate::store::{self, LiveLimit, Store};
 use anyhow::{Context, Result, bail};
@@ -72,10 +74,14 @@ pub fn parse(json: &str, ts_ms: i64) -> Result<Parsed> {
         serde_json::from_str(json).context("ai-usage output is not a JSON array of providers")?;
     let mut out = Vec::new();
     let mut skipped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for p in providers {
         let Some(tool) = tool_of(&p.provider) else {
             continue;
         };
+        if !seen.insert(tool) {
+            continue;
+        }
         if let Some(err) = p.error.filter(|e| !e.trim().is_empty()) {
             skipped.push((tool, err.trim().to_owned()));
             continue;
@@ -228,6 +234,18 @@ mod tests {
         );
         assert!(r.iter().all(|l| l.ts_ms == 1_000));
         assert!(parse("{}", 0).is_err());
+    }
+
+    #[test]
+    fn keeps_only_the_first_account_per_provider() {
+        let json = r#"[
+          {"provider":"Codex","account_label":"Personal","windows":[{"used_percent":40.0,"window_seconds":604800}]},
+          {"provider":"Codex","account_label":"RIT","windows":[],"error":"not signed in"}
+        ]"#;
+        let r = parse(json, 0).unwrap();
+        assert_eq!(r.readings.len(), 1);
+        assert_eq!(r.readings[0].used_percent, 40.0);
+        assert!(r.skipped.is_empty());
     }
 
     #[test]

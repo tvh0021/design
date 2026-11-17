@@ -105,6 +105,10 @@ pub struct Report {
     /// `fingerprint` of the signed-in account; `None` when it is unknown.
     #[serde(default)]
     pub account: Option<String>,
+    /// A readable name for one of several accounts of a provider on one
+    /// machine, as `RIT`; `None` for the only or the default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
     /// False when the error is only that this machine has no sign-in.
     #[serde(default = "yes")]
     pub signed_in: bool,
@@ -130,6 +134,7 @@ impl Default for Report {
             advice: Vec::new(),
             error: None,
             account: None,
+            account_label: None,
             signed_in: true,
             stale: false,
             hosts: Vec::new(),
@@ -296,6 +301,6 @@ mod tests {
         assert!(v.get("plan").is_none() && v.get("error").is_none());
         // An element without the new fields still parses, as signed in.
         let old: Report = serde_json::from_str(r#"{"provider":"Codex","windows":[]}"#).unwrap();
-        assert!(old.signed_in && old.account.is_none() && old.hosts.is_empty());
+        assert!(old.signed_in && old.account.is_none() && old.account_label.is_none() && old.hosts.is_empty());
     }
 }
