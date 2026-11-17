@@ -81,6 +81,17 @@ machines, as `Antigravity @rpi5: ...`. A machine that cannot be read shows as
 "Host"`. A provider a machine is merely not signed in to is left out when
 another machine has it. Without the file, output is as on one machine.
 
+Codex uses `$CODEX_HOME` if it contains `auth.json`, otherwise `~/.codex`.
+To read more logins, add `codex-accounts.json` beside `hosts.json`:
+
+```json
+{"accounts":[{"label":"Personal","home":"~/.codex"},{"label":"RIT","home":"~/.codex-rit"}]}
+```
+
+The default home comes first; listing it only adds its label. Repeated homes
+are read once. Accounts show as `Codex · RIT`; JSON keeps `"provider":"Codex"`
+and adds `"account_label":"RIT"`. Without this file, output is unchanged.
+
 ## cli/scix_arxiv_radar
 
 Python MCP server that triages new arXiv and ADS/SciX papers against a few

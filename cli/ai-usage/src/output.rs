@@ -23,14 +23,16 @@ impl Painter {
     }
 }
 
-/// The provider's name, tagged with its hosts when not every reachable host
-/// has this account (`Antigravity @rpi5`); for a host error, the host's name.
+/// The provider's name with its account label (`Codex · RIT`), tagged with
+/// its hosts when not every reachable host has this account (`Antigravity
+/// @rpi5`); for a host error, the host's name.
 fn name(r: &Report, reachable: &[String]) -> String {
     if r.provider == HOST_PROVIDER {
         let names: Vec<&str> = r.hosts.iter().map(|h| h.name.as_str()).collect();
         return names.join(",");
     }
-    format!("{}{}", r.provider, tag(r, reachable))
+    let label = r.account_label.as_deref().map(|l| format!(" · {l}")).unwrap_or_default();
+    format!("{}{label}{}", r.provider, tag(r, reachable))
 }
 
 /// What can be used now, then the compact line for every provider.
