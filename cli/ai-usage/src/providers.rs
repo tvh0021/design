@@ -638,7 +638,12 @@ struct CodexAuth {
 }
 
 fn codex_auth_from_dir(codex_home: &Path) -> Result<CodexAuth, Failure> {
-    let text = read_credential(&codex_home.join("auth.json"), "no Codex login (~/.codex/auth.json)")?;
+    let auth_path = codex_home.join("auth.json");
+    let shown = match auth_path.strip_prefix(home()) {
+        Ok(rest) => Path::new("~").join(rest),
+        Err(_) => auth_path.clone(),
+    };
+    let text = read_credential(&auth_path, &format!("no Codex login ({})", shown.display()))?;
     let auth: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let tokens = &auth["tokens"];
     let token = tokens["access_token"]
