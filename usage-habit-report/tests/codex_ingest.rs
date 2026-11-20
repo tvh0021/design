@@ -431,7 +431,9 @@ fn cli_scan_reports_codex() {
     let empty = tmp.path().join("no-claude");
     let bin = env!("CARGO_BIN_EXE_usage-habit-report");
     let run = |args: &[&str]| {
+        // Offline: no rates file here, so each run would fetch LiteLLM's.
         let out = std::process::Command::new(bin)
+            .arg("--offline")
             .args(args)
             .env("XDG_CONFIG_HOME", tmp.path().join("config"))
             .env("HOME", tmp.path()) // keep other harnesses' default folders out

@@ -215,6 +215,39 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (tool, session_id)
     );
     "#,
+    // v13: the account behind each reading and session, so two sign-ins to
+    // one tool (two ChatGPT Plus seats) keep apart. `account` is the
+    // `ai-usage` fingerprint: the first 12 hex digits of
+    // sha256("<provider>:<id>"). Live readings gain it in their key; older
+    // ones keep '' (unknown). Codex rollouts written since November 2026
+    // name their creator in `session_meta`; `codex_account_backfill` queues
+    // their sources so the next scan reads that one line and stamps the
+    // account on rows already stored. Nothing else is re-read, so no turn
+    // or request is dropped or counted twice, and rows of files no longer
+    // on disk stay as they are.
+    r#"
+    CREATE TABLE live_limits_v13 (
+        tool         TEXT    NOT NULL,
+        account      TEXT    NOT NULL DEFAULT '',  -- '' when unknown
+        pool         TEXT    NOT NULL DEFAULT '',
+        window       TEXT    NOT NULL,
+        ts_ms        INTEGER NOT NULL,
+        used_percent REAL    NOT NULL,
+        resets_at_ms INTEGER,
+        PRIMARY KEY (tool, account, pool, window, ts_ms)
+    );
+    INSERT INTO live_limits_v13 (tool, account, pool, window, ts_ms, used_percent, resets_at_ms)
+        SELECT tool, '', pool, window, ts_ms, used_percent, resets_at_ms FROM live_limits;
+    DROP TABLE live_limits;
+    ALTER TABLE live_limits_v13 RENAME TO live_limits;
+    ALTER TABLE sessions ADD COLUMN account TEXT;
+    ALTER TABLE limit_samples ADD COLUMN account TEXT;
+    CREATE TABLE codex_account_backfill (
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE
+    );
+    INSERT INTO codex_account_backfill SELECT id FROM sources
+        WHERE tool = 'codex' AND (mtime_ms IS NULL OR mtime_ms >= 1793491200000);
+    "#,
 ];
 
 pub struct Store {
@@ -360,14 +393,17 @@ pub struct SessionUpdate {
     pub started_at_ms: Option<i64>,
     pub ended_at_ms: Option<i64>,
     pub user_turns: i64,
+    /// Fingerprint of the account the session ran under, when known.
+    pub account: Option<String>,
 }
 
 pub fn upsert_session(tx: &Transaction, s: &SessionUpdate) -> Result<()> {
     tx.execute(
         r#"
         INSERT INTO sessions (tool, session_id, source_id, is_subagent, parent_session_id,
-                              agent_type, title, cwd, started_at_ms, ended_at_ms, user_turns)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                              agent_type, title, cwd, started_at_ms, ended_at_ms, user_turns,
+                              account)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(tool, session_id) DO UPDATE SET
             source_id         = COALESCE(sessions.source_id, excluded.source_id),
             is_subagent       = MAX(sessions.is_subagent, excluded.is_subagent),
@@ -379,7 +415,11 @@ pub fn upsert_session(tx: &Transaction, s: &SessionUpdate) -> Result<()> {
                                     COALESCE(excluded.started_at_ms, sessions.started_at_ms)),
             ended_at_ms       = MAX(COALESCE(sessions.ended_at_ms, excluded.ended_at_ms),
                                     COALESCE(excluded.ended_at_ms, sessions.ended_at_ms)),
-            user_turns        = sessions.user_turns + excluded.user_turns
+            user_turns        = sessions.user_turns + excluded.user_turns,
+            -- The session's own source names its creator; other sources only fill a gap.
+            account           = CASE WHEN sessions.source_id IS excluded.source_id
+                                     THEN COALESCE(excluded.account, sessions.account)
+                                     ELSE COALESCE(sessions.account, excluded.account) END
         "#,
         params![
             s.tool,
@@ -393,6 +433,7 @@ pub fn upsert_session(tx: &Transaction, s: &SessionUpdate) -> Result<()> {
             s.started_at_ms,
             s.ended_at_ms,
             s.user_turns,
+            s.account,
         ],
     )?;
     Ok(())
@@ -498,7 +539,8 @@ pub fn reset_source(tx: &Transaction, source_id: i64) -> Result<()> {
         params![source_id],
     )?;
     tx.execute(
-        "UPDATE sessions SET user_turns = 0, title = NULL, started_at_ms = NULL, ended_at_ms = NULL
+        "UPDATE sessions SET user_turns = 0, title = NULL, started_at_ms = NULL, ended_at_ms = NULL,
+                             account = NULL
          WHERE source_id = ?1",
         params![source_id],
     )?;
@@ -531,14 +573,18 @@ pub struct LimitSample {
     pub kind: &'static str,
     /// Codex: the account's credit balance at the reading, when reported.
     pub credits_balance: Option<f64>,
+    /// Fingerprint of the account the reading belongs to, when known.
+    pub account: Option<String>,
 }
 
 /// One reading sampled live from `ai-usage`, account-wide rather than tied to
 /// a log file. `pool` names a per-model quota ("Fable", "Gemini"); empty for
-/// the plan's main window.
+/// the plan's main window. `account` is the `ai-usage` fingerprint, empty
+/// when unknown.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveLimit {
     pub tool: String,
+    pub account: String,
     pub pool: String,
     pub window: &'static str,
     pub ts_ms: i64,
@@ -552,12 +598,14 @@ pub fn record_live_limits(tx: &Transaction, readings: &[LiveLimit]) -> Result<us
     for r in readings {
         n += tx
             .prepare_cached(
-                "INSERT INTO live_limits (tool, pool, window, ts_ms, used_percent, resets_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT DO UPDATE SET used_percent = MAX(used_percent, excluded.used_percent)",
+                "INSERT INTO live_limits (tool, account, pool, window, ts_ms, used_percent, resets_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT DO UPDATE SET used_percent = MAX(used_percent, excluded.used_percent),
+                     resets_at_ms = COALESCE(excluded.resets_at_ms, resets_at_ms)",
             )?
             .execute(params![
                 r.tool,
+                r.account,
                 r.pool,
                 r.window,
                 r.ts_ms,
@@ -577,11 +625,12 @@ pub fn record_limit_samples(
 ) -> Result<()> {
     for s in samples {
         tx.prepare_cached(
-            "INSERT INTO limit_samples (source_id, tool, session_id, ts_ms, window, used_percent, resets_at_ms, kind, credits_balance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO limit_samples (source_id, tool, session_id, ts_ms, window, used_percent, resets_at_ms, kind, credits_balance, account)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT DO UPDATE SET used_percent = MAX(used_percent, excluded.used_percent),
                  resets_at_ms = COALESCE(excluded.resets_at_ms, resets_at_ms),
-                 credits_balance = COALESCE(excluded.credits_balance, credits_balance)",
+                 credits_balance = COALESCE(excluded.credits_balance, credits_balance),
+                 account = COALESCE(excluded.account, account)",
         )?
         .execute(params![
             source_id,
@@ -592,7 +641,8 @@ pub fn record_limit_samples(
             s.used_percent,
             s.resets_at_ms,
             s.kind,
-            s.credits_balance
+            s.credits_balance,
+            s.account
         ])?;
     }
     Ok(())
@@ -801,6 +851,7 @@ mod active_migration_tests {
             resets_at_ms: Some(2000),
             kind: "reading",
             credits_balance: None,
+            account: None,
         };
         record_limit_samples(&tx, "codex", "c", 1, &[sample(10.0), sample(12.0)]).unwrap();
         tx.commit().unwrap();
@@ -922,5 +973,123 @@ mod active_migration_tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// A store at v12, the schema before accounts.
+    fn at_v12() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..12] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn
+    }
+
+    #[test]
+    fn v13_keys_live_limits_by_account_and_queues_recent_codex_rollouts() {
+        let conn = at_v12();
+        conn.execute_batch(
+            "INSERT INTO sources(id, tool, path, offset, size, mtime_ms) VALUES
+                (1, 'codex', '/a', 9, 9, 1000), (2, 'codex', '/b', 9, 9, 1793500000000);
+             INSERT INTO sessions(tool, session_id, source_id, user_turns) VALUES
+                ('codex', 'n', 2, 3), ('codex', 'm', 1, 5);
+             INSERT INTO codex_cursors VALUES (2, '{}');
+             INSERT INTO live_limits VALUES ('codex', '', 'session', 5, 40, NULL);",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 13);
+        let q = |sql: &str| -> String { store.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        // Nothing is re-read: offsets, turns and cursors stay; only the
+        // recent source is queued for its account.
+        assert_eq!(
+            q(
+                "SELECT group_concat(x, ' ') FROM (SELECT id || ':' || offset x FROM sources ORDER BY id)"
+            ),
+            "1:9 2:9"
+        );
+        assert_eq!(
+            q(
+                "SELECT group_concat(x, ' ') FROM (SELECT session_id || ':' || user_turns x FROM sessions ORDER BY 1)"
+            ),
+            "m:5 n:3"
+        );
+        assert_eq!(q("SELECT group_concat(source_id) FROM codex_cursors"), "2");
+        assert_eq!(
+            q("SELECT group_concat(source_id) FROM codex_account_backfill"),
+            "2"
+        );
+        assert_eq!(
+            q("SELECT account || '|' || used_percent FROM live_limits"),
+            "|40.0"
+        );
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO live_limits VALUES ('codex', 'b', '', 'session', 5, 50, NULL);",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn v13_keeps_turns_of_vanished_rollouts_and_stamps_the_rest() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("sessions/2026/11/17");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("rollout-2026-11-17T00-00-00-k.jsonl");
+        let body = concat!(
+            r#"{"timestamp":"2026-11-17T00:00:00.000Z","type":"session_meta","payload":{"id":"k","creator_user_id":"cu-1","creator_account_id":"ws-1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-17T00:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":5.0,"window_minutes":300}}}}"#,
+            "\n"
+        );
+        std::fs::write(&kept, body).unwrap();
+        let gone = dir.join("rollout-2026-11-16T00-00-00-g.jsonl");
+        let conn = at_v12();
+        conn.execute(
+            "INSERT INTO sources(id, tool, path, offset, size, mtime_ms) VALUES
+                (1, 'codex', ?1, 500, 500, 1793500000000), (2, 'codex', ?2, ?3, ?3, 1793500000000)",
+            params![
+                gone.to_string_lossy(),
+                kept.to_string_lossy(),
+                body.len() as i64
+            ],
+        )
+        .unwrap();
+        // Session `g`'s file is gone; session `k` was read from that file and the kept one.
+        conn.execute_batch(
+            "INSERT INTO sessions(tool, session_id, source_id, user_turns) VALUES
+                ('codex', 'g', 1, 7), ('codex', 'k', 2, 2);
+             INSERT INTO session_events VALUES (1, 'codex', 'g', 1, 2), (1, 'codex', 'k', 0, 1),
+                (2, 'codex', 'k', 3, 4);
+             INSERT INTO requests(tool, request_key, session_id, source_id, ts_ms) VALUES
+                ('codex', 'r1', 'g', 1, 1), ('codex', 'r2', 'k', 2, 3);
+             INSERT INTO limit_samples VALUES
+                (1, 'codex', 'g', 1, 'session', 5, NULL, 'reading', NULL),
+                (2, 'codex', 'k', 3, 'session', 5, NULL, 'reading', NULL);
+             INSERT INTO codex_cursors VALUES (2, '{\"meta_seen\":true,\"session_id\":\"k\"}');",
+        )
+        .unwrap();
+        let mut store = Store::init(conn).unwrap();
+        crate::codex::scan_codex(&mut store, home.path()).unwrap();
+        let q = |sql: &str| -> String { store.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            q(
+                "SELECT group_concat(x, ' ') FROM (SELECT session_id || ':' || user_turns || ':' || COALESCE(account, '-') x FROM sessions ORDER BY 1)"
+            ),
+            "g:7:- k:2:b358e0ed9cea"
+        );
+        assert_eq!(q("SELECT CAST(count(*) AS TEXT) FROM requests"), "2");
+        assert_eq!(
+            q(
+                "SELECT group_concat(COALESCE(account, '-'), ' ') FROM (SELECT account FROM limit_samples ORDER BY source_id)"
+            ),
+            "- b358e0ed9cea"
+        );
+        assert_eq!(
+            q("SELECT CAST(count(*) AS TEXT) FROM codex_account_backfill"),
+            "0"
+        );
+        assert!(q("SELECT state FROM codex_cursors WHERE source_id = 2").contains("b358e0ed9cea"));
     }
 }

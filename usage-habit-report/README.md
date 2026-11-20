@@ -252,15 +252,16 @@ codex: ChatGPT Plus at $20.00/month; limit readings: readings; reference model g
     runs range $10.58 to $15.69, median $13.28
     2026-10: 45 runs, 52.6M tokens, est. $9.96 per full window, $10.44 at reference rates, mostly gpt-6.1-sol (86 %)
     windows used 229, exhausted 33, mean peak 44 %, mid-window resets 11
-  2026-10 (partial): est. $338.03 = 16.7x of the price, on pace for $478.65
-  mean over 4 complete months: est. $451.12 = 22.0x the price
+  2026-10 (partial): est. $338.03; 16.7x the price while a plan ran, on pace for $478.65
+  mean over 4 complete months: est. $451.12; 22.0x the price while a plan ran
   pace over the last 28 days: est. $493.37 a month = 24.7x the price
 ```
 
 **Windows.** Each tool has a session window of 5 hours and a weekly window
 of 168 hours, plus any per-model pool the provider reports live (Claude's
-Fable weekly pool; Antigravity's Gemini, Argon, and Claude & GPT pools). A
-pool covers only the models whose names carry its word. A *run* is a stretch
+Fable weekly pool; Antigravity's Gemini and Argon pools, with `Claude & GPT`
+excluded from the report). A pool covers only the models whose names carry its
+word. A *run* is a stretch
 of rising `used_percent` readings inside one window. It ends at a drop, a
 changed reset time, or a gap longer than the window, so mid-window resets
 and reset credits start a new run instead of inflating one. Concurrent
@@ -273,7 +274,8 @@ distinct sessions, estimated cost) and scaled by `100 / rise` to a whole
 window. Runs rising less than 20 % are ignored; the ten largest rises are
 averaged into `per_window`, with their `spread` (lowest, median, highest).
 A window that was never seen exhausted reports the busiest sliding window of
-that length as a lower bound instead.
+that length as a lower bound instead: one seat's requests at a time, and only
+those made while the window's plan ran.
 
 **Drift.** `drift` repeats the mean for every qualifying run by the month it
 started, with the month's main model by cost. Each figure is also priced at
@@ -299,25 +301,87 @@ Claude Code transcripts only record a rejection (`rate_limit_info` with
 Antigravity logs no limit data. Live readings from `limits record` fill both
 gaps from the day sampling starts.
 
+**Accounts and seats.** A tool can run on several accounts, such as two
+ChatGPT Plus seats. Each account has its own limit windows, so readings are
+kept apart by account: every run, utilization count, mid-window reset,
+session share and credit balance comes from one account's series, never two
+interleaved. Codex rollouts name their account (the fingerprint below, from
+the rollout's own `session_meta`), and so do `limits record` readings. A
+reading or request that names no account goes to the only plan line with an
+`account=` running at its time; failing that, to the tool's only account;
+with several accounts and no way to choose, it is left out. Such limit
+readings are counted in `unattributed_readings`; such requests are only left
+out of the windows. Lines of one plan name and price form a tier, and the
+runs of its seats are averaged together. A request counts toward a tier only
+while one of its plan lines runs, so an account that moves from Plus to Pro
+keeps each plan's requests apart; likewise a seat's requests count only
+within its own line's `from`/`until`, even while another seat of the same
+plan runs on. Limit readings follow the same rule: a reading taken outside
+the line that covers its account is dropped (it still flags the account in
+`unplanned_accounts`), so no run, peak or session share straddles a plan's
+start or end. Local tiers running now come first in `windows[]`, then remote
+tiers running now, so the summary's 5-hour and weekly figures are a current
+local plan's whenever one runs. When no plan runs now, the first ended tier
+with readings (else any tier with readings, else the primary plan) leads
+instead.
+
 **Months and pace.** `months[]` lists estimated API cost per local calendar
-month against the plan price (`multiple`), the days of history in the month,
+month against the plans' list price (`multiple`), the days of history in the month,
 and for a partial month its cost at that pace over a whole month. `complete`
 is false for the current month and the first month seen;
 `mean_monthly_cost_usd` and `mean_multiple` average the complete months, or
 the partial ones when no month is complete. `pace` is the monthly cost at the
 rate of the last 28 days (or of the whole history, when shorter); `combined`
-adds the plans together.
+adds the plans together, over the tools whose plans had a list price over
+those days and whose use there has an estimated cost. A month's and the pace's `price_usd` and `paid_usd`
+weight each plan line by the share of those days it ran, so a seat added
+mid-month counts for its days only. The cost behind `multiple` and the pace
+counts only requests made while a plan line of their account ran (by design,
+a request whose account cannot be told counts when any local plan of the
+tool ran). It is null when such use exists but none of it is priced, and $0
+when there is none but other use is priced. `usage` still totals every
+request of the month.
 
-Plan prices default to Claude Team at a premium seat ($150), ChatGPT Plus
+Plan prices default to Claude Team at a premium seat ($125), ChatGPT Plus
 ($20, the plan behind Codex) and Google AI Pro ($19.99, the plan behind
-Antigravity). Override them in `config.toml`:
+Antigravity). Override them in `config.toml`, one line per plan or seat:
 
 ```toml
 [subscriptions]
-codex = 200 "ChatGPT Pro"   # price a month, optional quoted plan name
-claude-code = 150
+codex = 200 "ChatGPT Pro"   # list price a month, optional quoted plan name
+claude-code = 125
 antigravity = none 'Free tier'   # none: no price, so no multiple
 ```
+
+```
+<tool> = <list USD|none> ["name"] [paid=<USD>] [account=<12 hex>] [label="text"]
+         [from=<YYYY-MM-DD[THH:MM]>] [until=<YYYY-MM-DD[THH:MM]>] [remote]
+```
+
+A repeated tool adds a line instead of replacing the first. `paid` is what you
+pay a month, the list price unless set (`paid=0` for a seat someone else pays
+for). `account` is the account's `ai-usage` fingerprint (12 hex digits, shown
+by `ai-usage --local --json` and in `query value --json`). `label` is a
+private name for the line; it and the account never appear on the public
+page, which says "seat 1", "seat 2". `from` and `until` are local times; a
+date alone for `until` includes that whole day. Two lines of one tool with
+the same `account` must not overlap, or the config fails to load naming both lines;
+one may start at the time the other's `until` names (`until=2026-11-10T20:35`
+then `from=2026-11-10T20:35`, or `until=2026-11-09` then `from=2026-11-10`).
+`remote` marks a plan used on another machine: its price counts, its use is
+not in this store.
+
+```toml
+[subscriptions]
+codex = 20 "ChatGPT Plus" account=0123456789ab label="Home"
+codex = 20 "ChatGPT Plus" paid=0 account=ba9876543210 label="Work" from=2026-11-16T21:40
+antigravity = 200 "Google AI Ultra" paid=20 remote
+```
+
+The Codex fingerprint is the first 12 hex digits of
+`sha256("codex:<creator_user_id>:<creator_account_id>")`, the same as
+`ai-usage` prints. Readings from accounts no line names are listed in a
+private finding.
 
 JSON shape: see [docs/json-shapes.md](docs/json-shapes.md#query-value).
 
@@ -330,7 +394,9 @@ usage-habit-report limits record [--every SECS] [--from FILE]
 Runs `ai-usage --local --json claude codex antigravity` and stores the used share,
 reset time, and pool of every 5-hour and weekly window in `live_limits`. One
 reading prints one line, such as `limits: 10 readings at
-2026-10-23T01:25:12Z (antigravity 5, claude-code 3, codex 2)`. `--every`
+2026-10-23T01:25:12Z (antigravity 5, claude-code 3, codex 2)`; a tool read
+from several accounts says so, as in `codex 4 (2 accounts)`. Each reading
+keeps the account `ai-usage` names. `--every`
 keeps sampling until interrupted (at least every 30 seconds) and reports a
 failed sample on stderr without stopping. A provider that `ai-usage` could
 not read, or that it shows an earlier reading for while rate limited, is left
@@ -1376,6 +1442,17 @@ The schema version is kept in `PRAGMA user_version`; migrations live in
   row per `(tool, pool, window, ts_ms)` with `used_percent` and
   `resets_at_ms`, written by `limits record`. `pool` is empty for the plan's
   own windows. `rebuild` keeps this table.
+- v13: `account` (the `ai-usage` fingerprint) on `sessions` and
+  `limit_samples`, and in the `live_limits` primary key (`''` for readings
+  taken before). The migration itself re-reads nothing: it only queues, in
+  `codex_account_backfill`, the Codex sources modified since 2026-11-01. The
+  next Codex scan reads the first `session_meta` of each queued rollout and
+  stamps that account on the session and its `limit_samples` where none is
+  set yet, and in the source's saved Codex cursor so readings appended later
+  carry it too, then drops it from the queue. Only `account` changes: offsets,
+  turn counts and requests stay as they were, so nothing is counted twice.
+  Rollouts written before Codex named the account, and rows whose file is
+  gone, keep no account.
 
 ## Tests
 
