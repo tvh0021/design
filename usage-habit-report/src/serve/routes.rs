@@ -81,7 +81,8 @@ pub fn load_page(
     let sessions = data::session_lists(conn, since, params.tool)?;
     let spend = data::spend(conn, window, now_ms, params.tool, tz)?;
     let tools = params.tool.map_or(data::TOOLS.to_vec(), |t| vec![t]);
-    let limit_bands = crate::value::limit_bands(conn, &tools, since, now_ms, tz)?;
+    let subscriptions = crate::config::load()?.subscriptions;
+    let limit_bands = crate::value::limit_bands(conn, &tools, &subscriptions, since, now_ms, tz)?;
     Ok(Page {
         audience: html::Audience::Private,
         window,

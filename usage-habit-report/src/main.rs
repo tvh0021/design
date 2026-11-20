@@ -602,6 +602,7 @@ fn main() -> Result<()> {
             for table in [
                 "session_events",
                 "codex_cursors",
+                "codex_account_backfill",
                 "requests",
                 "sessions",
                 "sources",

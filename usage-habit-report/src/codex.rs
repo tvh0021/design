@@ -15,8 +15,10 @@
 //!
 //! Each line is `{"timestamp", "ordinal", "type", "payload"}`. The parser uses:
 //! - `session_meta`: id, cwd, subagent parent (`parent_thread_id`), subagent
-//!   kind (`source.subagent`), and fork details. Only the first one in a file
-//!   counts; forks copy their parent's `session_meta` in after their own.
+//!   kind (`source.subagent`), fork details, and the signed-in account
+//!   (`creator_user_id`, `creator_account_id`, written since November 2026).
+//!   Only the first one in a file counts; forks copy their parent's
+//!   `session_meta` in after their own.
 //! - `turn_context`: `model` and `effort` for the requests that follow.
 //! - `event_msg` / `token_count`: `info.total_token_usage` is cumulative,
 //!   `info.last_token_usage` is the latest model call. A request is recorded
@@ -177,6 +179,21 @@ pub struct Cursor {
     /// A `token_usage_record` has been seen: requests come from those records
     /// from here on, and `token_count` only tracks the cumulative baseline.
     pub per_response: bool,
+    /// Fingerprint of the account that created the session (see
+    /// [`account_fingerprint`]); kept so later chunks stamp their readings.
+    pub account: Option<String>,
+}
+
+/// The account fingerprint `ai-usage` shows for a Codex sign-in: the first
+/// 12 hex digits of sha256("codex:<user id>:<workspace id>"). Only the
+/// fingerprint is stored, never the ids.
+pub fn account_fingerprint(user: &str, workspace: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("codex:{user}:{workspace}").as_bytes())
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Data-quality counts, reported by `scan`.
@@ -242,6 +259,8 @@ struct Meta {
     subagent_history_start_ordinal: Option<i64>,
     thread_source: Option<String>,
     source: Option<serde_json::Value>,
+    creator_user_id: Option<String>,
+    creator_account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -484,6 +503,12 @@ impl Chunk {
             || sub_kind.is_some()
             || m.thread_source.as_deref() == Some("subagent");
         c.agent_type = sub_kind;
+        c.account = m
+            .creator_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(|u| account_fingerprint(u, m.creator_account_id.as_deref().unwrap_or("").trim()));
         if m.forked_from_id.is_some() {
             match m.subagent_history_start_ordinal {
                 Some(o) => c.cut_ordinal = Some(o),
@@ -537,6 +562,7 @@ impl Chunk {
                 resets_at_ms: w.resets_at.map(|s| s * 1000),
                 kind: "reading",
                 credits_balance,
+                account: self.cursor.account.clone(),
             });
         }
     }
@@ -842,8 +868,89 @@ pub fn scan_codex(store: &mut Store, home: &Path) -> Result<CodexScanReport> {
         scan_file(store, &stem, &path, &mut out)
             .with_context(|| format!("scanning {}", path.display()))?;
     }
+    backfill_accounts(store)?;
     out.report.elapsed = start.elapsed();
     Ok(out)
+}
+
+/// Stamp the account on rows stored before rollouts were read for it: each
+/// source the v13 migration queued is read up to its `session_meta`, and
+/// only `account` changes, so turns and requests are never counted again.
+/// A source whose file is gone leaves the queue with its rows untouched; one
+/// that cannot be read now stays queued.
+fn backfill_accounts(store: &mut Store) -> Result<()> {
+    let queued: Vec<(i64, String)> = store
+        .conn
+        .prepare(
+            "SELECT b.source_id, s.path FROM codex_account_backfill b
+             JOIN sources s ON s.id = b.source_id",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, path) in queued {
+        let path = Path::new(&path);
+        // Only a file that is really gone leaves the queue; a permission or
+        // I/O error keeps it queued for the next scan.
+        let gone = match std::fs::metadata(path) {
+            Ok(_) => false,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => continue,
+        };
+        let meta = match rollout_stem(path).filter(|_| !gone) {
+            Some(stem) => match first_meta(path, stem) {
+                Ok(c) => Some(c),
+                Err(_) => continue,
+            },
+            None => None,
+        };
+        let tx = store.conn.transaction()?;
+        if let Some((session_id, Some(account))) = meta {
+            tx.execute(
+                "UPDATE sessions SET account = ?2
+                 WHERE tool = ?1 AND session_id = ?3 AND account IS NULL",
+                params![TOOL, account, session_id],
+            )?;
+            tx.execute(
+                "UPDATE limit_samples SET account = ?2 WHERE source_id = ?1 AND account IS NULL",
+                params![id, account],
+            )?;
+            let mut cursor = load_cursor(&tx, id)?;
+            if cursor.meta_seen && cursor.account.is_none() {
+                cursor.account = Some(account);
+                tx.execute(
+                    "UPDATE codex_cursors SET state = ?2 WHERE source_id = ?1",
+                    params![id, serde_json::to_string(&cursor)?],
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM codex_account_backfill WHERE source_id = ?1",
+            params![id],
+        )?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// The session id and account a rollout's first `session_meta` names,
+/// reading plain or zstd rollouts line by line until that line or EOF.
+fn first_meta(path: &Path, stem: &str) -> io::Result<(String, Option<String>)> {
+    let mut reader = open_at(path, 0)?.expect("offset 0 always fits");
+    let mut chunk = Chunk::new(stem, Cursor::default());
+    let mut line = Vec::new();
+    // Read until the meta, however far down it sits (or EOF).
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        chunk.push_line(line.strip_suffix(b"\n").unwrap_or(&line));
+        if chunk.cursor.meta_seen {
+            break;
+        }
+    }
+    let session_id = chunk.session_id().unwrap_or_else(|| stem.to_string());
+    Ok((session_id, chunk.cursor.account))
 }
 
 struct Prior {
@@ -1061,6 +1168,7 @@ fn scan_file(store: &mut Store, stem: &str, path: &Path, out: &mut CodexScanRepo
                 started_at_ms: chunk.started_at_ms,
                 ended_at_ms: chunk.ended_at_ms,
                 user_turns: chunk.user_turns,
+                account: c.account.clone(),
             },
         )?;
         if let (false, Some(label)) = (c.is_subagent, chunk.label) {
@@ -1238,6 +1346,7 @@ mod tests {
                     resets_at_ms: Some(1_792_541_597_000),
                     kind: "reading",
                     credits_balance: Some(791.5),
+                    account: None,
                 },
                 LimitSample {
                     ts_ms: 1_790_812_801_000,
@@ -1246,6 +1355,7 @@ mod tests {
                     resets_at_ms: Some(1_793_102_633_000),
                     kind: "reading",
                     credits_balance: Some(791.5),
+                    account: None,
                 },
                 LimitSample {
                     ts_ms: 1_790_812_803_000,
@@ -1254,9 +1364,98 @@ mod tests {
                     resets_at_ms: None,
                     kind: "reading",
                     credits_balance: None,
+                    account: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn session_meta_names_the_account_for_every_later_reading() {
+        // `ai-usage` computes fingerprint("codex", "cu-1:ws-1") for this sign-in.
+        assert_eq!(account_fingerprint("cu-1", "ws-1"), "b358e0ed9cea");
+        let mut c = Chunk::new("rollout-x", Cursor::default());
+        c.push_line(br#"{"timestamp":"2026-11-17T00:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"t1","creator_user_id":"cu-1","creator_account_id":"ws-1"}}"#);
+        // A fork's copy of its parent's meta, from another account, is ignored.
+        c.push_line(br#"{"timestamp":"2026-11-17T00:00:00.000Z","ordinal":1,"type":"session_meta","payload":{"id":"t0","creator_user_id":"other","creator_account_id":"ws-2"}}"#);
+        assert_eq!(c.cursor.account.as_deref(), Some("b358e0ed9cea"));
+        // The next scan resumes from the saved cursor and still stamps readings.
+        let saved: Cursor =
+            serde_json::from_str(&serde_json::to_string(&c.cursor).unwrap()).unwrap();
+        let mut next = Chunk::new("rollout-x", saved);
+        next.push_line(br#"{"timestamp":"2026-11-17T00:00:05.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":5.0,"window_minutes":300}}}}"#);
+        assert_eq!(next.limits[0].account.as_deref(), Some("b358e0ed9cea"));
+        // Rollouts from before Codex named the creator carry no account.
+        let mut old = Chunk::new("rollout-y", Cursor::default());
+        old.push_line(br#"{"timestamp":"2026-10-01T00:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"t2"}}"#);
+        assert_eq!(old.cursor.account, None);
+    }
+
+    fn meta_line(id: &str, user: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-11-17T00:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","creator_user_id":"{user}","creator_account_id":"ws-1"}}}}"#
+        )
+    }
+
+    fn reading(sec: u32) -> String {
+        format!(
+            r#"{{"timestamp":"2026-11-17T00:00:{sec:02}.000Z","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"primary":{{"used_percent":5.0,"window_minutes":300}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn backfill_meta_is_found_past_line_64_in_plain_and_zstd_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = "{\"type\":\"response_item\",\"payload\":{}}\n".repeat(70);
+        body.push_str(&meta_line("deep", "cu-1"));
+        body.push('\n');
+        let plain = dir.path().join("rollout-2026-11-17T00-00-00-deep.jsonl");
+        std::fs::write(&plain, &body).unwrap();
+        let zst = dir
+            .path()
+            .join("rollout-2026-11-17T00-00-00-deep.jsonl.zst");
+        std::fs::write(&zst, zstd::encode_all(body.as_bytes(), 0).unwrap()).unwrap();
+        for path in [&plain, &zst] {
+            let (sid, account) = first_meta(path, rollout_stem(path).unwrap()).unwrap();
+            assert_eq!(sid, "deep");
+            assert_eq!(account.as_deref(), Some("b358e0ed9cea"));
+        }
+    }
+
+    #[test]
+    fn replaced_shorter_rollout_restamps_the_session_account() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("sessions/2026/11/17");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-11-17T00-00-00-r.jsonl");
+        let write = |user: &str, readings: &[u32]| {
+            let mut body = meta_line("r", user) + "\n";
+            for &sec in readings {
+                body.push_str(&reading(sec));
+                body.push('\n');
+            }
+            std::fs::write(&path, body).unwrap();
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        let accounts = |store: &Store| -> (String, String) {
+            store
+                .conn
+                .query_row(
+                    "SELECT (SELECT account FROM sessions WHERE session_id = 'r'),
+                            (SELECT group_concat(DISTINCT account) FROM limit_samples)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        write("cu-1", &[5, 6]);
+        scan_codex(&mut store, home.path()).unwrap();
+        let old = account_fingerprint("cu-1", "ws-1");
+        assert_eq!(accounts(&store), (old.clone(), old));
+        write("cu-2", &[7]);
+        scan_codex(&mut store, home.path()).unwrap();
+        let new = account_fingerprint("cu-2", "ws-1");
+        assert_eq!(accounts(&store), (new.clone(), new));
     }
 
     #[test]

@@ -174,6 +174,47 @@ fn fixture_snapshot_is_redacted_offline_and_linked() {
 }
 
 #[test]
+fn plan_labels_and_accounts_stay_off_the_public_value_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("usage.db");
+    let store = fixture_store(&db);
+    // An hour ago, so the unplanned third account stays within the last 28 days.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 3_600_000;
+    store
+        .conn
+        .execute_batch(&format!(
+            "UPDATE sessions SET account = '444455556666';
+             INSERT INTO live_limits VALUES
+                ('codex', 'aaaabbbbcccc', '', 'session', {ts}, 40, NULL),
+                ('codex', '444455556666', '', 'session', {ts}, 60, NULL),
+                ('codex', '777788889999', '', 'session', {ts}, 10, NULL);"
+        ))
+        .unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[subscriptions]\ncodex = 20 \"ChatGPT Plus\" account=aaaabbbbcccc label=\"Home\"\ncodex = 20 \"ChatGPT Plus\" paid=0 account=444455556666 label=\"Lab\" from=2026-10-01\n",
+    )
+    .unwrap();
+    let out = tmp.path().join("out");
+    export_with_config(&db, &out, Some("4w"), Some(&config));
+    let body = std::fs::read_to_string(out.join(snapshot::VALUE_FILENAME)).unwrap();
+    // The plan lines are shown, by seat number only.
+    assert!(body.contains("ChatGPT Plus, seat 2"));
+    assert!(body.contains("You pay"));
+    for word in ["Lab", "Home"] {
+        assert!(!contains_whole_word(&body, word), "a plan label leaked");
+    }
+    for account in ["aaaabbbbcccc", "444455556666", "777788889999"] {
+        assert!(!body.contains(account), "an account fingerprint leaked");
+    }
+}
+
+#[test]
 fn explicit_windows_write_index_and_only_link_to_their_five_files() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("usage.db");

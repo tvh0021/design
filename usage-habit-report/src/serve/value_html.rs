@@ -143,10 +143,122 @@ fn token_total(u: &crate::query::Tokens) -> f64 {
 }
 
 fn price(t: &ToolValue, p: &ValuePage) -> String {
-    match t.subscription.monthly_usd {
-        Some(c) => format!("{} a month", p.usd(Some(c))),
-        None => "no price set".into(),
+    let sub = &t.subscription;
+    match (sub.monthly_usd, sub.paid_monthly_usd) {
+        (Some(c), Some(paid)) if (c - paid).abs() >= 0.005 => format!(
+            "{} a month at list prices; you pay {}",
+            p.usd(Some(c)),
+            p.usd(Some(paid))
+        ),
+        (Some(c), _) => format!("{} a month", p.usd(Some(c))),
+        (None, _) => "no price set".into(),
     }
+}
+
+/// "ChatGPT Plus, seat 2": how the public page names a plan line. A label
+/// or an account never appears there; locally the label follows.
+fn plan_name(p: &ValuePage, plan: &value::PlanValue) -> String {
+    let mut s = plan.name.clone();
+    if let Some(n) = plan.seat {
+        let _ = write!(s, ", seat {n}");
+    }
+    if !p.audience.is_public()
+        && let Some(label) = &plan.label
+    {
+        let _ = write!(s, " ({label})");
+    }
+    s
+}
+
+/// Each plan line with its prices and dates, when a tool has more than one
+/// or any line is dated or remote.
+fn plans_note(p: &ValuePage, t: &ToolValue) -> String {
+    let plans = &t.subscription.plans;
+    let plain = |l: &value::PlanValue| l.from.is_none() && l.until.is_none() && !l.remote;
+    if plans.len() < 2 && plans.iter().all(plain) {
+        return String::new();
+    }
+    let when = |t: &str| t.replace('T', " ");
+    let lines: Vec<String> = plans
+        .iter()
+        .map(|l| {
+            let mut s = format!("{}: {}", plan_name(p, l), p.usd(l.monthly_usd));
+            if l.paid_monthly_usd != l.monthly_usd {
+                let _ = write!(s, " list, you pay {}", p.usd(l.paid_monthly_usd));
+            }
+            match (&l.from, &l.until) {
+                (Some(a), Some(b)) => {
+                    let _ = write!(s, ", {} to {}", when(a), when(b));
+                }
+                (Some(a), None) => {
+                    let _ = write!(s, ", from {}", when(a));
+                }
+                (None, Some(b)) => {
+                    let _ = write!(s, ", until {}", when(b));
+                }
+                (None, None) => {}
+            }
+            if l.remote {
+                s.push_str(", used on another machine: its price counts here, its use is not in this store");
+            }
+            s
+        })
+        .collect();
+    format!("<p class=\"note\">Plans: {}.</p>", esc(&lines.join("; ")))
+}
+
+/// Seats pooled into a window and readings left out, for one tool.
+fn seats_note(t: &ToolValue) -> String {
+    let mut s = String::new();
+    let seats = t
+        .windows
+        .iter()
+        .filter(|w| w.pool.is_none())
+        .map(|w| w.seats)
+        .max()
+        .unwrap_or(1);
+    if seats > 1 {
+        let _ = write!(
+            s,
+            " Readings come from {seats} seats; each seat's windows are measured on their own and their runs averaged together."
+        );
+    }
+    let left: i64 = t.windows.iter().map(|w| w.unattributed_readings).sum();
+    if left > 0 {
+        let _ = write!(
+            s,
+            " {} older readings are left out: they name no account, and more than one was in use.",
+            fmt_int(left)
+        );
+    }
+    if s.is_empty() {
+        s
+    } else {
+        format!("<p class=\"note\">{}</p>", s.trim_start())
+    }
+}
+
+/// When a tool's price over the pace's days differs from its price now:
+/// that price, and the dates its plans changed within those days.
+fn repriced(r: &ValueReport, t: &ToolValue) -> Option<(f64, Vec<String>)> {
+    let pace = t.pace.as_ref()?;
+    let then = pace.price_usd?;
+    if (then - t.subscription.monthly_usd.unwrap_or(0.0)).abs() < 0.005 {
+        return None;
+    }
+    let since = value::days_before(&r.generated_at, pace.days);
+    let mut dates: Vec<String> = t
+        .subscription
+        .plans
+        .iter()
+        .flat_map(|l| [&l.from, &l.until])
+        .flatten()
+        .filter(|d| since.as_deref().is_none_or(|s| d.as_str() >= s) && **d <= r.generated_at)
+        .map(|d| value::date_of(d).to_owned())
+        .collect();
+    dates.sort();
+    dates.dedup();
+    Some((then, dates))
 }
 
 /// "5 hr", "weekly", "Fable pool, weekly".
@@ -159,6 +271,16 @@ fn window_name(w: &WindowEstimate) -> String {
     match &w.pool {
         Some(pool) => format!("{pool} pool, {base}"),
         None => base,
+    }
+}
+
+/// `window_name`, led by the plan's name when the tool has windows of
+/// several plans: "Google AI Ultra, weekly".
+fn tier_window_name(t: &ToolValue, w: &WindowEstimate) -> String {
+    if t.windows.iter().any(|x| x.plan != w.plan) {
+        format!("{}, {}", w.plan, window_name(w))
+    } else {
+        window_name(w)
     }
 }
 
@@ -199,20 +321,28 @@ fn finding(text: &str, tools: &[ToolValue]) -> String {
 
 fn summary(p: &ValuePage) -> String {
     let r = &p.report;
-    let mut s = String::from("<div class=\"facts\">");
-    // Pools and live limits lead; the headlines repeat the figure and the
-    // table below, and the rest sit by their tables.
-    for (kind, f) in value::tagged_findings(r) {
-        if matches!(kind, Finding::Pool | Finding::Now) {
-            s.push_str(&finding(&f, &r.tools));
+    let mut s = String::new();
+    let alerts: Vec<String> = value::tagged_findings(r)
+        .into_iter()
+        .filter(|(kind, _)| {
+            // Live-limit alerts lead; the accounts finding names accounts, so
+            // it stays local. Pool figures appear in the ledger below.
+            *kind == Finding::Now || (*kind == Finding::Accounts && !p.audience.is_public())
+        })
+        .map(|(_, f)| finding(&f, &r.tools))
+        .collect();
+    if !alerts.is_empty() {
+        s.push_str("<div class=\"facts\">");
+        for a in alerts {
+            s.push_str(&a);
         }
+        s.push_str("</div>");
     }
-    s.push_str("</div>");
     s.push_str(&super::value_svg::value_squares(p));
     let mut table = String::new();
     let _ = write!(
         table,
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 hr</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Last {} days</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\">Price</th><th scope=\"col\">You pay</th><th scope=\"col\">Est. cost a month</th><th scope=\"col\">Times the price</th><th scope=\"col\">Full 5 hr</th><th scope=\"col\">Full week</th><th scope=\"col\">Days</th></tr></thead><tbody>",
         r.pace_days
     );
     for t in &r.tools {
@@ -226,12 +356,14 @@ fn summary(p: &ValuePage) -> String {
         };
         let pace = t.pace.as_ref();
         let multiple = pace.and_then(|p| p.multiple);
+        let mark = if repriced(r, t).is_some() { "*" } else { "" };
         let _ = write!(
             table,
-            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}{mark}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             tool_name(&t.tool),
             esc(&t.subscription.name),
             p.usd(t.subscription.monthly_usd),
+            p.usd(t.subscription.paid_monthly_usd),
             p.usd(pace.and_then(|p| p.monthly_cost_usd)),
             fmt_x(multiple),
             cell(value::main_window(t, "session")),
@@ -242,26 +374,115 @@ fn summary(p: &ValuePage) -> String {
     let c = &r.combined;
     let _ = write!(
         table,
-        "<tr class=\"total\"><th scope=\"row\">All plans</th><td class=\"l\">{} plans</td><td>{}</td><td>{}</td><td>{}</td><td></td><td></td><td></td></tr>",
+        "<tr class=\"total\"><th scope=\"row\">All plans</th><td class=\"l\">{} plans</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td></td><td></td><td></td></tr>",
         c.plans,
         p.usd(Some(c.monthly_usd)),
+        p.usd(Some(c.paid_monthly_usd)),
         p.usd(c.pace_monthly_cost_usd),
         fmt_x(c.pace_multiple)
     );
     table.push_str("</tbody></table></div>");
     s.push_str(&noted(table));
+    let changed: Vec<String> = r
+        .tools
+        .iter()
+        .filter_map(|t| {
+            let (then, dates) = repriced(r, t)?;
+            let mut s = format!("{} {}", t.tool, p.usd(Some(then)));
+            if !dates.is_empty() {
+                let _ = write!(s, ", plans changed {}", dates.join(", "));
+            }
+            Some(s)
+        })
+        .collect();
+    if !changed.is_empty() {
+        let _ = write!(
+            s,
+            "<p class=\"note\">* Times the price uses the list price over the last {} days, each plan weighted by the days it ran: {}.</p>",
+            r.pace_days,
+            esc(&changed.join("; "))
+        );
+    }
     if r.tools.iter().flat_map(|t| &t.windows).any(lower_bound) {
         s.push_str(LOWER_BOUND_NOTE);
     }
+    s.push_str(&model_pools(p));
     s.push_str(&session_shares(&r.tools));
     s
+}
+
+/// Per-model quota pools with measured capacity, grouped by tool, tier and pool.
+fn model_pools(p: &ValuePage) -> String {
+    type PoolRow<'a> = (
+        &'a str,
+        usize,
+        &'a str,
+        &'a str,
+        Option<&'a Capacity>,
+        Option<&'a Capacity>,
+    );
+    let mut rows: Vec<PoolRow<'_>> = Vec::new();
+    for t in &p.report.tools {
+        let mut tier_idx = 0usize;
+        for (i, w) in t.windows.iter().enumerate() {
+            if i > 0 && w.pool.is_none() && w.window == "session" {
+                tier_idx += 1;
+            }
+            let (Some(pool), Some(cap)) = (w.pool.as_deref(), w.per_window.as_ref()) else {
+                continue;
+            };
+            let entry = match rows
+                .iter_mut()
+                .find(|r| r.0 == t.tool && r.1 == tier_idx && r.2 == w.plan && r.3 == pool)
+            {
+                Some(e) => e,
+                None => {
+                    rows.push((t.tool.as_str(), tier_idx, w.plan.as_str(), pool, None, None));
+                    rows.last_mut().unwrap()
+                }
+            };
+            if w.window == "weekly" {
+                entry.5 = Some(cap);
+            } else {
+                entry.4 = Some(cap);
+            }
+        }
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut table = String::from(
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>Model pools</caption><thead><tr><th scope=\"col\">Tool</th><th scope=\"col\" class=\"l\">Plan</th><th scope=\"col\" class=\"l\">Pool</th><th scope=\"col\">Full 5 hr</th><th scope=\"col\">Full week</th></tr></thead><tbody>",
+    );
+    let cell = |cap: Option<&Capacity>| match cap {
+        Some(c) => format!("<td>{}</td>", p.usd(c.estimated_cost_usd)),
+        None => "<td></td>".into(),
+    };
+    for (tool, _, plan, pool, session, weekly) in rows {
+        let _ = write!(
+            table,
+            "<tr><th scope=\"row\">{}</th><td class=\"l\">{}</td><td class=\"l\">{}</td>{}{}</tr>",
+            tool_name(tool),
+            esc(plan),
+            esc(pool),
+            cell(session),
+            cell(weekly),
+        );
+    }
+    table.push_str("</tbody></table></div>");
+    noted(table)
 }
 
 /// Weekly limit over session limit: how many full sessions one week holds.
 fn session_shares(tools: &[value::ToolValue]) -> String {
     let rows: Vec<_> = tools
         .iter()
-        .flat_map(|t| t.session_shares.iter().map(move |s| (t, s)))
+        .flat_map(|t| {
+            t.session_shares
+                .iter()
+                .filter(|s| s.windows > 0)
+                .map(move |s| (t, s))
+        })
         .collect();
     if rows.is_empty() {
         return String::new();
@@ -271,13 +492,19 @@ fn session_shares(tools: &[value::ToolValue]) -> String {
     );
     let mut pool_only = false;
     for (t, sh) in rows {
-        let limit = match (&sh.session_pool, &sh.weekly_pool) {
+        let multi_plan = t.windows.iter().any(|w| w.plan != sh.plan);
+        let base = match (&sh.session_pool, &sh.weekly_pool) {
             (Some(p), _) => format!("{p} pool"),
             (None, Some(w)) => {
                 pool_only = true;
                 format!("{w} weekly, {w} use only")
             }
             (None, None) => "Plan".to_owned(),
+        };
+        let limit = if multi_plan && (sh.session_pool.is_some() || sh.weekly_pool.is_some()) {
+            format!("{}, {base}", sh.plan)
+        } else {
+            base
         };
         let (ratio, share) = match sh.weekly_percent.filter(|v| *v > 0.0) {
             Some(v) => (format!("{:.1}", 100.0 / v), format!("{v:.0} % of the week")),
@@ -312,13 +539,18 @@ fn lower_bound(w: &WindowEstimate) -> bool {
 
 const LOWER_BOUND_NOTE: &str = "<p class=\"note\">&ge; marks a window never seen full: the busiest window of that length, a lower bound.</p>";
 
-fn runs_table(p: &ValuePage, w: &WindowEstimate, labels: &[(String, String)]) -> String {
+fn runs_table(
+    p: &ValuePage,
+    t: &ToolValue,
+    w: &WindowEstimate,
+    labels: &[(String, String)],
+) -> String {
     if w.runs.is_empty() {
         return String::new();
     }
     let mut s = format!(
         "<div class=\"table-wrap\"><table class=\"ledger quiet\"><caption>{} window</caption><thead><tr><th scope=\"col\">Start</th><th scope=\"col\">End</th><th scope=\"col\">From</th><th scope=\"col\">To</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th><th scope=\"col\">Per full window</th></tr></thead><tbody>",
-        esc(&capitalised(&window_name(w)))
+        esc(&capitalised(&tier_window_name(t, w)))
     );
     for (r, (start, end)) in w.runs.iter().zip(labels) {
         let Run {
@@ -349,7 +581,7 @@ fn drift_section(t: &ToolValue) -> String {
         .filter(|w| w.pool.is_none())
         .map(|w| super::value_svg::WindowPanel {
             window: w,
-            name: window_name(w),
+            name: tier_window_name(t, w),
             sentence: value::drift_sentence(t, w),
         })
         .collect();
@@ -406,14 +638,33 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
         .iter()
         .filter_map(|m| m.multiple)
         .fold(0.0, f64::max);
+    // The month's own price, when any month's differs from the price now.
+    let priced = t
+        .months
+        .iter()
+        .any(|m| m.price_usd != t.subscription.monthly_usd || m.paid_usd != m.price_usd);
     let mut s = format!(
-        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>By month</caption><thead><tr><th scope=\"col\">Month</th><th scope=\"col\">Days</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th>{}<th scope=\"col\">Times the price</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Times the price, as a bar</span></th><th scope=\"col\">Whole-month pace</th></tr></thead><tbody>",
+        "<div class=\"table-wrap\"><table class=\"ledger\"><caption>By month</caption><thead><tr><th scope=\"col\">Month</th><th scope=\"col\">Days</th><th scope=\"col\">Tokens</th><th scope=\"col\">Est. cost</th>{}{}<th scope=\"col\">Times the price</th><th scope=\"col\" class=\"l\"><span class=\"sr\">Times the price, as a bar</span></th><th scope=\"col\">Whole-month pace</th></tr></thead><tbody>",
         if credits {
             "<th scope=\"col\">Paid with credits</th>"
         } else {
             ""
+        },
+        if priced {
+            "<th scope=\"col\">Price</th><th scope=\"col\">You pay</th>"
+        } else {
+            ""
         }
     );
+    let price_cells = |m: Option<&MonthValue>| match (priced, m) {
+        (false, _) => String::new(),
+        (true, Some(m)) => format!(
+            "<td>{}</td><td>{}</td>",
+            p.usd(m.price_usd),
+            p.usd(m.paid_usd)
+        ),
+        (true, None) => "<td></td><td></td>".into(),
+    };
     let credit_cell = |m: Option<&MonthValue>| {
         if !credits {
             return String::new();
@@ -430,7 +681,7 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
         let u = &m.usage;
         let _ = write!(
             s,
-            "<tr><th scope=\"row\">{}{}</th><td>{:.0}</td><td>{}</td><td>{}{}</td>{}<td>{}</td><td class=\"bar\">{}</td><td>{}</td></tr>",
+            "<tr><th scope=\"row\">{}{}</th><td>{:.0}</td><td>{}</td><td>{}{}</td>{}{}<td>{}</td><td class=\"bar\">{}</td><td>{}</td></tr>",
             esc(&m.month),
             if m.complete { "" } else { " (partial)" },
             m.days_covered,
@@ -442,6 +693,7 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
                 ""
             },
             credit_cell(Some(m)),
+            price_cells(Some(m)),
             fmt_x(m.multiple),
             bar(m.multiple, max, &t.tool),
             if m.complete {
@@ -456,10 +708,11 @@ fn months_table(p: &ValuePage, t: &ToolValue) -> String {
     {
         let _ = write!(
             s,
-            "<tr class=\"total\"><th scope=\"row\">{}</th><td></td><td></td><td>{}</td>{}<td>{}</td><td></td><td></td></tr>",
+            "<tr class=\"total\"><th scope=\"row\">{}</th><td></td><td></td><td>{}</td>{}{}<td>{}</td><td></td><td></td></tr>",
             mean_label(t.complete_months, t.months.len()),
             p.usd(Some(c)),
             credit_cell(None),
+            price_cells(None),
             fmt_x(Some(x))
         );
     }
@@ -501,6 +754,8 @@ fn source_note(p: &ValuePage, t: &ToolValue) -> String {
 
 fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
     let mut body = format!("<p class=\"note\">{}</p>", source_note(p, t));
+    body.push_str(&plans_note(p, t));
+    body.push_str(&seats_note(t));
     body.push_str("<div class=\"stack\">");
     body.push_str(&drift_section(t));
     body.push_str(&credits_note(p, t));
@@ -512,6 +767,7 @@ fn tool_section(p: &ValuePage, i: usize, t: &ToolValue) -> String {
         .map(|(j, w)| {
             runs_table(
                 p,
+                t,
                 w,
                 p.run_labels
                     .get(i)
@@ -594,7 +850,7 @@ pub fn render(p: &ValuePage) -> String {
     s.push_str(&section(
         "value",
         "What each plan buys",
-        "Est. cost prices each request at API list rates. Times the price is that cost over the plan's price.",
+        "Est. cost prices each request at API list rates. Times the price is the cost of use while a plan ran, over the plan's price.",
         &body,
     ));
     for (i, t) in p.report.tools.iter().enumerate() {
@@ -618,4 +874,214 @@ pub fn render(p: &ValuePage) -> String {
     );
     s.push_str("</p>\n</footer>\n</body>\n</html>\n");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{Combined, Latest, SessionShare, Subscription};
+
+    fn page(tools: Vec<ToolValue>, audience: Audience) -> ValuePage {
+        ValuePage {
+            audience,
+            now_label: "Wed 18 Nov 2026, 20:00".into(),
+            tz_label: "UTC-05:00".into(),
+            facts: StoreFacts {
+                sessions: 10,
+                requests: 100,
+                first_ts_ms: None,
+                last_ts_ms: None,
+            },
+            report: ValueReport {
+                generated_at: "2026-11-19T01:00:00Z".into(),
+                min_rise_percent: 20.0,
+                runs_averaged: 10,
+                tools,
+                pace_days: 28,
+                combined: Combined {
+                    plans: 1,
+                    monthly_usd: 200.0,
+                    paid_monthly_usd: 0.0,
+                    pace_plans: 1,
+                    pace_price_usd: Some(200.0),
+                    pace_paid_usd: Some(0.0),
+                    pace_monthly_cost_usd: Some(500.0),
+                    pace_multiple: Some(2.5),
+                    pace_paid_multiple: None,
+                },
+            },
+            run_labels: vec![],
+            rates_fetched_at: None,
+            load_ms: 1.0,
+        }
+    }
+
+    fn cap(cost: f64) -> Capacity {
+        Capacity {
+            tokens: 1_000_000.0,
+            estimated_cost_usd: Some(cost),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pools_render_as_a_ledger_without_facts_prose_and_empty_shares_drop() {
+        let pool_win = |plan: &str, pool: &str, window: &str, cost: Option<f64>| WindowEstimate {
+            plan: plan.into(),
+            pool: Some(pool.into()),
+            window: window.into(),
+            window_hours: if window == "weekly" { 168 } else { 5 },
+            per_window: cost.map(cap),
+            ..Default::default()
+        };
+        let ag = ToolValue {
+            tool: "antigravity".into(),
+            subscription: Subscription {
+                name: "Tier <Plus> + Pro".into(),
+                monthly_usd: Some(219.99),
+                paid_monthly_usd: Some(19.99),
+                plans: vec![],
+            },
+            windows: vec![
+                WindowEstimate {
+                    plan: "Tier <Plus>".into(),
+                    window: "session".into(),
+                    window_hours: 5,
+                    ..Default::default()
+                },
+                pool_win("Tier <Plus>", "Pool <A>", "session", Some(204.0)),
+                pool_win("Tier <Plus>", "Pool <A>", "weekly", Some(718.0)),
+                pool_win("Pro", "Argon", "weekly", Some(14.0)),
+            ],
+            session_shares: vec![
+                SessionShare {
+                    plan: "Pro".into(),
+                    session_pool: Some("Gemini".into()),
+                    weekly_pool: Some("Gemini".into()),
+                    windows: 0,
+                    weekly_percent: None,
+                },
+                SessionShare {
+                    plan: "Tier <Plus>".into(),
+                    session_pool: Some("Pool <A>".into()),
+                    weekly_pool: Some("Pool <A>".into()),
+                    windows: 4,
+                    weekly_percent: Some(10.0),
+                },
+            ],
+            ..Default::default()
+        };
+        let p = page(vec![ag], Audience::Private);
+        let html = summary(&p);
+
+        // No live/account alerts -> no `.facts` prose block.
+        assert!(!html.contains("<div class=\"facts\">"), "{html}");
+        // Model pools ledger groups session + weekly per (tool, plan, pool) and escapes HTML.
+        assert!(html.contains("<caption>Model pools</caption>"), "{html}");
+        assert!(
+            html.contains("<td class=\"l\">Tier &lt;Plus&gt;</td><td class=\"l\">Pool &lt;A&gt;</td><td>$204.00</td><td>$718.00</td>"),
+            "{html}"
+        );
+        // Weekly-only pool leaves Full 5 hr empty (not `*`) without triggering false "Not enough data".
+        assert!(
+            html.contains(
+                "<td class=\"l\">Pro</td><td class=\"l\">Argon</td><td></td><td>$14.00</td>"
+            ),
+            "{html}"
+        );
+        // Zero-window session share is omitted; multi-plan pool share carries its plan prefix.
+        assert!(!html.contains("Gemini pool"), "{html}");
+        assert!(
+            html.contains("<td class=\"l\">Tier &lt;Plus&gt;, Pool &lt;A&gt; pool</td>"),
+            "{html}"
+        );
+
+        // With a live exhausted alert, `.facts` appears and stays free of pool summaries.
+        let mut alert_ag = p.report.tools[0].clone();
+        alert_ag.windows[0].live_readings = 2;
+        alert_ag.windows[0].latest = Some(Latest {
+            at: "2026-11-19T00:00:00Z".into(),
+            used_percent: 100.0,
+            resets_at: Some("2026-11-19T05:00:00Z".into()),
+            live: true,
+        });
+        let alert_html = summary(&page(vec![alert_ag], Audience::Private));
+        assert!(alert_html.contains("<div class=\"facts\">"), "{alert_html}");
+        assert!(alert_html.contains("100 % used"), "{alert_html}");
+        assert!(!alert_html.contains("per 5-hour window"), "{alert_html}");
+    }
+
+    #[test]
+    fn same_name_tiers_render_separate_model_pool_rows() {
+        let pool_win = |plan: &str, window: &str, cost: f64| WindowEstimate {
+            plan: plan.into(),
+            pool: Some("Gemini".into()),
+            window: window.into(),
+            window_hours: if window == "weekly" { 168 } else { 5 },
+            per_window: Some(cap(cost)),
+            ..Default::default()
+        };
+        let tier_win = |plan: &str, window: &str| WindowEstimate {
+            plan: plan.into(),
+            window: window.into(),
+            window_hours: if window == "weekly" { 168 } else { 5 },
+            ..Default::default()
+        };
+        let ag = ToolValue {
+            tool: "antigravity".into(),
+            windows: vec![
+                tier_win("Google AI", "session"),
+                tier_win("Google AI", "weekly"),
+                pool_win("Google AI", "session", 10.0),
+                tier_win("Google AI", "session"),
+                tier_win("Google AI", "weekly"),
+                pool_win("Google AI", "weekly", 30.0),
+            ],
+            ..Default::default()
+        };
+        let html = summary(&page(vec![ag], Audience::Private));
+        assert!(
+            html.contains(
+                "<td class=\"l\">Google AI</td><td class=\"l\">Gemini</td><td>$10.00</td><td></td>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<td class=\"l\">Google AI</td><td class=\"l\">Gemini</td><td></td><td>$30.00</td>"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_tiny_weighted_price_draws_a_bounded_stack() {
+        let t = ToolValue {
+            tool: "codex".into(),
+            pace: Some(crate::value::Pace {
+                days: 28.0,
+                monthly_cost_usd: Some(500.0),
+                multiple: Some(5000.0),
+                price_usd: Some(0.1),
+                paid_usd: Some(0.1),
+                plans: 1,
+            }),
+            ..Default::default()
+        };
+        let svg = super::super::value_svg::value_squares(&page(vec![t.clone()], Audience::Private));
+        assert!(svg.matches("<rect").count() <= 60, "{svg}");
+        assert!(!svg.contains("=\"-"), "{svg}");
+        assert!(svg.contains("5000.0x the price, 60 drawn"), "{svg}");
+        // The public page rounds $6.04 to $6; blocks and cap follow 60.4x.
+        let mut t = t.clone();
+        t.pace = Some(crate::value::Pace {
+            monthly_cost_usd: Some(6.04),
+            multiple: Some(60.4),
+            ..t.pace.unwrap()
+        });
+        let mut p = page(vec![t], Audience::Private);
+        p.round_costs();
+        let svg = super::super::value_svg::value_squares(&p);
+        assert!(svg.contains("60.4x the price, 60 drawn"), "{svg}");
+    }
 }

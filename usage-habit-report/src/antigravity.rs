@@ -634,6 +634,7 @@ fn scan_db(store: &mut Store, db: &Path, st: &mut AntigravityStats) -> Result<()
                 .iter()
                 .filter(|&&i| i >= offset)
                 .count() as i64,
+            account: None,
         },
     )?;
     if let (false, Some(label)) = (is_subagent, conv.label) {

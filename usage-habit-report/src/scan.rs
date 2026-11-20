@@ -145,6 +145,7 @@ fn scan_file(
                 started_at_ms: chunk.started_at_ms,
                 ended_at_ms: chunk.ended_at_ms,
                 user_turns: chunk.user_turns,
+                account: None,
             },
         )?;
         if let (false, Some(label)) = (kind.is_subagent, chunk.label) {

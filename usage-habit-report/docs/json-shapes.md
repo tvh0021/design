@@ -182,14 +182,18 @@ own transcript, not its subagents.
 | `min_rise_percent` | number (20) |
 | `runs_averaged` | integer (10) |
 | `pace_days` | integer (28) |
-| `combined` | `{ plans: integer, monthly_usd: number, pace_monthly_cost_usd: number?, pace_multiple: number? }` over the priced plans |
+| `combined` | `{ plans: integer, monthly_usd: number, paid_monthly_usd: number, pace_plans: integer, pace_price_usd: number?, pace_paid_usd: number?, pace_monthly_cost_usd: number?, pace_multiple: number?, pace_paid_multiple: number? }`: `plans` counts plan lines running now with a list price; `monthly_usd` and `paid_monthly_usd` add up their list and paid prices; the pace fields (`pace_plans` included, which may count a plan retired within the pace days) add up the tools whose `pace.price_usd` is above zero and whose `pace.monthly_cost_usd` is set (the same tools the value page's blocks draw), and the multiples divide the pace cost by `pace_price_usd` and `pace_paid_usd` |
 | `tools[]` | one entry per tool, in tool order |
 | `tools[].tool` | string |
-| `tools[].subscription` | `{ name: string, monthly_usd: number? }` |
+| `tools[].subscription` | `{ name: string, monthly_usd: number?, paid_monthly_usd: number?, plans[] }`: `name` joins the plans running now by tier (`"ChatGPT Plus × 2"`, `"Google AI Pro + Google AI Ultra"`); the prices add up the plans running now |
+| `tools[].subscription.plans[]` | one per `[subscriptions]` line (or the default): `name: string`, `monthly_usd`, `paid_monthly_usd: number?`, `seat: integer?` (1, 2, ... within a tier of several lines), `account`, `label: string?`, `from`, `until: string?` (local `YYYY-MM-DDTHH:MM`, `until` exclusive), `remote`, `active: boolean` |
+| `tools[].unplanned_accounts` | string[], accounts read in the last `pace_days` days at times no plan line names them (only when some line names an account, or two accounts were read) |
 | `tools[].limit_source` | `"readings"` (logged), `"live"` (only `limits record`), `"rejections"` or `"none"` |
 | `tools[].reference_model` | string? (costliest model of the last `pace_days` days, else of all time) |
 | `tools[].first_request`, `tools[].last_request` | string? |
-| `tools[].windows[]` | `session`, `weekly`, then one per live pool and window |
+| `tools[].windows[]` | per tier running now, read or not, then per ended tier with readings (the first plan when there are neither): `session`, `weekly`, then one per pool and window |
+| `tools[].windows[].plan` | string, the tier's plan name |
+| `tools[].windows[].seats` | integer, accounts whose readings are pooled here |
 | `tools[].windows[].window` | string |
 | `tools[].windows[].window_hours` | integer (5 or 168) |
 | `tools[].windows[].pool` | string? (`"Fable"`, `"Gemini"`; null for the plan's own window) |
@@ -197,20 +201,28 @@ own transcript, not its subagents.
 | `tools[].windows[].readings` | integer, limit samples seen for the window, logged and live |
 | `tools[].windows[].live_readings` | integer, of `readings`, those from `limits record` |
 | `tools[].windows[].first_reading`, `last_reading` | string? |
-| `tools[].windows[].latest` | `{ at: string, used_percent: number, resets_at: string? }?`, the newest reading |
+| `tools[].windows[].latest` | `{ at: string, used_percent: number, resets_at: string?, live: boolean }?`, the newest reading of any seat; `live` when `limits record` sampled it |
+| `tools[].windows[].latest_by_seat[]` | `{ seat: integer?, account: string?, label: string?, at: string, used_percent: number, resets_at: string?, live: boolean }`, each account's newest reading |
+| `tools[].windows[].unattributed_readings` | integer, limit readings (not requests) left out because they name no account and several were in use. Counted once per tool, on the tier of the first local plan line running now (else the first tier listed); 0 on the others |
 | `tools[].windows[].qualifying_runs` | integer, runs rising at least `min_rise_percent` |
 | `tools[].windows[].runs[]` | the runs averaged, largest rise first: `start`, `end` (timestamps), `from_percent`, `to_percent`, `rise_percent` (numbers), `readings`, `sessions` (integers), Tokens, `per_window: Capacity` |
 | `tools[].windows[].per_window` | Capacity? (mean of `runs[]`; `null` with no runs) |
 | `tools[].windows[].spread` | `{ cost_min, cost_median, cost_max: number?, tokens_min, tokens_median, tokens_max: number }?` over `runs[]` |
 | `tools[].windows[].drift[]` | `month: "YYYY-MM"`, `runs: integer`, `per_window: Capacity` (mean of every qualifying run that started that month), `main_model: string?`, `main_model_share: number?` (share of the month's run cost) |
-| `tools[].windows[].lower_bound` | Capacity? (busiest sliding window; set only when `per_window` is null and requests exist) |
+| `tools[].windows[].lower_bound` | Capacity? (busiest sliding window of any one seat, over requests made while the tier's plan ran; set only when `per_window` is null and such requests exist) |
 | `tools[].windows[].utilization` | `{ windows, exhausted, cut_short, mean_peak_percent: number?, mid_window_resets, by_month: [{ month, windows, exhausted, cut_short, mean_peak_percent }] }?` over closed windows |
-| `tools[].months[]` | Tokens plus `month: "YYYY-MM"`, `complete: boolean`, `days_covered: number`, `multiple: number?` (plan-covered cost over the plan price), `projected_cost_usd: number?` (partial months at their pace), `credit_funded_cost_usd: number?` |
+| `tools[].months[]` | Tokens plus `month: "YYYY-MM"`, `complete: boolean`, `days_covered: number`, `multiple: number?` (plan-covered cost over `price_usd`; the Tokens fields count every request), `price_usd`, `paid_usd: number?` (list and paid price, each plan line weighted by the share of the month it ran), `projected_cost_usd: number?` (partial months at their pace), `credit_funded_cost_usd: number?` |
 | `tools[].complete_months` | integer |
 | `tools[].mean_monthly_cost_usd` | number? |
 | `tools[].mean_multiple` | number? |
-| `tools[].pace` | `{ days: number, monthly_cost_usd: number?, multiple: number? }?` |
-| `tools[].credits` | `{ first_at, last_at: string, first_balance, last_balance, spent, spent_at_limit, spent_near_resets, added: number, credit_funded: Tokens }?` (Codex) |
+| `tools[].pace` | `{ days: number, monthly_cost_usd: number?, multiple: number?, price_usd: number?, paid_usd: number?, plans: integer }?`; `monthly_cost_usd` is plan-covered cost as in `months[].multiple`; prices weighted as in `months[]` over the same days, `plans` counts plan lines with a list price that ran any of them, and `multiple` is over `price_usd` |
+| `tools[].credits` | `{ first_at, last_at: string, first_balance, last_balance, spent, spent_at_limit, spent_near_resets, added: number, credit_funded: Tokens }?` (Codex; each account's balance followed on its own, then added up) |
+| `tools[].session_shares[]` | `{ plan: string, session_pool, weekly_pool: string?, windows: integer, weekly_percent: number? }`, per tier |
+
+*Plan-covered cost* counts requests made while a plan line of their account ran, less
+credit-funded ones. A request whose account can't be told counts when any local
+plan line of the tool was running. It is null when covered use exists but none of it
+is priced, and 0 when there is no covered use while other use is priced.
 
 `Capacity` is `{ tokens, billable_tokens, requests, sessions, output_tokens,
 estimated_cost_usd, reference_cost_usd }`, all numbers scaled to one whole
@@ -221,7 +233,11 @@ and the first month seen. The mean fields cover complete months, or every
 month when none is complete. `mean_peak_percent` covers only windows that
 ran to their reset time; `cut_short` counts those a mid-window reset ended.
 Credit-funded requests (made while a window read 100 % and the balance fell)
-are left out of `multiple` and `pace`.
+are left out of `multiple` and `pace`; each account's credit spans cover only
+its own requests. Runs, utilization, resets and session shares come from one
+account's readings at a time; the runs of a tier's seats are then ranked
+together. `account` and `label` are private: the public `value.html` never
+shows them.
 
 ## `query models`
 

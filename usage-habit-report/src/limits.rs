@@ -9,13 +9,14 @@
 //!
 //! Readings land in `live_limits`, which no log can rebuild, so `rebuild`
 //! leaves the table alone. `--local` keeps them to this machine's accounts:
-//! with a hosts config, plain `ai-usage` also lists other machines, whose
-//! accounts (a second Antigravity sign-in, say) would mix into one series.
+//! with a hosts config, plain `ai-usage` also lists other machines. Each
+//! reading carries the provider's account fingerprint, so two sign-ins to one
+//! tool on this machine (two ChatGPT Plus seats) stay two series.
 
 use crate::store::{self, LiveLimit, Store};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Providers worth sampling; ChatLLM and Zed have no plan in the value report.
@@ -24,6 +25,9 @@ pub const PROVIDERS: [&str; 3] = ["claude", "codex", "antigravity"];
 #[derive(Deserialize)]
 struct Provider {
     provider: String,
+    /// `ai-usage`'s fingerprint of the signed-in account; null when unknown.
+    #[serde(default)]
+    account: Option<String>,
     #[serde(default)]
     windows: Vec<Window>,
     /// Set when the provider could not be read, e.g. an expired login.
@@ -84,6 +88,12 @@ pub fn parse(json: &str, ts_ms: i64) -> Result<Parsed> {
             skipped.push((tool, note.trim().to_owned()));
             continue;
         }
+        let account = p.account.as_deref().map(str::trim).unwrap_or_default();
+        let account = if account.len() == 12 && account.bytes().all(|b| b.is_ascii_hexdigit()) {
+            account.to_ascii_lowercase()
+        } else {
+            String::new()
+        };
         for w in p.windows {
             let Some(pct) = w.used_percent.filter(|p| p.is_finite()) else {
                 continue;
@@ -100,6 +110,7 @@ pub fn parse(json: &str, ts_ms: i64) -> Result<Parsed> {
                 .map(|t| (t.timestamp_millis() + 500).div_euclid(1000) * 1000);
             out.push(LiveLimit {
                 tool: tool.to_owned(),
+                account: account.clone(),
                 pool: w.pool.unwrap_or_default().trim().to_owned(),
                 window,
                 ts_ms,
@@ -147,17 +158,26 @@ pub fn fetch() -> Result<String> {
 
 /// Store one sample; returns a one-line summary such as
 /// `limits: 10 readings (antigravity 5, claude-code 3, codex 2)`, followed by
-/// `; skipped claude-code: <reason>` for each provider left out.
+/// `; skipped claude-code: <reason>` for each provider left out. A tool read
+/// for more than one account reads `codex 4 (2 accounts)`.
 pub fn record(store: &mut Store, json: &str, ts_ms: i64) -> Result<String> {
     let Parsed { readings, skipped } = parse(json, ts_ms)?;
     let tx = store.conn.transaction()?;
     let n = store::record_live_limits(&tx, &readings)?;
     tx.commit()?;
-    let mut by_tool: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_tool: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
     for r in &readings {
-        *by_tool.entry(r.tool.as_str()).or_default() += 1;
+        let e = by_tool.entry(r.tool.as_str()).or_default();
+        e.0 += 1;
+        e.1.insert(r.account.as_str());
     }
-    let parts: Vec<String> = by_tool.iter().map(|(t, n)| format!("{t} {n}")).collect();
+    let parts: Vec<String> = by_tool
+        .iter()
+        .map(|(t, (n, accounts))| match accounts.len() {
+            1 => format!("{t} {n}"),
+            k => format!("{t} {n} ({k} accounts)"),
+        })
+        .collect();
     let mut line = format!(
         "limits: {n} readings at {} ({})",
         crate::query::rfc3339(ts_ms),
@@ -244,6 +264,7 @@ mod tests {
         let r = r.readings;
         assert_eq!(r.len(), 1);
         assert_eq!((r[0].tool.as_str(), r[0].window), ("codex", "weekly"));
+        assert_eq!(r[0].account, "0123456789ab");
     }
 
     #[test]
@@ -261,6 +282,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM live_limits", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn two_accounts_of_one_tool_keep_separate_rows() {
+        let json = r#"[
+          {"provider":"Codex","account":"AAAABBBBCCCC","windows":[
+            {"used_percent":74.0,"window_seconds":18000},{"used_percent":73.0,"window_seconds":604800}]},
+          {"provider":"Codex","account":"444455556666","windows":[
+            {"used_percent":8.0,"window_seconds":18000},{"used_percent":46.0,"window_seconds":604800}]}
+        ]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("usage.db")).unwrap();
+        let line = record(&mut store, json, 5_000).unwrap();
+        assert_eq!(
+            line,
+            "limits: 4 readings at 1970-01-01T00:00:05Z (codex 4 (2 accounts))"
+        );
+        let rows: Vec<(String, String, f64)> = store
+            .conn
+            .prepare("SELECT account, window, used_percent FROM live_limits ORDER BY 1, 2")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("444455556666", "session", 8.0),
+                ("444455556666", "weekly", 46.0),
+                ("aaaabbbbcccc", "session", 74.0),
+                ("aaaabbbbcccc", "weekly", 73.0),
+            ]
+            .map(|(a, w, p)| (a.to_owned(), w.to_owned(), p))
+        );
     }
 
     #[test]

@@ -265,6 +265,7 @@ impl Chunk {
             resets_at_ms: info.resets_at.map(|s| s * 1000),
             kind: "rejected",
             credits_balance: None,
+            account: None,
         });
     }
 
@@ -410,6 +411,7 @@ mod tests {
                     resets_at_ms: Some(1_792_592_400_000),
                     kind: "rejected",
                     credits_balance: None,
+                    account: None,
                 },
                 LimitSample {
                     ts_ms: 1_792_579_741_000,
@@ -418,6 +420,7 @@ mod tests {
                     resets_at_ms: Some(1_793_000_000_000),
                     kind: "rejected",
                     credits_balance: None,
+                    account: None,
                 },
             ]
         );

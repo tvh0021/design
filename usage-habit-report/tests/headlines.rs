@@ -144,11 +144,11 @@ fn v8_migration_preserves_usage_labels_and_cursors() {
     s.conn.execute_batch("INSERT INTO sources(id,tool,path,offset) VALUES (1,'codex','/home/demo/rollout.jsonl',123);
         INSERT INTO codex_cursors VALUES (1,'{}');
         INSERT INTO session_labels VALUES ('claude-code','plain','coding',0);
-        ALTER TABLE sessions DROP COLUMN display_title; ALTER TABLE sessions DROP COLUMN title_source;
-        DROP TABLE limit_samples; DROP TABLE live_limits; DROP TABLE session_titles; PRAGMA user_version=8;").unwrap();
+        ALTER TABLE sessions DROP COLUMN display_title; ALTER TABLE sessions DROP COLUMN title_source; ALTER TABLE sessions DROP COLUMN account;
+        DROP TABLE limit_samples; DROP TABLE live_limits; DROP TABLE session_titles; DROP TABLE codex_account_backfill; PRAGMA user_version=8;").unwrap();
     drop(s);
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 12);
+    assert_eq!(s.schema_version().unwrap(), 13);
     assert!(titles(&s).iter().all(|(_, _, source)| !source.is_empty()));
     headlines::refresh(&mut s.conn, &sources()).unwrap();
     // v9 keeps the Codex offset and cursor; v10 and v11 then schedule one
@@ -259,11 +259,27 @@ fn scan_refreshes_rename_without_rollout_reads_and_rebuild_agrees() {
         Some("Renamed demo parser".into()),
         "codex-name".into()
     )));
+    // A queued account backfill for a source that rebuild clears must not outlive it.
+    let s = Store::open(&tmp.path().join("usage.db")).unwrap();
+    s.conn
+        .execute_batch(
+            "INSERT INTO sources (id, tool, path) VALUES (999, 'codex', '/gone/rollout.jsonl');
+             INSERT INTO codex_account_backfill VALUES (999);",
+        )
+        .unwrap();
+    drop(s);
     command(tmp.path(), &["rebuild", "--codex-dir", cxstr]);
-    assert_eq!(
-        before,
-        titles(&Store::open(&tmp.path().join("usage.db")).unwrap())
-    );
+    let s = Store::open(&tmp.path().join("usage.db")).unwrap();
+    assert_eq!(before, titles(&s));
+    let orphans: i64 = s
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM codex_account_backfill WHERE source_id = 999",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0);
 }
 #[test]
 fn cli_note_is_single_aggregate_line() {

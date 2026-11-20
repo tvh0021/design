@@ -203,15 +203,29 @@ styles of the main page and adds nothing new. Its controls carry one group,
 "Page", that links the two pages; the current one is underlined and carries
 `aria-current="page"`. Top to bottom:
 
-1. `section#value`: one sentence of method, the combined headline and any
-   pool or live-limit finding in `.facts` (a leading tool name takes the tool's
-   hue), then a ledger with a row per tool at its recent pace (plan, price,
-   estimated cost a month, times the price with a count bar, the per-window
-   costs, days of history), a total row, and one note on `≥`. Each tool's
-   own headline is left out because the ledger already says it.
-2. One `section#value-<tool>` per tool: a one-line note (price, request
-   dates, logged and live readings), the per-window ledger (`≥` lower bounds;
-   pools follow the plan's own windows), then in a `.stack`: per window a
+1. `section#value`: one sentence of method, any live-limit alert (locally,
+   also the finding on accounts no plan line names) in `.facts` when an alert
+   is present (a leading tool name takes the tool's hue), then the value
+   squares (each tool's blocks sized by its list price over the pace's days,
+   at most 60 blocks a tool with the exact multiple in its label, and a "you
+   pay" line where it differs), then a ledger with a row per tool
+   at its recent pace (plan: the tiers running now, such as "ChatGPT Plus × 2";
+   price: their list price now; you pay; estimated cost a month; times the
+   price over the list price of the pace's days; the per-window costs, from a
+   local running tier first, then remote running or historical fallback; days
+   of history), a total row with both prices, one note on `≥`, a `*` note
+   naming each tool whose list price over the pace's days differs from its
+   price now with the dates its plans changed, and then a `Model pools` ledger
+   summarizing measured per-model quota pools by tool, plan, and pool (`Full 5
+   hr` and `Full week`), followed by the `Weekly limit / session limit` ledger.
+   Each tool's own headline is left out because the ledger already says it.
+2. One `section#value-<tool>` per tool, titled by its tiers: a one-line note
+   (price, request dates, logged and live readings); with several plan lines
+   or a dated or remote one, a note listing each line with its prices and
+   dates (a remote plan: its price counts, its use is not in this store);
+   a note on pooled seats and readings left out; the per-window ledger (`≥`
+   lower bounds; pools follow the plan's own windows; with several tiers,
+   each window is named by its plan), then in a `.stack`: per window a
    drift sentence and table when two or more months qualify, with two count
    bars per row (cost at the month's prices and at the reference model's,
    on one scale); the closed-windows table, whose mean-peak column is a
@@ -226,6 +240,18 @@ styles of the main page and adds nothing new. Its controls carry one group,
 
 The utilization and credits findings are left off the page, since their
 tables carry the same figures; the text report and MCP still print them.
+
+A figure with several windows (two plans make four) switches between them
+with radio tabs and no script: input n shows panel n and marks label n.
+`dashboard.css` spells the rules out for up to eight panels. Past eight, the
+renderer gives the rest no tab: they follow the tabbed panel, always shown
+under their own name, so none is hidden for want of a rule. The tab strip
+wraps on narrow screens. Plan names in tab labels and SVG titles are escaped.
+
+Plan line labels and account fingerprints never reach the public page; it
+names seats "seat 1", "seat 2". The privacy guard skips needles under 12
+characters, so the renderer itself keeps them out: `plan_name` adds a label
+only for the local audience, and the accounts finding renders only locally.
 
 No activity map, so the page carries no script.
 
