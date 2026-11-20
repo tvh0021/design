@@ -965,15 +965,29 @@ def make_server(app: App, port: int = DEFAULT_PORT, verbose: bool = False) -> Se
 
 
 def serve(port: int = DEFAULT_PORT, graph_dir: Path | None = None, score_dir: Path | None = None,
-          verbose: bool = False) -> int:
+          verbose: bool = False, open_browser: bool = False) -> int:
+    import sys
+    import webbrowser
+
     from ..search import Context
+    from ..setup_data import format_missing_data_message, missing_serve_files
+
+    gdir, sdir, missing = missing_serve_files(graph_dir, score_dir)
+    if missing:
+        print(format_missing_data_message(gdir, sdir, missing, cmd_name="scenic serve"), file=sys.stderr)
+        return 1
 
     app = App(loader=lambda: Context.load(graph_dir, score_dir))
     httpd = make_server(app, port, verbose)
     app.start_loading()
     host, p = httpd.server_address[:2]
-    print(f"Maps for Wanderers on http://{host}:{p}/  (loading route data in the background; Ctrl-C stops)",
+    url = f"http://{host}:{p}/"
+    print(f"Maps for Wanderers on {url}  (loading route data in the background; Ctrl-C stops)",
           flush=True)
+    if open_browser:
+        t = threading.Timer(0.15, webbrowser.open, args=[url])
+        t.daemon = True
+        t.start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

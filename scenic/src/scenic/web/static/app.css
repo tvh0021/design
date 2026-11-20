@@ -72,11 +72,15 @@ strong, b { font-weight: 600; }
   background: var(--sky); border-right: 1px solid var(--line); padding: 18px var(--pad) 0;
 }
 #map { grid-area: map; min-height: 0; }
+#map.leaflet-container.picking { cursor: crosshair; }
 
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
 .page-head h1 { margin: 0; font-weight: 200; font-size: 2.3rem; line-height: 1.02; letter-spacing: -.025em; }
 .kind { margin: .45rem 0 0; font-style: italic; color: var(--haze); font-size: 1.05rem; line-height: 1.3; }
-.units { display: inline-flex; margin-top: 6px; flex: none; }
+.head-controls { display: inline-flex; align-items: center; gap: 8px; margin-top: 6px; flex: none; }
+.map-toggle { display: none; padding: 2px 9px; font-size: .88rem; }
+.map-toggle[aria-pressed="true"] { background: var(--trail); color: var(--sky-deep); border-color: var(--trail); font-weight: 400; }
+.units { display: inline-flex; flex: none; }
 .units button { padding: 2px 10px; font-size: .9rem; }
 .units button:last-child { border-left: 0; }
 .units button[aria-pressed="true"] { background: var(--trail); color: var(--sky-deep); border-color: var(--trail); font-weight: 400; }
@@ -118,6 +122,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--halpha); }
 .actions { display: flex; gap: 8px; margin: 10px 0 14px; }
 .hint { color: var(--haze); font-size: .9rem; font-style: italic; margin: 6px 0; }
 
+/* empty-state onboarding block before the first search */
+.starter { border-top: 1px solid var(--line); padding-top: 10px; margin: 2px 0 8px; }
+.starter-copy { margin: 0 0 8px; font-size: .88rem; color: var(--haze); line-height: 1.45; }
+.starter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.starter-label { font-size: .85rem; font-style: italic; color: var(--haze); margin-right: 2px; }
+
 .seg { display: inline-flex; }
 .seg button { padding: 4px 11px; font-size: .92rem; }
 .seg button + button { border-left: 0; }
@@ -151,7 +161,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--halpha); }
            max-height: 190px; overflow-y: auto; background: var(--sky-deep); }
 .results li { padding: 6px 9px; cursor: pointer; border-bottom: 1px solid var(--line); font-size: .9rem; }
 .results li:last-child { border-bottom: 0; }
-.results li:hover { background: var(--sel); }
+.results li:hover, .results li.kb-active { background: var(--sel); }
+.results li.kb-active { box-shadow: inset 2px 0 0 var(--halpha); }
 .results li.none { cursor: default; color: var(--haze); }
 .results li.none:hover { background: none; }
 .results li.group-head { font-size: .76rem; font-style: italic; letter-spacing: .02em; color: var(--haze);
@@ -187,6 +198,7 @@ table#routes { width: 100%; border-collapse: collapse; font-size: .92rem; font-w
 #routes td { padding: 8px 4px 2px; vertical-align: middle; }
 #routes tr.sub td { padding: 0 4px 8px; border-bottom: 1px solid var(--line); }
 #routes tr.route, #routes tr.sub { cursor: pointer; }
+#routes tr.route:focus-visible { outline: 1px solid var(--halpha); outline-offset: -1px; }
 #routes tr.route:hover, #routes tr.route:hover + tr.sub { background: var(--tint); }
 #routes tr.selected, #routes tr.selected:hover, #routes tr.selected:hover + tr.sub { background: var(--sel); }
 #routes tr.selected > td:first-child { box-shadow: inset 2px 0 0 var(--halpha); }
@@ -253,6 +265,7 @@ table#routes { width: 100%; border-collapse: collapse; font-size: .92rem; font-w
 
 /* ---- static demo (<html data-mode="demo">): presets and Auburn loops, no point picking - */
 html[data-mode="demo"] #panel-ab, html[data-mode="demo"] #loading,
+html[data-mode="demo"] #empty-ab, html[data-mode="demo"] #empty-loop,
 html[data-mode="demo"] #panel-loop #form-h, html[data-mode="demo"] #panel-loop .custom-min,
 html[data-mode="demo"] #panel-loop #form-x .row, html[data-mode="demo"] #panel-loop #clear-x,
 html[data-mode="demo"] #panel-loop #res-x, html[data-mode="demo"] #panel-loop #hint-loop,
@@ -326,15 +339,31 @@ html[data-mode="demo"] #panel-loop .actions { display: none; }
                    background: #fff; border: 3px solid #0b0b0b; box-shadow: 0 0 0 1px var(--haze); }
 
 /* ---- narrow screens: the website goes to one column under 900px; here the panel sits
-   over a shorter map and scrolls on its own, so both stay on screen ------------------- */
+   over a shorter map and scrolls on its own, with a 1-tap toggle to enlarge the map ---- */
 @media (max-width: 900px) {
-  body { grid-template: "nav" auto "panel" minmax(0, 46fr) "map" minmax(0, 54fr) / minmax(0, 1fr); }
+  body { grid-template: "nav" auto "panel" minmax(0, 48fr) "map" minmax(0, 52fr) / minmax(0, 1fr); }
+  body.map-expanded { grid-template: "nav" auto "panel" minmax(0, 26fr) "map" minmax(0, 74fr) / minmax(0, 1fr); }
   #panel { border-right: 0; border-bottom: 1px solid var(--line); padding-top: 12px; }
   :root { --pad: 16px; }
+  .map-toggle { display: inline-block; }
   .page-head { margin-bottom: 10px; }
   .page-head h1 { font-size: 1.85rem; }
   .kind { font-size: .98rem; margin-top: .3rem; }
   .site-nav nav { padding-block: .4rem .45rem; column-gap: 1rem; }
   .site-nav .mark { font-size: 1.15rem; }
   .site-nav ul { font-size: .95rem; column-gap: .9rem; }
+  /* keep inputs >= 16px so mobile Safari does not zoom the viewport on focus */
+  .row input, .custom-min input { font-size: 16px; min-height: 36px; }
+  button { min-height: 34px; }
+  button.link { min-height: 0; }
+}
+
+@media (max-width: 520px) {
+  table#routes { font-size: .86rem; }
+  #routes th, #routes td { padding-inline: 2px; }
+  .swatch { width: 16px; margin-right: 4px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner, .ab-pin.bad { animation: none; }
 }

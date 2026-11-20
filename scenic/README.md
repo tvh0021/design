@@ -1,36 +1,208 @@
 # Maps for Wanderers
 
-Scenic drives across New York State: a route planner that finds the most
-scenic route under a time budget. See `docs/PLAN.md` for the full plan.
+Maps for Wanderers plans scenic drives across New York State. Pick a start and
+an end, or a start point and a time budget, and it searches a statewide
+OpenStreetMap road graph scored from elevation, land cover, water views, and
+mapped landmarks, then builds an editable Google Maps link for the drive you
+pick.
 
-The product is called Maps for Wanderers. The code keeps its working name: the
-Python package is `scenic`, the command is `scenic`, and the folder and
-branch are still `scenic`.
+The Python package, CLI command, folder, and branch keep the working name
+`scenic`. `docs/PLAN.md` covers the project plan, and `docs/SCORE_SPEC.md` and
+`docs/SCORE_V02.md` specify how the pipeline scores road edges and scenic
+stops.
 
-- `scenic serve` runs the interactive planner on your own machine
-  (`docs/WEB.md`).
-- `scenic demo build` writes a static demo site with five preset routes,
-  for GitHub Pages (`docs/PUBLISH.md`).
+## Use it in your browser
 
-So far it does phase 1 for OpenStreetMap only. It downloads the New York OSM
-extract, builds a statewide graph of drivable roads, and finds the fastest
-route between two points. It also gives every road edge a scenery score
-(v0.2, `docs/SCORE_SPEC.md`; the v0.1 and v0.2 changes are listed at its end,
-and `docs/SCORE_V02.md` gives the reasons for v0.2).
+### 1. Install `scenic`
 
-## Setup
+With Python 3.11 or newer, install directly from GitHub without cloning using
+`uv` or `pipx`:
 
+```sh
+uv tool install "git+https://github.com/tvh0021/design.git#subdirectory=scenic"
 ```
+
+Or with `pipx`:
+
+```sh
+pipx install "git+https://github.com/tvh0021/design.git#subdirectory=scenic"
+```
+
+Inside a local clone of this repository, create a virtual environment in
+`scenic/` instead:
+
+```sh
+cd scenic
 python3 -m venv .venv
 .venv/bin/pip install -e '.[test]'
+source .venv/bin/activate   # puts `scenic` on your PATH
 ```
 
-Data goes in `data/` (or the folder in `$SCENIC_DATA`). It is not committed.
+### 2. Prepare the New York route data
 
-## Commands
+Download the prebuilt New York data (about 160 MB; the checksum is verified
+before anything is unpacked):
+
+```sh
+scenic setup --prebuilt
+```
+
+The data is derived from OpenStreetMap (© OpenStreetMap contributors, ODbL)
+and is published as a
+[GitHub release](https://github.com/tvh0021/design/releases/tag/wanderers-data-v0.2).
+
+If you have another prebuilt runtime archive containing `nodes.npz`, `edges.parquet`,
+`edge_delays.parquet`, `scores.parquet`, and `moments.parquet`, unpack and
+verify it in a few seconds:
+
+```sh
+scenic setup --bundle /path/to/scenic-ny-runtime.tar.gz
+```
+
+`--bundle` accepts a local `.tar.gz`, `.tar`, or `.zip` file or an `https://`
+URL, about 163 MB compressed.
+
+To download the public source datasets and build everything locally in one
+idempotent command instead:
+
+```sh
+scenic setup
+```
+
+A cold build downloads about 5.0 GB from Geofabrik, USGS 3DEP, MRLC Annual NLCD
+2023, NYSDOT scenic byways, and Census TIGER state boundaries. It uses about
+7.2 GB of disk, runs for 6 to 10 minutes, and peaks near 15 GB of RAM during
+raster scoring. Re-running `scenic setup` skips finished downloads and
+up-to-date stages. Run `scenic setup --check` at any time to check which files
+are present.
+
+Where `scenic` stores data:
+
+- `$SCENIC_DATA`, when set in your environment.
+- `./data` inside a git checkout of `scenic/`.
+- `~/.local/share/scenic`, or `$XDG_DATA_HOME/scenic`, when installed as a
+  standalone tool via `uv tool` or `pipx`.
+
+### 3. Open the map
+
+```sh
+scenic serve --open
+```
+
+`scenic serve` binds only to `127.0.0.1` on port `8765` by default, loads the
+825,892-edge road graph and scenery scores in about 1 second, and opens
+`http://127.0.0.1:8765/` in your default browser. Options:
+
+- `--open` or `-o` opens the map in your browser as soon as the server listens.
+- `--port PORT` selects another local port when `8765` is busy.
+- `--setup` runs `scenic setup` first if route data is missing.
+- `--graph DIR` and `--score DIR` point at custom `graph/` and `score/`
+  directories.
+
+To browse preset routes without running a Python server, `scenic demo build`
+writes a static site with five A-to-B drives and Finger Lakes drive-around
+loops, documented in `docs/PUBLISH.md`.
+
+## Using the browser planner
+
+The left panel holds two planning tabs, `mi` and `km` unit buttons, route
+comparisons, scenic stops, and Google Maps links. `docs/WEB.md` documents the
+HTTP API and security model.
+
+### A to B tab
+
+1. **Set Start `A` and End `B`.** Click the map once for `A` and again for `B`,
+   drag either marker to adjust, paste `lat, lon` coordinates, or type a New
+   York town or landmark and press **Search**. Before your first search, the
+   starter buttons **Rochester to Watkins Glen**, **Kingston to Oneonta**, and
+   **Lake George to Lake Placid** run a sample drive in one click.
+2. **Compare time budgets.** Click **Find routes**, or press `Cmd+Enter` on
+   macOS or `Ctrl+Enter` on Windows and Linux. In about 3 seconds, the map and
+   table compare the **fastest** route in dashed grey against the most scenic
+   route within `+15%`, `+30%`, and `+50%` of the fastest travel time in blue,
+   orange, and reddish purple. When two budgets pick the same path, they merge
+   into one row such as `+30% = +50%`. **Swap** reverses `A` and `B`, and
+   **Clear** resets the tab.
+
+### Drive-around tab
+
+Switch to **Drive-around** to find up to three circular drives that start and
+finish at pin `S` without retracing their own roads, documented in
+`docs/LOOP_SPEC.md`. When `A` is already set, opening **Drive-around** copies
+`A` into `S` the first time.
+
+1. **Pick a duration.** Choose `1 h`, `2 h`, `3 h`, or enter a custom budget
+   from `30` to `360` minutes.
+2. **Choose Which way:**
+   - **Any way** spreads up to three loops across compass directions from `S`.
+   - **A direction** opens an 8-point compass rose from `N` through `NW` and
+     steers loops into that sector.
+   - **Past a place** shows clickable chips for nearby lakes, gorges, falls,
+     and viewpoints reachable within your time budget. You can also search a
+     place or scenic feature by name, or click the map to place anchor pin `P`.
+     Clicking open water snaps `P` to the nearest mapped lake or river shore.
+3. **Run Find loops.** The starter buttons **Auburn**, **Ithaca**, and
+   **Lake Placid** run a 2-hour sample loop in one click. Switching between
+   **A to B** and **Drive-around** preserves each tab's pins and results.
+
+### Reading results and opening Google Maps
+
+- **Table and scenery strips.** Each row lists drive minutes, extra minutes over
+  the fastest route on **A to B**, distance, and **scenic minutes**, above a
+  start-to-end color strip and the route's main roads. Click a row or map line
+  to select it, or focus a row and press `Enter`, `Space`, `Up`, or `Down`. The
+  checkbox on each row hides or shows that route on the map.
+- **Color by scenery.** Checked by default, this setting colors the selected
+  route in five YlGnBu bands representing fifths of New York road miles ranked
+  by scenery score `S`, from pale yellow in the bottom fifth to dark blue in
+  the top fifth.
+- **Scenic stops.** White dots on the map and the numbered list in the detail
+  pane list credited water views, vistas, gorges, and landmarks in drive order,
+  with minutes from the start and a Google Maps satellite link. Consecutive
+  stops along one lake or river fold into one expandable line.
+- **Google Maps link.** Click **Get a Google Maps link** on the selected route
+  to place mid-road waypoints that keep Google's router on the scenic path and
+  report the route overlap percentage. Google Maps locks route editing above 9
+  total stops, which means 7 intermediate waypoints, so longer drives and loops
+  split into editable **Part 1**, **Part 2**, ... links joined at a numbered
+  handoff waypoint.
+- **Home, links, keyboard, and mobile.** **Set as home** stores `A`, `B`, or `S`
+  in browser `localStorage` under `scenic.home`, kept on your own machine, and
+  **From home** fills `A` or `S`. The URL hash records your pins, mode, and
+  selected route for bookmarking. Search dropdowns accept `Up`, `Down`,
+  `Enter`, and `Escape`. Narrow screens stack the panel above the map and show
+  a **Larger map** toggle in the header.
+
+## Command-line reference
+
+All commands read from `$SCENIC_DATA` when set, `./data` inside a repo
+checkout, or `~/.local/share/scenic` in a standalone install.
 
 ```
-scenic fetch
+scenic setup [--data DIR] [--bundle PATH_OR_URL] [--check] [--force]
+```
+
+Runs the full New York data pipeline across `fetch`, `build-graph`,
+`fetch-layers`, `boundary`, and `score`, checks readiness with `--check`, or
+unpacks and verifies a prebuilt runtime archive with `--bundle`.
+
+```
+scenic serve [--port 8765] [-o | --open] [--setup] [--graph DIR] [--score DIR] [--verbose]
+```
+
+Runs the local browser planner on `http://127.0.0.1:8765/`, documented in
+`docs/WEB.md`. When required graph or score files are missing, `scenic serve`
+prints setup instructions and exits unless `--setup` is passed.
+
+```
+scenic demo build [--out DIR] [--presets FILE] [--graph DIR] [--score DIR]
+```
+
+Runs the preset drives and loops in `config/demo_routes.toml` and writes a
+static demo site, documented in `docs/PUBLISH.md`.
+
+```
+scenic fetch [--url URL] [--force]
 ```
 
 Downloads `new-york-latest.osm.pbf` (about 500 MB) from Geofabrik into
@@ -38,16 +210,16 @@ Downloads `new-york-latest.osm.pbf` (about 500 MB) from Geofabrik into
 matches Geofabrik's. Checks the md5 after every download.
 
 ```
-scenic build-graph
+scenic build-graph [--pbf FILE] [--out DIR]
 ```
 
 Builds the drivable road graph into `data/graph/`: `edges.parquet` (one row
 per road segment between junctions, with geometry, OSM way id, name, ref,
-class, surface, oneway, length, speed and travel time) and `nodes.npz`
-(junctions). Takes under a minute and about 4 GB of memory.
+class, surface, oneway, length, speed and travel time), `edge_delays.parquet`,
+and `nodes.npz` (junctions). Takes under a minute and about 4 GB of memory.
 
 ```
-scenic fastest --from 43.1566,-77.6088 --to 43.0481,-76.1474 --geojson route.geojson
+scenic fastest --from 43.1566,-77.6088 --to 43.0481,-76.1474 [--geojson route.geojson]
 ```
 
 Prints the fastest route's minutes, km and main roads. `--geojson` also saves

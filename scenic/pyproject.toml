@@ -30,6 +30,7 @@ scenic = "scenic.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"scenic" = ["_config/*.toml"]
 "scenic.web" = ["static/*", "static/vendor/*/*", "static/vendor/*/images/*"]
 
 [tool.pytest.ini_options]

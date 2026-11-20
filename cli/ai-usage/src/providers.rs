@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, Months, TimeZone, Utc};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::report::{Report, Window, ago, fingerprint, until};
@@ -43,17 +44,25 @@ impl From<&str> for Failure {
     }
 }
 
-type Probe = fn() -> Result<Report, Failure>;
+type Probe = fn() -> Vec<Report>;
+
+pub fn failed(provider: &str, f: Failure) -> Report {
+    Report { provider: provider.into(), error: Some(f.message), signed_in: f.signed_in, ..Default::default() }
+}
+
+fn single(provider: &str, result: Result<Report, Failure>) -> Vec<Report> {
+    vec![result.unwrap_or_else(|f| failed(provider, f))]
+}
 
 const HOUR: i64 = 3600;
 const WEEK: i64 = 7 * 24 * HOUR;
 
 pub const PROVIDERS: [(&str, Probe); 5] = [
-    ("Claude", claude),
+    ("Claude", || single("Claude", claude())),
     ("Codex", codex),
-    ("Antigravity", antigravity),
-    ("ChatLLM", abacus),
-    ("Zed", zed),
+    ("Antigravity", || single("Antigravity", antigravity())),
+    ("ChatLLM", || single("ChatLLM", abacus())),
+    ("Zed", || single("Zed", zed())),
 ];
 
 // ---------- HTTP and parsing helpers ----------
@@ -554,7 +563,71 @@ fn claude_reset_credits(
 fn codex_home_from(codex_home: Option<&str>, home: &Path) -> PathBuf {
     non_empty(codex_home)
         .map(PathBuf::from)
+        .filter(|dir| dir.join("auth.json").is_file())
         .unwrap_or_else(|| home.join(".codex"))
+}
+
+#[derive(Deserialize)]
+struct CodexAccounts {
+    accounts: Vec<CodexHome>,
+}
+
+#[derive(Deserialize)]
+struct CodexHome {
+    label: Option<String>,
+    #[serde(rename = "home")]
+    dir: PathBuf,
+}
+
+fn load_codex_accounts(config_dir: &Path) -> Res<Vec<CodexHome>> {
+    match std::fs::read_to_string(config_dir.join("codex-accounts.json")) {
+        Ok(text) => serde_json::from_str::<CodexAccounts>(&text)
+            .map(|c| c.accounts)
+            .map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// Default first; a repeated home only supplies its first label.
+fn codex_homes(default: PathBuf, configured: Vec<CodexHome>, home: &Path) -> Vec<CodexHome> {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.components().collect());
+    let mut homes = vec![CodexHome { label: None, dir: default }];
+    for mut c in configured {
+        if let Ok(rest) = c.dir.strip_prefix("~") {
+            c.dir = home.join(rest);
+        }
+        match homes.iter_mut().find(|h| canonical(&h.dir) == canonical(&c.dir)) {
+            Some(h) if h.label.is_none() => h.label = c.label,
+            Some(_) => {}
+            None => homes.push(c),
+        }
+    }
+    homes
+}
+
+fn codex() -> Vec<Report> {
+    let home = home();
+    let default = codex_home_from(std::env::var("CODEX_HOME").ok().as_deref(), &home);
+    let configured = load_codex_accounts(&crate::hosts::config_dir());
+    let (configured, error) = match configured {
+        Ok(c) => (c, None),
+        Err(e) => (vec![], Some(e)),
+    };
+    let mut reports: Vec<_> = codex_homes(default, configured, &home)
+        .into_iter()
+        .map(|h| {
+            let mut r = codex_usage(&h.dir).unwrap_or_else(|f| failed("Codex", f));
+            r.account_label = h.label;
+            r
+        })
+        .collect();
+    if let Some(error) = error {
+        let mut r = failed("Codex", error.into());
+        r.account_label = Some("codex-accounts.json".into());
+        reports.push(r);
+    }
+    reports
 }
 
 struct CodexAuth {
@@ -565,7 +638,12 @@ struct CodexAuth {
 }
 
 fn codex_auth_from_dir(codex_home: &Path) -> Result<CodexAuth, Failure> {
-    let text = read_credential(&codex_home.join("auth.json"), "no Codex login (~/.codex/auth.json)")?;
+    let auth_path = codex_home.join("auth.json");
+    let shown = match auth_path.strip_prefix(home()) {
+        Ok(rest) => Path::new("~").join(rest),
+        Err(_) => auth_path.clone(),
+    };
+    let text = read_credential(&auth_path, &format!("no Codex login ({})", shown.display()))?;
     let auth: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let tokens = &auth["tokens"];
     let token = tokens["access_token"]
@@ -617,9 +695,8 @@ fn base64url_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn codex() -> Result<Report, Failure> {
-    let codex_home = codex_home_from(std::env::var("CODEX_HOME").ok().as_deref(), &home());
-    let CodexAuth { token, account_id, account } = codex_auth_from_dir(&codex_home)?;
+fn codex_usage(dir: &Path) -> Result<Report, Failure> {
+    let CodexAuth { token, account_id, account } = codex_auth_from_dir(dir)?;
 
     let mut headers = vec![
         ("Authorization", format!("Bearer {token}")),
@@ -1223,25 +1300,32 @@ mod tests {
     }
 
     #[test]
-    fn codex_reads_default_and_codex_home() {
+    fn codex_default_first_and_homes_read_once() {
         let tmp = TempDir::new("codex");
-        let default_dir = codex_home_from(None, tmp.path());
-        assert_eq!(default_dir, tmp.path().join(".codex"));
-        let missing = codex_auth_from_dir(&default_dir).err().unwrap();
-        assert_eq!(missing.message, "no Codex login (~/.codex/auth.json)");
-        assert!(!missing.signed_in);
-
+        let usual = tmp.path().join(".codex");
         let custom = tmp.path().join("custom-codex");
         std::fs::create_dir_all(&custom).unwrap();
-        write_private(
-            &custom.join("auth.json"),
-            r#"{"tokens":{"access_token":"codex-tok","account_id":"acct-42"}}"#,
-        );
-        let resolved = codex_home_from(Some(custom.to_str().unwrap()), tmp.path());
-        let auth = codex_auth_from_dir(&resolved).ok().unwrap();
+        assert_eq!(codex_home_from(None, tmp.path()), usual);
+        assert_eq!(codex_home_from(Some(custom.to_str().unwrap()), tmp.path()), usual);
+        write_private(&custom.join("auth.json"), r#"{"tokens":{"access_token":"codex-tok","account_id":"acct-42"}}"#);
+        assert_eq!(codex_home_from(Some(custom.to_str().unwrap()), tmp.path()), custom);
+        let auth = codex_auth_from_dir(&custom).ok().unwrap();
         assert_eq!(auth.token, "codex-tok");
         assert_eq!(auth.account_id.as_deref(), Some("acct-42"));
-        assert_eq!(auth.account, None, "no id token, no account");
+        assert_eq!(auth.account, None);
+
+        assert!(load_codex_accounts(tmp.path()).unwrap().is_empty());
+        write_private(&tmp.path().join("codex-accounts.json"), r#"{"accounts":[
+            {"label":"RIT","home":"~/custom-codex"},
+            {"label":"Personal","home":"~/.codex"},
+            {"label":"Again","home":"~/custom-codex/."}]}"#);
+        let homes = codex_homes(usual.clone(), load_codex_accounts(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(homes.len(), 2);
+        assert_eq!((&homes[0].dir, homes[0].label.as_deref()), (&usual, Some("Personal")));
+        assert_eq!((&homes[1].dir, homes[1].label.as_deref()), (&custom, Some("RIT")));
+        let homes = codex_homes(custom.clone(), load_codex_accounts(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(homes.len(), 2);
+        assert_eq!((&homes[0].dir, homes[0].label.as_deref()), (&custom, Some("RIT")));
     }
 
     /// An unsigned JWT with these claims.

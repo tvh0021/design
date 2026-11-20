@@ -5,22 +5,29 @@ drive-around loops, on your own machine. The same page also runs as a read-only
 static demo with preset routes (`scenic demo build`, see `docs/PUBLISH.md`).
 
 ```
-scenic serve [--port 8765] [--graph DIR] [--score DIR] [--verbose]
+scenic serve [--port 8765] [-o | --open] [--setup] [--graph DIR] [--score DIR] [--verbose]
 ```
 
-Open http://127.0.0.1:8765/. The server listens on 127.0.0.1 only and has no
-login, so it is not reachable from other machines. It needs the same data as
-`scenic route`: `data/graph/` and `data/score/` (scores and moments). The
-route data loads in the background in about a second. The page shows a
-loading banner until it is ready, and builds the reverse time matrix and
-waypoint index (about 3.5 s) just after that.
+Open `http://127.0.0.1:8765/` (or pass `--open` to launch your default browser
+automatically). The server listens on `127.0.0.1` only and has no login, so it
+is not reachable from other machines. It needs the same runtime files as
+`scenic route`: `graph/nodes.npz`, `graph/edges.parquet`, and
+`score/scores.parquet` (plus `graph/edge_delays.parquet` and
+`score/moments.parquet` when present). If those files are missing, `scenic
+serve` exits before binding a port and prints the `scenic setup` commands to
+build or unpack them; pass `--setup` to build missing data automatically first.
+Once started, the route data loads in the background in about a second while
+the page shows a loading banner, and builds the waypoint index just after that.
 
 ## Using it
 
-- **Start and end.** Click the map once for A and again for B, then drag the
-  markers to adjust. You can also type a place name and press Search (or
-  Enter), then pick a result. Typing `43.1566, -77.6088` sets a point
-  directly. Clear starts over and Swap reverses the trip.
+- **Start and end.** Click the map once for A and again for B (the map cursor
+  switches to a crosshair while a pin is still needed), then drag the markers
+  to adjust. You can also type a place name and press Search (or Enter), then
+  pick a result with the mouse or with the Up/Down arrow keys and Enter
+  (Escape closes the list). Typing `43.1566, -77.6088` sets a point directly.
+  Before the first search on a tab, starter chips load sample New York drives
+  or 2-hour loops in one click. Clear starts over and Swap reverses the trip.
 - **Home.** "Set as home" next to A, B or S saves that point in the browser
   (localStorage key `scenic.home`, `{lat, lon, label}`). "From home" puts it
   in A or in the loop start S.
@@ -29,10 +36,13 @@ waypoint index (about 3.5 s) just after that.
   (`scenic.units`). Server errors send distances as numbers (`snap_m`,
   `limit_m`), and the page words them in the chosen unit, so an error
   already on screen switches units too.
-- **Find routes.** Shows the fastest route as a dashed grey line and the
+- **Find routes.** Click Find routes or press `Cmd+Enter` (`Ctrl+Enter` on
+  Windows and Linux). Shows the fastest route as a dashed grey line and the
   most scenic route under +15 %, +30 % and +50 % of its time in blue
   (#0072B2), orange (#E69F00) and reddish purple (#CC79A7), the Okabe-Ito
-  colours, picked by the route's `role` index. A search takes about 3 s.
+  colours, picked by the route's `role` index. A search takes about 3 s, with
+  an elapsed-second counter shown on longer searches, and scrolls the results
+  table into view if the panel was scrolled above it.
   The table lists, per route: minutes, extra minutes over the fastest
   route, distance, and scenic minutes (drive time on roads scenier than the
   fastest route's average, weighted by how much scenier; the caption under
@@ -42,7 +52,8 @@ waypoint index (about 3.5 s) just after that.
   time, and the snap distance only when A or B is more than 500 m from a
   road. When two picks are the same route, it is drawn once and its row
   shows both labels (for example `+30% = +50%`).
-- **Select a route** by clicking its row or its line. The selected route is
+- **Select a route** by clicking its row or its line, or by focusing a row and
+  pressing Enter, Space, or the Up/Down arrow keys. The selected route is
   drawn wide and on top; the others are thin. The checkboxes show or hide
   routes. The detail area says how scenic the route is as a percentile
   ("on average, scenier than 58% of NY road miles") and lists its scenic
@@ -61,38 +72,42 @@ waypoint index (about 3.5 s) just after that.
   0.79), and the legend names them "bottom fifth" to "top fifth". The
   checkbox turns it off.
 - **Google Maps.** The detail area has one button for the selected route,
-  "Get a Google Maps link". It reduces the route to at most 9 waypoints
-  that make the fastest route follow it (`scenic.waypoints`) and shows the
-  result in place: the number of waypoints and how much of the route
+  "Get a Google Maps link". It places mid-road waypoints so Google's fastest
+  router follows the route (`scenic.waypoints`, `split_waypoints`) and shows
+  the result in place: the number of waypoints and how much of the route
   Google's route follows, a warning when that is under 90 % (check the
-  route in Google before driving), the waypoint placer's notes folded under
-  "Notes", and numbered pins on the map (an orange outline marks a weaker
-  spot near a junction or another road). Only then does it show the "Open
-  in Google Maps" link, which opens a new tab when clicked. No tab opens
-  before the result is known.
+  route in Google before driving), placement notes folded away, and numbered
+  pins on the map (an orange outline marks a weaker spot near a junction or
+  another road). Single links stop at 7 intermediate waypoints so Google Maps
+  keeps the route editable; longer routes and loops split into balanced
+  `Part 1`, `Part 2`, ... links sharing a blue handoff waypoint, plus a
+  1-link overview. No tab opens before the result is known.
 - **Map key.** With results on screen, a key at the bottom left explains
-  the scenic stop dot, the numbered waypoint and the weak waypoint outline.
+  the scenic stop dot, the numbered waypoint, the blue part-handoff waypoint
+  (when split), and the weak waypoint outline.
 - **Base layers.** Switch between OpenStreetMap streets, USGS Topo
   (terrain and contours, for hills) and USGS Imagery (top right), all from
   public tile servers that need no API key (`docs/PUBLISH.md` gives their
   terms). The USGS layers have tiles to zoom 16 and are enlarged beyond it.
   Satellite shows shorelines and lakes under the routes. The attribution
   always credits OpenStreetMap for the routes, whatever the base layer.
-- **Drive-around (`docs/LOOP_SPEC.md`).** Switch to the Drive-around tab to
-  plan loops starting and ending at `S` (copied from `A` on first open if `A`
-  is already set). Pick a budget (`1 h`, `2 h`, `3 h`, or a custom 30 to
-  360 minutes) and choose "Which way":
+- **Drive-around (`docs/LOOP_SPEC.md`).** Switch to the Drive-around tab (or
+  press Left/Right arrow keys on the tab bar) to plan loops starting and
+  ending at `S` (copied from `A` on first open if `A` is already set). Pick a
+  budget (`1 h`, `2 h`, `3 h`, or a custom 30 to 360 minutes; press Enter in
+  the custom box to run) and choose "Which way":
   - **Any way** spreads up to three loops across compass directions.
-  - **Direction** opens an 8-point compass rose (`N` through `NW`) and steers
+  - **A direction** opens an 8-point compass rose (`N` through `NW`) and steers
     into a 135 degree cone around that bearing.
-  - **Pass by** anchors the trip on a scenic feature chip within reach, a
+  - **Past a place** anchors the trip on a scenic feature chip within reach, a
     place or feature search, or a map pin `P` (clicking open water snaps to
     the nearest mapped lake or river shore).
   Loop rows omit the extra-minutes column, draw in the three budget colours
   (`role` 1 to 3), and note shared out-and-back stems of 1 km or more in the
   detail line. Switching between A to B and Drive-around keeps each tab's
-  pins and last search in memory. The static demo hides Drive-around because
-  it has no server.
+  pins and last search in memory. On the static demo, Drive-around shows
+  precomputed loops when `[loop]` is configured in `config/demo_routes.toml`
+  and hides the tab otherwise.
 
 The page URL keeps the trip, for example
 `#from=43.15660,-77.60880&to=43.04810,-76.14740&route=%2B50%25&scenery=0&layer=topo`
@@ -295,9 +310,12 @@ panel ends with the site's footer line. The page has no email address.
 - **CSP**: unchanged. Fonts fall under `default-src 'self'`, so self-hosted
   files load and no font host is allowed. The page links no Google Fonts.
   `scenic serve` sends the files as `font/woff2`.
-- **Narrow screens** (under 900 px, where the website goes to one column):
-  the panel sits above the map, takes a bit under half the height and
-  scrolls on its own, so the map stays on screen.
+- **Narrow screens**, under 900 px where the website goes to one column:
+  the panel sits above the map, takes a bit under half the height, and
+  scrolls on its own so the map stays on screen. A **Larger map** button in
+  the panel header expands the map to roughly three quarters of the viewport
+  height, and text inputs stay at 16 px so mobile Safari does not zoom on
+  focus.
 
 `test_vendored_fonts_referenced_by_app_css_exist` checks that every
 `url()` in `app.css` is a self-hosted file that exists.

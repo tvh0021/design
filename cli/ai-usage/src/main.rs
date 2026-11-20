@@ -6,7 +6,8 @@
 //! credentials each tool already stores locally:
 //!
 //! - Claude: Claude Code's OAuth token in the macOS keychain or `~/.claude/.credentials.json`
-//! - Codex: `~/.codex/auth.json` (ChatGPT login)
+//! - Codex: `$CODEX_HOME/auth.json`, else `~/.codex/auth.json` (ChatGPT
+//!   login), plus any homes named in `codex-accounts.json`
 //! - Antigravity: T3's `acp_token.json` (Google OAuth refresh token)
 //! - ChatLLM (Abacus): T3's stored `ABACUS_API_KEY`, or the env var
 //! - Zed: T3's stored dashboard session cookie, or `ZED_DASHBOARD_SESSION`
@@ -37,7 +38,7 @@ use chrono::{Local, Utc};
 
 use hosts::Config;
 use output::Painter;
-use providers::PROVIDERS;
+use providers::{PROVIDERS, failed};
 use report::{HostRef, Report};
 
 const USAGE: &str = "\
@@ -61,7 +62,10 @@ lists other machines to read over ssh, e.g.
    \"hosts\": [{\"name\": \"rpi5\", \"ssh\": \"rpi5\", \"t3_environment\": \"rpi5\"}]}
 Each host runs `ai-usage --local --json` there. An account signed in on
 several hosts shows once; one that is not on every host is tagged with its
-hosts, as `Antigravity @rpi5`.";
+hosts, as `Antigravity @rpi5`.
+
+Codex: add {\"accounts\": [{\"label\": \"RIT\", \"home\": \"~/.codex-rit\"}]}
+to codex-accounts.json beside hosts.json to read more logins.";
 
 struct Options {
     json: bool,
@@ -122,16 +126,9 @@ fn collect_local(wanted: &[String], me: &HostRef) -> Vec<Report> {
         let handles: Vec<_> = selected.iter().map(|&&(name, probe)| (name, s.spawn(probe))).collect();
         handles
             .into_iter()
-            .map(|(name, h)| {
-                let result = h.join().unwrap_or_else(|_| Err("probe panicked".into()));
-                let mut report = result
-                    .unwrap_or_else(|f| Report {
-                        provider: name.into(),
-                        error: Some(f.message),
-                        signed_in: f.signed_in,
-                        ..Default::default()
-                    })
-                    .finish(now);
+            .flat_map(|(name, h)| h.join().unwrap_or_else(|_| vec![failed(name, "probe panicked".into())]))
+            .map(|r| {
+                let mut report = r.finish(now);
                 report.hosts = vec![me.clone()];
                 report
             })
