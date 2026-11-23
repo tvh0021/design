@@ -22,6 +22,63 @@ if TYPE_CHECKING:
 
 SCHEMA_VERSION = 1
 MAX_HISTORY_PENALTY = 1e4
+MAX_GEOJSON_BYTES = 64 * 1024 * 1024
+MAX_GEOJSON_FEATURES = 10_000
+MAX_HISTORY_V1_EDGES = 200_000
+MAX_HISTORY_V1_MOMENTS = 10_000
+
+
+def _reject_non_finite_json(token: str) -> None:
+    raise ValueError(f"non-finite JSON constant not allowed: {token!r}")
+
+
+def _parse_finite_json_float(token: str) -> float:
+    val = float(token)
+    if not math.isfinite(val):
+        raise ValueError(f"non-finite JSON float not allowed: {token!r}")
+    return val
+
+
+def _loads_strict_json(text: str):
+    return json.loads(
+        text,
+        parse_constant=_reject_non_finite_json,
+        parse_float=_parse_finite_json_float,
+    )
+
+
+def _geojson_features(doc: object) -> list:
+    """Validate a GeoJSON Feature/FeatureCollection dict and return its feature list."""
+    if not isinstance(doc, dict):
+        raise ValueError("GeoJSON document must be a JSON object")
+    if doc.get("type") == "FeatureCollection":
+        features = doc.get("features")
+        if not isinstance(features, list):
+            raise ValueError("GeoJSON FeatureCollection features must be a list")
+        if len(features) > MAX_GEOJSON_FEATURES:
+            raise ValueError(f"GeoJSON FeatureCollection exceeds maximum of {MAX_GEOJSON_FEATURES} features")
+        return features
+    return [doc]
+
+
+def load_geojson_file(path: Path, *, max_bytes: int | None = None) -> dict:
+    """Read and strictly parse a GeoJSON file up to max_bytes and MAX_GEOJSON_FEATURES."""
+    cap = MAX_GEOJSON_BYTES if max_bytes is None else max_bytes
+    chunks: list[bytes] = []
+    total = 0
+    limit = cap + 1
+    with Path(path).open("rb") as f:
+        while total < limit:
+            chunk = f.read(min(1024 * 1024, limit - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    if total > cap:
+        raise ValueError(f"GeoJSON file exceeds maximum allowed size of {cap} bytes")
+    doc = _loads_strict_json(b"".join(chunks).decode("utf-8"))
+    _geojson_features(doc)
+    return doc
 
 LatLon = tuple[float, float]
 TripInput = "Route | ScenicRoute | LoopRoute | Path | str | Sequence[LatLon]"
@@ -673,6 +730,10 @@ def _prepare_payload(
     raw_edges, raw_moments = payload.get("trip_edges"), payload.get("trip_moments")
     if not isinstance(raw_edges, list) or not isinstance(raw_moments, list) or not raw_edges:
         raise ValueError("invalid history_v1 records")
+    if len(raw_edges) > MAX_HISTORY_V1_EDGES:
+        raise ValueError(f"history_v1 trip_edges exceeds maximum of {MAX_HISTORY_V1_EDGES} records")
+    if len(raw_moments) > MAX_HISTORY_V1_MOMENTS:
+        raise ValueError(f"history_v1 trip_moments exceeds maximum of {MAX_HISTORY_V1_MOMENTS} records")
 
     edges: list[dict] = []
     for seq, edge in enumerate(raw_edges):
@@ -730,14 +791,22 @@ def _prepare_payload(
         _coordinates([[moment["lon"], moment["lat"]], [moment["lon"], moment["lat"]]])
         moments.append({c: moment.get(c) for c in _MOMENT_COLUMNS})
 
-    for name, expected in (("waypoints_json", list), ("metadata_json", dict)):
-        raw_json = trip.get(name)
-        if not isinstance(raw_json, str) or not isinstance(json.loads(raw_json), expected):
-            raise ValueError("invalid history_v1 JSON")
+    raw_waypoints = trip.get("waypoints_json")
+    if not isinstance(raw_waypoints, str) or not isinstance(_loads_strict_json(raw_waypoints), list):
+        raise ValueError("invalid history_v1 JSON")
+    raw_metadata = trip.get("metadata_json")
+    if not isinstance(raw_metadata, str):
+        raise ValueError("invalid history_v1 JSON")
+    imported_meta = _loads_strict_json(raw_metadata)
+    if not isinstance(imported_meta, dict):
+        raise ValueError("invalid history_v1 JSON")
+    # Strip any untrusted sync_id so crafted GeoJSON cannot seed a spoofed sync identity.
+    imported_meta.pop("sync_id", None)
+    trip["metadata_json"] = json.dumps(imported_meta, allow_nan=False)
     if trip.get("anchor_json") is not None:
         if not isinstance(trip["anchor_json"], str):
             raise ValueError("invalid history_v1 anchor_json")
-        json.loads(trip["anchor_json"])
+        _loads_strict_json(trip["anchor_json"])
 
     if metadata is not None:
         if metadata.title:
@@ -763,9 +832,8 @@ def _prepare_payload(
         if metadata.taken_at is not None:
             trip["taken_at"] = _timestamp(metadata.taken_at)
         if metadata.metadata:
-            merged_meta = json.loads(trip["metadata_json"])
-            merged_meta.update(metadata.metadata)
-            trip["metadata_json"] = json.dumps(merged_meta, allow_nan=False)
+            imported_meta.update(metadata.metadata)
+            trip["metadata_json"] = json.dumps(imported_meta, allow_nan=False)
 
     trip["taken_at"] = _timestamp(_parse_iso_timestamp(trip.get("taken_at")))
     trip.setdefault("title", "")
@@ -801,19 +869,26 @@ def _prepare_trip_record(
     waypoints: list[list[float]] = []
     legacy_feature: dict | None = None
 
-    if isinstance(source, Path):
-        document = json.loads(source.read_text())
-        features = document.get("features", []) if document.get("type") == "FeatureCollection" else [document]
-        lines = [f for f in features if isinstance(f, dict) and f.get("geometry", {}).get("type") == "LineString"]
+    if isinstance(source, (Path, dict)):
+        document = load_geojson_file(source) if isinstance(source, Path) else source
+        features = _geojson_features(document)
+        lines = [
+            f for f in features
+            if isinstance(f, dict)
+            and isinstance(f.get("geometry"), dict)
+            and f["geometry"].get("type") == "LineString"
+        ]
         if pick is not None:
             lines = [
                 f for f in lines
-                if pick in (f.get("properties", {}).get("role"), f.get("properties", {}).get("label"))
+                if isinstance(f.get("properties"), dict)
+                and pick in (f["properties"].get("role"), f["properties"].get("label"))
             ]
         if len(lines) != 1:
             raise ValueError("select exactly one route LineString with --pick")
         feature = lines[0]
-        payload = feature.get("properties", {}).get("history_v1")
+        props = feature.get("properties")
+        payload = props.get("history_v1") if isinstance(props, dict) else None
         if payload is not None:
             return _prepare_payload(payload, feature["geometry"], metadata)
         legacy_feature = feature
@@ -1092,10 +1167,10 @@ class HistoryDB:
             ]
             return TripRecord(
                 trip,
-                json.loads(trip["geometry_geojson"]),
+                _loads_strict_json(trip["geometry_geojson"]),
                 edges,
                 moments,
-                json.loads(trip["metadata_json"]),
+                _loads_strict_json(trip["metadata_json"]),
             )
 
     def delete_trip(self, trip_id: int) -> bool:
@@ -1195,7 +1270,7 @@ class HistoryDB:
             taken = _parse_iso_timestamp(trip["taken_at"])
             age_days = max(0.0, (now - taken).total_seconds() / 86400.0)
             weight = 2.0 ** (-age_days / half_life_days)
-            coords = json.loads(trip["geometry_geojson"])["coordinates"]
+            coords = _loads_strict_json(trip["geometry_geojson"])["coordinates"]
             intervals_by_edge: dict[int, list[tuple[float, float]]] = {}
 
             for edge in trip["edges"]:

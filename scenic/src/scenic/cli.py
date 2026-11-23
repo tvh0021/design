@@ -22,9 +22,17 @@ def _latlon(s: str) -> tuple[float, float]:
 
 
 def cmd_history(args) -> int:
+    try:
+        return _cmd_history(args)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
+def _cmd_history(args) -> int:
     from dataclasses import asdict
     from datetime import datetime
-    from .history import HistoryDB, TripMetadata, _resolve_history_db
+    from .history import HistoryDB, TripMetadata, _resolve_history_db, load_geojson_file
 
     path, explicit = _resolve_history_db(args.history_db)
     db = HistoryDB(path, require_parent=explicit)
@@ -32,11 +40,32 @@ def cmd_history(args) -> int:
         if args.geojson is not None:
             if args.from_ is not None or args.to is not None or args.waypoints:
                 raise ValueError("choose one history input form")
-            source = args.geojson
-            doc = json.loads(source.read_text())
-            features = doc.get("features", []) if doc.get("type") == "FeatureCollection" else [doc]
-            selected = [f for f in features if f.get("geometry", {}).get("type") == "LineString" and (args.pick is None or args.pick in (f.get("properties", {}).get("role"), f.get("properties", {}).get("label")))]
-            needs_graph = not (len(selected) == 1 and "history_v1" in selected[0].get("properties", {}))
+            doc = load_geojson_file(args.geojson)
+            if doc.get("type") == "FeatureCollection":
+                features = doc.get("features")
+                if not isinstance(features, list):
+                    raise ValueError("GeoJSON FeatureCollection features must be a list")
+            else:
+                features = [doc]
+            selected = [
+                f for f in features
+                if isinstance(f, dict)
+                and isinstance(f.get("geometry"), dict)
+                and f["geometry"].get("type") == "LineString"
+                and (
+                    args.pick is None
+                    or (
+                        isinstance(f.get("properties"), dict)
+                        and args.pick in (f["properties"].get("role"), f["properties"].get("label"))
+                    )
+                )
+            ]
+            needs_graph = not (
+                len(selected) == 1
+                and isinstance(selected[0].get("properties"), dict)
+                and "history_v1" in selected[0]["properties"]
+            )
+            source = doc
         elif args.google_maps_url is not None:
             if args.from_ is not None or args.to is not None or args.waypoints or args.pick:
                 raise ValueError("choose one history input form")

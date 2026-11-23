@@ -501,6 +501,94 @@ def test_history_v1_round_trip_without_graph_and_preserves_metadata(tmp_path, mo
     assert rec3.trip["rating"] == 4
 
 
+def test_geojson_security_strict_json_size_cap_sync_id_strip_and_single_read(tmp_path, monkeypatch):
+    import scenic.history as hist_mod
+
+    ctx = _twin_corridor_ctx()
+    res = search(ctx, _latlon(ctx.g, 0), _latlon(ctx.g, 4))
+    db = HistoryDB(tmp_path / "sec.db")
+    tid = db.record_trip(
+        res.picks[1.30],
+        ctx=ctx,
+        metadata=TripMetadata(taken_at=T0, title="Secure Trip", metadata={"kept": "yes"}),
+    )
+    exported_doc = db.export_trip_geojson(tid)
+
+    # 1) Untrusted sync_id in history_v1 metadata_json is stripped on import, other keys preserved
+    spoof_doc = json.loads(json.dumps(exported_doc))
+    spoof_trip = spoof_doc["features"][0]["properties"]["history_v1"]["trip"]
+    meta = json.loads(spoof_trip["metadata_json"])
+    meta["sync_id"] = "0" * 64
+    spoof_trip["metadata_json"] = json.dumps(meta)
+    spoof_path = tmp_path / "spoof_sync_id.geojson"
+    spoof_path.write_text(json.dumps(spoof_doc))
+    tid_imported = db.record_trip(spoof_path)
+    rec_imported = db.get_trip(tid_imported)
+    assert "sync_id" not in rec_imported.metadata
+    assert rec_imported.metadata["kept"] == "yes"
+
+    # 2) Reject non-finite JSON constants and overflowing floats (NaN / Infinity / -Infinity / 1e400)
+    for bad_token in ("NaN", "Infinity", "-Infinity", "1e400", "-1e400"):
+        bad_top = tmp_path / f"bad_top_{bad_token}.geojson"
+        bad_top.write_text(f'{{"type": "FeatureCollection", "features": [], "extra": {bad_token}}}')
+        with pytest.raises(ValueError, match="non-finite"):
+            db.record_trip(bad_top)
+
+        bad_embed_doc = json.loads(json.dumps(exported_doc))
+        bad_embed_doc["features"][0]["properties"]["history_v1"]["trip"]["metadata_json"] = (
+            f'{{"x": {bad_token}}}'
+        )
+        bad_embed_path = tmp_path / f"bad_embed_{bad_token}.geojson"
+        bad_embed_path.write_text(json.dumps(bad_embed_doc))
+        with pytest.raises(ValueError, match="non-finite"):
+            db.record_trip(bad_embed_path)
+
+    # 2b) FeatureCollection with features: null or exceeding record cap fails cleanly (CLI exit 1 and direct dict)
+    null_feats = tmp_path / "null_features.geojson"
+    null_feats.write_text('{"type": "FeatureCollection", "features": null}')
+    with pytest.raises(ValueError, match="features must be a list"):
+        hist_mod.load_geojson_file(null_feats)
+    with pytest.raises(ValueError, match="features must be a list"):
+        db.record_trip({"type": "FeatureCollection", "features": None})
+    assert cli_main(["history", "add", "--history-db", str(db.path), "--geojson", str(null_feats)]) == 1
+
+    many_feats = tmp_path / "many_features.geojson"
+    many_doc = {"type": "FeatureCollection", "features": [{}] * 5}
+    many_feats.write_text(json.dumps(many_doc))
+    monkeypatch.setattr(hist_mod, "MAX_GEOJSON_FEATURES", 3)
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        hist_mod.load_geojson_file(many_feats)
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        db.record_trip(many_doc)
+    assert cli_main(["history", "add", "--history-db", str(db.path), "--geojson", str(many_feats)]) == 1
+    monkeypatch.undo()
+
+    # 3) Reject oversized GeoJSON files in both library and CLI
+    valid_path = tmp_path / "valid.geojson"
+    valid_text = json.dumps(exported_doc)
+    valid_path.write_text(valid_text)
+    with pytest.raises(ValueError, match="maximum allowed size"):
+        hist_mod.load_geojson_file(valid_path, max_bytes=len(valid_text.encode("utf-8")) - 1)
+    monkeypatch.setattr(hist_mod, "MAX_GEOJSON_BYTES", 32)
+    with pytest.raises(ValueError, match="maximum allowed size"):
+        db.record_trip(valid_path)
+    assert cli_main(["history", "add", "--history-db", str(db.path), "--geojson", str(valid_path)]) == 1
+    monkeypatch.undo()
+
+    # 4) CLI `history add --geojson` reads and parses the GeoJSON file only once
+    read_calls = 0
+    orig_loader = hist_mod.load_geojson_file
+
+    def counted_loader(path, *, max_bytes=None):
+        nonlocal read_calls
+        read_calls += 1
+        return orig_loader(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(hist_mod, "load_geojson_file", counted_loader)
+    assert cli_main(["history", "add", "--history-db", str(db.path), "--geojson", str(valid_path)]) == 0
+    assert read_calls == 1
+
+
 def test_google_maps_url_and_waypoints_import_and_rejection(tmp_path):
     ctx = _twin_corridor_ctx()
     g = ctx.g
