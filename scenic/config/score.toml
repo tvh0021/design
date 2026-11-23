@@ -356,3 +356,11 @@ dijkstra_count_range = [80, 600]
 [output]
 heatmap_cell_m = 500.0
 heatmap_width_px = 3000
+
+[history]
+edge_penalty = 3.0
+moment_penalty = 3.0
+half_life_days = 180.0
+home_radius_m = 2000.0
+edge_match_m = 25.0
+moment_match_m = 250.0

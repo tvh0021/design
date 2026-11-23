@@ -46,12 +46,16 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from .route import MIN_COST, RoadGraph, Route
+
+if TYPE_CHECKING:
+    from .history import HistoryBias
 
 
 GENERIC_FEATURES = {"cliff", "waterfall", "viewpoint"}  # OSM kinds used as labels for unnamed features
@@ -241,6 +245,7 @@ class ScenicRoute:
     passed: list = field(default_factory=list)  # every moment passed, in route order
     moment_pts: float = 0.0
     score: float = 0.0
+    history: dict | None = None
 
     @property
     def edges(self) -> np.ndarray:
@@ -412,7 +417,22 @@ def moment_points(m: np.ndarray, cfg: dict) -> float:
     return float(np.sum(m ** float(cfg.get("moment_power", 1.0)))) if len(m) else 0.0
 
 
-def score_route(sr: ScenicRoute, ctx: Context, t0: float, s_fast: float) -> ScenicRoute:
+def _history_active(history: HistoryBias | None, ctx: Context) -> bool:
+    if history is None:
+        return False
+    from .history import is_history_active
+
+    return is_history_active(history, n_edges=ctx.g.n_edges, n_moments=len(ctx.moments.id))
+
+
+def score_route(
+    sr: ScenicRoute,
+    ctx: Context,
+    t0: float,
+    s_fast: float,
+    *,
+    history: HistoryBias | None = None,
+) -> ScenicRoute:
     cfg = ctx.cfg
     e = sr.route.edges
     t = ctx.g.time_s[e]
@@ -423,12 +443,49 @@ def score_route(sr: ScenicRoute, ctx: Context, t0: float, s_fast: float) -> Scen
     cap = moment_cap(cfg, t0)
     body = ctx.moments.body
     feat = body[ids] if body is not None else None
-    cred = credit_moments(ids, pos, ctx.moments.m[ids], cfg["moment_spacing_km"] * 1000, cap,
-                          feat, cfg.get("feature_spacing_km", 0.0) * 1000)
+    spacing_m = cfg["moment_spacing_km"] * 1000
+    feat_spacing_m = cfg.get("feature_spacing_km", 0.0) * 1000
+    if not _history_active(history, ctx):
+        cred = credit_moments(ids, pos, ctx.moments.m[ids], spacing_m, cap, feat, feat_spacing_m)
+        sr.passed = [int(i) for i in ids]
+        sr.moments = [int(i) for i in cred]
+        sr.moment_pts = moment_points(ctx.moments.m[cred], cfg)
+        sr.score = sr.scenic_min + cfg["moment_minutes"] * sr.moment_pts
+        sr.history = None
+        return sr
+
+    assert history is not None
+    raw_cred = credit_moments(ids, pos, ctx.moments.m[ids], spacing_m, cap, feat, feat_spacing_m)
+    raw_moment_pts = moment_points(ctx.moments.m[raw_cred], cfg)
+    raw_score = sr.scenic_min + cfg["moment_minutes"] * raw_moment_pts
+
+    p = float(cfg.get("moment_power", 1.0))
+    P = float(history.edge_penalty)
+    M = float(history.moment_penalty)
+    H_e = np.asarray(history.edge_strength, dtype=np.float64)
+    H_m = np.asarray(history.moment_strength, dtype=np.float64)
+
+    q_ids = 1.0 / (1.0 + M * H_m[ids]) if len(ids) else np.zeros(0, dtype=np.float64)
+    eff_m = ctx.moments.m[ids] * (q_ids ** (1.0 / p)) if (len(ids) and p > 0.0) else ctx.moments.m[ids]
+    cred = credit_moments(ids, pos, eff_m, spacing_m, cap, feat, feat_spacing_m)
     sr.passed = [int(i) for i in ids]
     sr.moments = [int(i) for i in cred]
-    sr.moment_pts = moment_points(ctx.moments.m[cred], cfg)
-    sr.score = sr.scenic_min + cfg["moment_minutes"] * sr.moment_pts
+    if len(cred):
+        q_cred = 1.0 / (1.0 + M * H_m[cred])
+        sr.moment_pts = float(np.sum((ctx.moments.m[cred] ** p) * q_cred))
+    else:
+        sr.moment_pts = 0.0
+    tot_t = float(t.sum())
+    R = float(np.sum(t * H_e[e]) / tot_t) if tot_t > 0.0 else 0.0
+    sr.score = (sr.scenic_min + cfg["moment_minutes"] * sr.moment_pts) / (1.0 + P * R)
+    ue = np.unique(e)
+    repeated_km = float(ctx.g.length_m[ue[H_e[ue] > 0.0]].sum() / 1000.0) if len(ue) else 0.0
+    sr.history = {
+        "raw_score": float(raw_score),
+        "raw_moment_points": float(raw_moment_pts),
+        "history_exposure": float(R),
+        "repeated_km": float(repeated_km),
+    }
     return sr
 
 
@@ -451,6 +508,7 @@ class SearchResult:
     via_candidates: int = 0
     spur_rejections: int = 0
     shared: dict = field(default_factory=dict)  # budget -> smaller budget whose pick it repeats
+    history: dict | None = None
 
 
 def route_overlap(a: Route, b: Route, length_m: np.ndarray) -> float:
@@ -461,12 +519,22 @@ def route_overlap(a: Route, b: Route, length_m: np.ndarray) -> float:
     return float(length_m[both].sum() / longer) if longer > 0 else 1.0
 
 
-def _pick_key(sr: ScenicRoute):
+def _pick_key(sr: ScenicRoute, *, use_history: bool = False):
+    if use_history:
+        exposure = float(sr.history["history_exposure"]) if sr.history is not None else 0.0
+        return (round(sr.score, 9), -round(exposure, 9), -sr.route.time_s)
     return (round(sr.score, 9), -sr.route.time_s)
 
 
-def choose_picks(routes: list, budgets, length_m: np.ndarray, max_overlap: float = 1.0,
-                 min_score_frac: float = 1.0) -> tuple[dict, dict]:
+def choose_picks(
+    routes: list,
+    budgets,
+    length_m: np.ndarray,
+    max_overlap: float = 1.0,
+    min_score_frac: float = 1.0,
+    *,
+    use_history: bool = False,
+) -> tuple[dict, dict]:
     """The best route under each budget, smallest budget first. When the
     best under a larger budget is the same as, or shares more than
     `max_overlap` of its length with, a smaller budget's pick, take instead
@@ -480,8 +548,9 @@ def choose_picks(routes: list, budgets, length_m: np.ndarray, max_overlap: float
     overlapping it is fine."""
     picks: dict = {}
     shared: dict = {}
+    key_fn = (lambda sr: _pick_key(sr, use_history=True)) if use_history else _pick_key
     for b in sorted(budgets):
-        under = sorted((sr for sr in routes if sr.ratio <= b + 1e-9), key=_pick_key, reverse=True)
+        under = sorted((sr for sr in routes if sr.ratio <= b + 1e-9), key=key_fn, reverse=True)
         best = under[0]
         earlier = [(pb, sr) for pb, sr in picks.items()
                    if pb not in shared and (sr.origin != "fastest" or sr is best)]
@@ -585,8 +654,26 @@ def _via_time(T: CostGraph, src: int, dst: int, vias: list, t_arc) -> float:
     return float(tot + T.tree(cur)[0][dst])
 
 
-def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
+def search(
+    ctx: Context,
+    a_latlon,
+    b_latlon,
+    log=None,
+    *,
+    history: HistoryBias | None = None,
+) -> SearchResult | None:
     g, S, mom, cfg = ctx.g, ctx.S, ctx.moments, ctx.cfg
+    hist_active = _history_active(history, ctx)
+    edge_mult = (
+        1.0 + float(history.edge_penalty) * np.asarray(history.edge_strength, dtype=np.float64)
+        if hist_active
+        else None
+    )
+    q_mom = (
+        1.0 / (1.0 + float(history.moment_penalty) * np.asarray(history.moment_strength, dtype=np.float64))
+        if hist_active
+        else None
+    )
     secs: dict[str, float] = {}
     t_start = time.monotonic()
     budgets = sorted(cfg["budgets"])
@@ -621,9 +708,12 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
 
     # 2. lambda sweep (retain only via_lambda for step 4)
     lam_v = float(cfg["via_lambda"])
-    GV: CostGraph | None = T if lam_v == 0.0 else None
+    GV: CostGraph | None = T if (lam_v == 0.0 and not hist_active) else None
     for lam in cfg["lambdas"]:
-        G = CostGraph(g, arcs, g.time_s * (1 + lam * (1 - S)))
+        cost = g.time_s * (1 + lam * (1 - S))
+        if edge_mult is not None:
+            cost = cost * edge_mult
+        G = CostGraph(g, arcs, cost)
         p = G.path(src, dst)
         if p is not None:
             kept.add(g.make_route(p, G.arcs_between(p[:-1], p[1:])), f"lambda {lam:g}")
@@ -639,7 +729,10 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
         for sr in kept.routes:
             used[sr.route.edges] = True
         for lam in cfg["alt_lambdas"]:
-            cost = g.time_s * (1 + lam * (1 - S)) * (1 + cfg["reuse_penalty"] * used)
+            cost = g.time_s * (1 + lam * (1 - S))
+            if edge_mult is not None:
+                cost = cost * edge_mult
+            cost = cost * (1 + cfg["reuse_penalty"] * used)
             G = CostGraph(g, arcs, cost)
             p = G.path(src, dst)
             if p is not None:
@@ -655,6 +748,9 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
     feat = mom.body if mom.body is not None else np.full(len(mom.id), None, dtype=object)
     fast_feats = {feat[i] for i in on_fast} - {None}
     dA_r, dB_r = T.tree(src)[0], T.tree(dst, reverse=True)[0]
+    m_by_id = mom.m ** float(cfg.get("moment_power", 1.0))
+    if q_mom is not None:
+        m_by_id = m_by_id * q_mom
     # every moment, both directions of its best edge: (tail, head, arc, id)
     cand = []
     for k in range(len(mom.id)):
@@ -677,7 +773,7 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
         best = order[first]
         via_arcs, vt = via_arcs[best], vt[best]
         extra = np.maximum((vt - t0) / 60, cfg["via_min_extra_min"])
-        rank = mom.m[via_arcs[:, 3]] ** float(cfg.get("moment_power", 1.0)) / extra
+        rank = m_by_id[via_arcs[:, 3]] / extra
         mid = via_arcs[:, 3]
         top = np.argsort(-rank, kind="stable")
         pick = _top_distinct(top, feat[mid[top]], int(cfg["via_top"]))
@@ -697,8 +793,10 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
 
     t1 = time.monotonic()
     if GV is None:
-        GV = CostGraph(g, arcs, g.time_s * (1 + lam_v * (1 - S)))
-    m_by_id = mom.m ** float(cfg.get("moment_power", 1.0))
+        v_cost = g.time_s * (1 + lam_v * (1 - S))
+        if edge_mult is not None:
+            v_cost = v_cost * edge_mult
+        GV = CostGraph(g, arcs, v_cost)
     for seed in seeds:
         seq = [seed]
         for step in range(int(cfg["via_max_moments"])):
@@ -748,17 +846,36 @@ def search(ctx: Context, a_latlon, b_latlon, log=None) -> SearchResult | None:
 
     # 5. score and pick
     t1 = time.monotonic()
+    score_hist = history if hist_active else None
     for sr in kept.routes:
-        score_route(sr, ctx, t0, s_fast)
+        score_route(sr, ctx, t0, s_fast, history=score_hist)
     fastest = kept.routes[0]
-    picks, shared = choose_picks(kept.routes, budgets, g.length_m, cfg.get("pick_max_overlap", 1.0),
-                                 cfg.get("pick_min_score_frac", 1.0))
+    picks, shared = choose_picks(
+        kept.routes,
+        budgets,
+        g.length_m,
+        cfg.get("pick_max_overlap", 1.0),
+        cfg.get("pick_min_score_frac", 1.0),
+        use_history=hist_active,
+    )
     secs["score"] = time.monotonic() - t1
     secs["total"] = time.monotonic() - t_start
-    return SearchResult(a=tuple(a_latlon), b=tuple(b_latlon), snap=snap, t0=t0, s_fast=s_fast, fastest=fastest,
-                        kept=kept.routes, picks=picks, seconds={k: round(v, 2) for k, v in secs.items()},
-                        region_nodes=region_nodes, via_candidates=via_candidates,
-                        spur_rejections=kept.spur_rejections, shared=shared)
+    return SearchResult(
+        a=tuple(a_latlon),
+        b=tuple(b_latlon),
+        snap=snap,
+        t0=t0,
+        s_fast=s_fast,
+        fastest=fastest,
+        kept=kept.routes,
+        picks=picks,
+        seconds={k: round(v, 2) for k, v in secs.items()},
+        region_nodes=region_nodes,
+        via_candidates=via_candidates,
+        spur_rejections=kept.spur_rejections,
+        shared=shared,
+        history=dict(history.diagnostics) if hist_active and history is not None else None,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -771,7 +888,7 @@ def main_roads(g: RoadGraph, route: Route, top: int = 4, min_km: float = 1.0) ->
 
 def describe(ctx: Context, sr: ScenicRoute) -> dict:
     mom = ctx.moments
-    return {
+    out = {
         "origin": sr.origin,
         "minutes": round(sr.minutes, 1), "ratio": round(sr.ratio, 3), "km": round(sr.km, 1),
         "scenic_minutes": round(sr.scenic_min, 1), "moment_points": round(sr.moment_pts, 2),
@@ -782,10 +899,18 @@ def describe(ctx: Context, sr: ScenicRoute) -> dict:
         "moments_passed": len(sr.passed),
         "roads": [(lab, round(km, 1)) for lab, km in main_roads(ctx.g, sr.route, top=6)],
     }
+    if sr.history is not None:
+        out["history"] = {
+            "raw_score": round(float(sr.history["raw_score"]), 1),
+            "raw_moment_points": round(float(sr.history["raw_moment_points"]), 2),
+            "history_exposure": round(float(sr.history["history_exposure"]), 4),
+            "repeated_km": round(float(sr.history["repeated_km"]), 2),
+        }
+    return out
 
 
 def result_json(ctx: Context, res: SearchResult) -> dict:
-    return {
+    out = {
         "from": list(res.a), "to": list(res.b), "snap_m": [round(res.snap["from_snap_m"]), round(res.snap["to_snap_m"])],
         "t0_min": round(res.t0 / 60, 1), "S_fast": round(res.s_fast, 3), "kept": len(res.kept),
         "region_nodes": res.region_nodes, "via_candidates": res.via_candidates, "seconds": res.seconds,
@@ -794,18 +919,31 @@ def result_json(ctx: Context, res: SearchResult) -> dict:
         "picks": {f"+{round((b - 1) * 100)}%": describe(ctx, sr) for b, sr in res.picks.items()},
         "shared": {f"+{round((b - 1) * 100)}%": f"+{round((pb - 1) * 100)}%" for b, pb in res.shared.items()},
     }
+    if res.history is not None:
+        out["history"] = dict(res.history)
+    return out
 
 
-def geojson(ctx: Context, res: SearchResult) -> dict:
+def geojson(ctx: Context, res: SearchResult, *, include_history: bool = False) -> dict:
     """Fastest route and the budget picks as LineStrings (with the ordered
     edge and node index paths), and the credited moments as Points."""
+    emit_history = bool(include_history or res.history is not None)
+    if emit_history:
+        from .history import TripMetadata, build_history_v1_payload
     feats = []
-    rows = [("fastest", res.fastest)] + [(f"+{round((b - 1) * 100)}%", sr) for b, sr in res.picks.items()]
+    rows = [("fastest", None, res.fastest)] + [(f"+{round((b - 1) * 100)}%", float(b), sr) for b, sr in res.picks.items()]
     shown = set()
-    for role, sr in rows:
+    for role, budget_ratio, sr in rows:
         props = {"role": role, **describe(ctx, sr), "edge_path": [int(e) for e in sr.edges],
                  "node_path": [int(n) for n in sr.nodes]}
         props["roads"] = [list(r) for r in props["roads"]]
+        if emit_history:
+            meta = TripMetadata(
+                mode="route",
+                budget_ratio=budget_ratio,
+                metadata={"role": role, "origin": sr.origin},
+            )
+            props["history_v1"] = build_history_v1_payload(ctx, sr, metadata=meta)
         feats.append({"type": "Feature", "properties": props,
                       "geometry": {"type": "LineString", "coordinates": [list(p) for p in sr.route.geometry]}})
         shown |= set(sr.moments)

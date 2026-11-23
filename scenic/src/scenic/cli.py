@@ -21,6 +21,72 @@ def _latlon(s: str) -> tuple[float, float]:
     return lat, lon
 
 
+def cmd_history(args) -> int:
+    from dataclasses import asdict
+    from datetime import datetime
+    from .history import HistoryDB, TripMetadata, _resolve_history_db
+
+    path, explicit = _resolve_history_db(args.history_db)
+    db = HistoryDB(path, require_parent=explicit)
+    if args.history_cmd == "add":
+        if args.geojson is not None:
+            if args.from_ is not None or args.to is not None or args.waypoints:
+                raise ValueError("choose one history input form")
+            source = args.geojson
+            doc = json.loads(source.read_text())
+            features = doc.get("features", []) if doc.get("type") == "FeatureCollection" else [doc]
+            selected = [f for f in features if f.get("geometry", {}).get("type") == "LineString" and (args.pick is None or args.pick in (f.get("properties", {}).get("role"), f.get("properties", {}).get("label")))]
+            needs_graph = not (len(selected) == 1 and "history_v1" in selected[0].get("properties", {}))
+        elif args.google_maps_url is not None:
+            if args.from_ is not None or args.to is not None or args.waypoints or args.pick:
+                raise ValueError("choose one history input form")
+            source, needs_graph = args.google_maps_url, True
+        else:
+            if args.from_ is None or args.to is None or args.pick:
+                raise ValueError("provide --from and --to")
+            source = [args.from_] + ([_latlon(x) for x in args.waypoints.split(";")] if args.waypoints else []) + [args.to]
+            needs_graph = True
+        ctx = graph = None
+        if needs_graph:
+            if args.score is not None:
+                from .search import Context
+                ctx = Context.load(args.graph, args.score)
+            else:
+                from .route import RoadGraph
+                graph = RoadGraph.load(args.graph)
+        metadata = TripMetadata(taken_at=datetime.fromisoformat(args.taken_at.replace("Z", "+00:00")) if args.taken_at else None,
+                                title=args.title, mode=args.mode, rating=args.rating, notes=args.notes,
+                                origin_label=args.origin_label, destination_label=args.destination_label)
+        trip_id = db.record_trip(source, ctx=ctx, graph=graph, pick=args.pick, metadata=metadata)
+        print(f"recorded trip {trip_id}" + (" (local fastest route)" if isinstance(source, (str, list)) else ""))
+        return 0
+    if args.history_cmd == "export":
+        args.geojson.write_text(json.dumps(db.export_trip_geojson(args.id), allow_nan=False))
+        print(f"wrote {args.geojson}")
+        return 0
+    if args.history_cmd == "init":
+        db.init_db()
+        print(f"initialized {db.path}")
+        return 0
+    if args.history_cmd == "list":
+        since = datetime.fromisoformat(args.since.replace("Z", "+00:00")) if args.since else None
+        rows = [asdict(row) for row in db.list_trips(limit=args.limit, since=since, mode=args.mode)]
+        print(json.dumps(rows, indent=2))
+    elif args.history_cmd == "stats":
+        print(json.dumps(asdict(db.stats()), indent=2))
+    elif args.history_cmd == "delete":
+        deleted = db.delete_trip(args.id)
+        print("deleted" if deleted else "trip not found")
+        return 0 if deleted else 1
+    elif args.history_cmd == "show":
+        row = db.get_trip(args.id)
+        if row is None:
+            print("trip not found", file=sys.stderr)
+            return 1
+        print(json.dumps(asdict(row), indent=2))
+    return 0
+
+
 def cmd_setup(args) -> int:
     from .setup_data import run_setup
 
@@ -77,9 +143,36 @@ def cmd_fastest(args) -> int:
     return 0
 
 
+def _prepare_history_handle(args):
+    """Resolve and validate history DB + penalty before loading Context.
+
+    Called ONLY when `--avoid-history` is enabled.
+    """
+    from .history import HistoryDB, _resolve_history_db, history_config, validate_history_penalty
+
+    hcfg = history_config()
+    if args.history_penalty is not None:
+        hcfg["edge_penalty"] = validate_history_penalty(args.history_penalty)
+    else:
+        hcfg["edge_penalty"] = validate_history_penalty(hcfg["edge_penalty"])
+    validate_history_penalty(hcfg["moment_penalty"])
+    path, explicit = _resolve_history_db(args.history_db)
+    if not path.exists():
+        raise FileNotFoundError(f"history database not found: {path}; run scenic history init")
+    return HistoryDB(path, require_parent=explicit), hcfg
+
+
 def cmd_route(args) -> int:
     from .search import Context, format_table, geojson, plot_routes, result_json, search
     from .setup_data import format_missing_data_message, missing_serve_files
+
+    hist_handle = None
+    if args.avoid_history:
+        try:
+            hist_handle = _prepare_history_handle(args)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     gdir, sdir, missing = missing_serve_files(args.graph, args.score)
     if missing:
@@ -89,14 +182,24 @@ def cmd_route(args) -> int:
     t0 = time.monotonic()
     ctx = Context.load(args.graph, args.score)
     t1 = time.monotonic()
-    res = search(ctx, args.from_, args.to)
+    history_bias = None
+    if hist_handle is not None:
+        db, hcfg = hist_handle
+        try:
+            history_bias = db.bias(ctx, start=args.from_, end=args.to, cfg=hcfg)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    res = search(ctx, args.from_, args.to, history=history_bias)
     if res is None:
         print("no route found")
         return 1
     print(f"loaded in {t1 - t0:.1f} s; snapped start {res.snap['from_snap_m']:.0f} m, end {res.snap['to_snap_m']:.0f} m")
     print(format_table(ctx, res))
     if args.geojson:
-        Path(args.geojson).write_text(json.dumps(geojson(ctx, res)))
+        include_history = bool(args.avoid_history or args.history_metadata)
+        Path(args.geojson).write_text(json.dumps(geojson(ctx, res, include_history=include_history)))
         print(f"wrote {args.geojson}")
     if args.json:
         Path(args.json).write_text(json.dumps(result_json(ctx, res), indent=1))
@@ -110,6 +213,14 @@ def cmd_loop(args) -> int:
     from .loop import LoopError, Steer, format_table, geojson, loop_config, loops, plot_loops, result_json
     from .search import Context
     from .setup_data import format_missing_data_message, missing_serve_files
+
+    hist_handle = None
+    if args.avoid_history:
+        try:
+            hist_handle = _prepare_history_handle(args)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     gdir, sdir, missing = missing_serve_files(args.graph, args.score)
     if missing:
@@ -130,8 +241,17 @@ def cmd_loop(args) -> int:
     t0 = time.monotonic()
     ctx = Context.load(args.graph, args.score)
     t1 = time.monotonic()
+    history_bias = None
+    if hist_handle is not None:
+        db, hcfg = hist_handle
+        try:
+            history_bias = db.bias(ctx, start=args.from_, end=args.from_, cfg=hcfg)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
     try:
-        res = loops(ctx, args.from_, minutes, steer=steer, cfg=cfg)
+        res = loops(ctx, args.from_, minutes, steer=steer, cfg=cfg, history=history_bias)
     except (LoopError, ValueError) as exc:
         msg = exc.message if isinstance(exc, LoopError) else str(exc)
         print(msg)
@@ -144,7 +264,8 @@ def cmd_loop(args) -> int:
         print(f"anchor ({anc.kind}): {desc}, moved {anc.moved_m:.0f} m")
     print(format_table(ctx, res))
     if args.geojson:
-        Path(args.geojson).write_text(json.dumps(geojson(ctx, res)))
+        include_history = bool(args.avoid_history or args.history_metadata)
+        Path(args.geojson).write_text(json.dumps(geojson(ctx, res, include_history=include_history)))
         print(f"wrote {args.geojson}")
     if args.json:
         Path(args.json).write_text(json.dumps(result_json(ctx, res), indent=1))
@@ -268,6 +389,11 @@ def main(argv: list[str] | None = None) -> int:
     rt.add_argument("--json", type=Path, help="write the summary table as JSON")
     rt.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     rt.add_argument("--score", type=Path, help="score directory (default data/score)")
+    rt.add_argument("--avoid-history", action="store_true", help="softly avoid previously recorded roads and moments")
+    rt.add_argument("--history-db", help="path to the history SQLite database")
+    rt.add_argument("--history-penalty", type=float, help="override history edge penalty (finite, >= 0)")
+    rt.add_argument("--history-metadata", action="store_true",
+                    help="include portable history_v1 metadata in GeoJSON output")
     rt.set_defaults(func=cmd_route)
 
     lp = sub.add_parser("loop", help="scenic drive-around loops starting and ending at the same point")
@@ -287,7 +413,52 @@ def main(argv: list[str] | None = None) -> int:
     lp.add_argument("--json", type=Path, help="write the summary table as JSON")
     lp.add_argument("--graph", type=Path, help="graph directory (default data/graph)")
     lp.add_argument("--score", type=Path, help="score directory (default data/score)")
+    lp.add_argument("--avoid-history", action="store_true", help="softly avoid previously recorded roads and moments")
+    lp.add_argument("--history-db", help="path to the history SQLite database")
+    lp.add_argument("--history-penalty", type=float, help="override history edge penalty (finite, >= 0)")
+    lp.add_argument("--history-metadata", action="store_true",
+                    help="include portable history_v1 metadata in GeoJSON output")
     lp.set_defaults(func=cmd_loop)
+
+    hist = sub.add_parser("history", help="manage explicitly recorded trips")
+    hsub = hist.add_subparsers(dest="history_cmd", required=True)
+    for name in ("init", "list", "show", "delete", "stats"):
+        command = hsub.add_parser(name)
+        command.add_argument("--history-db")
+        if name in ("show", "delete"):
+            command.add_argument("id", type=int)
+        if name == "list":
+            command.add_argument("--limit", type=int, default=50)
+            command.add_argument("--since")
+            command.add_argument("--mode", choices=("loop", "route", "custom"))
+        if name in ("list", "show", "stats"):
+            command.add_argument("--json", action="store_true")
+        command.set_defaults(func=cmd_history)
+
+    add = hsub.add_parser("add")
+    inputs = add.add_mutually_exclusive_group()
+    inputs.add_argument("--geojson", type=Path)
+    inputs.add_argument("--google-maps-url")
+    add.add_argument("--from", dest="from_", type=_latlon)
+    add.add_argument("--to", type=_latlon)
+    add.add_argument("--waypoints")
+    add.add_argument("--pick")
+    add.add_argument("--history-db")
+    add.add_argument("--graph", type=Path)
+    add.add_argument("--score", type=Path)
+    add.add_argument("--taken-at")
+    add.add_argument("--title", default="")
+    add.add_argument("--mode", choices=("route", "loop", "custom"))
+    add.add_argument("--rating", type=int, choices=range(1, 6))
+    add.add_argument("--notes", default="")
+    add.add_argument("--origin-label")
+    add.add_argument("--destination-label")
+    add.set_defaults(func=cmd_history)
+    export = hsub.add_parser("export")
+    export.add_argument("id", type=int)
+    export.add_argument("--geojson", required=True, type=Path)
+    export.add_argument("--history-db")
+    export.set_defaults(func=cmd_history)
 
     dm = sub.add_parser("demo", help="static demo site with preset routes (docs/PUBLISH.md)")
     dsub = dm.add_subparsers(dest="demo_cmd", required=True)

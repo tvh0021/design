@@ -11,6 +11,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -24,6 +25,7 @@ from .search import (
     CostGraph,
     ScenicRoute,
     _densify,
+    _history_active,
     _INK,
     _INK2,
     _MUTED,
@@ -36,6 +38,9 @@ from .search import (
     route_overlap,
     score_route,
 )
+
+if TYPE_CHECKING:
+    from .history import HistoryBias
 
 DIRECTIONS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 DIRECTION_WORDS = {
@@ -180,6 +185,8 @@ class LoopResult:
     region_arcs: int
     seconds: dict
     note: str | None
+    history: dict | None = None
+    history_fallback: bool = False
 
 
 def loop_config(cfg: dict | None = None) -> dict:
@@ -654,9 +661,26 @@ def _edge_midpoints_lonlat(g: RoadGraph, edges: np.ndarray) -> tuple[np.ndarray,
     return lon, lat
 
 
-def _build_candidates(ctx: Context, reach: Reach, cfg: dict) -> tuple[list[_Via], np.ndarray, cKDTree, np.ndarray, np.ndarray]:
+def _build_candidates(
+    ctx: Context,
+    reach: Reach,
+    cfg: dict,
+    *,
+    history: HistoryBias | None = None,
+) -> tuple[list[_Via], np.ndarray, cKDTree, np.ndarray, np.ndarray]:
     """Return (candidates, reg_edges, reg_mid_tree, node_x5070, node_y5070)."""
     g, S, mom = ctx.g, ctx.S, ctx.moments
+    hist_active = _history_active(history, ctx)
+    q_mom = (
+        1.0 / (1.0 + float(history.moment_penalty) * np.asarray(history.moment_strength, dtype=np.float64))
+        if hist_active
+        else None
+    )
+    edge_disc_all = (
+        1.0 / (1.0 + float(history.edge_penalty) * np.asarray(history.edge_strength, dtype=np.float64))
+        if hist_active
+        else None
+    )
     region = reach.region
     fa, ra = reach.fa, reach.ra
     dH, dR = reach.dH, reach.dR
@@ -685,6 +709,8 @@ def _build_candidates(ctx: Context, reach: Reach, cfg: dict) -> tuple[list[_Via]
         for k in range(len(mom.id)):
             e = int(mom.edge[k])
             val = float(mom.m[k]) ** 2
+            if q_mom is not None:
+                val *= float(q_mom[k])
             mid = int(mom.id[k])
             for a in (int(fa[e]), int(ra[e])):
                 if a >= 0 and region[g.arc_tail[a]] and region[g.arc_head[a]]:
@@ -694,6 +720,7 @@ def _build_candidates(ctx: Context, reach: Reach, cfg: dict) -> tuple[list[_Via]
     if len(reg_edges):
         s_reg = S[reg_edges]
         l_reg = g.length_m[reg_edges]
+        disc_reg = edge_disc_all[reg_edges] if edge_disc_all is not None else None
         qual = (
             (s_reg >= float(cfg["seed_min_S"]))
             & (l_reg >= float(cfg["seed_min_length_m"]))
@@ -711,10 +738,15 @@ def _build_candidates(ctx: Context, reach: Reach, cfg: dict) -> tuple[list[_Via]
             seed_full = float(cfg["seed_full_m"])
             for members in cells.values():
                 m_arr = np.asarray(members, dtype=np.int64)
-                scores = s_reg[m_arr] * np.sqrt(l_reg[m_arr])
+                if disc_reg is not None:
+                    d_arr = disc_reg[m_arr]
+                    scores = s_reg[m_arr] * np.sqrt(l_reg[m_arr]) * d_arr
+                    tot_ls = float(np.sum(l_reg[m_arr] * s_reg[m_arr] * d_arr))
+                else:
+                    scores = s_reg[m_arr] * np.sqrt(l_reg[m_arr])
+                    tot_ls = float(np.sum(l_reg[m_arr] * s_reg[m_arr]))
                 best_local = int(m_arr[int(np.argmax(scores))])
                 e = int(reg_edges[best_local])
-                tot_ls = float(np.sum(l_reg[m_arr] * s_reg[m_arr]))
                 val = seed_val_max * min(1.0, tot_ls / max(seed_full, 1e-9))
                 key = -1 - e
                 for a in (int(fa[e]), int(ra[e])):
@@ -814,6 +846,8 @@ class _LoopBuilder:
         mid_tree: cKDTree,
         nx5070: np.ndarray,
         ny5070: np.ndarray,
+        *,
+        history: HistoryBias | None = None,
     ):
         self.ctx = ctx
         self.g = ctx.g
@@ -826,15 +860,27 @@ class _LoopBuilder:
         self.dijkstras = 0
         self.built = 0
 
+        hist_active = _history_active(history, ctx)
+        edge_mult = (
+            1.0 + float(history.edge_penalty) * np.asarray(history.edge_strength, dtype=np.float64)
+            if hist_active
+            else None
+        )
+
         self.lambdas = [float(lam) for lam in cfg["lambdas"]]
         self.graphs: dict[float, CostGraph] = {}
         for lam in self.lambdas:
             if lam not in self.graphs:
                 cost = self.g.time_s if lam == 0.0 else self.g.time_s * (1.0 + lam * (1.0 - ctx.S))
+                if edge_mult is not None:
+                    cost = cost * edge_mult
                 self.graphs[lam] = CostGraph(self.g, reach.arcs, cost)
-        if 0.0 not in self.graphs:
-            self.graphs[0.0] = CostGraph(self.g, reach.arcs, self.g.time_s)
-        self.G0 = self.graphs[0.0]
+        if hist_active:
+            self.G0 = CostGraph(self.g, reach.arcs, self.g.time_s)
+        else:
+            if 0.0 not in self.graphs:
+                self.graphs[0.0] = CostGraph(self.g, reach.arcs, self.g.time_s)
+            self.G0 = self.graphs[0.0]
         self.arc_edges: dict[float, np.ndarray] = {
             lam: self.g.arc_edge[G.arc] for lam, G in self.graphs.items()
         }
@@ -1406,66 +1452,26 @@ def _build_note(picks: list[LoopRoute], steer: Steer, anchor: Anchor | None, cfg
     return " ".join(notes) if notes else None
 
 
-def loops(
+def _run_loop_pass(
     ctx: Context,
-    start: tuple[float, float],
-    minutes: float,
-    steer: Steer = Steer(),
-    cfg: dict | None = None,
-    log=None,
-) -> LoopResult:
-    cfg = loop_config(cfg)
-    min_m, max_m = int(cfg["min_minutes"]), int(cfg["max_minutes"])
-    if not (isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes)):
-        raise ValueError(f"minutes must be a finite number in [{min_m}, {max_m}]")
-    if not (min_m <= float(minutes) <= max_m):
-        raise ValueError(f"minutes must be in [{min_m}, {max_m}], got {minutes}")
-
-    mode = str(steer.mode or "any").strip().lower()
-    if mode not in ("any", "compass", "anchor"):
-        raise ValueError(f"unknown steer mode {steer.mode!r}")
-
-    req_dir: str | None = None
-    theta = 0.0
-    if mode == "compass":
-        if not steer.direction:
-            raise ValueError("compass steer requires direction")
-        req_dir = str(steer.direction).strip().upper()
-        theta = direction_bearing(req_dir)
-    elif mode == "anchor":
-        has_feat = bool(steer.feature and str(steer.feature).strip())
-        has_pt = steer.point is not None
-        if has_feat == has_pt:
-            raise ValueError("anchor steer requires exactly one of point or feature")
-
-    norm_steer = Steer(
-        mode=mode,
-        direction=req_dir,
-        point=(float(steer.point[0]), float(steer.point[1])) if steer.point is not None else None,
-        feature=str(steer.feature).strip() if steer.feature else None,
-    )
-
-    t_total0 = time.monotonic()
+    reach: Reach,
+    anchor: Anchor | None,
+    norm_steer: Steer,
+    req_dir: str | None,
+    theta: float,
+    B: float,
+    min_disp: int,
+    cfg: dict,
+    *,
+    routing_history: HistoryBias | None,
+    scoring_history: HistoryBias | None,
+) -> tuple[list[LoopRoute], int, int, int, dict[str, float]]:
+    mode = norm_steer.mode
     secs: dict[str, float] = {}
-    B = 60.0 * float(minutes)
-    min_disp = int(round(float(minutes)))
-
-    # 4.1 & 4.2 Reach cut
-    t0 = time.monotonic()
-    reach = compute_reach(ctx.g, (float(start[0]), float(start[1])), B, cfg)
-    if reach.snap_m > MAX_SNAP_M:
-        raise LoopError(
-            "snap_far",
-            "The start point is too far from the nearest road in the graph.",
-            snap_m=round(reach.snap_m),
-            limit_m=round(MAX_SNAP_M),
-        )
-    anchor = resolve_anchor(ctx, reach, norm_steer, cfg) if mode == "anchor" else None
-    secs["reach"] = round(time.monotonic() - t0, 3)
 
     # 4.3 Candidate vias
     t0 = time.monotonic()
-    vias, reg_edges, mid_tree, nx5070, ny5070 = _build_candidates(ctx, reach, cfg)
+    vias, reg_edges, mid_tree, nx5070, ny5070 = _build_candidates(ctx, reach, cfg, history=routing_history)
     secs["vias"] = round(time.monotonic() - t0, 3)
 
     # 4.4-4.6 Build loops under work cap
@@ -1474,7 +1480,7 @@ def loops(
     c_lo, c_hi = int(cfg["dijkstra_count_range"][0]), int(cfg["dijkstra_count_range"][1])
     max_dijkstras = int(np.clip(math.floor(float(cfg["dijkstra_work_arcs"]) / n_arcs), c_lo, c_hi))
 
-    builder = _LoopBuilder(ctx, reach, cfg, reg_edges, mid_tree, nx5070, ny5070)
+    builder = _LoopBuilder(ctx, reach, cfg, reg_edges, mid_tree, nx5070, ny5070, history=routing_history)
     raw_built: list[tuple[Route, bool, str, tuple]] = []  # (route, uturn, origin, vias_tuple)
     lim_s = float(cfg["max_time_frac"]) * B
 
@@ -1505,6 +1511,7 @@ def loops(
                 raw_built.append((route, uturn, f"any {a1.key}->{a2.key}", (a1.key, a2.key)))
 
     elif mode == "compass":
+        assert req_dir is not None
         cone_deg = float(cfg["cone_deg"])
         rt_hi = float(cfg["first_rt_frac"][1]) * B
         rt_lo = float(cfg["first_rt_frac"][0]) * B
@@ -1670,7 +1677,7 @@ def loops(
             tier=val["tier"],
             uturn=uturn,
         )
-        score_route(lr, ctx, t0=B, s_fast=s_base)
+        score_route(lr, ctx, t0=B, s_fast=s_base, history=scoring_history)
         if mode == "anchor" and anchor is not None:
             if anchor.kind == "point":
                 if int(anchor.node) not in set(int(n) for n in route.nodes):
@@ -1713,14 +1720,18 @@ def loops(
             f"No loop fits in {min_disp} min from here. Try a longer drive.",
         )
 
-    tier1 = sorted(
-        (lr for lr in valid_loops if lr.tier == 1),
-        key=lambda lr: (-round(lr.rank, 9), -round(lr.score, 9), lr.route.time_s),
-    )
-    tier2 = sorted(
-        (lr for lr in valid_loops if lr.tier == 2),
-        key=lambda lr: (-round(lr.rank, 9), -round(lr.score, 9), lr.route.time_s),
-    )
+    if scoring_history is not None:
+        sort_key = lambda lr: (  # noqa: E731
+            -round(lr.rank, 9),
+            -round(lr.score, 9),
+            round(float(lr.history["history_exposure"]), 9) if lr.history is not None else 0.0,
+            lr.route.time_s,
+        )
+    else:
+        sort_key = lambda lr: (-round(lr.rank, 9), -round(lr.score, 9), lr.route.time_s)  # noqa: E731
+
+    tier1 = sorted((lr for lr in valid_loops if lr.tier == 1), key=sort_key)
+    tier2 = sorted((lr for lr in valid_loops if lr.tier == 2), key=sort_key)
     picks = _select_loops(tier1 + tier2, ctx.g.length_m, norm_steer, cfg)
     if not picks:
         if mode == "compass" and req_dir:
@@ -1734,9 +1745,110 @@ def loops(
             f"No loop fits in {min_disp} min from here. Try a longer drive.",
         )
 
+    secs["select"] = round(time.monotonic() - t0, 3)
+    return picks, kept_count, builder.built, builder.dijkstras, secs
+
+
+def loops(
+    ctx: Context,
+    start: tuple[float, float],
+    minutes: float,
+    steer: Steer = Steer(),
+    cfg: dict | None = None,
+    log=None,
+    *,
+    history: HistoryBias | None = None,
+) -> LoopResult:
+    cfg = loop_config(cfg)
+    min_m, max_m = int(cfg["min_minutes"]), int(cfg["max_minutes"])
+    if not (isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes)):
+        raise ValueError(f"minutes must be a finite number in [{min_m}, {max_m}]")
+    if not (min_m <= float(minutes) <= max_m):
+        raise ValueError(f"minutes must be in [{min_m}, {max_m}], got {minutes}")
+
+    mode = str(steer.mode or "any").strip().lower()
+    if mode not in ("any", "compass", "anchor"):
+        raise ValueError(f"unknown steer mode {steer.mode!r}")
+
+    req_dir: str | None = None
+    theta = 0.0
+    if mode == "compass":
+        if not steer.direction:
+            raise ValueError("compass steer requires direction")
+        req_dir = str(steer.direction).strip().upper()
+        theta = direction_bearing(req_dir)
+    elif mode == "anchor":
+        has_feat = bool(steer.feature and str(steer.feature).strip())
+        has_pt = steer.point is not None
+        if has_feat == has_pt:
+            raise ValueError("anchor steer requires exactly one of point or feature")
+
+    norm_steer = Steer(
+        mode=mode,
+        direction=req_dir,
+        point=(float(steer.point[0]), float(steer.point[1])) if steer.point is not None else None,
+        feature=str(steer.feature).strip() if steer.feature else None,
+    )
+
+    hist_active = _history_active(history, ctx)
+    active_history = history if hist_active else None
+
+    t_total0 = time.monotonic()
+    secs: dict[str, float] = {}
+    B = 60.0 * float(minutes)
+    min_disp = int(round(float(minutes)))
+
+    # 4.1 & 4.2 Reach cut
+    t0 = time.monotonic()
+    reach = compute_reach(ctx.g, (float(start[0]), float(start[1])), B, cfg)
+    if reach.snap_m > MAX_SNAP_M:
+        raise LoopError(
+            "snap_far",
+            "The start point is too far from the nearest road in the graph.",
+            snap_m=round(reach.snap_m),
+            limit_m=round(MAX_SNAP_M),
+        )
+    anchor = resolve_anchor(ctx, reach, norm_steer, cfg) if mode == "anchor" else None
+    secs["reach"] = round(time.monotonic() - t0, 3)
+
+    history_fallback = False
+    try:
+        picks, kept_count, built_count, dijkstra_count, pass_secs = _run_loop_pass(
+            ctx,
+            reach,
+            anchor,
+            norm_steer,
+            req_dir,
+            theta,
+            B,
+            min_disp,
+            cfg,
+            routing_history=active_history,
+            scoring_history=active_history,
+        )
+    except LoopError as exc:
+        if not hist_active or exc.code not in ("no_loop", "no_loop_that_way"):
+            raise
+        history_fallback = True
+        picks, kept_count, built_count, dijkstra_count, pass_secs = _run_loop_pass(
+            ctx,
+            reach,
+            anchor,
+            norm_steer,
+            req_dir,
+            theta,
+            B,
+            min_disp,
+            cfg,
+            routing_history=None,
+            scoring_history=active_history,
+        )
+    secs.update(pass_secs)
+
     _label_picks(picks)
 
     # For shore anchors, move display point to the nearest used target moment
+    anchor_mset = set(int(m) for m in anchor.moments) if anchor is not None and len(anchor.moments) else set()
     if anchor is not None and anchor.kind == "shore" and anchor.requested is not None:
         used_moms = sorted({m for lr in picks for m in lr.passed if m in anchor_mset})
         if used_moms:
@@ -1751,7 +1863,6 @@ def loops(
             anchor.moved_m = float(dists_m[int(np.argmin(dists_m))])
 
     note = _build_note(picks, norm_steer, anchor, cfg)
-    secs["select"] = round(time.monotonic() - t0, 3)
     secs["total"] = round(time.monotonic() - t_total0, 3)
 
     return LoopResult(
@@ -1761,14 +1872,16 @@ def loops(
         budget_s=B,
         steer=norm_steer,
         anchor=anchor,
-        s_fast=s_base,
+        s_fast=float(cfg["s_base"]),
         picks=picks,
         kept=kept_count,
-        built=builder.built,
-        dijkstras=builder.dijkstras,
+        built=built_count,
+        dijkstras=dijkstra_count,
         region_arcs=int(len(reach.arcs)),
         seconds=secs,
         note=note,
+        history=dict(active_history.diagnostics) if active_history is not None else None,
+        history_fallback=history_fallback,
     )
 
 
@@ -1819,7 +1932,7 @@ def _describe_loop(ctx: Context, lr: LoopRoute) -> dict:
 
 
 def result_json(ctx: Context, res: LoopResult) -> dict:
-    return {
+    out = {
         "mode": "loop",
         "start": [round(res.start[0], 5), round(res.start[1], 5)],
         "snap_m": [round(res.snap_m)],
@@ -1834,11 +1947,19 @@ def result_json(ctx: Context, res: LoopResult) -> dict:
         "note": res.note,
         "picks": [_describe_loop(ctx, lr) for lr in res.picks],
     }
+    if res.history is not None:
+        out["history"] = dict(res.history)
+        out["history_fallback"] = bool(res.history_fallback)
+    return out
 
 
-def geojson(ctx: Context, res: LoopResult) -> dict:
+def geojson(ctx: Context, res: LoopResult, *, include_history: bool = False) -> dict:
+    emit_history = bool(include_history or res.history is not None)
+    if emit_history:
+        from .history import TripMetadata, build_history_v1_payload
     feats = []
     shown: set[int] = set()
+    steer_meta = steer_json(res.steer, res.anchor) if emit_history else None
     for rank_i, lr in enumerate(res.picks, 1):
         props = {
             "role": f"loop_{rank_i}",
@@ -1847,6 +1968,20 @@ def geojson(ctx: Context, res: LoopResult) -> dict:
             "node_path": [int(n) for n in lr.nodes],
         }
         props["roads"] = [list(r) for r in props["roads"]]
+        if emit_history:
+            meta = TripMetadata(
+                mode="loop",
+                direction=res.steer.direction if res.steer.mode == "compass" else None,
+                anchor=steer_meta if res.steer.mode == "anchor" else None,
+                budget_minutes=res.budget_s / 60.0,
+                metadata={
+                    "role": f"loop_{rank_i}",
+                    "label": lr.label,
+                    "origin": lr.origin,
+                    "steer": steer_meta,
+                },
+            )
+            props["history_v1"] = build_history_v1_payload(ctx, lr, metadata=meta)
         feats.append({
             "type": "Feature",
             "properties": props,
